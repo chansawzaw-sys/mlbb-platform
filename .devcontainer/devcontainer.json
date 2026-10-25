@@ -1,0 +1,1 @@
+{"forwardPorts":[3000],"image":"mcr.microsoft.com/devcontainers/javascript-node:22","name":"MLBB Platform (free test)","portsAttributes":{"3000":{"label":"MLBB Platform app","protocol":"https"}},"postCreateCommand":"bash scripts/codespace-setup.sh","postStartCommand":"bash scripts/codespace-start.sh"}

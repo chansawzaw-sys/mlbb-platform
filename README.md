@@ -118,6 +118,24 @@ normal account → Admin → Google Setup with your own Google Client
 ID → sign in with Google using the fixed admin Gmail → you become
 Owner → enable 2FA → Telegram → test on two real phones.
 
+## GitHub Codespaces မှာ အခမဲ့ စမ်းရန် / Free test on GitHub Codespaces
+
+This repo ships a `.devcontainer` config, so GitHub Codespaces boots
+the app automatically — the free way to test with real users before
+paying for hosting (free tier: 120 core-hours/month ≈ 60 hours on the
+default 2-core machine, 15 GB storage, no card required).
+
+1. Open the repo → **Code → Codespaces → Create codespace on main**
+   (or visit codespaces.new/chansawzaw-sys/mlbb-platform).
+2. Wait for the editor to open. Setup installs Bun + dependencies,
+   then the server auto-starts on port 3000 (data in `.data/`, which
+   persists in the Codespace between stops).
+3. In the **Ports** panel, set port **3000** visibility to **Public**,
+   then open its URL — that is the shareable test link.
+4. When done testing, stop the Codespace (github.com/codespaces) to
+   save free hours. Restarting it later auto-starts the app again
+   with the same data and the same link.
+
 ## VPS မှာ တင်ရန် / Deploy on a VPS
 
 ```bash
