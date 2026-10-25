@@ -1,0 +1,28 @@
+# Render Blueprint — MLBB Platform (standalone Bun server)
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Runtime note: Render's native runtimes include Node.js/Bun. The
+# Blueprint `runtime` value for that native runtime is `node` (there is
+# no `bun` value in the Blueprint spec); Bun itself is preinstalled in
+# the runtime, so the build/start commands call bun directly — the
+# same pattern as Bun's official Render guide.
+#
+# The persistent disk is REQUIRED: DATA_DIR holds the SQLite database
+# and every uploaded image. Without the disk, all accounts, coins and
+# photos are lost on every redeploy/restart. DATA_DIR must exactly
+# match the disk mountPath.
+services:
+  - type: web
+    name: mlbb-platform
+    runtime: node
+    plan: 0.5c-512mb # Starter tier: 0.5 CPU / 512 MB, $7/month
+    buildCommand: bun install
+    startCommand: bun run server.ts
+    healthCheckPath: /health
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: mlbb-data
+      mountPath: /var/data
+      sizeGB: 1
