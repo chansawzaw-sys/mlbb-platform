@@ -15,8 +15,9 @@ the fixed admin email are unchanged: `src/actions.ts` and
 - `drizzle/` — SQL migrations (run automatically on boot)
 - `client/dist/` — the built web client (unchanged; it already speaks
   `POST ./actions` with `{action, args}`, so no client rebuild was needed)
-- `vendor/space-sdk.tgz` — the `@hatch/space-sdk` package the actions
-  import, vendored so the package is self-contained
+- `vendor/space-sdk/` — the `@hatch/space-sdk` package the actions
+  import, vendored as extracted files so the package is self-contained
+- `render.yaml` / `railway.json` — deploy config for Render / Railway
 
 ## Env vars
 
@@ -32,6 +33,48 @@ bun install
 bun run start          # = bun run server.ts
 # open http://localhost:3000  •  health: http://localhost:3000/health
 ```
+
+## Railway မှာ တင်ရန် / Deploy on Railway (current choice, 2026-10-25)
+
+This package ships a `railway.json` with the build/start/healthcheck
+settings filled in (Nixpacks detects Bun from `bun.lock`):
+
+| Setting | Value |
+|---|---|
+| Builder | NIXPACKS (Bun auto-detected) |
+| Build command | `bun install` |
+| Start command | `bun run server.ts` |
+| Health check path | `/health` (Railway injects `PORT` itself) |
+
+**Steps:**
+
+1. Push this package to GitHub (done: `chansawzaw-sys/mlbb-platform`).
+2. railway.app → sign up with GitHub → **New Project → Deploy from
+   GitHub repo** → select `mlbb-platform`. The first deploy starts
+   automatically from `railway.json`.
+3. **Add the Volume (REQUIRED):** open the service → **Settings →
+   Volumes → Add Volume** → mount path `/data`, size **1 GB**.
+   Volumes can only be added in the dashboard — no config file can
+   define one. Without it, Railway's filesystem is ephemeral and all
+   accounts, coins and photos are lost on every redeploy.
+4. **Set the data dir:** service → **Variables** → add
+   `DATA_DIR=/data` (must exactly match the volume mount path), then
+   redeploy.
+5. **Public URL:** service → **Settings → Networking → Generate
+   Domain**. Open it and check the app loads.
+
+Cost (railway.com/pricing, checked 2026-10-25 — recheck before
+paying): new accounts get a **$5 trial credit for 30 days, no card** —
+enough to test the real deploy first. Then **Hobby $5/month**, which
+includes $5 of usage; this app running always-on costs roughly
+**$5–8/month** total at current rates (RAM $10/GB/mo, CPU
+$20/vCPU/mo, volume $0.15/GB/mo, billed per second of actual use).
+No separate database is needed (SQLite lives on the volume).
+
+After the deploy is live, do the in-app production steps: register a
+normal account → Admin → Google Setup with your own Google Client
+ID → sign in with Google using the fixed admin Gmail → you become
+Owner → enable 2FA → Telegram → test on two real phones.
 
 ## Render မှာ တင်ရန် / Deploy on Render
 

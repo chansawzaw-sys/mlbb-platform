@@ -1,0 +1,1 @@
+{"$schema":"https://railway.com/railway.schema.json","build":{"buildCommand":"bun install","builder":"NIXPACKS"},"deploy":{"healthcheckPath":"/health","healthcheckTimeout":100,"restartPolicyMaxRetries":3,"restartPolicyType":"ON_FAILURE","startCommand":"bun run server.ts"}}
