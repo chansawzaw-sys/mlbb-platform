@@ -177,6 +177,23 @@ const DEFAULT_SETTINGS: Record<string, string> = {
     "Emote မသုံးရ",
     "ပထမ kill ရသူ နိုင်",
   ]),
+  // Fixed rule sets ("ပုံသေ") keyed by mode × team size — the server stamps
+  // the matching set onto every challenge; players can never add rules.
+  rules_1v1: JSON.stringify(["No Rule — ကြိုက်သလိုဆော့", "Victory ရသူ အနိုင်"]),
+  rules_brawl: JSON.stringify(["No Rule — ကြိုက်သလိုဆော့", "Victory ရသူ အနိုင်"]),
+  rules_classic_1: JSON.stringify([
+    "4 Kill အရင် ရသူ အနိုင်",
+    "Def item 1 ခုပဲ ဆက်ခွင့်ရှိ",
+    "Ban items: Rose Gold, Wind Chant",
+    "Assassin role သာ Retri ယူခွင့်ရှိ",
+  ]),
+  rules_classic_2_3: JSON.stringify([
+    "Mid only",
+    "ကြိုက်သလိုဆော့",
+    "Item အကုန် ဆက်လို့ရ",
+    "Hero အကုန် ကိုင်ခွင့်ရှိ",
+  ]),
+  rules_classic_4_5: JSON.stringify(["Hero အကုန် ကိုင်ခွင့်ရှိ", "ကြိုက်သလိုဆော့"]),
   challenge_min_stake_coins: "100",
 };
 
@@ -189,15 +206,52 @@ export const DEFAULT_PRESET_RULES: string[] = [
   "ပထမ kill ရသူ နိုင်",
 ];
 
-function parsePresetRules(s: Record<string, string>): string[] {
+/** Fixed rule sets keyed by mode × team size, as dictated by the Owner.
+ *  createChallenge stamps the matching set onto the challenge; the Owner
+ *  edits the sets in Admin Content. */
+export const DEFAULT_FIXED_RULES: Record<"mode_1v1" | "brawl" | "classic_1" | "classic_2_3" | "classic_4_5", string[]> = {
+  mode_1v1: ["No Rule — ကြိုက်သလိုဆော့", "Victory ရသူ အနိုင်"],
+  brawl: ["No Rule — ကြိုက်သလိုဆော့", "Victory ရသူ အနိုင်"],
+  classic_1: [
+    "4 Kill အရင် ရသူ အနိုင်",
+    "Def item 1 ခုပဲ ဆက်ခွင့်ရှိ",
+    "Ban items: Rose Gold, Wind Chant",
+    "Assassin role သာ Retri ယူခွင့်ရှိ",
+  ],
+  classic_2_3: ["Mid only", "ကြိုက်သလိုဆော့", "Item အကုန် ဆက်လို့ရ", "Hero အကုန် ကိုင်ခွင့်ရှိ"],
+  classic_4_5: ["Hero အကုန် ကိုင်ခွင့်ရှိ", "ကြိုက်သလိုဆော့"],
+};
+
+function parseRuleList(raw: string | undefined, defaults: string[]): string[] {
   try {
-    const parsed = JSON.parse(s["preset_rules"] ?? "[]") as unknown;
+    const parsed = JSON.parse(raw ?? "[]") as unknown;
     if (Array.isArray(parsed))
       return parsed.filter((x): x is string => typeof x === "string" && x.trim() !== "");
   } catch {
     /* fall through to defaults */
   }
-  return [...DEFAULT_PRESET_RULES];
+  return [...defaults];
+}
+
+function parseFixedRules(s: Record<string, string>): { mode_1v1: string[]; brawl: string[]; classic_1: string[]; classic_2_3: string[]; classic_4_5: string[] } {
+  return {
+    mode_1v1: parseRuleList(s["rules_1v1"], DEFAULT_FIXED_RULES.mode_1v1),
+    brawl: parseRuleList(s["rules_brawl"], DEFAULT_FIXED_RULES.brawl),
+    classic_1: parseRuleList(s["rules_classic_1"], DEFAULT_FIXED_RULES.classic_1),
+    classic_2_3: parseRuleList(s["rules_classic_2_3"], DEFAULT_FIXED_RULES.classic_2_3),
+    classic_4_5: parseRuleList(s["rules_classic_4_5"], DEFAULT_FIXED_RULES.classic_4_5),
+  };
+}
+
+/** The fixed set that applies to a challenge of this arena + team size:
+ *  brawl and the 1v1 mode use one set at any size; classic varies by size. */
+function fixedRulesFor(s: Record<string, string>, arena: string, teamSize: number): string[] {
+  const sets = parseFixedRules(s);
+  if (arena === "brawl") return sets.brawl;
+  if (arena === "1v1") return sets.mode_1v1;
+  if (teamSize <= 1) return sets.classic_1;
+  if (teamSize <= 3) return sets.classic_2_3;
+  return sets.classic_4_5;
 }
 
 async function getSettingsMap(db: Db): Promise<Record<string, string>> {
@@ -710,6 +764,27 @@ async function teamGateFor(db: Db, playerId: number, teamSize: number): Promise<
   return false;
 }
 
+/** Roster fill for one side of a match: how many of the side's team members
+ *  are marked ready (the count the team gate builds on) — at least 1, since
+ *  the side's player is in the match by definition — capped at teamSize. */
+async function teamFillFor(db: Db, playerId: number, teamSize: number): Promise<number> {
+  if (teamSize <= 1) return 1;
+  let best = 1;
+  const memberships = await db
+    .select()
+    .from(schema.teamMembers)
+    .where(eq(schema.teamMembers.playerId, playerId));
+  for (const ms of memberships) {
+    const members = await db
+      .select()
+      .from(schema.teamMembers)
+      .where(eq(schema.teamMembers.teamId, ms.teamId));
+    const ready = members.filter((mm) => mm.ready === 1).length;
+    best = Math.max(best, Math.min(ready, teamSize));
+  }
+  return best;
+}
+
 /** Timeout sweep: ready-check warning -> cancel+refund; stale live matches.
  *  Runs lazily on reads (bootstrap/match/board) and via sweepTimeouts. */
 async function sweepTimeoutsInternal(db: Db): Promise<number> {
@@ -1151,6 +1226,8 @@ const matchShape = z.object({
   team_gate_required: z.boolean(),
   team_a_ready: z.boolean(),
   team_b_ready: z.boolean(),
+  team_a_fill: z.number(),
+  team_b_fill: z.number(),
   a_evidence_url: z.string(),
   b_evidence_url: z.string(),
   winner_id: z.number().nullable(),
@@ -1230,6 +1307,8 @@ async function matchOut(ctx: Ctx, db: Db, m: MatchRow, viewerId: number | null =
     team_gate_required: m.teamSize > 1,
     team_a_ready: await teamGateFor(db, m.playerAId, m.teamSize),
     team_b_ready: await teamGateFor(db, m.playerBId, m.teamSize),
+    team_a_fill: await teamFillFor(db, m.playerAId, m.teamSize),
+    team_b_fill: await teamFillFor(db, m.playerBId, m.teamSize),
     a_evidence_url: await evUrl(m.aEvidence),
     b_evidence_url: await evUrl(m.bEvidence),
     winner_id: m.winnerId ?? null,
@@ -1290,6 +1369,13 @@ const settingsShape = z.object({
   slide_image_2: z.string(),
   slide_image_3: z.string(),
   preset_rules: z.array(z.string()),
+  fixed_rules: z.object({
+    classic_1: z.array(z.string()),
+    classic_2_3: z.array(z.string()),
+    classic_4_5: z.array(z.string()),
+    brawl: z.array(z.string()),
+    mode_1v1: z.array(z.string()),
+  }),
   challenge_min_stake_coins: z.number(),
 });
 
@@ -1304,6 +1390,7 @@ function settingsOut(s: Record<string, string>) {
   } catch {
     packages = [];
   }
+  const fixedRules = parseFixedRules(s);
   return {
     announcement_my: s["announcement_my"] ?? "",
     announcement_en: s["announcement_en"] ?? "",
@@ -1357,7 +1444,10 @@ function settingsOut(s: Record<string, string>) {
     slide_image_1: s["slide_image_1"] ?? "",
     slide_image_2: s["slide_image_2"] ?? "",
     slide_image_3: s["slide_image_3"] ?? "",
-    preset_rules: parsePresetRules(s),
+    // Back-compat alias: preset_rules mirrors the Classic 4–5 fixed list
+    // (the tournament pick-list; challenges use fixed_rules via the server).
+    preset_rules: fixedRules.classic_4_5,
+    fixed_rules: fixedRules,
     challenge_min_stake_coins: numSetting(s, "challenge_min_stake_coins", 100),
   };
 }
@@ -1949,7 +2039,13 @@ export const Actions = {
       const out = [];
       for (const c of rows) {
         if (args.arena !== "all" && c.arena !== args.arena) continue;
-        if (args.hero_rule !== "all" && c.heroRule !== args.hero_rule) continue;
+        if (args.hero_rule !== "all") {
+          // The "same" filter matches "same", "same:<HeroName>" and the
+          // legacy "same_hero" value by prefix.
+          const sameMatch = args.hero_rule === "same" &&
+            (c.heroRule === "same" || c.heroRule === "same_hero" || c.heroRule.startsWith("same:"));
+          if (!sameMatch && c.heroRule !== args.hero_rule) continue;
+        }
         // Rank restrictions were removed — anyone may challenge anyone, so
         // the board never filters by rank any more (args.rank is ignored).
         if (args.max_stake > 0 && c.stake > args.max_stake) continue;
@@ -1986,6 +2082,8 @@ export const Actions = {
       team_size: z.number().int().min(1).max(5),
       hero_rule: z.string().max(40),
       rank_restriction: z.string().max(30).default(""),
+      // Accepted for API compatibility but IGNORED: the server stamps the
+      // challenge's rules from the arena's fixed terms in settings.
       custom_rules: z.string().max(2000).default(""),
       stake: z.number().int().min(1).max(1000000),
     }),
@@ -2018,7 +2116,10 @@ export const Actions = {
           // Rank restrictions removed: anyone can challenge anyone. The arg
           // is still accepted for API compatibility but never stored.
           rankRestriction: "",
-          customRules: args.custom_rules,
+          // Rules are the Admin's FIXED terms for this mode × team size:
+          // any custom_rules a client submits are ignored and the challenge
+          // is stamped from settings, so no tampered client can inject rules.
+          customRules: fixedRulesFor(s, args.arena, args.team_size).join("\n"),
           // Snapshot of the admin hero-ban list at creation time — enforced
           // later in the match room, not just displayed.
           bannedHeroes: s["banned_heroes"] ?? "",
@@ -2504,7 +2605,16 @@ export const Actions = {
       if (roleRules.includes(m.heroRule) && role !== m.heroRule)
         return { ok: false, error: `ဒီပွဲက ${m.heroRule} only ပါ — ${hero} က ${role} ဖြစ်နေပါတယ်`, hero: "" };
       const otherHero = isA ? m.bHero : m.aHero;
-      if (m.heroRule === "same_hero" && otherHero && otherHero !== hero)
+      // Same-hero family: legacy "same_hero", the wizard's "same", and
+      // "same:<HeroName>" — with a name, both sides must play that hero.
+      const sameNamed = m.heroRule.startsWith("same:") ? m.heroRule.slice(5).trim() : "";
+      const namedHero = sameNamed
+        ? (HERO_NAMES.find((h) => h.toLowerCase() === sameNamed.toLowerCase()) ?? "")
+        : "";
+      const isSameRule = m.heroRule === "same_hero" || m.heroRule === "same" || m.heroRule.startsWith("same:");
+      if (isSameRule && namedHero && hero !== namedHero)
+        return { ok: false, error: `Same Hero — ဒီပွဲမှာ ${namedHero} ပဲ ကိုင်ရပါမယ်`, hero: "" };
+      if (isSameRule && otherHero && otherHero !== hero)
         return { ok: false, error: `Same Hero only — opponent က ${otherHero} ရွေးထားပါတယ်`, hero: "" };
       if (m.heroRule === "no_duplicate" && otherHero && otherHero === hero)
         return { ok: false, error: `No Duplicate — opponent က ${hero} ရွေးပြီးသားပါ`, hero: "" };
