@@ -28,6 +28,25 @@ function effectiveRole(p: PlayerRow): string {
   return p.role;
 }
 
+/** Earned rank ladder — a player's rank is COMPUTED from their total wins,
+ *  never self-declared. Original metal/gem names (not MLBB's official ones).
+ *  The stored players.rank column is legacy: display always uses this. */
+export const RANK_TIERS: { name: string; min: number }[] = [
+  { name: "Bronze", min: 0 },
+  { name: "Silver", min: 5 },
+  { name: "Gold", min: 15 },
+  { name: "Platinum", min: 30 },
+  { name: "Diamond", min: 50 },
+  { name: "Ruby", min: 80 },
+  { name: "Champion", min: 120 },
+  { name: "Supreme", min: 180 },
+];
+export function rankFromWins(wins: number): string {
+  let name = RANK_TIERS[0]!.name;
+  for (const t of RANK_TIERS) if ((wins ?? 0) >= t.min) name = t.name;
+  return name;
+}
+
 /** Hero catalog used for REAL ban / role enforcement (name -> role). */
 export const HERO_CATALOG: Record<string, string> = {
   Miya: "marksman", Layla: "marksman", Clint: "marksman", Bruno: "marksman",
@@ -144,7 +163,42 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   terms_version: "1",
   terms_text: "",
   rules_text: "",
+  slide_image_1: "",
+  slide_image_1_key: "",
+  slide_image_2: "",
+  slide_image_2_key: "",
+  slide_image_3: "",
+  slide_image_3_key: "",
+  preset_rules: JSON.stringify([
+    "ပထမ tower ရသူ နိုင်",
+    "Lord မသတ်ရ",
+    "Mid lane သာ",
+    "Recall မလုပ်ရ",
+    "Emote မသုံးရ",
+    "ပထမ kill ရသူ နိုင်",
+  ]),
+  challenge_min_stake_coins: "100",
 };
+
+export const DEFAULT_PRESET_RULES: string[] = [
+  "ပထမ tower ရသူ နိုင်",
+  "Lord မသတ်ရ",
+  "Mid lane သာ",
+  "Recall မလုပ်ရ",
+  "Emote မသုံးရ",
+  "ပထမ kill ရသူ နိုင်",
+];
+
+function parsePresetRules(s: Record<string, string>): string[] {
+  try {
+    const parsed = JSON.parse(s["preset_rules"] ?? "[]") as unknown;
+    if (Array.isArray(parsed))
+      return parsed.filter((x): x is string => typeof x === "string" && x.trim() !== "");
+  } catch {
+    /* fall through to defaults */
+  }
+  return [...DEFAULT_PRESET_RULES];
+}
 
 async function getSettingsMap(db: Db): Promise<Record<string, string>> {
   const rows = await db.select().from(schema.settings);
@@ -217,7 +271,7 @@ function playerOut(p: PlayerRow, avatarUrl = "") {
     name: p.name,
     mlbb_id: p.mlbbId,
     server_id: p.serverId,
-    rank: p.rank,
+    rank: rankFromWins(p.wins),
     avatar_color: p.avatarColor,
     avatar_url: avatarUrl,
     avatar_blob_key: (p as PlayerRow & { avatarBlobKey?: string }).avatarBlobKey ?? "",
@@ -1232,6 +1286,11 @@ const settingsShape = z.object({
   topup_min_coins: z.number(),
   topup_max_coins: z.number(),
   withdraw_max_coins_per_day: z.number(),
+  slide_image_1: z.string(),
+  slide_image_2: z.string(),
+  slide_image_3: z.string(),
+  preset_rules: z.array(z.string()),
+  challenge_min_stake_coins: z.number(),
 });
 
 function settingsOut(s: Record<string, string>) {
@@ -1295,6 +1354,11 @@ function settingsOut(s: Record<string, string>) {
     topup_min_coins: numSetting(s, "topup_min_coins", 10),
     topup_max_coins: numSetting(s, "topup_max_coins", 1000000),
     withdraw_max_coins_per_day: numSetting(s, "withdraw_max_coins_per_day", 100000),
+    slide_image_1: s["slide_image_1"] ?? "",
+    slide_image_2: s["slide_image_2"] ?? "",
+    slide_image_3: s["slide_image_3"] ?? "",
+    preset_rules: parsePresetRules(s),
+    challenge_min_stake_coins: numSetting(s, "challenge_min_stake_coins", 100),
   };
 }
 
@@ -1686,7 +1750,7 @@ export const Actions = {
       name: z.string().min(1).max(60),
       mlbb_id: z.string().max(30).default(""),
       server_id: z.string().max(30).default(""),
-      rank: z.string().default("Epic"),
+      rank: z.string().default("Bronze"),
       referral_code: z.string().max(30).default(""),
       avatar_color: z.string().default("#7c3aed"),
     }),
@@ -1722,7 +1786,9 @@ export const Actions = {
           name: args.name.trim(),
           mlbbId: args.mlbb_id.trim(),
           serverId: args.server_id.trim(),
-          rank: args.rank,
+          // Rank is earned from wins (rankFromWins) — new accounts start at
+          // the bottom of the ladder; the stored column is never displayed.
+          rank: "Bronze",
           avatarColor: args.avatar_color,
           // No first-registrant bootstrap any more: normal signup is ALWAYS a
           // plain player. Owner exists only via the fixed admin Gmail.
@@ -1754,7 +1820,7 @@ export const Actions = {
       name: z.string().min(1).max(60),
       mlbb_id: z.string().max(30),
       server_id: z.string().max(30),
-      rank: z.string(),
+      rank: z.string().default("Bronze"),
       avatar_color: z.string(),
     }),
     response: z.object({ ok: z.boolean() }),
@@ -1770,7 +1836,7 @@ export const Actions = {
           name: args.name.trim(),
           mlbbId: args.mlbb_id.trim(),
           serverId: args.server_id.trim(),
-          rank: args.rank,
+          // Rank is NOT editable — it is earned from wins (rankFromWins).
           avatarColor: args.avatar_color,
         })
         .where(eq(schema.players.id, args.player_id));
@@ -1884,7 +1950,8 @@ export const Actions = {
       for (const c of rows) {
         if (args.arena !== "all" && c.arena !== args.arena) continue;
         if (args.hero_rule !== "all" && c.heroRule !== args.hero_rule) continue;
-        if (args.rank !== "all" && c.rankRestriction !== args.rank) continue;
+        // Rank restrictions were removed — anyone may challenge anyone, so
+        // the board never filters by rank any more (args.rank is ignored).
         if (args.max_stake > 0 && c.stake > args.max_stake) continue;
         if (args.team_size > 0 && c.teamSize !== args.team_size) continue;
         const creator = all.find((p) => p.id === c.creatorId);
@@ -1897,7 +1964,7 @@ export const Actions = {
           arena: c.arena,
           team_size: c.teamSize,
           hero_rule: c.heroRule,
-          rank_restriction: c.rankRestriction,
+          rank_restriction: "",
           custom_rules: c.customRules,
           stake: c.stake,
           fee_amount: fee,
@@ -1919,8 +1986,8 @@ export const Actions = {
       team_size: z.number().int().min(1).max(5),
       hero_rule: z.string().max(40),
       rank_restriction: z.string().max(30).default(""),
-      custom_rules: z.string().max(500).default(""),
-      stake: z.number().int().min(10).max(1000000),
+      custom_rules: z.string().max(2000).default(""),
+      stake: z.number().int().min(1).max(1000000),
     }),
     response: z.object({ ok: z.boolean(), error: z.string(), challenge_id: z.number() }),
     async handler(ctx, args) {
@@ -1934,6 +2001,11 @@ export const Actions = {
       if (!p) return { ok: false, error: AUTH_ERR, challenge_id: 0 };
       if (p.status === "perm_banned" || p.status === "temp_banned")
         return { ok: false, error: "Account ban ခံထားရပါတယ်", challenge_id: 0 };
+      // Admin-set minimum stake (challenge_min_stake_coins) — enforced here
+      // so no client can undercut it.
+      const minStake = numSetting(s, "challenge_min_stake_coins", 100);
+      if (args.stake < minStake)
+        return { ok: false, error: `လောင်းကြေး နည်းလွန်းပါတယ် — အနည်းဆုံး ${minStake.toLocaleString()} coins လောင်းရပါမယ် (Admin သတ်မှတ်ထား)`, challenge_id: 0 };
       if (p.balance < args.stake)
         return { ok: false, error: "Coin မလုံလောက်ပါ — Wallet မှာ အရင်ဝယ်ပါ", challenge_id: 0 };
       const ins = await db
@@ -1943,7 +2015,9 @@ export const Actions = {
           arena: args.arena,
           teamSize: args.team_size,
           heroRule: args.hero_rule,
-          rankRestriction: args.rank_restriction,
+          // Rank restrictions removed: anyone can challenge anyone. The arg
+          // is still accepted for API compatibility but never stored.
+          rankRestriction: "",
           customRules: args.custom_rules,
           // Snapshot of the admin hero-ban list at creation time — enforced
           // later in the match room, not just displayed.
@@ -1986,8 +2060,8 @@ export const Actions = {
         return { ok: false, error: "Player မတွေ့ပါ", match_id: 0 };
       if (acceptor.status === "perm_banned" || acceptor.status === "temp_banned")
         return { ok: false, error: "Account ban ခံထားရပါတယ်", match_id: 0 };
-      if (ch.rankRestriction && acceptor.rank !== ch.rankRestriction)
-        return { ok: false, error: `Rank ကန့်သတ်ထားပါတယ် — ${ch.rankRestriction} ပဲ လက်ခံလို့ရပါတယ်`, match_id: 0 };
+      // No rank gate on accepting: rank restrictions were removed, so any
+      // player may accept any open challenge regardless of rank.
       if (acceptor.balance < ch.stake || creator.balance < ch.stake)
         return { ok: false, error: "Coin မလုံလောက်ပါ (နှစ်ဖက်လုံး stake ရှိရပါမယ်)", match_id: 0 };
 
@@ -3118,6 +3192,80 @@ export const Actions = {
     },
   }),
 
+  uploadSlideImage: defineAction({
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+      slot: z.number().int().min(1).max(3),
+      image_base64: z.string().max(12_000_000).default(""),
+      image_mime: z.string().max(60).default(""),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string(), image_url: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const fail = (error: string) => ({ ok: false, error, image_url: "" });
+      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor) return fail(auth.error ?? AUTH_ERR);
+      if (!args.confirmed) return fail("Slideshow ပုံ ပြောင်းရန် security confirmation လိုပါတယ်");
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return fail(err2fa);
+      const v = validateImage(args.image_base64, args.image_mime);
+      if (v.error || !v.bytes) return fail(v.error || "ပုံ မမှန်ပါ");
+      const s = await getSettingsMap(db);
+      const keyField = `slide_image_${args.slot}_key`;
+      const urlField = `slide_image_${args.slot}`;
+      const oldKey = s[keyField] ?? "";
+      const key = `slides/slide-${args.slot}-${Date.now()}.${v.ext}`;
+      try {
+        await ctx.blobs.put(key, v.bytes, { contentType: v.mime });
+      } catch {
+        return fail("ပုံ သိမ်းလို့ မရပါ — ပြန်ကြိုးစားပါ");
+      }
+      const url = await blobUrlSafe(ctx, key);
+      await setSetting(db, urlField, url);
+      await setSetting(db, keyField, key);
+      if (oldKey && oldKey !== key) {
+        try { await ctx.blobs.delete(oldKey); } catch { /* best-effort */ }
+      }
+      await logAct(db, auth.actor.name, `Slideshow image updated (slot ${args.slot})`);
+      ctx.invalidateQueries();
+      return { ok: true, error: "", image_url: url };
+    },
+  }),
+
+  deleteSlideImage: defineAction({
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+      slot: z.number().int().min(1).max(3),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
+      if (!args.confirmed) return { ok: false, error: "Slideshow ပုံ ဖျက်ရန် security confirmation လိုပါတယ်" };
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return { ok: false, error: err2fa };
+      const s = await getSettingsMap(db);
+      const keyField = `slide_image_${args.slot}_key`;
+      const urlField = `slide_image_${args.slot}`;
+      const oldKey = s[keyField] ?? "";
+      await setSetting(db, urlField, "");
+      await setSetting(db, keyField, "");
+      if (oldKey) {
+        try { await ctx.blobs.delete(oldKey); } catch { /* best-effort */ }
+      }
+      await logAct(db, auth.actor.name, `Slideshow image removed (slot ${args.slot}) — default hero restored`);
+      ctx.invalidateQueries();
+      return { ok: true, error: "" };
+    },
+  }),
+
   telegramCallback: defineAction({
     request: z.object({
       update: z.record(z.string(), z.unknown()),
@@ -3620,7 +3768,7 @@ export const Actions = {
               return {
                 rank_no: i + 1,
                 name: nameOf(pid),
-                detail: `${p?.rank ?? ""} • best streak in period`,
+                detail: `${rankFromWins(p?.wins ?? 0)} • best streak in period`,
                 value: v,
                 color: colorOf(pid),
                 image_url: avatarUrlMap.get(pid) ?? "",
@@ -3635,7 +3783,7 @@ export const Actions = {
               return {
                 rank_no: i + 1,
                 name: nameOf(pid),
-                detail: `${p?.rank ?? ""} • ${p ? Math.round((p.wins / Math.max(1, p.wins + p.losses)) * 100) : 0}% win rate`,
+                detail: `${rankFromWins(p?.wins ?? 0)} • ${p ? Math.round((p.wins / Math.max(1, p.wins + p.losses)) * 100) : 0}% win rate`,
                 value: w,
                 color: colorOf(pid),
                 image_url: avatarUrlMap.get(pid) ?? "",
@@ -4509,6 +4657,7 @@ export const Actions = {
         "google_client_id", "google_enabled",
         "coin_rate_kyat", "withdraw_fee_percent", "withdraw_min_coins",
         "withdraw_max_coins_per_day", "topup_min_coins", "topup_max_coins",
+        "challenge_min_stake_coins",
         "kpay_phone", "wave_phone",
       ];
       const touchesCritical = Object.keys(args.values).some((k) => critical.includes(k));
@@ -4851,7 +5000,7 @@ export const Actions = {
         .insert(schema.players)
         .values({
           name: displayName,
-          rank: "Epic",
+          rank: "Bronze",
           role: roleFor(email),
           referralCode: myCode,
           googleSub: info.sub,
