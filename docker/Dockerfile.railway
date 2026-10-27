@@ -1,0 +1,20 @@
+# Railway build image for the MLBB Platform standalone server.
+# Uses the official Bun image directly — no Nixpacks/Node involved.
+FROM oven/bun:1
+
+WORKDIR /app
+COPY . .
+
+RUN bun install
+
+# Hero images ship as base64 text in the repo; decode them at build
+# time so the served .webp files are ready (the server would also
+# restore them at boot, but doing it here keeps the first boot clean).
+RUN for f in /app/client/dist/assets/*.webp.b64; do base64 -d "$f" > "${f%.b64}"; done
+
+# Railway injects PORT at runtime; the server reads it (default 3000).
+# DATA_DIR must match the Railway volume mount path (/data).
+ENV DATA_DIR=/data
+EXPOSE 3000
+
+CMD ["bun", "run", "server.ts"]
