@@ -331,6 +331,36 @@ export const withdrawRequests = sqliteTable("withdraw_requests", {
   decidedAt: integer("decided_at", { mode: "timestamp_ms" }),
 });
 
+export const diamondPackages = sqliteTable("diamond_packages", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull().default(""),
+  diamonds: integer("diamonds").notNull().default(0),
+  bonusText: text("bonus_text").notNull().default(""),
+  priceCoins: integer("price_coins").notNull().default(0),
+  enabled: integer("enabled").notNull().default(1),
+  sort: integer("sort").notNull().default(0),
+  createdAt: ts("created_at"),
+});
+
+export const diamondOrders = sqliteTable("diamond_orders", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  playerId: integer("player_id").notNull(),
+  packageId: integer("package_id").notNull().default(0),
+  packageName: text("package_name").notNull().default(""),
+  diamonds: integer("diamonds").notNull().default(0),
+  priceCoins: integer("price_coins").notNull().default(0),
+  status: text("status", {
+    enum: ["pending", "fulfilled", "rejected", "expired"],
+  })
+    .notNull()
+    .default("pending"),
+  txnCode: text("txn_code").notNull().default(""),
+  rejectReason: text("reject_reason").notNull().default(""),
+  decidedBy: text("decided_by").notNull().default(""),
+  createdAt: ts("created_at"),
+  decidedAt: integer("decided_at", { mode: "timestamp_ms" }),
+});
+
 export const notificationReads = sqliteTable("notification_reads", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   notificationId: integer("notification_id").notNull(),

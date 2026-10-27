@@ -1,5 +1,5 @@
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import * as schema from "./schema";
 
 function getDb(ctx: Ctx) {
@@ -169,6 +169,20 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   slide_image_2_key: "",
   slide_image_3: "",
   slide_image_3_key: "",
+  slide_image_4: "",
+  slide_image_4_key: "",
+  slide_image_5: "",
+  slide_image_5_key: "",
+  slide_image_6: "",
+  slide_image_6_key: "",
+  slide_image_7: "",
+  slide_image_7_key: "",
+  slide_image_8: "",
+  slide_image_8_key: "",
+  slide_image_9: "",
+  slide_image_9_key: "",
+  slide_image_10: "",
+  slide_image_10_key: "",
   preset_rules: JSON.stringify([
     "ပထမ tower ရသူ နိုင်",
     "Lord မသတ်ရ",
@@ -308,11 +322,13 @@ function feeFor(
 ): { fee: number; label: string } {
   const type = s[`fee_${arena}_type`] ?? "percent";
   const value = Number(s[`fee_${arena}_value`] ?? "5") || 0;
+  // The fee is clamped into [0, pot]: a negative fee_*_value in settings
+  // must never INFLATE the winner's payout beyond the pot.
   if (type === "fixed") {
-    const fee = Math.min(value, pot);
+    const fee = Math.max(0, Math.min(value, pot));
     return { fee, label: `Fixed ${value} coins` };
   }
-  const fee = Math.min(Math.round((pot * value) / 100), pot);
+  const fee = Math.max(0, Math.min(Math.round((pot * value) / 100), pot));
   return { fee, label: `${value}% of pot` };
 }
 
@@ -362,6 +378,10 @@ function playerPublicOut(p: PlayerRow, viewerId: number | null, avatarUrl = "") 
     balance: 0,
     locked_coins: 0,
     email: isFixedAdminEmail(p.email) ? p.email : "",
+    // Internal moderation/security fields never leak to other players:
+    // the suspicious reason and the 2FA flag are self-view / staff-only.
+    totp_enabled: false,
+    suspicious_reason: "",
     role: effectiveRole(p),
   };
 }
@@ -564,6 +584,20 @@ function moneyKeyboard(kind: "pur" | "wd", id: number) {
   return { inline_keyboard: [[positive, negative]] };
 }
 
+/** Inline decision keyboard for diamond orders in Telegram. callback_data
+ *  format: "dd:<orderId>:<approve|reject>" — routed by telegramCallback to
+ *  the same decision core as the admin dashboard. */
+function diamondKeyboard(id: number) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "✅ Fulfill", callback_data: `dd:${id}:approve` },
+        { text: "❌ Reject", callback_data: `dd:${id}:reject` },
+      ],
+    ],
+  };
+}
+
 /** Read raw blob bytes when the host provides them (the standalone host
  *  exposes ctx.blobBytes via its local-disk store). The portable BlobClient
  *  contract has no byte-read, so in other runtimes this returns null and
@@ -581,6 +615,16 @@ async function blobBytes(ctx: Ctx, key: string): Promise<Uint8Array | null> {
   } catch {
     return null;
   }
+}
+
+/** Host-secret check for host-only actions (C1). The standalone host
+ *  generates a random secret at every boot and exposes it on the ctx of
+ *  its INTERNAL dispatches only (its Telegram poller) — external /actions
+ *  callers cannot set ctx fields, so they can never satisfy this. Hosts
+ *  without the hook (the artifact runtime) fail closed. */
+function hostSecretOk(ctx: Ctx): boolean {
+  const extra = (ctx as unknown as { hostSecret?: unknown }).hostSecret;
+  return typeof extra === "string" && extra.length >= 16;
 }
 
 /** SHA-256 hex of image bytes (WebCrypto — portable across runtimes). */
@@ -716,6 +760,7 @@ async function playerBySession(
 }
 
 const AUTH_ERR = "Login session မမှန်ပါ — ပြန် login ဝင်ပါ (သူများ အကောင့်ကို ပြောင်းသုံးခွင့် မရှိပါ)";
+const TEMP_BAN_ERR = "Account ကို ယာယီ ban ထားပါတယ် — ban ကာလအတွင်း coin ရွှေ့/ရလဒ် တင်တာတွေ လုပ်လို့ မရပါ (temporarily banned)";
 
 /** Resolve an admin actor from (actor_player_id, session_token) and check
  *  the DB role. The client-sent actor NAME is never trusted. Returns an
@@ -917,6 +962,48 @@ async function expireMoneyRequestsInternal(db: Db): Promise<number> {
     await logAct(db, "system", `Withdraw request #${w.id} expired after 24h — refunded ${w.coins} coins`);
     acted++;
   }
+  const staleDiamond = await db
+    .select()
+    .from(schema.diamondOrders)
+    .where(eq(schema.diamondOrders.status, "pending"));
+  for (const o of staleDiamond) {
+    if (o.createdAt >= cutoff) continue;
+    const upd = await db
+      .update(schema.diamondOrders)
+      .set({ status: "expired", decidedBy: "system (24h expiry)", decidedAt: new Date() })
+      .where(
+        and(
+          eq(schema.diamondOrders.id, o.id),
+          eq(schema.diamondOrders.status, "pending"),
+        ),
+      )
+      .returning({ id: schema.diamondOrders.id });
+    if (upd.length === 0) continue;
+    // Coins were deducted at order time — an expired order refunds in full.
+    const p = await getPlayer(db, o.playerId);
+    if (p) {
+      const nb = p.balance + o.priceCoins;
+      await db
+        .update(schema.players)
+        .set({ balance: nb })
+        .where(eq(schema.players.id, p.id));
+      await addTxn(db, {
+        playerId: p.id,
+        type: "diamond_refund",
+        amount: o.priceCoins,
+        balanceAfter: nb,
+        note: `Diamond order #${o.id} expired (24h) — coins refunded`,
+      });
+    }
+    await notify(db, {
+      playerId: o.playerId,
+      type: "wallet",
+      title: "💎 Diamond order သက်တမ်းကုန်ပါပြီ ⏰",
+      body: `Diamond order #${o.id} (${o.packageName} — ${o.diamonds} 💎) ကို ၂၄ နာရီအတွင်း admin မဆုံးဖြတ်လို့ သက်တမ်းကုန်ပြီး 🪙 ${o.priceCoins} coin အပြည့် ပြန်အမ်းပြီးပါပြီ။`,
+    });
+    await logAct(db, "system", `Diamond order #${o.id} expired after 24h — refunded ${o.priceCoins} coins`);
+    acted++;
+  }
   return acted;
 }
 
@@ -1009,7 +1096,22 @@ async function settleMatch(
   db: Db,
   match: typeof schema.matches.$inferSelect,
   winnerId: number,
-) {
+): Promise<boolean> {
+  // CLAIM FIRST (money-core discipline): atomically flip the match to
+  // "completed" from any non-terminal state BEFORE any balance moves.
+  // Whoever loses this race is a clean no-op — so one match can only ever
+  // pay out once, however many settle paths fire concurrently.
+  const claim = await db
+    .update(schema.matches)
+    .set({ status: "completed", winnerId, completedAt: new Date() })
+    .where(
+      and(
+        eq(schema.matches.id, match.id),
+        inArray(schema.matches.status, ["ready_check", "live", "result_pending", "disputed"]),
+      ),
+    )
+    .returning({ id: schema.matches.id });
+  if (claim.length === 0) return false;
   void (await getSettingsMap(db)); // settings intentionally NOT used for the locked referral %
   const loserId = winnerId === match.playerAId ? match.playerBId : match.playerAId;
   const winner = await getPlayer(db, winnerId);
@@ -1132,10 +1234,7 @@ async function settleMatch(
     await logAct(db, "system", `Referral commission held/cancelled for suspicious winner ${winner.name} (${match.code})`);
   }
 
-  await db
-    .update(schema.matches)
-    .set({ status: "completed", winnerId, completedAt: new Date() })
-    .where(eq(schema.matches.id, match.id));
+  // (status/winner/completedAt were already written by the claim above.)
   await notify(db, {
     playerId: winnerId,
     type: "result",
@@ -1151,13 +1250,28 @@ async function settleMatch(
     matchId: match.id,
   });
   ctx.invalidateQueries();
+  return true;
 }
 
 async function refundMatch(
   db: Db,
   match: typeof schema.matches.$inferSelect,
   reason: string,
-) {
+): Promise<boolean> {
+  // CLAIM FIRST, same discipline as settleMatch: atomically flip to
+  // "cancelled" from a non-terminal state before refunding anyone. The
+  // race loser no-ops — a match yields exactly one payout OR one refund.
+  const claim = await db
+    .update(schema.matches)
+    .set({ status: "cancelled" })
+    .where(
+      and(
+        eq(schema.matches.id, match.id),
+        inArray(schema.matches.status, ["ready_check", "live", "result_pending", "disputed"]),
+      ),
+    )
+    .returning({ id: schema.matches.id });
+  if (claim.length === 0) return false;
   for (const pid of [match.playerAId, match.playerBId]) {
     const p = await getPlayer(db, pid);
     if (!p) continue;
@@ -1194,10 +1308,8 @@ async function refundMatch(
         eq(schema.referralCommissions.status, "pending"),
       ),
     );
-  await db
-    .update(schema.matches)
-    .set({ status: "cancelled" })
-    .where(eq(schema.matches.id, match.id));
+  // (status was already set to "cancelled" by the claim above.)
+  return true;
 }
 
 const matchShape = z.object({
@@ -1238,7 +1350,16 @@ const matchShape = z.object({
 
 type MatchRow = typeof schema.matches.$inferSelect;
 
-async function matchOut(ctx: Ctx, db: Db, m: MatchRow, viewerId: number | null = null) {
+async function matchOut(
+  ctx: Ctx,
+  db: Db,
+  m: MatchRow,
+  viewerId: number | null = null,
+  // Evidence screenshots are PRIVATE: their blob URLs are handed out only
+  // when priv is true (match participants and staff). Spectator surfaces
+  // (public live lists) always get empty evidence fields.
+  priv = false,
+) {
   const a = await getPlayer(db, m.playerAId);
   const b = await getPlayer(db, m.playerBId);
   const evUrl = async (key: string) => {
@@ -1309,8 +1430,8 @@ async function matchOut(ctx: Ctx, db: Db, m: MatchRow, viewerId: number | null =
     team_b_ready: await teamGateFor(db, m.playerBId, m.teamSize),
     team_a_fill: await teamFillFor(db, m.playerAId, m.teamSize),
     team_b_fill: await teamFillFor(db, m.playerBId, m.teamSize),
-    a_evidence_url: await evUrl(m.aEvidence),
-    b_evidence_url: await evUrl(m.bEvidence),
+    a_evidence_url: priv ? await evUrl(m.aEvidence) : "",
+    b_evidence_url: priv ? await evUrl(m.bEvidence) : "",
     winner_id: m.winnerId ?? null,
     created_at: iso(m.createdAt) ?? "",
     player_a: await playerPublicOutAsync(ctx, a ?? fallback(m.playerAId), viewerId),
@@ -1368,6 +1489,13 @@ const settingsShape = z.object({
   slide_image_1: z.string(),
   slide_image_2: z.string(),
   slide_image_3: z.string(),
+  slide_image_4: z.string(),
+  slide_image_5: z.string(),
+  slide_image_6: z.string(),
+  slide_image_7: z.string(),
+  slide_image_8: z.string(),
+  slide_image_9: z.string(),
+  slide_image_10: z.string(),
   preset_rules: z.array(z.string()),
   fixed_rules: z.object({
     classic_1: z.array(z.string()),
@@ -1379,7 +1507,7 @@ const settingsShape = z.object({
   challenge_min_stake_coins: z.number(),
 });
 
-function settingsOut(s: Record<string, string>) {
+function settingsOut(s: Record<string, string>, adminView = false) {
   let packages: { coins: number; price: number }[] = [];
   try {
     const parsed = JSON.parse(s["packages"] ?? "[]") as {
@@ -1416,7 +1544,10 @@ function settingsOut(s: Record<string, string>) {
     telegram_configured:
       (s["telegram_bot_token"] ?? "").trim() !== "" &&
       (s["telegram_chat_id"] ?? "").trim() !== "",
-    telegram_chat_id: s["telegram_chat_id"] ?? "",
+    // C1: the admin chat id is a CREDENTIAL for Telegram decisions — it
+    // must never ship in the public bootstrap settings. Only the gated
+    // getAdmin payload (Owner's own dashboard) reveals it.
+    telegram_chat_id: adminView ? (s["telegram_chat_id"] ?? "") : "",
     google_client_id: s["google_client_id"] ?? "",
     google_enabled:
       s["google_enabled"] === "1" && (s["google_client_id"] ?? "").trim() !== "",
@@ -1429,7 +1560,14 @@ function settingsOut(s: Record<string, string>) {
     terms_version: s["terms_version"] ?? "1",
     terms_text: s["terms_text"] ?? "",
     rules_text: s["rules_text"] ?? "",
-    fixed_admin_email: FIXED_ADMIN_EMAIL,
+    // The fixed admin email is public ONLY while the Google setup is
+    // unconfirmed (the pre-Owner bootstrap flow needs it client-side).
+    // Once confirmed it leaves the public payload; the gated admin
+    // payload (adminView) always carries it for the Owner's own view.
+    fixed_admin_email:
+      adminView || (s["google_setup_state"] ?? "") !== "confirmed"
+        ? FIXED_ADMIN_EMAIL
+        : "",
     match_timeout_min: numSetting(s, "match_timeout_min", 180),
     kpay_phone: s["kpay_phone"] ?? "",
     kpay_qr: s["kpay_qr"] ?? "",
@@ -1444,6 +1582,13 @@ function settingsOut(s: Record<string, string>) {
     slide_image_1: s["slide_image_1"] ?? "",
     slide_image_2: s["slide_image_2"] ?? "",
     slide_image_3: s["slide_image_3"] ?? "",
+    slide_image_4: s["slide_image_4"] ?? "",
+    slide_image_5: s["slide_image_5"] ?? "",
+    slide_image_6: s["slide_image_6"] ?? "",
+    slide_image_7: s["slide_image_7"] ?? "",
+    slide_image_8: s["slide_image_8"] ?? "",
+    slide_image_9: s["slide_image_9"] ?? "",
+    slide_image_10: s["slide_image_10"] ?? "",
     // Back-compat alias: preset_rules mirrors the Classic 4–5 fixed list
     // (the tournament pick-list; challenges use fixed_rules via the server).
     preset_rules: fixedRules.classic_4_5,
@@ -1616,6 +1761,93 @@ async function decideWithdrawInternal(
   return { ok: true, error: "" };
 }
 
+/* ---------- Diamond order decision core (dashboard + Telegram) ----------
+ * Same contract as the money cores: callers own authorization, this owns
+ * the state machine. Coins were deducted at order time, so "fulfill" only
+ * flips the status (the admin delivers the diamonds in-game), while
+ * "reject" claims pending->rejected atomically and refunds exactly once. */
+async function decideDiamondOrderInternal(
+  ctx: Ctx,
+  db: Db,
+  orderId: number,
+  decision: "fulfill" | "reject",
+  decidedByName: string,
+  reason: string,
+): Promise<{ ok: boolean; error: string }> {
+  const fail = (error: string) => ({ ok: false, error });
+  const rows = await db
+    .select()
+    .from(schema.diamondOrders)
+    .where(eq(schema.diamondOrders.id, orderId))
+    .limit(1);
+  const o = rows[0];
+  if (!o) return fail("Diamond order မတွေ့ပါ");
+  if (o.status === "expired")
+    return fail("ဒီ order က သက်တမ်းကုန်ပြီး coin ပြန်အမ်းပြီးသားပါ");
+  if (o.status !== "pending")
+    return fail("ဒီ order ကို ဆုံးဖြတ်ပြီးသားပါ — နှစ်ခါ ရွှေ့လို့ မရပါ");
+  if (decision === "fulfill") {
+    const upd = await db
+      .update(schema.diamondOrders)
+      .set({ status: "fulfilled", decidedBy: decidedByName, decidedAt: new Date(), rejectReason: "" })
+      .where(
+        and(
+          eq(schema.diamondOrders.id, o.id),
+          eq(schema.diamondOrders.status, "pending"),
+        ),
+      )
+      .returning({ id: schema.diamondOrders.id });
+    if (upd.length === 0) return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ");
+    await notify(db, {
+      playerId: o.playerId,
+      type: "wallet",
+      title: "💎 Diamond ရောက်ပါပြီ",
+      body: `${o.packageName} — ${o.diamonds.toLocaleString()} 💎 ကို သင့် MLBB account ထဲ ထည့်ပေးပြီးပါပြီ။ (Order #${o.id}, ${o.txnCode})`,
+    });
+    await logAct(db, decidedByName, `Diamond order #${o.id} FULFILLED: ${o.diamonds} diamonds (${o.packageName}) for player ${o.playerId}`);
+    ctx.invalidateQueries();
+    return { ok: true, error: "" };
+  }
+  // Reject: claim first, then refund the deducted coins exactly once.
+  const upd = await db
+    .update(schema.diamondOrders)
+    .set({
+      status: "rejected",
+      decidedBy: decidedByName,
+      decidedAt: new Date(),
+      rejectReason: (reason ?? "").slice(0, 300),
+    })
+    .where(
+      and(
+        eq(schema.diamondOrders.id, o.id),
+        eq(schema.diamondOrders.status, "pending"),
+      ),
+    )
+    .returning({ id: schema.diamondOrders.id });
+  if (upd.length === 0) return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ");
+  const p = await getPlayer(db, o.playerId);
+  if (p) {
+    const nb = p.balance + o.priceCoins;
+    await db.update(schema.players).set({ balance: nb }).where(eq(schema.players.id, p.id));
+    await addTxn(db, {
+      playerId: p.id,
+      type: "diamond_refund",
+      amount: o.priceCoins,
+      balanceAfter: nb,
+      note: `Diamond order #${o.id} rejected — coins refunded${reason ? ` (${reason})` : ""}`,
+    });
+  }
+  await notify(db, {
+    playerId: o.playerId,
+    type: "wallet",
+    title: "💎 Diamond order ပယ်ချခံရပါတယ်",
+    body: `Diamond order #${o.id} (${o.packageName} — ${o.diamonds} 💎) ကို admin က ပယ်ချပြီး 🪙 ${o.priceCoins} coin အပြည့် ပြန်အမ်းပြီးပါပြီ။${reason ? `\nအကြောင်းရင်း: ${reason}` : ""}`,
+  });
+  await logAct(db, decidedByName, `Diamond order #${o.id} rejected — refunded ${o.priceCoins} coins${reason ? ` — ${reason}` : ""}`);
+  ctx.invalidateQueries();
+  return { ok: true, error: "" };
+}
+
 type PurchaseRow = typeof schema.purchaseRequests.$inferSelect;
 type WithdrawRow = typeof schema.withdrawRequests.$inferSelect;
 
@@ -1695,6 +1927,74 @@ const withdrawReqShape = z.object({
   decided_at: z.string().nullable(),
 });
 
+type DiamondPackageRow = typeof schema.diamondPackages.$inferSelect;
+type DiamondOrderRow = typeof schema.diamondOrders.$inferSelect;
+
+function diamondPackageOut(r: DiamondPackageRow) {
+  return {
+    id: r.id,
+    name: r.name,
+    diamonds: r.diamonds,
+    bonus_text: r.bonusText,
+    price_coins: r.priceCoins,
+    enabled: r.enabled === 1,
+    sort: r.sort,
+  };
+}
+
+function diamondOrderOut(
+  r: DiamondOrderRow,
+  playerName: string,
+  mlbbId: string,
+  serverId: string,
+) {
+  return {
+    id: r.id,
+    player_id: r.playerId,
+    player_name: playerName,
+    player_mlbb_id: mlbbId,
+    player_server_id: serverId,
+    package_id: r.packageId,
+    package_name: r.packageName,
+    diamonds: r.diamonds,
+    price_coins: r.priceCoins,
+    status: r.status,
+    txn_code: r.txnCode,
+    reject_reason: r.rejectReason,
+    decided_by: r.decidedBy,
+    created_at: iso(r.createdAt) ?? "",
+    decided_at: iso(r.decidedAt),
+  };
+}
+
+const diamondPackageShape = z.object({
+  id: z.number(),
+  name: z.string(),
+  diamonds: z.number(),
+  bonus_text: z.string(),
+  price_coins: z.number(),
+  enabled: z.boolean(),
+  sort: z.number(),
+});
+
+const diamondOrderShape = z.object({
+  id: z.number(),
+  player_id: z.number(),
+  player_name: z.string(),
+  player_mlbb_id: z.string(),
+  player_server_id: z.string(),
+  package_id: z.number(),
+  package_name: z.string(),
+  diamonds: z.number(),
+  price_coins: z.number(),
+  status: z.string(),
+  txn_code: z.string(),
+  reject_reason: z.string(),
+  decided_by: z.string(),
+  created_at: z.string(),
+  decided_at: z.string().nullable(),
+});
+
 export const Actions = {
   getBootstrap: defineAction({
     request: z.object({
@@ -1731,6 +2031,8 @@ export const Actions = {
         }),
       ),
       total_paid_kyat: z.number(),
+      diamond_packages: z.array(diamondPackageShape),
+      diamond_orders: z.array(diamondOrderShape),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
@@ -1830,6 +2132,28 @@ export const Actions = {
             .from(schema.withdrawRequests)
             .where(eq(schema.withdrawRequests.status, "paid"));
           return paidAll.reduce((a, w) => a + w.netKyat, 0);
+        })(),
+        // Diamond shop: enabled packages (sorted) for everyone; the
+        // viewer's own orders only (empty when logged out).
+        diamond_packages: await (async () => {
+          const pkgs = await db
+            .select()
+            .from(schema.diamondPackages)
+            .where(eq(schema.diamondPackages.enabled, 1))
+            .orderBy(schema.diamondPackages.sort, schema.diamondPackages.id);
+          return pkgs.map(diamondPackageOut);
+        })(),
+        diamond_orders: await (async () => {
+          if (!viewer) return [];
+          const rows = await db
+            .select()
+            .from(schema.diamondOrders)
+            .where(eq(schema.diamondOrders.playerId, viewer.id))
+            .orderBy(desc(schema.diamondOrders.id))
+            .limit(30);
+          return rows.map((o) =>
+            diamondOrderOut(o, viewer.name, viewer.mlbbId, viewer.serverId),
+          );
         })(),
       };
     },
@@ -2099,6 +2423,30 @@ export const Actions = {
       if (!p) return { ok: false, error: AUTH_ERR, challenge_id: 0 };
       if (p.status === "perm_banned" || p.status === "temp_banned")
         return { ok: false, error: "Account ban ခံထားရပါတယ်", challenge_id: 0 };
+      // One lobby at a time: a creator may hold at most ONE open challenge,
+      // and may not open a new lobby while one of their matches is still
+      // unfinished. They must cancel the open lobby (cancelChallenge) or
+      // finish the live match first.
+      const myOpen = await db
+        .select()
+        .from(schema.challenges)
+        .where(
+          and(
+            eq(schema.challenges.creatorId, p.id),
+            eq(schema.challenges.status, "open"),
+          ),
+        )
+        .limit(1);
+      if (myOpen.length > 0)
+        return { ok: false, error: "သင့်မှာ ဖွင့်ထားတဲ့ lobby တစ်ခု ရှိနေပါတယ် — အရင် အဲ့ဒီ lobby ကို ဖျက်ပြီးမှ အသစ် ထောင်လို့ရပါမယ် (You already have an open lobby — cancel it first)", challenge_id: 0 };
+      const myMatchesAll = await db.select().from(schema.matches);
+      const myLive = myMatchesAll.find(
+        (m) =>
+          (m.playerAId === p.id || m.playerBId === p.id) &&
+          ["ready_check", "live", "result_pending", "disputed"].includes(m.status),
+      );
+      if (myLive)
+        return { ok: false, error: "သင့်မှာ မပြီးသေးတဲ့ match တစ်ခု ရှိနေပါတယ် — အဲ့ဒီ match ပြီးမှ lobby အသစ် ထောင်လို့ရပါမယ် (Finish your current match first)", challenge_id: 0 };
       // Admin-set minimum stake (challenge_min_stake_coins) — enforced here
       // so no client can undercut it.
       const minStake = numSetting(s, "challenge_min_stake_coins", 100);
@@ -2180,13 +2528,52 @@ export const Actions = {
       if (claimed.length === 0)
         return { ok: false, error: "တခြားသူ အရင် လက်ခံသွားပါပြီ", match_id: 0 };
 
-      // Lock coins on both sides.
-      for (const p of [creator, acceptor]) {
-        const nb = p.balance - ch.stake;
+      // Lock coins on both sides with GUARDED atomic updates: balance and
+      // locked move together, only while the CURRENT balance still covers
+      // the stake (a stale read can never over-lock). If the second lock
+      // fails, the first is compensated and the challenge claim released —
+      // no half-locked state survives.
+      const lockSide = async (p: PlayerRow) => {
+        const r = await db
+          .update(schema.players)
+          .set({
+            balance: sql`${schema.players.balance} - ${ch.stake}`,
+            lockedCoins: sql`${schema.players.lockedCoins} + ${ch.stake}`,
+          })
+          .where(
+            and(
+              eq(schema.players.id, p.id),
+              gte(schema.players.balance, ch.stake),
+            ),
+          )
+          .returning({ balance: schema.players.balance });
+        return r[0]?.balance;
+      };
+      const unlockSide = async (p: PlayerRow) => {
         await db
           .update(schema.players)
-          .set({ balance: nb, lockedCoins: p.lockedCoins + ch.stake })
+          .set({
+            balance: sql`${schema.players.balance} + ${ch.stake}`,
+            lockedCoins: sql`${schema.players.lockedCoins} - ${ch.stake}`,
+          })
           .where(eq(schema.players.id, p.id));
+      };
+      const nbCreator = await lockSide(creator);
+      const nbAcceptor = nbCreator !== undefined ? await lockSide(acceptor) : undefined;
+      if (nbCreator === undefined || nbAcceptor === undefined) {
+        if (nbCreator !== undefined) await unlockSide(creator);
+        await db
+          .update(schema.challenges)
+          .set({ status: "open" })
+          .where(
+            and(
+              eq(schema.challenges.id, ch.id),
+              eq(schema.challenges.status, "matched"),
+            ),
+          );
+        return { ok: false, error: "Coin မလုံလောက်ပါ (နှစ်ဖက်လုံး stake ရှိရပါမယ်)", match_id: 0 };
+      }
+      for (const [p, nb] of [[creator, nbCreator], [acceptor, nbAcceptor]] as const) {
         await addTxn(db, {
           playerId: p.id,
           type: "lock",
@@ -2259,23 +2646,34 @@ export const Actions = {
       session_token: z.string().default(""),
       challenge_id: z.number(),
     }),
-    response: z.object({ ok: z.boolean() }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const me = await playerBySession(db, args.player_id, args.session_token);
-      if (!me) return { ok: false };
+      if (!me) return { ok: false, error: AUTH_ERR };
+      const chRows = await db
+        .select()
+        .from(schema.challenges)
+        .where(eq(schema.challenges.id, args.challenge_id))
+        .limit(1);
+      const ch = chRows[0];
+      if (!ch) return { ok: false, error: "Challenge မတွေ့ပါ" };
+      if (ch.creatorId !== me.id)
+        return { ok: false, error: "ဒီ lobby က သင့်ဟာ မဟုတ်ပါ — ကိုယ်ထောင်ထားတဲ့ lobby ပဲ ဖျက်လို့ရပါတယ်" };
+      if (ch.status !== "open")
+        return { ok: false, error: "ဒီ lobby က ပွင့်နေတာ မဟုတ်တော့ပါ — ဖျက်လို့ မရပါ" };
       await db
         .update(schema.challenges)
         .set({ status: "cancelled" })
         .where(
           and(
             eq(schema.challenges.id, args.challenge_id),
-            eq(schema.challenges.creatorId, args.player_id),
+            eq(schema.challenges.creatorId, me.id),
             eq(schema.challenges.status, "open"),
           ),
         );
       ctx.invalidateQueries();
-      return { ok: true };
+      return { ok: true, error: "" };
     },
   }),
 
@@ -2384,7 +2782,7 @@ export const Actions = {
         (m) => m.playerAId === args.player_id || m.playerBId === args.player_id,
       );
       const out = [];
-      for (const m of mine) out.push(await matchOut(ctx, db, m, args.player_id));
+      for (const m of mine) out.push(await matchOut(ctx, db, m, args.player_id, true));
       return { matches: out };
     },
   }),
@@ -2433,12 +2831,23 @@ export const Actions = {
       const m = rows[0];
       if (!m)
         return { match: null, chat: [], result_unlocked: false, unlock_at: null, heroes: heroesFor("") };
-      const chat = await db
-        .select()
-        .from(schema.chatMessages)
-        .where(eq(schema.chatMessages.matchId, m.id))
-        .orderBy(schema.chatMessages.id)
-        .limit(200);
+      // Privacy gate (M3): chat history and evidence URLs go ONLY to the
+      // match's participants or staff. Match ids are sequential, so an
+      // ungated read would leak every room's chat + screenshots to anyone.
+      const isParticipant =
+        !!viewer && (viewer.id === m.playerAId || viewer.id === m.playerBId);
+      const isStaff =
+        !!viewer &&
+        ["owner", "admin", "moderator", "support"].includes(effectiveRole(viewer));
+      const priv = isParticipant || isStaff;
+      const chat = priv
+        ? await db
+            .select()
+            .from(schema.chatMessages)
+            .where(eq(schema.chatMessages.matchId, m.id))
+            .orderBy(schema.chatMessages.id)
+            .limit(200)
+        : [];
       const chatPlayers = await db.select().from(schema.players);
       const chatAvatarMap = new Map<number, string>();
       const chatColorMap = new Map<number, string>();
@@ -2447,7 +2856,7 @@ export const Actions = {
       const unlockAt = m.startedAt ? new Date(m.startedAt.getTime() + delay) : null;
       return {
         heroes: heroesFor(m.bannedHeroes),
-        match: await matchOut(ctx, db, m, viewer?.id ?? null),
+        match: await matchOut(ctx, db, m, viewer?.id ?? null, priv),
         chat: chat.map((c) => ({
           id: c.id,
           sender_id: c.senderId,
@@ -2648,6 +3057,7 @@ export const Actions = {
       if (!m) return { ok: false, error: "Match မတွေ့ပါ", outcome: "" };
       const meSub = await playerBySession(db, args.player_id, args.session_token);
       if (!meSub) return { ok: false, error: AUTH_ERR, outcome: "" };
+      if (meSub.status === "temp_banned") return { ok: false, error: TEMP_BAN_ERR, outcome: "" };
       if (m.status !== "live" && m.status !== "result_pending")
         return { ok: false, error: "ရလဒ် တင်လို့ မရသေးပါ", outcome: "" };
       if (!m.startedAt) return { ok: false, error: "Match မစသေးပါ", outcome: "" };
@@ -2667,24 +3077,39 @@ export const Actions = {
 
       let evKey = isA ? m.aEvidence : m.bEvidence;
       if (args.evidence_base64) {
+        // Evidence goes through the SAME image validation as every other
+        // upload (JPG/PNG/WebP magic bytes, ≤3MB). An invalid "screenshot"
+        // rejects the WHOLE submission — no result, no evidence recorded.
+        const v = validateImage(args.evidence_base64, args.evidence_mime);
+        if (v.error || !v.bytes)
+          return { ok: false, error: `ရလဒ် screenshot မမှန်ပါ — ${v.error || "ပုံ မမှန်ပါ"}`, outcome: "" };
         try {
-          const bytes = Buffer.from(args.evidence_base64, "base64");
-          evKey = `evidence/${m.id}/${args.player_id}-${Date.now()}`;
-          await ctx.blobs.put(evKey, bytes, { contentType: args.evidence_mime });
+          evKey = `evidence/${m.id}/${args.player_id}-${Date.now()}.${v.ext}`;
+          await ctx.blobs.put(evKey, v.bytes, { contentType: v.mime });
         } catch {
-          evKey = isA ? m.aEvidence : m.bEvidence;
+          return { ok: false, error: "Screenshot သိမ်းလို့ မရပါ — ပြန်ကြိုးစားပါ", outcome: "" };
         }
       }
       // Write ONLY the submitter's own columns, then re-read: two players
       // submitting at the same moment must never overwrite each other.
-      await db
+      // The write is status-guarded: if a settle/refund claim already
+      // finished the match, this submit is a no-op error, never a revive.
+      const wrote = await db
         .update(schema.matches)
         .set(
           isA
             ? { aResult: args.result, aEvidence: evKey, status: "result_pending" }
             : { bResult: args.result, bEvidence: evKey, status: "result_pending" },
         )
-        .where(eq(schema.matches.id, m.id));
+        .where(
+          and(
+            eq(schema.matches.id, m.id),
+            inArray(schema.matches.status, ["live", "result_pending"]),
+          ),
+        )
+        .returning({ id: schema.matches.id });
+      if (wrote.length === 0)
+        return { ok: false, error: "Match ပြီးဆုံးသွားပါပြီ", outcome: "" };
       const freshRows = await db
         .select()
         .from(schema.matches)
@@ -2704,10 +3129,17 @@ export const Actions = {
           await settleMatch(ctx, db, updated, winnerId);
           return { ok: true, error: "", outcome: "confirmed" };
         }
+        // Only a still-pending match can become disputed — never flip a
+        // match a concurrent settle already completed.
         await db
           .update(schema.matches)
           .set({ status: "disputed" })
-          .where(eq(schema.matches.id, m.id));
+          .where(
+            and(
+              eq(schema.matches.id, m.id),
+              eq(schema.matches.status, "result_pending"),
+            ),
+          );
         for (const pid of [m.playerAId, m.playerBId]) {
           await notify(db, {
             playerId: pid,
@@ -2743,11 +3175,22 @@ export const Actions = {
       if (!m) return { ok: false, error: "Match မတွေ့ပါ" };
       const meCan = await playerBySession(db, args.player_id, args.session_token);
       if (!meCan) return { ok: false, error: AUTH_ERR };
+      if (meCan.status === "temp_banned") return { ok: false, error: TEMP_BAN_ERR };
       if (m.status === "completed" || m.status === "cancelled")
         return { ok: false, error: "ပြီးဆုံးပြီး match ပါ" };
       if (m.playerAId !== args.player_id && m.playerBId !== args.player_id)
         return { ok: false, error: "ဒီ match မှာ မပါဝင်ပါ" };
-      await refundMatch(db, m, "Match cancel — refund");
+      // H2 (loss-escape fix): participants may cancel ONLY before any
+      // result exists — lobby / ready / live with neither side submitted.
+      // result_pending and disputed matches resolve via admin alone.
+      if (
+        (m.status !== "ready_check" && m.status !== "live") ||
+        m.aResult !== "" ||
+        m.bResult !== ""
+      )
+        return { ok: false, error: "ရလဒ် တင်ပြီးသား match ကို player က cancel လို့ မရပါ — Admin ပဲ ဆုံးဖြတ်နိုင်ပါတယ် (A match with a submitted result can only be resolved by an admin)" };
+      const refunded = await refundMatch(db, m, "Match cancel — refund");
+      if (!refunded) return { ok: false, error: "ပြီးဆုံးပြီး match ပါ" };
       // Reputation hit for the cancelling side when match had started.
       if (m.status === "live") {
         const p = await getPlayer(db, args.player_id);
@@ -2770,12 +3213,21 @@ export const Actions = {
       actor: z.string().default("admin"),
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
     }),
     response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const auth = await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin", "moderator"]);
       if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
+      // Resolving a dispute MOVES the pot (settle or refund), so on top of
+      // the staff role gate it needs the standard money gate: explicit
+      // security confirmation + TOTP (when the actor has 2FA enabled).
+      if (!args.confirmed)
+        return { ok: false, error: "Dispute ဆုံးဖြတ်ရန် security confirmation လိုပါတယ်" };
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return { ok: false, error: err2fa };
       const rows = await db
         .select()
         .from(schema.matches)
@@ -2813,7 +3265,7 @@ export const Actions = {
         .where(eq(schema.matches.status, "disputed"))
         .orderBy(desc(schema.matches.id));
       const out = [];
-      for (const m of rows) out.push(await matchOut(ctx, db, m));
+      for (const m of rows) out.push(await matchOut(ctx, db, m, null, true));
       return { matches: out };
     },
   }),
@@ -2901,6 +3353,7 @@ export const Actions = {
         return fail("Emergency mode — wallet transaction ယာယီပိတ်ထားပါတယ်");
       const p = await playerBySession(db, args.player_id, args.session_token);
       if (!p) return fail(AUTH_ERR);
+      if (p.status === "temp_banned") return fail(TEMP_BAN_ERR);
       const rl = await rateLimit(db, `buy:${p.id}`, 20, 10 * 60 * 1000);
       if (rl) return fail(rl);
       await expireMoneyRequestsInternal(db).catch(() => 0);
@@ -3098,6 +3551,7 @@ export const Actions = {
         return fail("Emergency mode — wallet transaction ယာယီပိတ်ထားပါတယ်");
       const p = await playerBySession(db, args.player_id, args.session_token);
       if (!p) return fail(AUTH_ERR);
+      if (p.status === "temp_banned") return fail(TEMP_BAN_ERR);
       const rl = await rateLimit(db, `withdraw:${p.id}`, 20, 10 * 60 * 1000);
       if (rl) return fail(rl);
       await expireMoneyRequestsInternal(db).catch(() => 0);
@@ -3133,9 +3587,50 @@ export const Actions = {
       const net = gross - fee;
       // Coins are deducted (locked) up-front; a reject/expiry refunds them
       // exactly, a "paid" decision keeps them deducted.
+      // M1+L5: the deduction is a GUARDED atomic decrement (it lands only
+      // if the CURRENT balance still covers it — a stale read can never
+      // overdraw), and the request row is inserted only after the
+      // deduction; if the insert fails, the decrement is compensated.
       const code = uid("TXN");
-      const nb = p.balance - args.coins;
-      await db.update(schema.players).set({ balance: nb }).where(eq(schema.players.id, p.id));
+      const dec = await db
+        .update(schema.players)
+        .set({ balance: sql`${schema.players.balance} - ${args.coins}` })
+        .where(
+          and(
+            eq(schema.players.id, p.id),
+            gte(schema.players.balance, args.coins),
+          ),
+        )
+        .returning({ balance: schema.players.balance });
+      if (dec.length === 0)
+        return fail(`Balance မလုံလောက်ပါ — သုံးနိုင်သော coin: ${p.balance.toLocaleString()} (Insufficient balance)`);
+      const nb = dec[0]!.balance;
+      let ins: { id: number }[];
+      try {
+        ins = await db
+          .insert(schema.withdrawRequests)
+          .values({
+            playerId: p.id,
+            coins: args.coins,
+            rateKyat: rate,
+            grossKyat: gross,
+            feePercent: feePct,
+            feeKyat: fee,
+            netKyat: net,
+            method: args.method,
+            payoutPhone: phone,
+            status: "pending",
+            txnCode: code,
+          })
+          .returning({ id: schema.withdrawRequests.id });
+      } catch (e) {
+        await db
+          .update(schema.players)
+          .set({ balance: sql`${schema.players.balance} + ${args.coins}` })
+          .where(eq(schema.players.id, p.id));
+        throw e;
+      }
+      const requestId = ins[0]?.id ?? 0;
       await addTxn(db, {
         playerId: p.id,
         type: "withdraw",
@@ -3143,23 +3638,6 @@ export const Actions = {
         balanceAfter: nb,
         note: `Withdraw request — ${args.coins} coins → ${net.toLocaleString()} ကျပ် (${args.method === "wave" ? "Wave" : "KPay"} ${phone})`,
       });
-      const ins = await db
-        .insert(schema.withdrawRequests)
-        .values({
-          playerId: p.id,
-          coins: args.coins,
-          rateKyat: rate,
-          grossKyat: gross,
-          feePercent: feePct,
-          feeKyat: fee,
-          netKyat: net,
-          method: args.method,
-          payoutPhone: phone,
-          status: "pending",
-          txnCode: code,
-        })
-        .returning({ id: schema.withdrawRequests.id });
-      const requestId = ins[0]?.id ?? 0;
       const ownerRow = (await db.select().from(schema.players))
         .find((x) => isFixedAdminEmail(x.email));
       if (ownerRow) {
@@ -3225,6 +3703,259 @@ export const Actions = {
       if (err2fa) return { ok: false, error: err2fa };
       await expireMoneyRequestsInternal(db).catch(() => 0);
       return decideWithdrawInternal(ctx, db, args.request_id, args.decision, auth.actor.name, args.reason ?? "");
+    },
+  }),
+
+  buyDiamonds: defineAction({
+    request: z.object({
+      player_id: z.number(),
+      session_token: z.string().default(""),
+      package_id: z.number(),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string(),
+      order_id: z.number(),
+      txn_code: z.string(),
+      status: z.string(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const fail = (error: string) => ({ ok: false, error, order_id: 0, txn_code: "", status: "" });
+      const s = await getSettingsMap(db);
+      if (s["emergency"] === "1")
+        return fail("Emergency mode — wallet transaction ယာယီပိတ်ထားပါတယ်");
+      const p = await playerBySession(db, args.player_id, args.session_token);
+      if (!p) return fail(AUTH_ERR);
+      const rl = await rateLimit(db, `dia:${p.id}`, 20, 10 * 60 * 1000);
+      if (rl) return fail(rl);
+      await expireMoneyRequestsInternal(db).catch(() => 0);
+      const pkgRows = await db
+        .select()
+        .from(schema.diamondPackages)
+        .where(eq(schema.diamondPackages.id, args.package_id))
+        .limit(1);
+      const pkg = pkgRows[0];
+      if (!pkg || pkg.enabled !== 1)
+        return fail("ဒီ package ကို အခု ဝယ်လို့ မရပါ (Package not available)");
+      // Coins are deducted IMMEDIATELY (like a withdrawal request): the
+      // order then waits for the admin to deliver the diamonds in-game.
+      // Reject / 24h expiry refunds the full price exactly once.
+      if (p.balance < pkg.priceCoins)
+        return fail(`Coin မလုံလောက်ပါ — ဒီ package က 🪙 ${pkg.priceCoins.toLocaleString()} coin လိုပါတယ် (လက်ကျန်: ${p.balance.toLocaleString()})`);
+      const txnCode = uid("DIA");
+      // Guarded atomic decrement (M1 discipline) + insert-or-compensate:
+      // the order row exists only if the deduction landed, and vice versa.
+      const dec = await db
+        .update(schema.players)
+        .set({ balance: sql`${schema.players.balance} - ${pkg.priceCoins}` })
+        .where(
+          and(
+            eq(schema.players.id, p.id),
+            gte(schema.players.balance, pkg.priceCoins),
+          ),
+        )
+        .returning({ balance: schema.players.balance });
+      if (dec.length === 0)
+        return fail(`Coin မလုံလောက်ပါ — ဒီ package က 🪙 ${pkg.priceCoins.toLocaleString()} coin လိုပါတယ် (လက်ကျန်: ${p.balance.toLocaleString()})`);
+      const nb = dec[0]!.balance;
+      let ins: { id: number }[];
+      try {
+        ins = await db
+          .insert(schema.diamondOrders)
+          .values({
+            playerId: p.id,
+            packageId: pkg.id,
+            packageName: pkg.name,
+            diamonds: pkg.diamonds,
+            priceCoins: pkg.priceCoins,
+            status: "pending",
+            txnCode,
+          })
+          .returning({ id: schema.diamondOrders.id });
+      } catch (e) {
+        await db
+          .update(schema.players)
+          .set({ balance: sql`${schema.players.balance} + ${pkg.priceCoins}` })
+          .where(eq(schema.players.id, p.id));
+        throw e;
+      }
+      const orderId = ins[0]?.id ?? 0;
+      await addTxn(db, {
+        playerId: p.id,
+        type: "diamond_buy",
+        amount: -pkg.priceCoins,
+        balanceAfter: nb,
+        note: `Diamond order #${orderId} — ${pkg.name} (${pkg.diamonds} 💎)`,
+      });
+      await logAct(db, p.name, `Diamond order #${orderId} created: ${pkg.name} (${pkg.diamonds} diamonds) for ${pkg.priceCoins} coins (${txnCode})`);
+      const ownerRow = (await db.select().from(schema.players))
+        .find((x) => isFixedAdminEmail(x.email));
+      if (ownerRow) {
+        await notify(db, {
+          playerId: ownerRow.id,
+          type: "wallet",
+          title: "💎 Diamond order အသစ်",
+          body: `${p.name} က ${pkg.name} (${pkg.diamonds} 💎) ကို 🪙 ${pkg.priceCoins} coin နဲ့ မှာထားပါတယ် — Admin မှာ Fulfill/Reject လုပ်ပါ။`,
+        });
+      }
+      // Telegram: text + one-tap Fulfill/Reject buttons (fail-soft).
+      if (telegramConfigured(s) && orderId > 0) {
+        const text =
+          `💎 Diamond order အသစ် #${orderId}\n` +
+          `Player: ${p.name}\n` +
+          `MLBB ID: ${p.mlbbId || "—"} (Server: ${p.serverId || "—"})\n` +
+          `Package: ${pkg.name} — ${pkg.diamonds.toLocaleString()} 💎${pkg.bonusText ? ` (${pkg.bonusText})` : ""}\n` +
+          `Price: 🪙 ${pkg.priceCoins.toLocaleString()} coins • ${txnCode}\n` +
+          `Admin dashboard သို့မဟုတ် ဒီကပဲ ဆုံးဖြတ်နိုင်ပါတယ်။`;
+        await telegramSend(s, text, diamondKeyboard(orderId));
+      }
+      ctx.invalidateQueries();
+      return { ok: true, error: "", order_id: orderId, txn_code: txnCode, status: "pending" };
+    },
+  }),
+
+  listDiamondOrders: defineAction({
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+    }),
+    response: z.object({
+      orders: z.array(diamondOrderShape),
+      packages: z.array(diamondPackageShape),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      await expireMoneyRequestsInternal(db).catch(() => 0);
+      const actor = await playerBySession(db, args.actor_player_id, args.session_token);
+      if (!actor) return { orders: [], packages: [] };
+      const role = effectiveRole(actor);
+      const isAdmin = role === "owner" || role === "admin";
+      const allPlayers = await db.select().from(schema.players);
+      const rows = isAdmin
+        ? await db.select().from(schema.diamondOrders).orderBy(desc(schema.diamondOrders.id)).limit(100)
+        : await db.select().from(schema.diamondOrders)
+            .where(eq(schema.diamondOrders.playerId, actor.id))
+            .orderBy(desc(schema.diamondOrders.id))
+            .limit(50);
+      const pkgRows = await db
+        .select()
+        .from(schema.diamondPackages)
+        .orderBy(schema.diamondPackages.sort, schema.diamondPackages.id);
+      return {
+        orders: rows.map((o) => {
+          const pl = allPlayers.find((x) => x.id === o.playerId);
+          return diamondOrderOut(o, pl?.name ?? "?", pl?.mlbbId ?? "", pl?.serverId ?? "");
+        }),
+        // Admins see every package (incl. disabled) for CRUD; players only
+        // the enabled ones.
+        packages: pkgRows
+          .filter((pk) => isAdmin || pk.enabled === 1)
+          .map(diamondPackageOut),
+      };
+    },
+  }),
+
+  decideDiamondOrder: defineAction({
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      actor: z.string().default("admin"),
+      session_token: z.string().default(""),
+      order_id: z.number(),
+      decision: z.enum(["fulfill", "reject"]),
+      reason: z.string().max(300).default(""),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      // Same gates as decideWithdraw: Owner-only + confirmation + TOTP.
+      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
+      if (!args.confirmed) return { ok: false, error: "Diamond order ဆုံးဖြတ်ရန် security confirmation လိုပါတယ်" };
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return { ok: false, error: err2fa };
+      await expireMoneyRequestsInternal(db).catch(() => 0);
+      return decideDiamondOrderInternal(ctx, db, args.order_id, args.decision, auth.actor.name, args.reason ?? "");
+    },
+  }),
+
+  saveDiamondPackage: defineAction({
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+      id: z.number().default(0),
+      name: z.string().min(1).max(60),
+      diamonds: z.number().int().min(1).max(10000000),
+      bonus_text: z.string().max(80).default(""),
+      price_coins: z.number().int().min(0).max(10000000),
+      enabled: z.boolean().default(true),
+      sort: z.number().int().min(0).max(9999).default(0),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string(), package_id: z.number() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const fail = (error: string) => ({ ok: false, error, package_id: 0 });
+      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor) return fail(auth.error ?? AUTH_ERR);
+      if (!args.confirmed) return fail("Diamond package သိမ်းရန် security confirmation လိုပါတယ်");
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return fail(err2fa);
+      const values = {
+        name: args.name.trim(),
+        diamonds: args.diamonds,
+        bonusText: args.bonus_text.trim(),
+        priceCoins: args.price_coins,
+        enabled: args.enabled ? 1 : 0,
+        sort: args.sort,
+      };
+      if (args.id > 0) {
+        const upd = await db
+          .update(schema.diamondPackages)
+          .set(values)
+          .where(eq(schema.diamondPackages.id, args.id))
+          .returning({ id: schema.diamondPackages.id });
+        if (upd.length === 0) return fail("Package မတွေ့ပါ");
+        await logAct(db, auth.actor.name, `Diamond package #${args.id} updated (${values.name})`);
+        ctx.invalidateQueries();
+        return { ok: true, error: "", package_id: args.id };
+      }
+      const ins = await db
+        .insert(schema.diamondPackages)
+        .values(values)
+        .returning({ id: schema.diamondPackages.id });
+      const newId = ins[0]?.id ?? 0;
+      await logAct(db, auth.actor.name, `Diamond package created #${newId} (${values.name} — ${values.diamonds} diamonds, ${values.priceCoins} coins)`);
+      ctx.invalidateQueries();
+      return { ok: true, error: "", package_id: newId };
+    },
+  }),
+
+  deleteDiamondPackage: defineAction({
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+      id: z.number(),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
+      if (!args.confirmed) return { ok: false, error: "Diamond package ဖျက်ရန် security confirmation လိုပါတယ်" };
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return { ok: false, error: err2fa };
+      // Orders keep their snapshots (name/diamonds/price copied at buy
+      // time), so deleting a package never rewrites order history.
+      await db.delete(schema.diamondPackages).where(eq(schema.diamondPackages.id, args.id));
+      await logAct(db, auth.actor.name, `Diamond package #${args.id} deleted`);
+      ctx.invalidateQueries();
+      return { ok: true, error: "" };
     },
   }),
 
@@ -3306,7 +4037,7 @@ export const Actions = {
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
-      slot: z.number().int().min(1).max(3),
+      slot: z.number().int().min(1).max(10),
       image_base64: z.string().max(12_000_000).default(""),
       image_mime: z.string().max(60).default(""),
       confirmed: z.boolean().default(false),
@@ -3349,7 +4080,7 @@ export const Actions = {
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
-      slot: z.number().int().min(1).max(3),
+      slot: z.number().int().min(1).max(10),
       confirmed: z.boolean().default(false),
       totp_code: z.string().default(""),
     }),
@@ -3384,6 +4115,15 @@ export const Actions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const ignore = { ok: true, error: "", handled: false };
+      // C1 (CRITICAL): this action moves money on the strength of a chat
+      // id carried INSIDE the caller-supplied payload — forgeable by
+      // anyone who can POST /actions. It is accepted ONLY from the
+      // standalone host's internal dispatch (the Telegram poller), proven
+      // by the per-boot host secret on ctx (see hostSecretOk). Every
+      // other caller — including one quoting the CORRECT chat id — is
+      // rejected with zero side effects.
+      if (!hostSecretOk(ctx))
+        return { ok: false, error: "Telegram callback ကို host မှသာ လက်ခံပါတယ် (host-only)", handled: false };
       const s = await getSettingsMap(db);
       const token = (s["telegram_bot_token"] ?? "").trim();
       const chatId = (s["telegram_chat_id"] ?? "").trim();
@@ -3409,11 +4149,13 @@ export const Actions = {
       if (fromChat === undefined || String(fromChat) !== chatId)
         return { ok: false, error: "Telegram chat မကိုက်ပါ — ဆုံးဖြတ်ခွင့် မရှိပါ", handled: false };
       const data = typeof cq.data === "string" ? cq.data : "";
-      const m = data.match(/^(pur|wd):(\d+):(approve|reject|paid)$/);
-      if (!m) return ignore;
-      const kind = m[1]!;
-      const reqId = Number(m[2]);
-      const rawDecision = m[3]!;
+      // Diamond orders use their own prefix: "dd:<orderId>:<approve|reject>".
+      const dd = data.match(/^dd:(\d+):(approve|reject)$/);
+      const m = dd ? null : data.match(/^(pur|wd):(\d+):(approve|reject|paid)$/);
+      if (!dd && !m) return ignore;
+      const kind = m?.[1] ?? "";
+      const reqId = Number(m?.[2] ?? 0);
+      const rawDecision = m?.[3] ?? "";
       if (kind === "pur" && rawDecision === "paid") return ignore;
       if (kind === "wd" && rawDecision === "approve") return ignore;
       await expireMoneyRequestsInternal(db).catch(() => 0);
@@ -3424,7 +4166,15 @@ export const Actions = {
       const decidedBy = `Telegram (${fromName})`;
       let outcome: string;
       let already = false;
-      if (kind === "pur") {
+      if (dd) {
+        const r = await decideDiamondOrderInternal(
+          ctx, db, Number(dd[1]), dd[2] === "approve" ? "fulfill" : "reject", decidedBy, "",
+        );
+        outcome = r.ok
+          ? dd[2] === "approve" ? "✅ Fulfill မှတ်ပြီးပါပြီ — diamond ပို့ပေးပြီးပါပြီ" : "❌ ပယ်ချပြီး coin ပြန်အမ်းပြီးပါပြီ"
+          : r.error;
+        already = !r.ok && r.error.includes("ဆုံးဖြတ်ပြီးသား");
+      } else if (kind === "pur") {
         const r = await decidePurchaseInternal(
           ctx, db, reqId, rawDecision as "approve" | "reject", decidedBy, "",
         );
@@ -3708,18 +4458,22 @@ export const Actions = {
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
     }),
-    response: z.object({ ok: z.boolean() }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const auth = await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin"]);
-      if (auth.error || !auth.actor) return { ok: false };
+      if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
       const rows = await db
         .select()
         .from(schema.bracketMatches)
         .where(eq(schema.bracketMatches.id, args.bracket_id))
         .limit(1);
       const b = rows[0];
-      if (!b) return { ok: true };
+      if (!b) return { ok: false, error: "Bracket match မတွေ့ပါ" };
+      // The winner must be one of THIS bracket match's two entrants —
+      // arbitrary strings are rejected, never stored.
+      if (args.winner !== b.labelA && args.winner !== b.labelB)
+        return { ok: false, error: "Winner က ဒီ bracket match ထဲက entrant နှစ်ခုထဲက တစ်ခု ဖြစ်ရပါမယ်" };
       await db
         .update(schema.bracketMatches)
         .set({ winner: args.winner })
@@ -3756,7 +4510,7 @@ export const Actions = {
       }
       await logAct(db, auth.actor.name, `Bracket winner set: ${args.winner}`);
       ctx.invalidateQueries();
-      return { ok: true };
+      return { ok: true, error: "" };
     },
   }),
 
@@ -3926,7 +4680,7 @@ export const Actions = {
           ["completed", "cancelled", "disputed"].includes(m.status),
       );
       const out = [];
-      for (const m of mine) out.push(await matchOut(ctx, db, m, args.player_id));
+      for (const m of mine) out.push(await matchOut(ctx, db, m, args.player_id, true));
       return { matches: out };
     },
   }),
@@ -4025,7 +4779,7 @@ export const Actions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       // The actor is the session player (injected by the client). Ready can
-      // only be set for oneself; add/remove only by the team leader or self.
+      // only be set for oneself; add is leader-only; remove is leader-or-self.
       const actorTm = await playerBySession(db, args.actor_player_id, args.session_token);
       if (!actorTm) return { ok: false, error: AUTH_ERR };
       const teamRows = await db.select().from(schema.teams)
@@ -4034,7 +4788,12 @@ export const Actions = {
       if (!teamRow) return { ok: false, error: "Team မတွေ့ပါ" };
       if (args.action === "ready" && args.player_id !== actorTm.id)
         return { ok: false, error: "ကိုယ့် ready ပဲ ပြောင်းနိုင်ပါတယ်" };
-      if (args.action !== "ready" && teamRow.leaderId !== actorTm.id && args.player_id !== actorTm.id)
+      // Adding a member is LEADER-ONLY — there is no self-join path: a
+      // non-leader cannot add anyone, not even themselves.
+      if (args.action === "add" && teamRow.leaderId !== actorTm.id)
+        return { ok: false, error: "Team leader ပဲ member ထည့်နိုင်ပါတယ်" };
+      // Removing stays leader-or-self (leaving your own team still works).
+      if (args.action === "remove" && teamRow.leaderId !== actorTm.id && args.player_id !== actorTm.id)
         return { ok: false, error: "Team leader သို့မဟုတ် ကိုယ်တိုင်ပဲ လုပ်နိုင်ပါတယ်" };
       if (args.action === "add") {
         const existing = await db
@@ -4377,12 +5136,25 @@ export const Actions = {
       actor: z.string().default("admin"),
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
     }),
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const auth = await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin", "moderator"]);
       if (auth.error || !auth.actor) return { ok: false };
+      // H3: a perm_ban outcome is exactly as powerful as adminPlayerAction's
+      // perm_ban, so it carries the SAME gate — fixed-Gmail Owner +
+      // security confirmation + TOTP. Moderators/admins keep the lesser
+      // report outcomes (warning / temp_ban) without it.
+      if (args.action === "perm_ban") {
+        const ownerAuth = await requireOwner(db, args.actor_player_id, args.session_token);
+        if (ownerAuth.error || !ownerAuth.actor) return { ok: false };
+        if (!args.confirmed) return { ok: false };
+        const err2fa = await checkAdmin2fa(db, ownerAuth.actor.id, args.totp_code);
+        if (err2fa) return { ok: false };
+      }
       const rows = await db
         .select()
         .from(schema.reports)
@@ -4390,6 +5162,16 @@ export const Actions = {
         .limit(1);
       const r = rows[0];
       if (!r) return { ok: true };
+      // Hard guard: the fixed-Gmail Owner account itself can NEVER be
+      // perm-banned through a report — rejected outright for everyone,
+      // before the report is touched.
+      if (args.action === "perm_ban") {
+        const allP = await db.select().from(schema.players);
+        const targetP = allP.find(
+          (p) => p.name.toLowerCase() === r.targetName.toLowerCase(),
+        );
+        if (targetP && isFixedAdminEmail(targetP.email)) return { ok: false };
+      }
       const label =
         args.action === "warning"
           ? "Warning ပေးပြီး"
@@ -4581,11 +5363,18 @@ export const Actions = {
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      const auth = await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin", "moderator", "support"]);
+      // SECURITY GATE (must stay FIRST): the dashboard payload (full player
+      // list, money summary, activity, backups) is built ONLY for a caller
+      // whose server-side session resolves to an owner/admin. Forged or
+      // missing tokens and plain-player sessions get an all-zero payload —
+      // with settings built from an EMPTY map so not even real settings
+      // values are read, let alone returned.
+      const auth = await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin"]);
       if (auth.error) {
-        const emptySettings = settingsOut(await getSettingsMap(db));
         return {
-          settings: emptySettings,
+          // Explicit blanks on top of the empty-map output: the zero
+          // payload must not leak even the pre-confirmation public fields.
+          settings: { ...settingsOut({}), fixed_admin_email: "", telegram_chat_id: "" },
           health: { total_players: 0, online_players: 0, active_matches: 0, pending_disputes: 0, pending_reports: 0, open_tickets: 0, total_transactions: 0, total_fees: 0, db_status: "FORBIDDEN" },
           money: { topups_today_count: 0, topups_today_coins: 0, withdrawals_today_count: 0, withdrawals_today_kyat: 0, fees_today_coins: 0, pending_topups: 0, pending_withdrawals: 0 },
           activity: [], players: [], suspicious_players: [], terms_history: [], backups: [],
@@ -4620,7 +5409,7 @@ export const Actions = {
         .orderBy(desc(schema.backupSnapshots.id))
         .limit(20);
       return {
-        settings: settingsOut(s),
+        settings: settingsOut(s, true),
         health: {
           total_players: all.length,
           online_players: all.filter((p) => p.lastSeenAt >= cutoff).length,
@@ -4849,7 +5638,7 @@ export const Actions = {
       session_token: z.string().default(""),
       player_id: z.number(),
       action: z.enum(["warn", "temp_ban", "perm_ban", "unban", "adjust_coins", "set_role", "flag_suspicious", "clear_suspicious"]),
-      amount: z.number().default(0),
+      amount: z.number().int().min(-10000000).max(10000000).default(0),
       role: z.string().default("player"),
       confirmed: z.boolean().default(false),
       totp_code: z.string().default(""),
@@ -4867,6 +5656,15 @@ export const Actions = {
         : await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin", "moderator"]);
       if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
       const actorName = auth.actor.name;
+      // Unban is stronger than banning: Owner/Admin ONLY (moderators can
+      // no longer lift bans at all) and it needs the security confirmation.
+      if (args.action === "unban") {
+        const ua = await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin"]);
+        if (ua.error || !ua.actor)
+          return { ok: false, error: "Unban ကို Owner/Admin ပဲ လုပ်နိုင်ပါတယ် (moderator မရပါ)" };
+        if (!args.confirmed)
+          return { ok: false, error: "Unban ရန် security confirmation လိုပါတယ်" };
+      }
       if (isFixedAdminEmail(p.email) && args.action !== "clear_suspicious")
         return { ok: false, error: "Fixed Owner အကောင့်ကို ပြင်/ ban လို့ မရပါ" };
       if (
@@ -5243,6 +6041,11 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const meV = await playerBySession(db, args.player_id, args.session_token);
       if (!meV) return { signals: [] };
+      // Participant-only, mirroring voiceSignalSend: outsiders get nothing.
+      const mRows = await db.select().from(schema.matches)
+        .where(eq(schema.matches.id, args.match_id)).limit(1);
+      const mm = mRows[0];
+      if (!mm || (mm.playerAId !== meV.id && mm.playerBId !== meV.id)) return { signals: [] };
       const rows = await db
         .select()
         .from(schema.voiceSignals)
@@ -5318,28 +6121,54 @@ export const Actions = {
             .onConflictDoUpdate({ target: schema.settings.key, set: { value: v } });
           restored++;
         }
-        // Players: update existing rows by id (balance/locked/stats/status).
+        // Players: restore profile/stats/status — but NEVER the money.
+        // A player who exists live keeps their CURRENT live balance and
+        // locked_coins exactly (a restore can never resurrect spent coins
+        // or erase earned ones). A player who exists only in the backup is
+        // re-created with balance 0 / locked 0 for the same reason.
         // Roles are re-derived: owner only for the fixed admin Gmail.
         for (const row of tablesIn["players"] ?? []) {
           const id = Number(row["id"] ?? 0);
           if (!id) continue;
           const existing = await getPlayer(db, id);
-          if (!existing) continue;
-          const email = String(row["email"] ?? existing.email);
-          await db.update(schema.players).set({
-            balance: Number(row["balance"] ?? existing.balance),
-            lockedCoins: Number(row["lockedCoins"] ?? existing.lockedCoins),
-            wins: Number(row["wins"] ?? existing.wins),
-            losses: Number(row["losses"] ?? existing.losses),
-            winStreak: Number(row["winStreak"] ?? existing.winStreak),
-            bestStreak: Number(row["bestStreak"] ?? existing.bestStreak),
-            reputation: Number(row["reputation"] ?? existing.reputation),
-            status: (["active", "warned", "temp_banned", "perm_banned"].includes(String(row["status"]))
-              ? String(row["status"]) : existing.status) as "active" | "warned" | "temp_banned" | "perm_banned",
-            role: isFixedAdminEmail(email)
-              ? "owner"
-              : existing.role === "owner" ? "player" : existing.role,
-          }).where(eq(schema.players.id, id));
+          const email = String(row["email"] ?? existing?.email ?? "");
+          const statusIn = String(row["status"] ?? "");
+          const status = (["active", "warned", "temp_banned", "perm_banned"].includes(statusIn)
+            ? statusIn : (existing?.status ?? "active")) as "active" | "warned" | "temp_banned" | "perm_banned";
+          if (existing) {
+            await db.update(schema.players).set({
+              // balance + lockedCoins deliberately NOT set: live values win.
+              wins: Number(row["wins"] ?? existing.wins),
+              losses: Number(row["losses"] ?? existing.losses),
+              winStreak: Number(row["winStreak"] ?? existing.winStreak),
+              bestStreak: Number(row["bestStreak"] ?? existing.bestStreak),
+              reputation: Number(row["reputation"] ?? existing.reputation),
+              status,
+              role: isFixedAdminEmail(email)
+                ? "owner"
+                : existing.role === "owner" ? "player" : existing.role,
+            }).where(eq(schema.players.id, id));
+          } else {
+            await db.insert(schema.players).values({
+              id,
+              name: String(row["name"] ?? `Player ${id}`),
+              mlbbId: String(row["mlbbId"] ?? ""),
+              serverId: String(row["serverId"] ?? ""),
+              rank: String(row["rank"] ?? "Epic"),
+              avatarColor: String(row["avatarColor"] ?? "#7c3aed"),
+              role: isFixedAdminEmail(email) ? "owner" : "player",
+              status,
+              balance: 0,
+              lockedCoins: 0,
+              wins: Number(row["wins"] ?? 0),
+              losses: Number(row["losses"] ?? 0),
+              winStreak: Number(row["winStreak"] ?? 0),
+              bestStreak: Number(row["bestStreak"] ?? 0),
+              reputation: Number(row["reputation"] ?? 100),
+              referralCode: String(row["referralCode"] ?? ""),
+              email,
+            });
+          }
           restored++;
         }
         await logAct(db, actorName, `Backup RESTORE done (${restored} rows from ${args.snapshot_code || "uploaded JSON"})`);

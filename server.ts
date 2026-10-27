@@ -21,6 +21,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { eq } from "drizzle-orm";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { isAction } from "@hatch/space-sdk";
 import { Actions } from "./src/actions";
@@ -87,13 +88,22 @@ for (const [name, value] of Object.entries(Actions)) {
   }
 }
 
-function buildCtx() {
+// Per-boot host secret (security fix C1): generated fresh on every start
+// and attached ONLY to the ctx of this host's INTERNAL dispatches (the
+// Telegram poller). The telegramCallback action requires it, so a forged
+// POST /actions call — even one quoting the correct admin chat id — can
+// never reach the money decision cores. External requests get a ctx
+// WITHOUT the secret (see handleAction vs invokeActionInternal).
+const TG_HOST_SECRET = `${randomUUID()}${randomUUID()}`;
+
+function buildCtx(internal = false) {
   return {
     slug: SLUG,
     invocationId: randomUUID(),
     spaceDir: ROOT,
     db: () => db,
     blobs,
+    ...(internal ? { hostSecret: TG_HOST_SECRET } : {}),
     // Host hook used by the money actions to read proof/QR image bytes
     // (e.g. to forward a top-up screenshot to Telegram via sendPhoto).
     // The portable BlobClient contract has no byte read, so the actions
@@ -150,7 +160,7 @@ async function invokeActionInternal(actionName: string, rawArgs: unknown): Promi
   const definition = actionsByName.get(actionName) ?? actionsByName.get(slugifyActionName(actionName));
   if (!definition) throw new Error(`action '${actionName}' is not defined`);
   const parsedArgs = definition.request.parse(rawArgs ?? {});
-  const result = await definition.handler(buildCtx() as never, parsedArgs as never);
+  const result = await definition.handler(buildCtx(true) as never, parsedArgs as never);
   return definition.response.parse(result);
 }
 
@@ -198,6 +208,100 @@ async function telegramConfig(): Promise<{ token: string; chatId: string }> {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+async function telegramSendText(token: string, chatId: string, text: string): Promise<void> {
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch {
+    /* replies are best-effort */
+  }
+}
+
+/** Diamond-shop text commands, ADMIN CHAT ONLY — messages from any other
+ *  chat are ignored entirely. Runs against the same database the actions
+ *  use, so a price changed here is the price players immediately see.
+ *    /diamond                     list packages (id, name, 💎, price, on/off)
+ *    /diamond_price <id> <coins>  set a package's coin price
+ *    /diamond_toggle <id>         flip a package on/off sale              */
+async function handleTelegramTextCommand(
+  message: Record<string, unknown>,
+  token: string,
+  configuredChatId: string,
+): Promise<void> {
+  const chat = message["chat"] as { id?: unknown } | undefined;
+  const fromChatId = chat?.id !== undefined && chat?.id !== null ? String(chat.id) : "";
+  if (!fromChatId || fromChatId !== configuredChatId) return;
+  const text = typeof message["text"] === "string" ? message["text"].trim() : "";
+  if (!text.startsWith("/")) return;
+  const parts = text.split(/\s+/);
+  const cmd = (parts[0] ?? "").split("@")[0];
+  const reply = (t: string) => telegramSendText(token, configuredChatId, t);
+  if (cmd === "/diamond") {
+    const pkgs = await db
+      .select()
+      .from(schema.diamondPackages)
+      .orderBy(schema.diamondPackages.sort, schema.diamondPackages.id);
+    if (pkgs.length === 0) {
+      await reply("💎 Diamond packages မရှိသေးပါ — Admin မှာ အရင် ထည့်ပါ။");
+      return;
+    }
+    const lines = pkgs.map(
+      (p) =>
+        `#${p.id} 💎 ${p.diamonds.toLocaleString()} ${p.name} — 🪙 ${p.priceCoins.toLocaleString()} coins (${p.enabled === 1 ? "ON ✅" : "OFF ❌"})`,
+    );
+    await reply(
+      ["💎 Diamond Packages", ...lines, "", "/diamond_price <id> <coins> — ဈေးပြောင်း", "/diamond_toggle <id> — ဖွင့်/ပိတ်"].join("\n"),
+    );
+    return;
+  }
+  if (cmd === "/diamond_price") {
+    const id = Number(parts[1]);
+    const coins = Number(parts[2]);
+    if (!Number.isInteger(id) || id <= 0 || !Number.isInteger(coins) || coins < 0) {
+      await reply("ပုံစံ: /diamond_price <id> <coins>");
+      return;
+    }
+    const upd = await db
+      .update(schema.diamondPackages)
+      .set({ priceCoins: coins })
+      .where(eq(schema.diamondPackages.id, id))
+      .returning({ name: schema.diamondPackages.name, diamonds: schema.diamondPackages.diamonds });
+    if (upd.length === 0) {
+      await reply(`Package #${id} မတွေ့ပါ`);
+      return;
+    }
+    await reply(`✅ Package #${id} (${upd[0]!.name}, 💎 ${upd[0]!.diamonds.toLocaleString()}) ဈေးနှုန်း → 🪙 ${coins.toLocaleString()} coins`);
+    return;
+  }
+  if (cmd === "/diamond_toggle") {
+    const id = Number(parts[1]);
+    if (!Number.isInteger(id) || id <= 0) {
+      await reply("ပုံစံ: /diamond_toggle <id>");
+      return;
+    }
+    const rows = await db
+      .select()
+      .from(schema.diamondPackages)
+      .where(eq(schema.diamondPackages.id, id))
+      .limit(1);
+    const pk = rows[0];
+    if (!pk) {
+      await reply(`Package #${id} မတွေ့ပါ`);
+      return;
+    }
+    const next = pk.enabled === 1 ? 0 : 1;
+    await db
+      .update(schema.diamondPackages)
+      .set({ enabled: next })
+      .where(eq(schema.diamondPackages.id, id));
+    await reply(`${next === 1 ? "✅ ဖွင့်လိုက်ပါပြီ" : "❌ ပိတ်လိုက်ပါပြီ"} — Package #${id} (${pk.name})`);
+  }
+}
+
 async function telegramPollLoop(): Promise<void> {
   let offset = readTelegramOffset();
   let backoffMs = 1000;
@@ -209,7 +313,7 @@ async function telegramPollLoop(): Promise<void> {
         continue;
       }
       const res = await fetch(
-        `https://api.telegram.org/bot${token}/getUpdates?timeout=25&offset=${offset}&allowed_updates=${encodeURIComponent('["callback_query"]')}`,
+        `https://api.telegram.org/bot${token}/getUpdates?timeout=25&offset=${offset}&allowed_updates=${encodeURIComponent('["callback_query","message"]')}`,
         { signal: AbortSignal.timeout(40000) },
       );
       const body = (await res.json()) as { ok?: boolean; result?: Array<Record<string, unknown>> };
@@ -226,6 +330,13 @@ async function telegramPollLoop(): Promise<void> {
             await invokeActionInternal("telegramCallback", { update });
           } catch (err) {
             console.error(`[mlbb-standalone] telegramCallback dispatch failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+        if (update["message"]) {
+          try {
+            await handleTelegramTextCommand(update["message"] as Record<string, unknown>, token, chatId);
+          } catch (err) {
+            console.error(`[mlbb-standalone] telegram text command failed: ${err instanceof Error ? err.message : String(err)}`);
           }
         }
       }
