@@ -220,6 +220,15 @@ export class LocalBlobStore {
     return rows.map(metadataFromRow);
   }
 
+  /** Byte read for host hooks (ctx.blobBytes): null when the key is absent. */
+  async getBytes(key: string): Promise<Uint8Array | null> {
+    const row = this.row(validateKey(key));
+    if (!row) return null;
+    const file = Bun.file(this.objectPathForId(row.object_id));
+    if (!(await file.exists())) return null;
+    return new Uint8Array(await file.arrayBuffer());
+  }
+
   /** Serve helper for GET /blobs/<token>: returns file + content type. */
   async fileForToken(token: string): Promise<{ file: ReturnType<typeof Bun.file>; contentType: string } | null> {
     const key = decodeBlobKeyToken(token);

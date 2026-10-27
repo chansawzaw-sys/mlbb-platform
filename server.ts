@@ -94,6 +94,12 @@ function buildCtx() {
     spaceDir: ROOT,
     db: () => db,
     blobs,
+    // Host hook used by the money actions to read proof/QR image bytes
+    // (e.g. to forward a top-up screenshot to Telegram via sendPhoto).
+    // The portable BlobClient contract has no byte read, so the actions
+    // feature-detect this; the Muse runtime host does not provide it and
+    // the actions degrade to text-only Telegram messages there.
+    blobBytes: (key: string) => blobs.getBytes(key),
     // No privileged contracts are declared by this app's actions; any
     // attempt to use one standalone fails loudly instead of silently.
     executePrivileged: async () => {
@@ -136,6 +142,106 @@ async function handleAction(req: Request): Promise<Response> {
   } catch (err) {
     return json({ error: err instanceof Error ? err.message : String(err) }, 500);
   }
+}
+
+/** Internal dispatch (same lookup/parse/validate path as POST /actions),
+ *  used by the Telegram update poller below. */
+async function invokeActionInternal(actionName: string, rawArgs: unknown): Promise<unknown> {
+  const definition = actionsByName.get(actionName) ?? actionsByName.get(slugifyActionName(actionName));
+  if (!definition) throw new Error(`action '${actionName}' is not defined`);
+  const parsedArgs = definition.request.parse(rawArgs ?? {});
+  const result = await definition.handler(buildCtx() as never, parsedArgs as never);
+  return definition.response.parse(result);
+}
+
+// --- Telegram update poller -------------------------------------------------
+// The money actions send top-up/withdrawal requests to the admin's Telegram
+// chat with ✅/❌ inline buttons. Button taps arrive as callback_query
+// updates, which only a poller/webhook can receive — this host long-polls
+// getUpdates and dispatches each callback_query into the telegramCallback
+// action (which itself validates the chat id and runs the shared decision
+// core, so a replayed or foreign update cannot move money twice).
+// Design: single loop started once at boot; offset persisted in a small
+// state file under DATA_DIR so restarts don't re-deliver old updates;
+// exponential backoff on network/API errors; sleeps quietly while Telegram
+// is not configured (checked from the settings table every cycle, so
+// saving the token/chat id in the admin UI starts polling with no restart).
+const TG_OFFSET_FILE = join(DATA_DIR, "telegram-offset.json");
+let telegramPollerStarted = false;
+
+function readTelegramOffset(): number {
+  try {
+    const parsed = JSON.parse(readFileSync(TG_OFFSET_FILE, "utf8")) as { offset?: unknown };
+    return typeof parsed.offset === "number" && Number.isFinite(parsed.offset) ? parsed.offset : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeTelegramOffset(offset: number): void {
+  try {
+    writeFileSync(TG_OFFSET_FILE, JSON.stringify({ offset }));
+  } catch {
+    /* state file is best-effort; a lost offset only re-delivers updates,
+       and telegramCallback decisions are idempotent */
+  }
+}
+
+async function telegramConfig(): Promise<{ token: string; chatId: string }> {
+  const rows = await db.select().from(schema.settings);
+  const map = new Map(rows.map((r) => [r.key, r.value]));
+  return {
+    token: (map.get("telegram_bot_token") ?? "").trim(),
+    chatId: (map.get("telegram_chat_id") ?? "").trim(),
+  };
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function telegramPollLoop(): Promise<void> {
+  let offset = readTelegramOffset();
+  let backoffMs = 1000;
+  for (;;) {
+    try {
+      const { token, chatId } = await telegramConfig();
+      if (!token || !chatId) {
+        await sleep(15000);
+        continue;
+      }
+      const res = await fetch(
+        `https://api.telegram.org/bot${token}/getUpdates?timeout=25&offset=${offset}&allowed_updates=${encodeURIComponent('["callback_query"]')}`,
+        { signal: AbortSignal.timeout(40000) },
+      );
+      const body = (await res.json()) as { ok?: boolean; result?: Array<Record<string, unknown>> };
+      if (!body.ok || !Array.isArray(body.result)) throw new Error("getUpdates not ok");
+      backoffMs = 1000;
+      for (const update of body.result) {
+        const updateId = typeof update["update_id"] === "number" ? update["update_id"] : null;
+        if (updateId !== null && updateId >= offset) {
+          offset = updateId + 1;
+          writeTelegramOffset(offset);
+        }
+        if (update["callback_query"]) {
+          try {
+            await invokeActionInternal("telegramCallback", { update });
+          } catch (err) {
+            console.error(`[mlbb-standalone] telegramCallback dispatch failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`[mlbb-standalone] telegram poll error: ${err instanceof Error ? err.message : String(err)} (retry in ${Math.round(backoffMs / 1000)}s)`);
+      await sleep(backoffMs);
+      backoffMs = Math.min(backoffMs * 2, 30000);
+    }
+  }
+}
+
+function startTelegramPoller(): void {
+  if (telegramPollerStarted) return;
+  telegramPollerStarted = true;
+  console.log("[mlbb-standalone] telegram update poller started (activates when bot token + chat id are configured)");
+  void telegramPollLoop();
 }
 
 // --- static client --------------------------------------------------------
@@ -200,3 +306,4 @@ const server = Bun.serve({
 console.log(`[mlbb-standalone] listening on http://0.0.0.0:${server.port}`);
 console.log(`[mlbb-standalone] data dir: ${DATA_DIR}`);
 console.log(`[mlbb-standalone] actions loaded: ${Object.keys(Actions).length}`);
+startTelegramPoller();

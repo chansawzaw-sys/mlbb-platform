@@ -298,11 +298,35 @@ export const purchaseRequests = sqliteTable("purchase_requests", {
   playerId: integer("player_id").notNull(),
   coins: integer("coins").notNull(),
   label: text("label").notNull().default(""),
-  status: text("status", { enum: ["pending", "approved", "rejected"] })
+  status: text("status", { enum: ["pending", "approved", "rejected", "expired"] })
     .notNull()
     .default("pending"),
   decidedBy: text("decided_by").notNull().default(""),
   txnCode: text("txn_code").notNull().default(""),
+  proofBlobKey: text("proof_blob_key").notNull().default(""),
+  proofHash: text("proof_hash").notNull().default(""),
+  rejectReason: text("reject_reason").notNull().default(""),
+  createdAt: ts("created_at"),
+  decidedAt: integer("decided_at", { mode: "timestamp_ms" }),
+});
+
+export const withdrawRequests = sqliteTable("withdraw_requests", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  playerId: integer("player_id").notNull(),
+  coins: integer("coins").notNull(),
+  rateKyat: integer("rate_kyat").notNull().default(0),
+  grossKyat: integer("gross_kyat").notNull().default(0),
+  feePercent: integer("fee_percent").notNull().default(0),
+  feeKyat: integer("fee_kyat").notNull().default(0),
+  netKyat: integer("net_kyat").notNull().default(0),
+  method: text("method", { enum: ["kpay", "wave"] }).notNull().default("kpay"),
+  payoutPhone: text("payout_phone").notNull().default(""),
+  status: text("status", { enum: ["pending", "paid", "rejected", "expired"] })
+    .notNull()
+    .default("pending"),
+  reason: text("reason").notNull().default(""),
+  txnCode: text("txn_code").notNull().default(""),
+  decidedBy: text("decided_by").notNull().default(""),
   createdAt: ts("created_at"),
   decidedAt: integer("decided_at", { mode: "timestamp_ms" }),
 });

@@ -36,6 +36,13 @@
       "when": 1792809551603,
       "tag": "0005_add_avatar_and_team_logo_blobs",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1793110000000,
+      "tag": "0006_money_topups_withdrawals",
+      "breakpoints": true
     }
   ]
 }

@@ -129,6 +129,18 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   google_setup_by_id: "",
   google_setup_by_name: "",
   google_setup_at: "",
+  kpay_phone: "",
+  kpay_qr: "",
+  kpay_qr_key: "",
+  wave_phone: "",
+  wave_qr: "",
+  wave_qr_key: "",
+  coin_rate_kyat: "8",
+  withdraw_fee_percent: "0",
+  withdraw_min_coins: "1000",
+  withdraw_max_coins_per_day: "100000",
+  topup_min_coins: "10",
+  topup_max_coins: "1000000",
   terms_version: "1",
   terms_text: "",
   rules_text: "",
@@ -347,6 +359,7 @@ async function logAct(db: Db, actor: string, action: string) {
 async function telegramSend(
   s: Record<string, string>,
   text: string,
+  replyMarkup?: unknown,
 ): Promise<{ sent: boolean; error: string }> {
   const token = (s["telegram_bot_token"] ?? "").trim();
   const chatId = (s["telegram_chat_id"] ?? "").trim();
@@ -355,8 +368,13 @@ async function telegramSend(
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
+      signal: AbortSignal.timeout(8000),
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text: text.slice(0, 3900) }),
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text.slice(0, 3900),
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      }),
     });
     const data = (await res.json().catch(() => null)) as
       | { ok?: boolean; description?: string }
@@ -367,6 +385,118 @@ async function telegramSend(
   } catch (e) {
     return { sent: false, error: `Telegram ချိတ်ဆက်မှု မအောင်မြင်ပါ: ${e instanceof Error ? e.message : "network error"}` };
   }
+}
+
+/** Generic Bot API call (JSON body). Fail-soft: never throws. */
+async function telegramApi(
+  token: string,
+  method: string,
+  payload: Record<string, unknown>,
+): Promise<{ ok: boolean; error: string; result: unknown }> {
+  if (!token) return { ok: false, error: "no token", result: null };
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      method: "POST",
+      signal: AbortSignal.timeout(8000),
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json().catch(() => null)) as
+      | { ok?: boolean; description?: string; result?: unknown }
+      | null;
+    if (!res.ok || !data?.ok)
+      return { ok: false, error: `Telegram API: ${data?.description ?? `HTTP ${res.status}`}`, result: null };
+    return { ok: true, error: "", result: data.result ?? null };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "network error", result: null };
+  }
+}
+
+/** Send a photo (raw bytes) with an optional inline keyboard. Fail-soft. */
+async function telegramSendPhoto(
+  s: Record<string, string>,
+  bytes: Uint8Array,
+  caption: string,
+  replyMarkup?: unknown,
+): Promise<{ sent: boolean; error: string }> {
+  const token = (s["telegram_bot_token"] ?? "").trim();
+  const chatId = (s["telegram_chat_id"] ?? "").trim();
+  if (!token || !chatId) return { sent: false, error: "Telegram မချိတ်ရသေးပါ" };
+  try {
+    const form = new FormData();
+    form.append("chat_id", chatId);
+    form.append("caption", caption.slice(0, 1000));
+    const photoAb = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    form.append("photo", new Blob([photoAb], { type: "image/jpeg" }), "proof.jpg");
+    if (replyMarkup) form.append("reply_markup", JSON.stringify(replyMarkup));
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+      method: "POST",
+      signal: AbortSignal.timeout(8000),
+      body: form,
+    });
+    const data = (await res.json().catch(() => null)) as
+      | { ok?: boolean; description?: string }
+      | null;
+    if (!res.ok || !data?.ok)
+      return { sent: false, error: `Telegram API: ${data?.description ?? `HTTP ${res.status}`}` };
+    return { sent: true, error: "" };
+  } catch (e) {
+    return { sent: false, error: e instanceof Error ? e.message : "network error" };
+  }
+}
+
+/** Inline decision keyboard for money requests in Telegram. callback_data
+ *  format: "<kind>:<id>:<decision>" — kind "pur" (top-up) or "wd" (withdraw). */
+function moneyKeyboard(kind: "pur" | "wd", id: number) {
+  const positive =
+    kind === "pur"
+      ? { text: "✅ Approve", callback_data: `pur:${id}:approve` }
+      : { text: "💸 Paid", callback_data: `wd:${id}:paid` };
+  const negative = { text: "❌ Reject", callback_data: `${kind}:${id}:reject` };
+  return { inline_keyboard: [[positive, negative]] };
+}
+
+/** Read raw blob bytes when the host provides them (the standalone host
+ *  exposes ctx.blobBytes via its local-disk store). The portable BlobClient
+ *  contract has no byte-read, so in other runtimes this returns null and
+ *  callers fall back to text-only behaviour. Fail-soft by design. */
+async function blobBytes(ctx: Ctx, key: string): Promise<Uint8Array | null> {
+  if (!key) return null;
+  const extra = (
+    ctx as unknown as {
+      blobBytes?: (k: string) => Promise<Uint8Array | null>;
+    }
+  ).blobBytes;
+  if (typeof extra !== "function") return null;
+  try {
+    return await extra(key);
+  } catch {
+    return null;
+  }
+}
+
+/** SHA-256 hex of image bytes (WebCrypto — portable across runtimes). */
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  const digest = await crypto.subtle.digest("SHA-256", ab);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/** Public display mask for payout names: first word, first 3 chars + "***"
+ *  (single initial + "***" for very short names). Never a full name. */
+function maskName(name: string): string {
+  const first = (name ?? "").trim().split(/\s+/)[0] ?? "";
+  if (first.length <= 2) return `${first.slice(0, 1)}***`;
+  return `${first.slice(0, 3)}***`;
+}
+
+function telegramConfigured(s: Record<string, string>): boolean {
+  return (
+    (s["telegram_bot_token"] ?? "").trim() !== "" &&
+    (s["telegram_chat_id"] ?? "").trim() !== ""
+  );
 }
 
 const B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -530,6 +660,7 @@ async function teamGateFor(db: Db, playerId: number, teamSize: number): Promise<
  *  Runs lazily on reads (bootstrap/match/board) and via sweepTimeouts. */
 async function sweepTimeoutsInternal(db: Db): Promise<number> {
   let acted = 0;
+  acted += await expireMoneyRequestsInternal(db);
   const now = Date.now();
   const s = await getSettingsMap(db);
   const matchTimeoutMs = numSetting(s, "match_timeout_min", 180) * 60 * 1000;
@@ -577,6 +708,85 @@ async function sweepTimeoutsInternal(db: Db): Promise<number> {
         acted++;
       }
     }
+  }
+  return acted;
+}
+
+/** Money request expiry: pending top-ups and withdrawals older than 24h
+ *  expire exactly once (atomic pending->expired claim). Expired top-ups
+ *  never credit; expired withdrawals refund the deducted coins in full.
+ *  The player is notified once — the status flip IS the notification gate.
+ *  Runs inside the regular timeout sweep (invoked on bootstrap/app load)
+ *  and lazily from the money actions themselves. */
+async function expireMoneyRequestsInternal(db: Db): Promise<number> {
+  let acted = 0;
+  const cutoff = new Date(Date.now() - 24 * 3600 * 1000);
+  const stalePurchases = await db
+    .select()
+    .from(schema.purchaseRequests)
+    .where(eq(schema.purchaseRequests.status, "pending"));
+  for (const r of stalePurchases) {
+    if (r.createdAt >= cutoff) continue;
+    const upd = await db
+      .update(schema.purchaseRequests)
+      .set({ status: "expired", decidedBy: "system (24h expiry)", decidedAt: new Date() })
+      .where(
+        and(
+          eq(schema.purchaseRequests.id, r.id),
+          eq(schema.purchaseRequests.status, "pending"),
+        ),
+      )
+      .returning({ id: schema.purchaseRequests.id });
+    if (upd.length === 0) continue;
+    await notify(db, {
+      playerId: r.playerId,
+      type: "wallet",
+      title: "Coin တောင်းဆိုချက် သက်တမ်းကုန်ပါပြီ ⏰",
+      body: `${r.coins} coins တောင်းဆိုချက် (#${r.id}) ကို ၂၄ နာရီအတွင်း admin မဆုံးဖြတ်လို့ သက်တမ်းကုန်ပါပြီ — လိုအပ်ရင် အသစ် ပြန်တောင်းဆိုပါ။`,
+    });
+    await logAct(db, "system", `Purchase request #${r.id} expired after 24h (${r.coins} coins)`);
+    acted++;
+  }
+  const staleWithdrawals = await db
+    .select()
+    .from(schema.withdrawRequests)
+    .where(eq(schema.withdrawRequests.status, "pending"));
+  for (const w of staleWithdrawals) {
+    if (w.createdAt >= cutoff) continue;
+    const upd = await db
+      .update(schema.withdrawRequests)
+      .set({ status: "expired", decidedBy: "system (24h expiry)", decidedAt: new Date() })
+      .where(
+        and(
+          eq(schema.withdrawRequests.id, w.id),
+          eq(schema.withdrawRequests.status, "pending"),
+        ),
+      )
+      .returning({ id: schema.withdrawRequests.id });
+    if (upd.length === 0) continue;
+    const p = await getPlayer(db, w.playerId);
+    if (p) {
+      const nb = p.balance + w.coins;
+      await db
+        .update(schema.players)
+        .set({ balance: nb })
+        .where(eq(schema.players.id, p.id));
+      await addTxn(db, {
+        playerId: p.id,
+        type: "withdraw_refund",
+        amount: w.coins,
+        balanceAfter: nb,
+        note: `Withdraw #${w.id} expired (24h) — coins refunded`,
+      });
+    }
+    await notify(db, {
+      playerId: w.playerId,
+      type: "wallet",
+      title: "ငွေထုတ် တောင်းဆိုချက် သက်တမ်းကုန်ပါပြီ ⏰",
+      body: `Withdraw #${w.id} (${w.coins} coins) ၂၄ နာရီ ကျော်လို့ သက်တမ်းကုန်ပြီး coin အပြည့် ပြန်အမ်းပြီးပါပြီ။`,
+    });
+    await logAct(db, "system", `Withdraw request #${w.id} expired after 24h — refunded ${w.coins} coins`);
+    acted++;
   }
   return acted;
 }
@@ -1012,6 +1222,16 @@ const settingsShape = z.object({
   rules_text: z.string(),
   fixed_admin_email: z.string(),
   match_timeout_min: z.number(),
+  kpay_phone: z.string(),
+  kpay_qr: z.string(),
+  wave_phone: z.string(),
+  wave_qr: z.string(),
+  coin_rate_kyat: z.number(),
+  withdraw_fee_percent: z.number(),
+  withdraw_min_coins: z.number(),
+  topup_min_coins: z.number(),
+  topup_max_coins: z.number(),
+  withdraw_max_coins_per_day: z.number(),
 });
 
 function settingsOut(s: Record<string, string>) {
@@ -1065,8 +1285,261 @@ function settingsOut(s: Record<string, string>) {
     rules_text: s["rules_text"] ?? "",
     fixed_admin_email: FIXED_ADMIN_EMAIL,
     match_timeout_min: numSetting(s, "match_timeout_min", 180),
+    kpay_phone: s["kpay_phone"] ?? "",
+    kpay_qr: s["kpay_qr"] ?? "",
+    wave_phone: s["wave_phone"] ?? "",
+    wave_qr: s["wave_qr"] ?? "",
+    coin_rate_kyat: numSetting(s, "coin_rate_kyat", 8),
+    withdraw_fee_percent: numSetting(s, "withdraw_fee_percent", 0),
+    withdraw_min_coins: numSetting(s, "withdraw_min_coins", 1000),
+    topup_min_coins: numSetting(s, "topup_min_coins", 10),
+    topup_max_coins: numSetting(s, "topup_max_coins", 1000000),
+    withdraw_max_coins_per_day: numSetting(s, "withdraw_max_coins_per_day", 100000),
   };
 }
+
+/* ---------- Money decision core (shared by dashboard + Telegram) ----------
+ * Authorization lives in the CALLERS (dashboard actions verify Owner +
+ * confirmation + TOTP; the Telegram callback verifies the configured chat
+ * id). These helpers own the state machine only: atomic pending->decided
+ * claims make every money movement happen exactly once, whichever surface
+ * decides first. */
+
+async function decidePurchaseInternal(
+  ctx: Ctx,
+  db: Db,
+  requestId: number,
+  decision: "approve" | "reject",
+  decidedByName: string,
+  reason: string,
+): Promise<{ ok: boolean; error: string; txn_code: string }> {
+  const fail = (error: string) => ({ ok: false, error, txn_code: "" });
+  const rows = await db
+    .select()
+    .from(schema.purchaseRequests)
+    .where(eq(schema.purchaseRequests.id, requestId))
+    .limit(1);
+  const req = rows[0];
+  if (!req) return fail("Request မတွေ့ပါ");
+  if (req.status === "expired")
+    return fail("ဒီ request က သက်တမ်းကုန်ပြီးသားပါ — ဆုံးဖြတ်လို့ မရပါ");
+  if (req.status !== "pending")
+    return fail("ဒီ request ကို ဆုံးဖြတ်ပြီးသားပါ — နှစ်ခါ credit မဖြစ်ပါ");
+  if (decision === "reject") {
+    const upd = await db
+      .update(schema.purchaseRequests)
+      .set({
+        status: "rejected",
+        decidedBy: decidedByName,
+        decidedAt: new Date(),
+        rejectReason: (reason ?? "").slice(0, 300),
+      })
+      .where(
+        and(
+          eq(schema.purchaseRequests.id, req.id),
+          eq(schema.purchaseRequests.status, "pending"),
+        ),
+      )
+      .returning({ id: schema.purchaseRequests.id });
+    if (upd.length === 0) return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ");
+    await notify(db, {
+      playerId: req.playerId,
+      type: "wallet",
+      title: "Coin ဝယ်ယူမှု ပယ်ချခံရပါတယ်",
+      body: `${req.coins} coins တောင်းဆိုမှုကို admin က ပယ်ချပါတယ်။${reason ? `\nအကြောင်းရင်း: ${reason}` : ""}`,
+    });
+    await logAct(db, decidedByName, `Purchase request #${req.id} rejected (${req.coins} coins)${reason ? ` — ${reason}` : ""}`);
+    ctx.invalidateQueries();
+    return { ok: true, error: "", txn_code: "" };
+  }
+  // Atomic claim first (pending -> approved) so a double-click, a second
+  // admin, or a Telegram tap can never credit twice.
+  const code = uid("TXN");
+  const upd = await db
+    .update(schema.purchaseRequests)
+    .set({ status: "approved", decidedBy: decidedByName, decidedAt: new Date(), txnCode: code, rejectReason: "" })
+    .where(
+      and(
+        eq(schema.purchaseRequests.id, req.id),
+        eq(schema.purchaseRequests.status, "pending"),
+      ),
+    )
+    .returning({ id: schema.purchaseRequests.id });
+  if (upd.length === 0) return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ — နှစ်ခါ credit မဖြစ်ပါ");
+  const buyer = await getPlayer(db, req.playerId);
+  if (!buyer) return fail("Buyer မတွေ့ပါ");
+  const nb = buyer.balance + req.coins;
+  await db.update(schema.players).set({ balance: nb }).where(eq(schema.players.id, buyer.id));
+  await db.insert(schema.transactions).values({
+    code, playerId: buyer.id, type: "purchase", amount: req.coins,
+    balanceAfter: nb, note: `${req.label} — အတည်ပြုပြီး (request #${req.id}, by ${decidedByName})`,
+  });
+  await notify(db, { playerId: buyer.id, type: "wallet", title: "Coin ရောက်ပါပြီ 🪙", body: `${req.coins} coins ထည့်ပြီးပါပြီ။ Balance: ${nb} (Txn ${code})` });
+  await logAct(db, decidedByName, `Purchase request #${req.id} approved: +${req.coins} coins to ${buyer.name} (${code})`);
+  ctx.invalidateQueries();
+  return { ok: true, error: "", txn_code: code };
+}
+
+async function decideWithdrawInternal(
+  ctx: Ctx,
+  db: Db,
+  requestId: number,
+  decision: "paid" | "reject",
+  decidedByName: string,
+  reason: string,
+): Promise<{ ok: boolean; error: string }> {
+  const fail = (error: string) => ({ ok: false, error });
+  const rows = await db
+    .select()
+    .from(schema.withdrawRequests)
+    .where(eq(schema.withdrawRequests.id, requestId))
+    .limit(1);
+  const w = rows[0];
+  if (!w) return fail("Withdraw request မတွေ့ပါ");
+  if (w.status === "expired")
+    return fail("ဒီ withdraw က သက်တမ်းကုန်ပြီး coin ပြန်အမ်းပြီးသားပါ");
+  if (w.status !== "pending")
+    return fail("ဒီ withdraw ကို ဆုံးဖြတ်ပြီးသားပါ — နှစ်ခါ ရွှေ့လို့ မရပါ");
+  if (decision === "paid") {
+    const upd = await db
+      .update(schema.withdrawRequests)
+      .set({ status: "paid", decidedBy: decidedByName, decidedAt: new Date() })
+      .where(
+        and(
+          eq(schema.withdrawRequests.id, w.id),
+          eq(schema.withdrawRequests.status, "pending"),
+        ),
+      )
+      .returning({ id: schema.withdrawRequests.id });
+    if (upd.length === 0) return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ");
+    await notify(db, {
+      playerId: w.playerId,
+      type: "wallet",
+      title: "ငွေ ထုတ်ပေးပြီးပါပြီ 💸",
+      body: `Withdraw #${w.id}: ${w.netKyat.toLocaleString()} ကျပ် ကို ${w.method === "wave" ? "Wave Pay" : "KBZPay"} (${w.payoutPhone}) ထဲ ပို့ပြီးပါပြီ။`,
+    });
+    await logAct(db, decidedByName, `Withdraw #${w.id} PAID: ${w.netKyat} kyat (${w.coins} coins) via ${w.method}`);
+    ctx.invalidateQueries();
+    return { ok: true, error: "" };
+  }
+  // Reject: claim first, then refund the deducted coins exactly once.
+  const upd = await db
+    .update(schema.withdrawRequests)
+    .set({
+      status: "rejected",
+      decidedBy: decidedByName,
+      decidedAt: new Date(),
+      reason: (reason ?? "").slice(0, 300),
+    })
+    .where(
+      and(
+        eq(schema.withdrawRequests.id, w.id),
+        eq(schema.withdrawRequests.status, "pending"),
+      ),
+    )
+    .returning({ id: schema.withdrawRequests.id });
+  if (upd.length === 0) return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ");
+  const p = await getPlayer(db, w.playerId);
+  if (p) {
+    const nb = p.balance + w.coins;
+    await db.update(schema.players).set({ balance: nb }).where(eq(schema.players.id, p.id));
+    await addTxn(db, {
+      playerId: p.id,
+      type: "withdraw_refund",
+      amount: w.coins,
+      balanceAfter: nb,
+      note: `Withdraw #${w.id} rejected — coins refunded${reason ? ` (${reason})` : ""}`,
+    });
+  }
+  await notify(db, {
+    playerId: w.playerId,
+    type: "wallet",
+    title: "ငွေထုတ် တောင်းဆိုချက် ပယ်ချခံရပါတယ်",
+    body: `Withdraw #${w.id} (${w.coins} coins) ကို admin က ပယ်ချပြီး coin အပြည့် ပြန်အမ်းပြီးပါပြီ။${reason ? `\nအကြောင်းရင်း: ${reason}` : ""}`,
+  });
+  await logAct(db, decidedByName, `Withdraw #${w.id} rejected — refunded ${w.coins} coins${reason ? ` — ${reason}` : ""}`);
+  ctx.invalidateQueries();
+  return { ok: true, error: "" };
+}
+
+type PurchaseRow = typeof schema.purchaseRequests.$inferSelect;
+type WithdrawRow = typeof schema.withdrawRequests.$inferSelect;
+
+async function purchaseOut(ctx: Ctx, r: PurchaseRow, playerName: string) {
+  return {
+    id: r.id,
+    player_id: r.playerId,
+    player_name: playerName,
+    coins: r.coins,
+    label: r.label,
+    status: r.status,
+    txn_code: r.txnCode,
+    proof_url: r.proofBlobKey ? await blobUrlSafe(ctx, r.proofBlobKey) : "",
+    has_proof: r.proofBlobKey !== "",
+    reject_reason: r.rejectReason,
+    decided_by: r.decidedBy,
+    created_at: iso(r.createdAt) ?? "",
+    decided_at: iso(r.decidedAt),
+  };
+}
+
+function withdrawOut(r: WithdrawRow, playerName: string) {
+  return {
+    id: r.id,
+    player_id: r.playerId,
+    player_name: playerName,
+    coins: r.coins,
+    rate_kyat: r.rateKyat,
+    gross_kyat: r.grossKyat,
+    fee_percent: r.feePercent,
+    fee_kyat: r.feeKyat,
+    net_kyat: r.netKyat,
+    method: r.method,
+    payout_phone: r.payoutPhone,
+    status: r.status,
+    reason: r.reason,
+    txn_code: r.txnCode,
+    decided_by: r.decidedBy,
+    created_at: iso(r.createdAt) ?? "",
+    decided_at: iso(r.decidedAt),
+  };
+}
+
+const purchaseReqShape = z.object({
+  id: z.number(),
+  player_id: z.number(),
+  player_name: z.string(),
+  coins: z.number(),
+  label: z.string(),
+  status: z.string(),
+  txn_code: z.string(),
+  proof_url: z.string(),
+  has_proof: z.boolean(),
+  reject_reason: z.string(),
+  decided_by: z.string(),
+  created_at: z.string(),
+  decided_at: z.string().nullable(),
+});
+
+const withdrawReqShape = z.object({
+  id: z.number(),
+  player_id: z.number(),
+  player_name: z.string(),
+  coins: z.number(),
+  rate_kyat: z.number(),
+  gross_kyat: z.number(),
+  fee_percent: z.number(),
+  fee_kyat: z.number(),
+  net_kyat: z.number(),
+  method: z.string(),
+  payout_phone: z.string(),
+  status: z.string(),
+  reason: z.string(),
+  txn_code: z.string(),
+  decided_by: z.string(),
+  created_at: z.string(),
+  decided_at: z.string().nullable(),
+});
 
 export const Actions = {
   getBootstrap: defineAction({
@@ -1096,6 +1569,14 @@ export const Actions = {
         .nullable(),
       live_matches: z.array(matchShape),
       top_players: z.array(playerShape),
+      recent_payouts: z.array(
+        z.object({
+          masked_name: z.string(),
+          net_kyat: z.number(),
+          decided_at: z.string(),
+        }),
+      ),
+      total_paid_kyat: z.number(),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
@@ -1172,6 +1653,30 @@ export const Actions = {
           : null,
         live_matches: liveOut,
         top_players: await playersPublicOutAsync(ctx, allPlayers.slice(0, 5), viewerId),
+        recent_payouts: await (async () => {
+          // Public trust feed: PAID withdrawals only, names masked, and
+          // NEVER a phone number or full name.
+          const paid = await db
+            .select()
+            .from(schema.withdrawRequests)
+            .where(eq(schema.withdrawRequests.status, "paid"))
+            .orderBy(desc(schema.withdrawRequests.decidedAt))
+            .limit(30);
+          return paid.map((w) => ({
+            masked_name: maskName(
+              allPlayers.find((x) => x.id === w.playerId)?.name ?? "Player",
+            ),
+            net_kyat: w.netKyat,
+            decided_at: iso(w.decidedAt) ?? iso(w.createdAt) ?? "",
+          }));
+        })(),
+        total_paid_kyat: await (async () => {
+          const paidAll = await db
+            .select()
+            .from(schema.withdrawRequests)
+            .where(eq(schema.withdrawRequests.status, "paid"));
+          return paidAll.reduce((a, w) => a + w.netKyat, 0);
+        })(),
       };
     },
   }),
@@ -2133,16 +2638,8 @@ export const Actions = {
     request: z.object({ player_id: z.number(), session_token: z.string().default("") }),
     response: z.object({
       player: playerShape.nullable(),
-      purchase_requests: z.array(z.object({
-          id: z.number(),
-          player_id: z.number(),
-          player_name: z.string(),
-          coins: z.number(),
-          label: z.string(),
-          status: z.string(),
-          txn_code: z.string(),
-          created_at: z.string(),
-        })),
+      purchase_requests: z.array(purchaseReqShape),
+      withdraw_requests: z.array(withdrawReqShape),
       transactions: z.array(
         z.object({
           id: z.number(),
@@ -2158,12 +2655,19 @@ export const Actions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const p = await playerBySession(db, args.player_id, args.session_token);
-      if (!p) return { player: null, purchase_requests: [], transactions: [] };
+      if (!p) return { player: null, purchase_requests: [], withdraw_requests: [], transactions: [] };
+      await expireMoneyRequestsInternal(db).catch(() => 0);
       const reqs = await db
         .select()
         .from(schema.purchaseRequests)
         .where(eq(schema.purchaseRequests.playerId, args.player_id))
         .orderBy(desc(schema.purchaseRequests.id))
+        .limit(50);
+      const wreqs = await db
+        .select()
+        .from(schema.withdrawRequests)
+        .where(eq(schema.withdrawRequests.playerId, args.player_id))
+        .orderBy(desc(schema.withdrawRequests.id))
         .limit(50);
       const txns = await db
         .select()
@@ -2171,18 +2675,12 @@ export const Actions = {
         .where(eq(schema.transactions.playerId, args.player_id))
         .orderBy(desc(schema.transactions.id))
         .limit(100);
+      const purchaseOutList = [];
+      for (const r of reqs) purchaseOutList.push(await purchaseOut(ctx, r, p.name));
       return {
         player: p ? await playerOutAsync(ctx, p) : null,
-        purchase_requests: reqs.map((r) => ({
-          id: r.id,
-          player_id: r.playerId,
-          player_name: p.name,
-          coins: r.coins,
-          label: r.label,
-          status: r.status,
-          txn_code: r.txnCode,
-          created_at: iso(r.createdAt) ?? "",
-        })),
+        purchase_requests: purchaseOutList,
+        withdraw_requests: wreqs.map((w) => withdrawOut(w, p.name)),
         transactions: txns.map((t) => ({
           id: t.id,
           code: t.code,
@@ -2202,6 +2700,7 @@ export const Actions = {
       session_token: z.string().default(""),
       coins: z.number().int().min(1).max(10000000),
       label: z.string().max(80).default(""),
+      proof_key: z.string().max(200).default(""),
     }),
     response: z.object({
       ok: z.boolean(),
@@ -2220,6 +2719,42 @@ export const Actions = {
       if (!p) return fail(AUTH_ERR);
       const rl = await rateLimit(db, `buy:${p.id}`, 20, 10 * 60 * 1000);
       if (rl) return fail(rl);
+      await expireMoneyRequestsInternal(db).catch(() => 0);
+      // Admin-configured top-up limits.
+      const minCoins = numSetting(s, "topup_min_coins", 10);
+      const maxCoins = numSetting(s, "topup_max_coins", 1000000);
+      if (args.coins < minCoins)
+        return fail(`အနည်းဆုံး ${minCoins.toLocaleString()} coins မှ စပြီး ဝယ်လို့ရပါတယ် (Minimum top-up is ${minCoins} coins)`);
+      if (args.coins > maxCoins)
+        return fail(`တစ်ကြိမ်ကို အများဆုံး ${maxCoins.toLocaleString()} coins ပဲ ဝယ်လို့ရပါတယ် (Maximum top-up is ${maxCoins} coins)`);
+      // Payment proof: once the admin publishes any payment method, a
+      // screenshot is REQUIRED. The proof blob key is content-addressed —
+      // minted ONLY by uploadPurchaseProof as proofs/p<playerId>/<sha256>.<ext> —
+      // so the hash embedded in the key was computed by the server itself.
+      const paymentConfigured =
+        (s["kpay_phone"] ?? "").trim() !== "" || (s["kpay_qr"] ?? "").trim() !== "" ||
+        (s["wave_phone"] ?? "").trim() !== "" || (s["wave_qr"] ?? "").trim() !== "";
+      const proofKey = (args.proof_key ?? "").trim();
+      let proofHash = "";
+      if (paymentConfigured && !proofKey)
+        return fail("ငွေလွှဲပြီး screenshot တင်ရန် လိုပါတယ် — အရင် ငွေလွှဲ screenshot တင်ပြီးမှ တောင်းဆိုပါ (Payment screenshot is required)");
+      if (proofKey) {
+        const m = proofKey.match(new RegExp(`^proofs/p${p.id}/([0-9a-f]{64})\\.(jpg|png|webp)$`));
+        if (!m) return fail("Screenshot အထောက်အထား မမှန်ပါ — ပုံကို ပြန်တင်ပြီး ထပ်ကြိုးစားပါ (Invalid payment proof)");
+        const head = await ctx.blobs.head(proofKey).catch(() => null);
+        if (!head) return fail("Screenshot မတွေ့ပါ — ပုံကို ပြန်တင်ပါ (Payment proof not found)");
+        proofHash = m[1]!;
+        // Duplicate guard: one screenshot funds exactly ONE request, ever —
+        // any earlier request (any status, any player) with the same image
+        // hash blocks a resubmission.
+        const dup = await db
+          .select()
+          .from(schema.purchaseRequests)
+          .where(eq(schema.purchaseRequests.proofHash, proofHash))
+          .limit(1);
+        if (dup.length > 0)
+          return fail("ဒီ screenshot ကို သုံးပြီးသား ဖြစ်နေပါတယ် — screenshot တစ်ပုံကို တစ်ခါပဲ သုံးလို့ရပါတယ် (This screenshot has already been used)");
+      }
       // Coin economy: a purchase is only a REQUEST. The balance changes later,
       // when the fixed Owner approves it in decidePurchase — a player can
       // never credit their own balance from here.
@@ -2230,8 +2765,11 @@ export const Actions = {
           coins: args.coins,
           label: args.label || `Coin ဝယ်ယူမှု ${args.coins} coins`,
           status: "pending",
+          proofBlobKey: proofKey,
+          proofHash,
         })
         .returning({ id: schema.purchaseRequests.id });
+      const requestId = ins[0]?.id ?? 0;
       const ownerRow = (await db.select().from(schema.players))
         .find((x) => isFixedAdminEmail(x.email));
       if (ownerRow) {
@@ -2242,8 +2780,23 @@ export const Actions = {
           body: `${p.name} က ${args.coins} coins ဝယ်ဖို့ တောင်းဆိုထားပါတယ် — Admin မှာ အတည်ပြု/ပယ်ချ လုပ်ပါ။`,
         });
       }
+      // Telegram: photo + one-tap decision buttons (fail-soft).
+      if (telegramConfigured(s) && requestId > 0) {
+        const caption =
+          `🪙 Coin ဝယ်ယူမှု အသစ် #${requestId}\n` +
+          `Player: ${p.name}\nCoins: ${args.coins.toLocaleString()}\n${args.label || ""}\n` +
+          `Admin dashboard သို့မဟုတ် ဒီကပဲ ဆုံးဖြတ်နိုင်ပါတယ်။`;
+        const kb = moneyKeyboard("pur", requestId);
+        const bytes = proofKey ? await blobBytes(ctx, proofKey) : null;
+        if (bytes) {
+          const sent = await telegramSendPhoto(s, bytes, caption, kb);
+          if (!sent.sent) await telegramSend(s, caption, kb);
+        } else {
+          await telegramSend(s, caption, kb);
+        }
+      }
       ctx.invalidateQueries();
-      return { ok: true, error: "", txn_code: "", request_id: ins[0]?.id ?? 0, status: "pending" };
+      return { ok: true, error: "", txn_code: "", request_id: requestId, status: "pending" };
     },
   }),
 
@@ -2252,35 +2805,19 @@ export const Actions = {
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
     }),
-    response: z.object({ requests: z.array(z.object({
-          id: z.number(),
-          player_id: z.number(),
-          player_name: z.string(),
-          coins: z.number(),
-          label: z.string(),
-          status: z.string(),
-          txn_code: z.string(),
-          created_at: z.string(),
-        })) }),
+    response: z.object({ requests: z.array(purchaseReqShape) }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const auth = await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin"]);
       if (auth.error) return { requests: [] };
+      await expireMoneyRequestsInternal(db).catch(() => 0);
       const rows = await db.select().from(schema.purchaseRequests)
         .orderBy(desc(schema.purchaseRequests.id)).limit(100);
       const all = await db.select().from(schema.players);
-      return {
-        requests: rows.map((r) => ({
-          id: r.id,
-          player_id: r.playerId,
-          player_name: all.find((x) => x.id === r.playerId)?.name ?? "?",
-          coins: r.coins,
-          label: r.label,
-          status: r.status,
-          txn_code: r.txnCode,
-          created_at: iso(r.createdAt) ?? "",
-        })),
-      };
+      const out = [];
+      for (const r of rows)
+        out.push(await purchaseOut(ctx, r, all.find((x) => x.id === r.playerId)?.name ?? "?"));
+      return { requests: out };
     },
   }),
 
@@ -2291,6 +2828,7 @@ export const Actions = {
       session_token: z.string().default(""),
       request_id: z.number(),
       decision: z.enum(["approve", "reject"]),
+      reason: z.string().max(300).default(""),
       confirmed: z.boolean().default(false),
       totp_code: z.string().default(""),
     }),
@@ -2299,48 +2837,379 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const fail = (error: string) => ({ ok: false, error, txn_code: "" });
       // Wallet decisions are Owner-only (fixed admin Gmail) + confirmation,
-      // plus a real TOTP check when the owner has 2FA enabled.
+      // plus a real TOTP check when the owner has 2FA enabled. The state
+      // machine itself lives in decidePurchaseInternal (shared with the
+      // Telegram callback path, which authenticates by chat id instead).
       const auth = await requireOwner(db, args.actor_player_id, args.session_token);
       if (auth.error || !auth.actor) return fail(auth.error ?? AUTH_ERR);
       if (!args.confirmed) return fail("Coin အတည်ပြုရန် security confirmation လိုပါတယ်");
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
       if (err2fa) return fail(err2fa);
-      const rows = await db.select().from(schema.purchaseRequests)
-        .where(eq(schema.purchaseRequests.id, args.request_id)).limit(1);
-      const req = rows[0];
-      if (!req) return fail("Request မတွေ့ပါ");
-      if (req.status !== "pending") return fail("ဒီ request ကို ဆုံးဖြတ်ပြီးသားပါ — နှစ်ခါ credit မဖြစ်ပါ");
-      if (args.decision === "reject") {
-        const upd = await db.update(schema.purchaseRequests)
-          .set({ status: "rejected", decidedBy: auth.actor.name, decidedAt: new Date() })
-          .where(and(eq(schema.purchaseRequests.id, req.id), eq(schema.purchaseRequests.status, "pending")))
-          .returning({ id: schema.purchaseRequests.id });
-        if (upd.length === 0) return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ");
-        await notify(db, { playerId: req.playerId, type: "wallet", title: "Coin ဝယ်ယူမှု ပယ်ချခံရပါတယ်", body: `${req.coins} coins တောင်းဆိုမှုကို admin က ပယ်ချပါတယ်။` });
-        await logAct(db, auth.actor.name, `Purchase request #${req.id} rejected (${req.coins} coins)`);
-        ctx.invalidateQueries();
-        return { ok: true, error: "", txn_code: "" };
+      await expireMoneyRequestsInternal(db).catch(() => 0);
+      return decidePurchaseInternal(ctx, db, args.request_id, args.decision, auth.actor.name, args.reason ?? "");
+    },
+  }),
+
+  uploadPurchaseProof: defineAction({
+    request: z.object({
+      player_id: z.number(),
+      session_token: z.string().default(""),
+      image_base64: z.string().max(12_000_000).default(""),
+      image_mime: z.string().max(60).default(""),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string(),
+      proof_key: z.string(),
+      proof_url: z.string(),
+      proof_hash: z.string(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const fail = (error: string) => ({ ok: false, error, proof_key: "", proof_url: "", proof_hash: "" });
+      const me = await playerBySession(db, args.player_id, args.session_token);
+      if (!me) return fail(AUTH_ERR);
+      const rl = await rateLimit(db, `proof:${me.id}`, 30, 60 * 60 * 1000);
+      if (rl) return fail(rl);
+      const v = validateImage(args.image_base64, args.image_mime);
+      if (v.error || !v.bytes) return fail(v.error || "ပုံ မမှန်ပါ");
+      // Content-addressed: the SHA-256 of the image IS the file name, minted
+      // here by the server — buyCoins can trust the hash in the key.
+      const hash = await sha256Hex(v.bytes);
+      const key = `proofs/p${me.id}/${hash}.${v.ext}`;
+      const existing = await ctx.blobs.head(key).catch(() => null);
+      if (!existing) {
+        try {
+          await ctx.blobs.put(key, v.bytes, { contentType: v.mime });
+        } catch {
+          return fail("ပုံ သိမ်းလို့ မရပါ — ပြန်ကြိုးစားပါ");
+        }
       }
-      // Atomic claim first (pending -> approved) so a double-click or a
-      // concurrent admin call can never credit twice.
+      return { ok: true, error: "", proof_key: key, proof_url: await blobUrlSafe(ctx, key), proof_hash: hash };
+    },
+  }),
+
+  requestWithdraw: defineAction({
+    request: z.object({
+      player_id: z.number(),
+      session_token: z.string().default(""),
+      coins: z.number().int().min(1).max(10000000),
+      method: z.enum(["kpay", "wave"]).default("kpay"),
+      payout_phone: z.string().max(30).default(""),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string(),
+      request_id: z.number(),
+      gross_kyat: z.number(),
+      fee_kyat: z.number(),
+      net_kyat: z.number(),
+      txn_code: z.string(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const fail = (error: string) => ({ ok: false, error, request_id: 0, gross_kyat: 0, fee_kyat: 0, net_kyat: 0, txn_code: "" });
+      const s = await getSettingsMap(db);
+      if (s["emergency"] === "1")
+        return fail("Emergency mode — wallet transaction ယာယီပိတ်ထားပါတယ်");
+      const p = await playerBySession(db, args.player_id, args.session_token);
+      if (!p) return fail(AUTH_ERR);
+      const rl = await rateLimit(db, `withdraw:${p.id}`, 20, 10 * 60 * 1000);
+      if (rl) return fail(rl);
+      await expireMoneyRequestsInternal(db).catch(() => 0);
+      const phone = (args.payout_phone ?? "").trim();
+      if (!phone) return fail("ငွေလက်ခံမယ့် ဖုန်းနံပါတ် ထည့်ပါ (Payout phone number is required)");
+      const rate = Math.floor(numSetting(s, "coin_rate_kyat", 0));
+      if (rate <= 0)
+        return fail("ငွေထုတ် စနစ် မဖွင့်ရသေးပါ — admin က လဲနှုန်း မသတ်မှတ်ရသေးပါ (Withdrawals are not configured yet)");
+      const minCoins = numSetting(s, "withdraw_min_coins", 1000);
+      if (args.coins < minCoins)
+        return fail(`အနည်းဆုံး ${minCoins.toLocaleString()} coins မှ ထုတ်လို့ရပါတယ် (Minimum withdrawal is ${minCoins} coins)`);
+      if (p.balance < args.coins)
+        return fail(`Balance မလုံလောက်ပါ — သုံးနိုင်သော coin: ${p.balance.toLocaleString()} (Insufficient balance)`);
+      // Daily cap: today's pending + paid withdrawals (UTC day) count
+      // against it; rejected/expired ones do not.
+      const dailyCap = numSetting(s, "withdraw_max_coins_per_day", 100000);
+      if (dailyCap > 0) {
+        const dayStart = new Date();
+        dayStart.setUTCHours(0, 0, 0, 0);
+        const mine = await db
+          .select()
+          .from(schema.withdrawRequests)
+          .where(eq(schema.withdrawRequests.playerId, p.id));
+        const usedToday = mine
+          .filter((w) => (w.status === "pending" || w.status === "paid") && w.createdAt >= dayStart)
+          .reduce((a, w) => a + w.coins, 0);
+        if (usedToday + args.coins > dailyCap)
+          return fail(`ဒီနေ့ ထုတ်နိုင်တဲ့ ပမာဏ ကျော်နေပါတယ် — တစ်နေ့ အများဆုံး ${dailyCap.toLocaleString()} coins (ဒီနေ့ သုံးပြီး: ${usedToday.toLocaleString()})`);
+      }
+      const feePct = Math.min(100, Math.max(0, numSetting(s, "withdraw_fee_percent", 0)));
+      const gross = args.coins * rate;
+      const fee = Math.floor((gross * feePct) / 100);
+      const net = gross - fee;
+      // Coins are deducted (locked) up-front; a reject/expiry refunds them
+      // exactly, a "paid" decision keeps them deducted.
       const code = uid("TXN");
-      const upd = await db.update(schema.purchaseRequests)
-        .set({ status: "approved", decidedBy: auth.actor.name, decidedAt: new Date(), txnCode: code })
-        .where(and(eq(schema.purchaseRequests.id, req.id), eq(schema.purchaseRequests.status, "pending")))
-        .returning({ id: schema.purchaseRequests.id });
-      if (upd.length === 0) return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ — နှစ်ခါ credit မဖြစ်ပါ");
-      const buyer = await getPlayer(db, req.playerId);
-      if (!buyer) return fail("Buyer မတွေ့ပါ");
-      const nb = buyer.balance + req.coins;
-      await db.update(schema.players).set({ balance: nb }).where(eq(schema.players.id, buyer.id));
-      await db.insert(schema.transactions).values({
-        code, playerId: buyer.id, type: "purchase", amount: req.coins,
-        balanceAfter: nb, note: `${req.label} — Owner အတည်ပြုပြီး (request #${req.id})`,
+      const nb = p.balance - args.coins;
+      await db.update(schema.players).set({ balance: nb }).where(eq(schema.players.id, p.id));
+      await addTxn(db, {
+        playerId: p.id,
+        type: "withdraw",
+        amount: -args.coins,
+        balanceAfter: nb,
+        note: `Withdraw request — ${args.coins} coins → ${net.toLocaleString()} ကျပ် (${args.method === "wave" ? "Wave" : "KPay"} ${phone})`,
       });
-      await notify(db, { playerId: buyer.id, type: "wallet", title: "Coin ရောက်ပါပြီ 🪙", body: `${req.coins} coins ထည့်ပြီးပါပြီ။ Balance: ${nb} (Txn ${code})` });
-      await logAct(db, auth.actor.name, `Purchase request #${req.id} approved: +${req.coins} coins to ${buyer.name} (${code})`);
+      const ins = await db
+        .insert(schema.withdrawRequests)
+        .values({
+          playerId: p.id,
+          coins: args.coins,
+          rateKyat: rate,
+          grossKyat: gross,
+          feePercent: feePct,
+          feeKyat: fee,
+          netKyat: net,
+          method: args.method,
+          payoutPhone: phone,
+          status: "pending",
+          txnCode: code,
+        })
+        .returning({ id: schema.withdrawRequests.id });
+      const requestId = ins[0]?.id ?? 0;
+      const ownerRow = (await db.select().from(schema.players))
+        .find((x) => isFixedAdminEmail(x.email));
+      if (ownerRow) {
+        await notify(db, {
+          playerId: ownerRow.id,
+          type: "wallet",
+          title: "💸 ငွေထုတ် တောင်းဆိုချက် အသစ်",
+          body: `${p.name} က ${args.coins} coins (${net.toLocaleString()} ကျပ်) ထုတ်ဖို့ တောင်းဆိုထားပါတယ် — Admin မှာ စစ်ပြီး ပေးပါ။`,
+        });
+      }
+      if (telegramConfigured(s) && requestId > 0) {
+        const text =
+          `💸 ငွေထုတ် တောင်းဆိုချက် #${requestId}\n` +
+          `Player: ${p.name}\nCoins: ${args.coins.toLocaleString()} × ${rate} = ${gross.toLocaleString()} ကျပ်\n` +
+          `Fee: ${fee.toLocaleString()} ကျပ် (${feePct}%)\nပေးရန်: ${net.toLocaleString()} ကျပ်\n` +
+          `${args.method === "wave" ? "Wave Pay" : "KBZPay"}: ${phone}\nငွေလွှဲပြီးမှ Paid နှိပ်ပါ။`;
+        await telegramSend(s, text, moneyKeyboard("wd", requestId));
+      }
       ctx.invalidateQueries();
-      return { ok: true, error: "", txn_code: code };
+      return { ok: true, error: "", request_id: requestId, gross_kyat: gross, fee_kyat: fee, net_kyat: net, txn_code: code };
+    },
+  }),
+
+  listWithdrawRequests: defineAction({
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+    }),
+    response: z.object({ requests: z.array(withdrawReqShape) }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const auth = await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin"]);
+      if (auth.error) return { requests: [] };
+      await expireMoneyRequestsInternal(db).catch(() => 0);
+      const rows = await db.select().from(schema.withdrawRequests)
+        .orderBy(desc(schema.withdrawRequests.id)).limit(100);
+      const all = await db.select().from(schema.players);
+      return {
+        requests: rows.map((w) => withdrawOut(w, all.find((x) => x.id === w.playerId)?.name ?? "?")),
+      };
+    },
+  }),
+
+  decideWithdraw: defineAction({
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      actor: z.string().default("admin"),
+      session_token: z.string().default(""),
+      request_id: z.number(),
+      decision: z.enum(["paid", "reject"]),
+      reason: z.string().max(300).default(""),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      // Same gates as decidePurchase: Owner-only + confirmation + TOTP.
+      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
+      if (!args.confirmed) return { ok: false, error: "ငွေထုတ် ဆုံးဖြတ်ရန် security confirmation လိုပါတယ်" };
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return { ok: false, error: err2fa };
+      await expireMoneyRequestsInternal(db).catch(() => 0);
+      return decideWithdrawInternal(ctx, db, args.request_id, args.decision, auth.actor.name, args.reason ?? "");
+    },
+  }),
+
+  uploadPaymentQr: defineAction({
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+      method: z.enum(["kpay", "wave"]),
+      image_base64: z.string().max(12_000_000).default(""),
+      image_mime: z.string().max(60).default(""),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string(), qr_url: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const fail = (error: string) => ({ ok: false, error, qr_url: "" });
+      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor) return fail(auth.error ?? AUTH_ERR);
+      if (!args.confirmed) return fail("QR ပြောင်းရန် security confirmation လိုပါတယ်");
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return fail(err2fa);
+      const v = validateImage(args.image_base64, args.image_mime);
+      if (v.error || !v.bytes) return fail(v.error || "ပုံ မမှန်ပါ");
+      const s = await getSettingsMap(db);
+      const keyField = args.method === "wave" ? "wave_qr_key" : "kpay_qr_key";
+      const urlField = args.method === "wave" ? "wave_qr" : "kpay_qr";
+      const oldKey = s[keyField] ?? "";
+      const key = `payments/${args.method}-qr-${Date.now()}.${v.ext}`;
+      try {
+        await ctx.blobs.put(key, v.bytes, { contentType: v.mime });
+      } catch {
+        return fail("QR ပုံ သိမ်းလို့ မရပါ — ပြန်ကြိုးစားပါ");
+      }
+      const url = await blobUrlSafe(ctx, key);
+      await setSetting(db, urlField, url);
+      await setSetting(db, keyField, key);
+      if (oldKey && oldKey !== key) {
+        try { await ctx.blobs.delete(oldKey); } catch { /* best-effort */ }
+      }
+      await logAct(db, auth.actor.name, `Payment QR updated (${args.method})`);
+      ctx.invalidateQueries();
+      return { ok: true, error: "", qr_url: url };
+    },
+  }),
+
+  deletePaymentQr: defineAction({
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+      method: z.enum(["kpay", "wave"]),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
+      if (!args.confirmed) return { ok: false, error: "QR ဖျက်ရန် security confirmation လိုပါတယ်" };
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return { ok: false, error: err2fa };
+      const s = await getSettingsMap(db);
+      const keyField = args.method === "wave" ? "wave_qr_key" : "kpay_qr_key";
+      const urlField = args.method === "wave" ? "wave_qr" : "kpay_qr";
+      const oldKey = s[keyField] ?? "";
+      await setSetting(db, urlField, "");
+      await setSetting(db, keyField, "");
+      if (oldKey) {
+        try { await ctx.blobs.delete(oldKey); } catch { /* best-effort */ }
+      }
+      await logAct(db, auth.actor.name, `Payment QR removed (${args.method})`);
+      ctx.invalidateQueries();
+      return { ok: true, error: "" };
+    },
+  }),
+
+  telegramCallback: defineAction({
+    request: z.object({
+      update: z.record(z.string(), z.unknown()),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string(), handled: z.boolean() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const ignore = { ok: true, error: "", handled: false };
+      const s = await getSettingsMap(db);
+      const token = (s["telegram_bot_token"] ?? "").trim();
+      const chatId = (s["telegram_chat_id"] ?? "").trim();
+      if (!token || !chatId) return { ok: false, error: "Telegram မချိတ်ရသေးပါ", handled: false };
+      const update = (args.update ?? {}) as Record<string, unknown>;
+      const cq = update["callback_query"] as
+        | {
+            id?: unknown;
+            data?: unknown;
+            from?: { first_name?: unknown };
+            message?: {
+              message_id?: unknown;
+              text?: unknown;
+              caption?: unknown;
+              chat?: { id?: unknown };
+            };
+          }
+        | undefined;
+      if (!cq) return ignore;
+      // The ONLY authorization on this path: the tap must come from the
+      // configured admin chat. Anything else is rejected with no effects.
+      const fromChat = cq.message?.chat?.id;
+      if (fromChat === undefined || String(fromChat) !== chatId)
+        return { ok: false, error: "Telegram chat မကိုက်ပါ — ဆုံးဖြတ်ခွင့် မရှိပါ", handled: false };
+      const data = typeof cq.data === "string" ? cq.data : "";
+      const m = data.match(/^(pur|wd):(\d+):(approve|reject|paid)$/);
+      if (!m) return ignore;
+      const kind = m[1]!;
+      const reqId = Number(m[2]);
+      const rawDecision = m[3]!;
+      if (kind === "pur" && rawDecision === "paid") return ignore;
+      if (kind === "wd" && rawDecision === "approve") return ignore;
+      await expireMoneyRequestsInternal(db).catch(() => 0);
+      const fromName =
+        typeof cq.from?.first_name === "string" && cq.from.first_name
+          ? cq.from.first_name
+          : "Telegram admin";
+      const decidedBy = `Telegram (${fromName})`;
+      let outcome: string;
+      let already = false;
+      if (kind === "pur") {
+        const r = await decidePurchaseInternal(
+          ctx, db, reqId, rawDecision as "approve" | "reject", decidedBy, "",
+        );
+        outcome = r.ok
+          ? rawDecision === "approve" ? "✅ အတည်ပြုပြီး — coin credit ဝင်ပြီးပါပြီ" : "❌ ပယ်ချပြီးပါပြီ"
+          : r.error;
+        already = !r.ok && r.error.includes("ဆုံးဖြတ်ပြီးသား");
+      } else {
+        const r = await decideWithdrawInternal(
+          ctx, db, reqId, rawDecision as "paid" | "reject", decidedBy, "",
+        );
+        outcome = r.ok
+          ? rawDecision === "paid" ? "💸 Paid မှတ်ပြီးပါပြီ" : "❌ ပယ်ချပြီး coin ပြန်အမ်းပြီးပါပြီ"
+          : r.error;
+        already = !r.ok && r.error.includes("ဆုံးဖြတ်ပြီးသား");
+      }
+      // Best-effort Bot API feedback: answer the tap + stamp the outcome
+      // onto the original message. Failures here never roll back the DB.
+      const cqId = typeof cq.id === "string" ? cq.id : "";
+      if (cqId) {
+        await telegramApi(token, "answerCallbackQuery", {
+          callback_query_id: cqId,
+          text: already ? "ဆုံးဖြတ်ပြီးသား ဖြစ်နေပါတယ်" : outcome.slice(0, 190),
+        });
+      }
+      const msgId = cq.message?.message_id;
+      const origText =
+        (typeof cq.message?.text === "string" && cq.message.text) ||
+        (typeof cq.message?.caption === "string" && cq.message.caption) ||
+        "";
+      if (typeof msgId === "number" && origText) {
+        // Photo messages need editMessageCaption; plain ones editMessageText.
+        const isPhoto = typeof cq.message?.text !== "string";
+        await telegramApi(token, isPhoto ? "editMessageCaption" : "editMessageText", {
+          chat_id: chatId,
+          message_id: msgId,
+          ...(isPhoto
+            ? { caption: `${origText.slice(0, 900)}\n\n— ${outcome} (by ${fromName})` }
+            : { text: `${origText.slice(0, 3700)}\n\n— ${outcome} (by ${fromName})` }),
+        });
+      }
+      await logAct(db, decidedBy, `Telegram callback ${data} → ${outcome.slice(0, 80)}`);
+      return { ok: true, error: "", handled: true };
     },
   }),
 
@@ -3418,6 +4287,15 @@ export const Actions = {
         total_fees: z.number(),
         db_status: z.string(),
       }),
+      money: z.object({
+        topups_today_count: z.number(),
+        topups_today_coins: z.number(),
+        withdrawals_today_count: z.number(),
+        withdrawals_today_kyat: z.number(),
+        fees_today_coins: z.number(),
+        pending_topups: z.number(),
+        pending_withdrawals: z.number(),
+      }),
       activity: z.array(
         z.object({ id: z.number(), actor: z.string(), action: z.string(), created_at: z.string() }),
       ),
@@ -3451,6 +4329,7 @@ export const Actions = {
         return {
           settings: emptySettings,
           health: { total_players: 0, online_players: 0, active_matches: 0, pending_disputes: 0, pending_reports: 0, open_tickets: 0, total_transactions: 0, total_fees: 0, db_status: "FORBIDDEN" },
+          money: { topups_today_count: 0, topups_today_coins: 0, withdrawals_today_count: 0, withdrawals_today_kyat: 0, fees_today_coins: 0, pending_topups: 0, pending_withdrawals: 0 },
           activity: [], players: [], suspicious_players: [], terms_history: [], backups: [],
         };
       }
@@ -3499,6 +4378,32 @@ export const Actions = {
             .reduce((a, t) => a + t.amount, 0),
           db_status: "OK",
         },
+        money: await (async () => {
+          // Today's money summary (UTC day). Top-ups are coin-denominated
+          // (kyat actually received is off-platform); fees come from the
+          // platform_fee ledger rows written at match settlement.
+          const dayStart = new Date();
+          dayStart.setUTCHours(0, 0, 0, 0);
+          const purchases = await db.select().from(schema.purchaseRequests);
+          const withdrawals = await db.select().from(schema.withdrawRequests);
+          const approvedToday = purchases.filter(
+            (r) => r.status === "approved" && r.decidedAt && r.decidedAt >= dayStart,
+          );
+          const paidToday = withdrawals.filter(
+            (w) => w.status === "paid" && w.decidedAt && w.decidedAt >= dayStart,
+          );
+          return {
+            topups_today_count: approvedToday.length,
+            topups_today_coins: approvedToday.reduce((a, r) => a + r.coins, 0),
+            withdrawals_today_count: paidToday.length,
+            withdrawals_today_kyat: paidToday.reduce((a, w) => a + w.netKyat, 0),
+            fees_today_coins: txnRows
+              .filter((t) => t.type === "platform_fee" && t.createdAt >= dayStart)
+              .reduce((a, t) => a + t.amount, 0),
+            pending_topups: purchases.filter((r) => r.status === "pending").length,
+            pending_withdrawals: withdrawals.filter((w) => w.status === "pending").length,
+          };
+        })(),
         activity: act.map((a) => ({
           id: a.id,
           actor: a.actor,
@@ -3602,6 +4507,9 @@ export const Actions = {
         "fee_brawl_type", "fee_brawl_value", "referral_percent_x100", "packages",
         "emergency", "maintenance", "telegram_bot_token", "telegram_chat_id",
         "google_client_id", "google_enabled",
+        "coin_rate_kyat", "withdraw_fee_percent", "withdraw_min_coins",
+        "withdraw_max_coins_per_day", "topup_min_coins", "topup_max_coins",
+        "kpay_phone", "wave_phone",
       ];
       const touchesCritical = Object.keys(args.values).some((k) => critical.includes(k));
       if (touchesCritical && !args.confirmed)
