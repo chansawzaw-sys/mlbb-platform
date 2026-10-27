@@ -639,6 +639,31 @@ function suspiciousCheck(
   return reasons.join(" • ");
 }
 
+/** Player display names are unique platform-wide, compared
+ * case-insensitively after trimming. */
+const normName = (n: string) => n.trim().toLowerCase();
+function nameTaken(
+  all: PlayerRow[],
+  name: string,
+  exceptId?: number,
+): boolean {
+  const wanted = normName(name);
+  return all.some((p) => p.id !== exceptId && normName(p.name) === wanted);
+}
+/** A free display name: the base itself, or base + " #2", " #3", …
+ * (kept within the 60-char name limit). */
+function uniqueDisplayName(all: PlayerRow[], base: string): string {
+  if (!nameTaken(all, base)) return base;
+  for (let i = 2; ; i++) {
+    const suffix = ` #${i}`;
+    const cand = base.slice(0, 60 - suffix.length).trimEnd() + suffix;
+    if (!nameTaken(all, cand)) return cand;
+  }
+}
+
+const NAME_TAKEN_ERR =
+  "ဒီနာမည် သုံးပြီးသား ဖြစ်နေပါတယ် — တခြားနာမည် တစ်ခု ရွေးပါ (This name is already taken — please choose a different name)";
+
 /** Settle a match: payout winner, platform fee, referral commission. */
 async function settleMatch(
   ctx: Ctx,
@@ -1171,6 +1196,8 @@ export const Actions = {
       const rl = await rateLimit(db, "register", 10, 10 * 60 * 1000);
       if (rl) return { ok: false, player: null, error: rl, session_token: "" };
       const existing = await db.select().from(schema.players);
+      if (nameTaken(existing, args.name))
+        return { ok: false, player: null, error: NAME_TAKEN_ERR, session_token: "" };
       let referredById: number | null = null;
       const code = args.referral_code.trim().toUpperCase();
       if (code) {
@@ -1230,6 +1257,8 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const me = await playerBySession(db, args.player_id, args.session_token);
       if (!me) return { ok: false };
+      const allPlayers = await db.select().from(schema.players);
+      if (nameTaken(allPlayers, args.name, me.id)) return { ok: false };
       await db
         .update(schema.players)
         .set({
@@ -3903,7 +3932,12 @@ export const Actions = {
       }
       const rl = await rateLimit(db, "register", 10, 10 * 60 * 1000);
       if (rl) return { ok: false, player: null, session_token: "", error: rl };
-      const displayName = (info.name || email.split("@")[0] || "Player").slice(0, 60);
+      // A name collision must never block a Google signup — least of all
+      // the fixed-Gmail Owner confirmation — so suffix instead of failing.
+      const displayName = uniqueDisplayName(
+        all,
+        (info.name || email.split("@")[0] || "Player").slice(0, 60),
+      );
       const myCode = `${displayName.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "MLBB"}${Math.floor(1000 + Math.random() * 9000)}`;
       const inserted = await db
         .insert(schema.players)
