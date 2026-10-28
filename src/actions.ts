@@ -6647,37 +6647,68 @@ export const Actions = {
       const userId = args.mlbb_id.trim();
       const zoneId = args.server_id.trim();
       try {
-        const form = new URLSearchParams();
-        form.set("voucherTypeName", "MOBILE_LEGENDS");
-        form.set("user.userId", userId);
-        form.set("user.zoneId", zoneId);
-        form.set("MOBILE_LEGENDS(userId,zoneId)", `${userId}(${zoneId})`);
+        // The exact validation request the maintained check-ign libraries
+        // (CodashopProvider) use: a JSON body WITH a voucher price point.
+        // Without the price-point fields Codashop answers errorCode -32602
+        // "Invalid Request Parameter(s)" for every pair — real IDs too.
         const res = await fetch("https://order-sg.codashop.com/initPayment.action", {
           method: "POST",
           headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+            "Content-Type": "application/json",
+            "Origin": "https://www.codashop.com",
+            "Referer": "https://www.codashop.com/",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.63 Mobile Safari/537.36",
           },
-          body: form.toString(),
+          body: JSON.stringify({
+            "voucherPricePoint.id": 27684,
+            "voucherPricePoint.price": 527250,
+            "voucherPricePoint.variablePrice": 0,
+            "user.userId": userId,
+            "user.zoneId": zoneId,
+            "voucherTypeName": "MOBILE_LEGENDS",
+            "lvtId": "",
+            "shopLang": "id_ID",
+            "dynamicSkuToken": "",
+            "pricePointDynamicSkuToken": "",
+            "voucherTypeId": "",
+          }),
           signal: AbortSignal.timeout(8000),
         });
         if (res.status === 429) return fail("rate_limited");
         if (!res.ok) return fail("unavailable");
         const data = (await res.json()) as {
           success?: boolean;
-          errorCode?: number;
+          errorCode?: number | string;
+          RESULT_CODE?: number | string;
           confirmationFields?: { username?: string };
         };
-        const rawName = (data.confirmationFields?.username ?? "").trim();
-        if (rawName) {
-          let name = rawName;
-          try { name = decodeURIComponent(rawName); } catch { /* keep raw */ }
+        // Codashop-level throttle (RESULT_CODE 10001) → rate_limited.
+        if (data.RESULT_CODE !== undefined && String(data.RESULT_CODE) === "10001") {
+          return fail("rate_limited");
+        }
+        const rawName = data.confirmationFields?.username ?? "";
+        if (rawName.trim()) {
+          // Decode like PHP urldecode: "+" → " ", then percent-decode.
+          let name = rawName.replace(/\+/g, " ");
+          try { name = decodeURIComponent(name); } catch { /* keep raw */ }
           name = name.trim();
           if (name) return { found: true, name, reason: "" };
         }
-        // Codashop answered but rejected the pair (e.g. errorCode -100
-        // "Invalid user ID") — the ID/Server combo does not resolve.
-        return fail("not_found");
+        const errNum =
+          data.errorCode === undefined ||
+          (typeof data.errorCode === "string" && data.errorCode.trim() === "")
+            ? NaN
+            : Number(data.errorCode);
+        // -32602 means OUR request was malformed — never report not_found.
+        if (errNum === -32602) return fail("unavailable");
+        // A well-formed request for a nonexistent pair is rejected with
+        // success:false + a numeric errorCode (e.g. 1003 "Error_Role_Null",
+        // -100, -200) — that is the only true not_found signal.
+        if (data.success === false && !Number.isNaN(errNum)) return fail("not_found");
+        // Everything else (unknown RESULT_CODE, success without a username,
+        // missing fields) is an upstream oddity — unavailable, not a verdict
+        // on the player's ID.
+        return fail("unavailable");
       } catch {
         // Network error / timeout / non-JSON body — service unavailable.
         return fail("unavailable");
