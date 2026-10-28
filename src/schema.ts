@@ -52,6 +52,11 @@ export const settings = sqliteTable("settings", {
 export const challenges = sqliteTable("challenges", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   creatorId: integer("creator_id").notNull(),
+  /** Batch 13 Add.3 (Item 10): friend-directed 1v1 challenge target.
+   *  NULL = public challenge (today's behavior for every existing row);
+   *  when set, ONLY that player may accept it and the challenge is
+   *  visible on the board only to its creator and its invitee. */
+  invitedPlayerId: integer("invited_player_id"),
   arena: text("arena", { enum: ["1v1", "classic", "brawl"] }).notNull(),
   teamSize: integer("team_size").notNull().default(1),
   heroRule: text("hero_rule").notNull().default("open"),

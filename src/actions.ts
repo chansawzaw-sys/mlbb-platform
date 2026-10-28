@@ -438,6 +438,58 @@ async function ownOpenChallenge(db: Db, playerId: number) {
   return rows[0] ?? null;
 }
 
+/** Batch 13 Add.3 (Item 9): createChallenge's unfinished-match message —
+ *  now THE shared IN_MATCH message for create / accept / join alike. */
+const UNFINISHED_MATCH_ERR = "သင့်မှာ မပြီးသေးတဲ့ match တစ်ခု ရှိနေပါတယ် — အဲ့ဒီ match ပြီးမှ lobby အသစ် ထောင်လို့ရပါမယ် (Finish your current match first)";
+
+/** Batch 13 Add.3 (Item 9): THE one lobby guard for createChallenge,
+ *  acceptChallenge and joinMatchSlot — the three paths can never drift
+ *  apart again. Returns the block reason for a player, or null:
+ *   - "OWN_LOBBY": the player holds an OPEN challenge of their own
+ *     (ownOpenChallenge — a directed challenge counts too).
+ *   - "IN_MATCH": the player participates in a match whose status is
+ *     ready_check, live or result_pending. Participation = a leader
+ *     column (playerAId / playerBId) OR a match_participants row that
+ *     is still state "locked" (a kicked/refunded snapshot row means the
+ *     player already left that match, so it no longer binds them).
+ *  DISPUTED matches NEVER block: a player whose only commitment is a
+ *  disputed match (admin decision pending) may create or accept one
+ *  other match; the disputed match itself is untouched — its coins
+ *  stay locked and no participant cancel exists for it.
+ *  `excludeMatchId` (joinMatchSlot only) skips ONE match in the
+ *  IN_MATCH scan — the very match being joined — so that action's own
+ *  already-participant rejection keeps firing with its own message
+ *  instead of the generic guard error. */
+async function lobbyBlockReason(
+  db: Db,
+  playerId: number,
+  excludeMatchId = 0,
+): Promise<"OWN_LOBBY" | "IN_MATCH" | null> {
+  const own = await ownOpenChallenge(db, playerId);
+  if (own) return "OWN_LOBBY";
+  const BLOCKING = ["ready_check", "live", "result_pending"];
+  const allMatches = await db.select().from(schema.matches);
+  const blocking = allMatches.filter(
+    (m) => BLOCKING.includes(m.status) && m.id !== excludeMatchId,
+  );
+  if (
+    blocking.some((m) => m.playerAId === playerId || m.playerBId === playerId)
+  )
+    return "IN_MATCH";
+  const blockingIds = new Set(blocking.map((m) => m.id));
+  if (blockingIds.size > 0) {
+    const myParts = await db
+      .select()
+      .from(schema.matchParticipants)
+      .where(eq(schema.matchParticipants.playerId, playerId));
+    if (
+      myParts.some((pt) => pt.state === "locked" && blockingIds.has(pt.matchId))
+    )
+      return "IN_MATCH";
+  }
+  return null;
+}
+
 /** Refund EVERY still-locked participant of a snapshot match (balance
  *  +stake, locked −stake, refund txn, participant state → refunded) and
  *  cancel the match's pending referral rows. Used by refundMatch's team
@@ -628,6 +680,30 @@ const searchPlayerShape = z.object({
   avatar_url: z.string(),
   is_online: z.boolean(),
   friend_state: z.enum(["friend", "added_you", "none"]),
+});
+
+/** Batch 13 Add.2 — player-summary popup payload: EXACTLY the public
+ *  field set and nothing else. No balance, locked_coins, email, phone,
+ *  role, status or any session/admin field ever appears here — this
+ *  shape is built field-by-field in getPlayerSummary, never by reusing
+ *  playerShape / playerPublicOut. friend_state adds "self" for the
+ *  viewer's own id on top of the searchAll states. */
+const playerSummaryShape = z.object({
+  id: z.number(),
+  name: z.string(),
+  game_name: z.string(),
+  mlbb_id: z.string(),
+  server_id: z.string(),
+  rank: z.string(),
+  wins: z.number(),
+  losses: z.number(),
+  total_matches: z.number(),
+  win_rate: z.number(),
+  reputation: z.number(),
+  avatar_color: z.string(),
+  avatar_url: z.string(),
+  is_online: z.boolean(),
+  friend_state: z.enum(["friend", "added_you", "none", "self"]),
 });
 
 async function getPlayer(db: Db, id: number) {
@@ -2860,6 +2936,10 @@ export const Actions = {
         online_players: z.number(),
         total_players: z.number(),
         active_matches: z.number(),
+        // Batch 13 Add.3 (Item 8): matches with status EXACTLY "live" —
+        // drives Home's compact "currently playing · N" count line.
+        // Computed from the same allMatches list as active_matches.
+        live_matches: z.number(),
         completed_matches: z.number(),
         open_challenges: z.number(),
       }),
@@ -2888,6 +2968,9 @@ export const Actions = {
       recent_winners: z.array(
         z.object({
           winner_names: z.array(z.string()),
+          // Batch 13 Add.2: winner player ids, parallel to winner_names,
+          // so a winner's name on Home can open the player-summary popup.
+          winner_ids: z.array(z.number()),
           amount: z.number(),
           team_size: z.number(),
           arena: z.string(),
@@ -2961,6 +3044,7 @@ export const Actions = {
           online_players: online,
           total_players: allPlayers.length,
           active_matches: active.length,
+          live_matches: allMatches.filter((m) => m.status === "live").length,
           completed_matches: allMatches.filter((m) => m.status === "completed")
             .length,
           open_challenges: openCh.length,
@@ -3021,6 +3105,7 @@ export const Actions = {
             allPlayers.find((x) => x.id === id)?.name ?? "Player";
           const out: {
             winner_names: string[];
+            winner_ids: number[];
             amount: number;
             team_size: number;
             arena: string;
@@ -3044,6 +3129,7 @@ export const Actions = {
               if (winRows.length === 0) continue;
               out.push({
                 winner_names: winRows.map((pt) => nameOf(pt.playerId)),
+                winner_ids: winRows.map((pt) => pt.playerId),
                 amount: winRows[0]!.payoutAmount,
                 team_size: cm.teamSize,
                 arena: cm.arena,
@@ -3053,6 +3139,7 @@ export const Actions = {
             } else {
               out.push({
                 winner_names: [nameOf(cm.winnerId)],
+                winner_ids: [cm.winnerId],
                 amount: cm.stake * 2 - cm.feeAmount,
                 team_size: cm.teamSize,
                 arena: cm.arena,
@@ -3362,6 +3449,9 @@ export const Actions = {
           status: z.string(),
           created_at: z.string(),
           creator_friend_state: z.enum(["friend", "added_you", "none"]),
+          // Batch 13 Add.3 (Item 10): directed-challenge target (null
+          // for public challenges) — the client badges directed cards.
+          invited_player_id: z.number().nullable(),
         }),
       ),
     }),
@@ -3404,6 +3494,15 @@ export const Actions = {
         if (!creator) continue;
         // The Owner is admin-only — never a playable opponent on the board.
         if (effectiveRole(creator) === "owner") continue;
+        // Friend-directed 1v1 (Batch 13 Add.3 Item 10): a directed
+        // challenge is visible ONLY to its creator and its invitee. It
+        // never appears in anonymous or third-party payloads.
+        if (
+          c.invitedPlayerId &&
+          (!lcViewer ||
+            (lcViewer.id !== c.creatorId && lcViewer.id !== c.invitedPlayerId))
+        )
+          continue;
         // Batch 8 shared calculator: for team sizes the pot is
         // stake × 2 × team_size (every roster player stakes) and the
         // preview is the PER-MEMBER winning share. Size 1 is unchanged.
@@ -3432,6 +3531,7 @@ export const Actions = {
                 ? "added_you"
                 : "none"
             : "none") as "friend" | "added_you" | "none",
+          invited_player_id: c.invitedPlayerId ?? null,
         });
       }
       return { challenges: out };
@@ -3450,6 +3550,9 @@ export const Actions = {
       // challenge's rules from the arena's fixed terms in settings.
       custom_rules: z.string().max(2000).default(""),
       stake: z.number().int().min(1).max(1000000),
+      // Batch 13 Add.3 (Item 10): friend-directed 1v1 challenge target.
+      // 0 / omitted = a normal public challenge.
+      invited_player_id: z.number().int().default(0),
     }),
     response: z.object({ ok: z.boolean(), error: z.string(), challenge_id: z.number() }),
     async handler(ctx, args) {
@@ -3486,21 +3589,47 @@ export const Actions = {
       // re-validated here.
       const heroErr = heroRuleSizeError(args.hero_rule, args.team_size, args.arena);
       if (heroErr) return { ok: false, error: heroErr, challenge_id: 0 };
-      // One lobby at a time: a creator may hold at most ONE open challenge,
-      // and may not open a new lobby while one of their matches is still
-      // unfinished. They must cancel the open lobby (cancelChallenge) or
-      // finish the live match first.
-      const myOpen = await ownOpenChallenge(db, p.id);
-      if (myOpen)
+      // One lobby at a time (Batch 13 Add.3 Item 9: THE shared guard —
+      // lobbyBlockReason, also used by acceptChallenge / joinMatchSlot):
+      // a creator may hold at most ONE open challenge, and may not open
+      // a new lobby while participating in an unfinished match
+      // (ready_check / live / result_pending — DISPUTED never blocks).
+      // They must cancel the open lobby (cancelChallenge) or finish the
+      // current match first. The two messages are create's own.
+      const blockC = await lobbyBlockReason(db, p.id);
+      if (blockC === "OWN_LOBBY")
         return { ok: false, error: "သင့်မှာ ဖွင့်ထားတဲ့ lobby တစ်ခု ရှိနေပါတယ် — အရင် အဲ့ဒီ lobby ကို ဖျက်ပြီးမှ အသစ် ထောင်လို့ရပါမယ် (You already have an open lobby — cancel it first)", challenge_id: 0 };
-      const myMatchesAll = await db.select().from(schema.matches);
-      const myLive = myMatchesAll.find(
-        (m) =>
-          (m.playerAId === p.id || m.playerBId === p.id) &&
-          ["ready_check", "live", "result_pending", "disputed"].includes(m.status),
-      );
-      if (myLive)
-        return { ok: false, error: "သင့်မှာ မပြီးသေးတဲ့ match တစ်ခု ရှိနေပါတယ် — အဲ့ဒီ match ပြီးမှ lobby အသစ် ထောင်လို့ရပါမယ် (Finish your current match first)", challenge_id: 0 };
+      if (blockC === "IN_MATCH")
+        return { ok: false, error: UNFINISHED_MATCH_ERR, challenge_id: 0 };
+      // Friend-directed 1v1 (Batch 13 Add.3 Item 10): when a target is
+      // given, the challenge is a private 1v1 for that ONE friend —
+      // size must be 1, the target must be a real non-Owner player other
+      // than the creator, and the creator must hold an OUTGOING friends
+      // row to them (checked ONLY here, at creation: unfriending later
+      // does not revoke the challenge). All other validations above and
+      // below apply unchanged, and a directed challenge counts as the
+      // creator's one open lobby via the shared guard.
+      let invitee: PlayerRow | null = null;
+      if (args.invited_player_id > 0) {
+        if (args.team_size !== 1)
+          return { ok: false, error: "တိုက်ရိုက် စိန်ခေါ်မှုက 1v1 ပဲ ရပါတယ် (Direct challenges are 1v1 only)", challenge_id: 0 };
+        if (args.invited_player_id === p.id)
+          return { ok: false, error: "ကိုယ့်ကိုယ်ကို စိန်ခေါ်လို့ မရပါ", challenge_id: 0 };
+        invitee = await getPlayer(db, args.invited_player_id);
+        if (!invitee || effectiveRole(invitee) === "owner")
+          return { ok: false, error: "စိန်ခေါ်မယ့် player မတွေ့ပါ", challenge_id: 0 };
+        const frD = await db
+          .select()
+          .from(schema.friends)
+          .where(
+            and(
+              eq(schema.friends.playerId, p.id),
+              eq(schema.friends.friendId, invitee.id),
+            ),
+          );
+        if (frD.length === 0)
+          return { ok: false, error: "သူငယ်ချင်း မဟုတ်သူကို တိုက်ရိုက် စိန်ခေါ်လို့ မရပါ — အရင် Add Friend လုပ်ပါ", challenge_id: 0 };
+      }
       // Admin-set minimum stake (challenge_min_stake_coins) — enforced here
       // so no client can undercut it.
       const minStake = numSetting(s, "challenge_min_stake_coins", 100);
@@ -3526,10 +3655,28 @@ export const Actions = {
           // later in the match room, not just displayed.
           bannedHeroes: s["banned_heroes"] ?? "",
           stake: args.stake,
+          invitedPlayerId: invitee ? invitee.id : null,
         })
         .returning({ id: schema.challenges.id });
+      const newChallengeId = ins[0]?.id ?? 0;
+      // Directed challenge: the invitee gets the SAME invite
+      // notification shape as a lobby invite (type "invite",
+      // challenge_id set, match_id null), so listNotifications produces
+      // invite_info and the existing one-time popup fires and opens the
+      // open-lobby view for this challenge. The body makes clear this
+      // is a direct 1v1 challenge, not a general lobby invite.
+      if (invitee && newChallengeId) {
+        await notify(db, {
+          playerId: invitee.id,
+          type: "invite",
+          title: "⚔️ တိုက်ရိုက် 1v1 စိန်ခေါ်ချက်",
+          body: `${p.name} က သင့်ကို 1v1 တိုက်ရိုက် စိန်ခေါ်ထားပါတယ် — Lobby ထဲ ဝင်ကြည့်ရန် နှိပ်ပါ`,
+          challengeId: newChallengeId,
+          matchId: null,
+        });
+      }
       ctx.invalidateQueries();
-      return { ok: true, error: "", challenge_id: ins[0]?.id ?? 0 };
+      return { ok: true, error: "", challenge_id: newChallengeId };
     },
   }),
 
@@ -3568,11 +3715,23 @@ export const Actions = {
       // MLBB ID gate (Batch 6): no profile IDs → no accepting either.
       if (!idsComplete(acceptor))
         return { ok: false, error: IDS_GATE_ERR, match_id: 0 };
-      // Own-lobby join block (Batch 13): a player holding an OPEN lobby
-      // of their own cannot accept someone else's — shared helper with
-      // createChallenge's one-lobby rule.
-      const ownAcc = await ownOpenChallenge(db, acceptor.id);
-      if (ownAcc) return { ok: false, error: OWN_LOBBY_JOIN_ERR, match_id: 0 };
+      // Friend-directed 1v1 (Batch 13 Add.3 Item 10): a directed
+      // challenge can be accepted ONLY by its invited player. Anyone
+      // else is rejected here — before any guard, balance or lock
+      // change — with zero state change. Friendship is NOT re-checked:
+      // it was verified at creation, and unfriending afterwards does
+      // not revoke the challenge. The invitee's accept runs every
+      // normal gate below unchanged, including the shared lobby guard.
+      if (ch.invitedPlayerId && ch.invitedPlayerId !== acceptor.id)
+        return { ok: false, error: "ဒီ challenge က တခြား player တစ်ယောက်ကို တိုက်ရိုက် စိန်ခေါ်ထားတာပါ — စိန်ခေါ်ခံရသူပဲ လက်ခံနိုင်ပါတယ် (This challenge was directed at another player)", match_id: 0 };
+      // Lobby guard (Batch 13 Add.3 Item 9: THE shared guard —
+      // lobbyBlockReason, also used by createChallenge / joinMatchSlot):
+      // an open lobby of your own blocks accepting, and so does
+      // participating in an unfinished match (ready_check / live /
+      // result_pending — DISPUTED never blocks).
+      const blockA = await lobbyBlockReason(db, acceptor.id);
+      if (blockA === "OWN_LOBBY") return { ok: false, error: OWN_LOBBY_JOIN_ERR, match_id: 0 };
+      if (blockA === "IN_MATCH") return { ok: false, error: UNFINISHED_MATCH_ERR, match_id: 0 };
       // No rank gate on accepting: rank restrictions were removed, so any
       // player may accept any open challenge regardless of rank.
       if (acceptor.balance < ch.stake || creator.balance < ch.stake)
@@ -4851,9 +5010,15 @@ export const Actions = {
       if (me.status === "perm_banned" || me.status === "temp_banned")
         return { ok: false, error: "Account ban ခံထားရပါတယ်" };
       if (!idsComplete(me)) return { ok: false, error: IDS_GATE_ERR };
-      // Own-lobby join block (Batch 13): same shared guard as accept.
-      const ownJoin = await ownOpenChallenge(db, me.id);
-      if (ownJoin) return { ok: false, error: OWN_LOBBY_JOIN_ERR };
+      // Lobby guard (Batch 13 Add.3 Item 9: THE shared guard —
+      // lobbyBlockReason, also used by createChallenge / acceptChallenge).
+      // The match being joined is EXCLUDED from the IN_MATCH scan, so a
+      // player already inside THIS match still gets the
+      // already-participant rejection below with its own message; any
+      // OTHER unfinished match (or an open lobby of their own) blocks.
+      const blockJ = await lobbyBlockReason(db, me.id, args.match_id);
+      if (blockJ === "OWN_LOBBY") return { ok: false, error: OWN_LOBBY_JOIN_ERR };
+      if (blockJ === "IN_MATCH") return { ok: false, error: UNFINISHED_MATCH_ERR };
       const rows = await db
         .select()
         .from(schema.matches)
@@ -6495,6 +6660,10 @@ export const Actions = {
           color: z.string(),
           image_url: z.string(),
           is_online: z.boolean(),
+          // Batch 13 Add.2: the player this row is about, so the client
+          // can open the shared player-summary popup from the row's
+          // avatar/name. 0 for rows that are not a player (top_team).
+          player_id: z.number(),
         }),
       ),
     }),
@@ -6536,7 +6705,7 @@ export const Actions = {
       for (const tm of allTeamsForLb) teamLogoMap.set(tm.name, await blobUrlSafe(ctx, tm.logoBlobKey ?? ""));
       const playerAvatarByName = new Map<string, string>();
       for (const pl of playersAll) playerAvatarByName.set(pl.name, avatarUrlMap.get(pl.id) ?? "");
-      type Row = { rank_no: number; name: string; detail: string; value: number; color: string; image_url: string; is_online: boolean };
+      type Row = { rank_no: number; name: string; detail: string; value: number; color: string; image_url: string; is_online: boolean; player_id: number };
       let rows: Row[] = [];
       if (args.category === "top_team") {
         const allTeams = await db
@@ -6557,6 +6726,7 @@ export const Actions = {
           image_url: teamLogoMap.get(t.name) ?? "",
           // Team rows are not a player — no presence.
           is_online: false,
+          player_id: 0,
         }));
       } else if (args.category === "champion") {
         const tours = await db
@@ -6580,6 +6750,7 @@ export const Actions = {
               const cp = playersAll.find((x) => x.name === t.champion);
               return cp ? isOnline(cp) : false;
             })(),
+            player_id: playersAll.find((x) => x.name === t.champion)?.id ?? 0,
           }));
       } else {
         const winsMap = new Map<number, number>();
@@ -6619,6 +6790,7 @@ export const Actions = {
                 color: colorOf(pid),
                 image_url: avatarUrlMap.get(pid) ?? "",
                 is_online: p ? isOnline(p) : false,
+                player_id: pid,
               };
             });
         } else {
@@ -6636,6 +6808,7 @@ export const Actions = {
                 color: colorOf(pid),
                 image_url: avatarUrlMap.get(pid) ?? "",
                 is_online: p ? isOnline(p) : false,
+                player_id: pid,
               };
             });
           if (args.category === "top_player") {
@@ -6755,7 +6928,7 @@ export const Actions = {
 
   teamMemberAction: defineAction({
     request: z.object({
-      action: z.enum(["add", "remove", "ready"]),
+      action: z.enum(["add", "remove", "ready", "disband"]),
       team_id: z.number(),
       player_id: z.number(),
       actor_player_id: z.number().default(0),
@@ -6784,6 +6957,17 @@ export const Actions = {
       // Removing stays leader-or-self (leaving your own team still works).
       if (args.action === "remove" && teamRow.leaderId !== actorTm.id && args.player_id !== actorTm.id)
         return { ok: false, error: "Team leader သို့မဟုတ် ကိုယ်တိုင်ပဲ လုပ်နိုင်ပါတယ်" };
+      // Batch 13 Add.2 — DISBAND is leader-only: anyone else is rejected
+      // with zero state change.
+      if (args.action === "disband" && teamRow.leaderId !== actorTm.id)
+        return { ok: false, error: "Team leader ပဲ Team ဖျက်နိုင်ပါတယ်" };
+      // Batch 13 Add.2 — the LEADER must not orphan the team by removing
+      // themself: self-remove for the leader is rejected and points at
+      // Disband instead. (There is no leadership transfer.) A non-leader
+      // removing the leader is already rejected by the guard above, so
+      // this branch only ever fires for the leader themself.
+      if (args.action === "remove" && args.player_id === teamRow.leaderId)
+        return { ok: false, error: "Leader က Leave လုပ်လို့ မရပါ — Team ဖျက်ချင်ရင် Disband ကို သုံးပါ" };
       if (args.action === "add") {
         const existing = await db
           .select()
@@ -6814,6 +6998,36 @@ export const Actions = {
               eq(schema.teamMembers.playerId, args.player_id),
             ),
           );
+      } else if (args.action === "disband") {
+        // Batch 13 Add.2 — DISBAND: delete every membership row AND the
+        // team row with sequential awaited writes (the standalone
+        // runtime's Db has no .batch method), and notify every member
+        // except the leader. UNCONDITIONAL by design: no team↔tournament or
+        // team↔match linkage exists in the data model (tournament
+        // entries are per-player, match rosters are frozen per-player
+        // snapshots), so nothing else is touched — matches, participants
+        // and all money state stay exactly as they are.
+        const memberRows = await db
+          .select()
+          .from(schema.teamMembers)
+          .where(eq(schema.teamMembers.teamId, args.team_id));
+        const others = [...new Set(memberRows.map((r) => r.playerId))].filter(
+          (pid) => pid !== teamRow.leaderId,
+        );
+        await db
+          .delete(schema.teamMembers)
+          .where(eq(schema.teamMembers.teamId, args.team_id));
+        await db.delete(schema.teams).where(eq(schema.teams.id, args.team_id));
+        for (const pid of others) {
+          await db.insert(schema.notifications).values({
+            playerId: pid,
+            type: "info",
+            title: "Team ဖျက်လိုက်ပါပြီ",
+            body: `"${teamRow.name}" Team ကို leader က ဖျက်လိုက်ပါပြီ။`,
+            matchId: null,
+            challengeId: null,
+          });
+        }
       } else {
         await db
           .update(schema.teamMembers)
@@ -6906,6 +7120,77 @@ export const Actions = {
       const friends = await playersPublicOutAsync(ctx, friendRows, args.player_id);
       ctx.invalidateQueries();
       return { friends, ok: true };
+    },
+  }),
+
+  /* Batch 13 Add.2 — ONE shared player-summary source for the popup
+   * that opens from avatars/names across the app (leaderboard, friends,
+   * search, lobby + match-room cards, chat list, Home rows). Session-
+   * gated like searchAll; the response is EXACTLY playerSummaryShape —
+   * public fields only. rank comes from rankFromWins, the same helper
+   * the leaderboard renders, so the popup's rank/wins always equal the
+   * leaderboard's for the same player. The Owner (admin-only) is never
+   * a summary target and cannot view summaries. */
+  getPlayerSummary: defineAction({
+    request: z.object({
+      player_id: z.number(),
+      target_id: z.number(),
+      session_token: z.string().default(""),
+    }),
+    response: z.object({
+      summary: playerSummaryShape.nullable(),
+      ok: z.boolean(),
+      error: z.string(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const viewer = await playerBySession(db, args.player_id, args.session_token);
+      if (!viewer) return { summary: null, ok: false, error: AUTH_ERR };
+      const obSum = ownerPlayerBlock(viewer);
+      if (obSum) return { summary: null, ok: false, error: obSum };
+      const target = await getPlayer(db, args.target_id);
+      if (!target || effectiveRole(target) === "owner")
+        return { summary: null, ok: false, error: "Player မတွေ့ပါ" };
+      let friendState: "friend" | "added_you" | "none" | "self" = "none";
+      if (target.id === viewer.id) {
+        friendState = "self";
+      } else {
+        // Same one-directional computation as searchAll.
+        const friendRows = await db.select().from(schema.friends);
+        const myFriendIds = new Set(
+          friendRows.filter((f) => f.playerId === viewer.id).map((f) => f.friendId),
+        );
+        const addedMeIds = new Set(
+          friendRows.filter((f) => f.friendId === viewer.id).map((f) => f.playerId),
+        );
+        friendState = myFriendIds.has(target.id)
+          ? "friend"
+          : addedMeIds.has(target.id)
+            ? "added_you"
+            : "none";
+      }
+      const total = target.wins + target.losses;
+      return {
+        summary: {
+          id: target.id,
+          name: target.name,
+          game_name: target.gameName,
+          mlbb_id: target.mlbbId,
+          server_id: target.serverId,
+          rank: rankFromWins(target.wins),
+          wins: target.wins,
+          losses: target.losses,
+          total_matches: total,
+          win_rate: total > 0 ? Math.round((target.wins / total) * 100) : 0,
+          reputation: target.reputation,
+          avatar_color: target.avatarColor,
+          avatar_url: await blobUrlSafe(ctx, target.avatarBlobKey ?? ""),
+          is_online: isOnline(target),
+          friend_state: friendState,
+        },
+        ok: true,
+        error: "",
+      };
     },
   }),
 
