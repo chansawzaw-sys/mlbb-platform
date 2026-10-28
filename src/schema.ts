@@ -186,6 +186,7 @@ export const notifications = sqliteTable("notifications", {
   title: text("title").notNull(),
   body: text("body").notNull().default(""),
   matchId: integer("match_id"),
+  challengeId: integer("challenge_id"),
   isRead: integer("is_read").notNull().default(0),
   createdAt: ts("created_at"),
 });

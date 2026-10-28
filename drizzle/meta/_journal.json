@@ -1,104 +1,111 @@
 {
-  "version": "7",
-  "dialect": "sqlite",
-  "entries": [
-    {
-      "idx": 0,
-      "version": "6",
-      "when": 1792749425283,
-      "tag": "0001_initial",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "6",
-      "when": 1792749425283,
-      "tag": "0002_platform_schema",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "6",
-      "when": 1792750406035,
-      "tag": "0003_integrations_2fa_voice_backup",
-      "breakpoints": true
-    },
-    {
-      "idx": 3,
-      "version": "6",
-      "when": 1792751523224,
-      "tag": "0004_security_fixed_admin_sessions_purchases",
-      "breakpoints": true
-    },
-    {
-      "idx": 4,
-      "version": "6",
-      "when": 1792809551603,
-      "tag": "0005_add_avatar_and_team_logo_blobs",
-      "breakpoints": true
-    },
-    {
-      "idx": 5,
-      "version": "6",
-      "when": 1793110000000,
-      "tag": "0006_money_topups_withdrawals",
-      "breakpoints": true
-    },
-    {
-      "idx": 6,
-      "version": "6",
-      "when": 1793200000000,
-      "tag": "0007_diamond_shop",
-      "breakpoints": true
-    },
-    {
-      "idx": 7,
-      "version": "6",
-      "when": 1793300000000,
-      "tag": "0008_security_constraints",
-      "breakpoints": true
-    },
-    {
-      "idx": 8,
-      "version": "6",
-      "when": 1793400000000,
-      "tag": "0009_add_first_result_at_to_matches",
-      "breakpoints": true
-    },
-    {
-      "idx": 9,
-      "version": "6",
-      "when": 1793500000000,
-      "tag": "0010_add_sender_name_to_purchase_requests",
-      "breakpoints": true
-    },
-    {
-      "idx": 10,
-      "version": "6",
-      "when": 1793600000000,
-      "tag": "0011_batch6_payout_account_name_and_game_name",
-      "breakpoints": true
-    },
-    {
-      "idx": 11,
-      "version": "6",
-      "when": 1793700000000,
-      "tag": "0012_purge_non_owner_players",
-      "breakpoints": true
-    },
-    {
-      "idx": 12,
-      "version": "6",
-      "when": 1793800000000,
-      "tag": "0013_add_match_participants",
-      "breakpoints": true
-    },
-    {
-      "idx": 13,
-      "version": "6",
-      "when": 1793900000000,
-      "tag": "0014_add_dm_messages_and_reads",
-      "breakpoints": true
-    }
-  ]
+ "version": "7",
+ "dialect": "sqlite",
+ "entries": [
+  {
+   "idx": 0,
+   "version": "6",
+   "when": 1792749425283,
+   "tag": "0001_initial",
+   "breakpoints": true
+  },
+  {
+   "idx": 1,
+   "version": "6",
+   "when": 1792749425283,
+   "tag": "0002_platform_schema",
+   "breakpoints": true
+  },
+  {
+   "idx": 2,
+   "version": "6",
+   "when": 1792750406035,
+   "tag": "0003_integrations_2fa_voice_backup",
+   "breakpoints": true
+  },
+  {
+   "idx": 3,
+   "version": "6",
+   "when": 1792751523224,
+   "tag": "0004_security_fixed_admin_sessions_purchases",
+   "breakpoints": true
+  },
+  {
+   "idx": 4,
+   "version": "6",
+   "when": 1792809551603,
+   "tag": "0005_add_avatar_and_team_logo_blobs",
+   "breakpoints": true
+  },
+  {
+   "idx": 5,
+   "version": "6",
+   "when": 1793110000000,
+   "tag": "0006_money_topups_withdrawals",
+   "breakpoints": true
+  },
+  {
+   "idx": 6,
+   "version": "6",
+   "when": 1793200000000,
+   "tag": "0007_diamond_shop",
+   "breakpoints": true
+  },
+  {
+   "idx": 7,
+   "version": "6",
+   "when": 1793300000000,
+   "tag": "0008_security_constraints",
+   "breakpoints": true
+  },
+  {
+   "idx": 8,
+   "version": "6",
+   "when": 1793400000000,
+   "tag": "0009_add_first_result_at_to_matches",
+   "breakpoints": true
+  },
+  {
+   "idx": 9,
+   "version": "6",
+   "when": 1793500000000,
+   "tag": "0010_add_sender_name_to_purchase_requests",
+   "breakpoints": true
+  },
+  {
+   "idx": 10,
+   "version": "6",
+   "when": 1793600000000,
+   "tag": "0011_batch6_payout_account_name_and_game_name",
+   "breakpoints": true
+  },
+  {
+   "idx": 11,
+   "version": "6",
+   "when": 1793700000000,
+   "tag": "0012_purge_non_owner_players",
+   "breakpoints": true
+  },
+  {
+   "idx": 12,
+   "version": "6",
+   "when": 1793800000000,
+   "tag": "0013_add_match_participants",
+   "breakpoints": true
+  },
+  {
+   "idx": 13,
+   "version": "6",
+   "when": 1793900000000,
+   "tag": "0014_add_dm_messages_and_reads",
+   "breakpoints": true
+  },
+  {
+   "idx": 14,
+   "version": "6",
+   "when": 1794000000000,
+   "tag": "0015_batch13_challenge_invites",
+   "breakpoints": true
+  }
+ ]
 }

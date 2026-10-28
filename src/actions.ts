@@ -114,8 +114,8 @@ function isHeroBanned(hero: string, bannedRaw: string): boolean {
 const DEFAULT_SETTINGS: Record<string, string> = {
   announcement_my: "",
   announcement_en: "",
-  banner_title: "FIGHT FOR GLORY",
-  banner_subtitle: "PLAY • COMPETE • WIN",
+  banner_title: "",
+  banner_subtitle: "",
   fee_1v1_type: "percent",
   fee_1v1_value: "5",
   fee_classic_type: "percent",
@@ -418,6 +418,26 @@ async function participantsFor(db: Db, matchId: number): Promise<ParticipantRow[
     .orderBy(schema.matchParticipants.id);
 }
 
+const OWN_LOBBY_JOIN_ERR = "ကိုယ့် lobby ဖွင့်ထားပါတယ် — သူများ ပွဲဝင်ချင်ရင် ကိုယ့် lobby အရင် ဖျက်ပါ (You have an open lobby — delete your own lobby first to join someone else's match)";
+
+/** Batch 13: the player's own OPEN challenge (creatorId = playerId), or
+ *  null. ONE shared guard: createChallenge uses it for the one-lobby
+ *  rule and acceptChallenge / joinMatchSlot use it for the own-lobby
+ *  join block, so the three paths can never drift apart. */
+async function ownOpenChallenge(db: Db, playerId: number) {
+  const rows = await db
+    .select()
+    .from(schema.challenges)
+    .where(
+      and(
+        eq(schema.challenges.creatorId, playerId),
+        eq(schema.challenges.status, "open"),
+      ),
+    )
+    .limit(1);
+  return rows[0] ?? null;
+}
+
 /** Refund EVERY still-locked participant of a snapshot match (balance
  *  +stake, locked −stake, refund txn, participant state → refunded) and
  *  cancel the match's pending referral rows. Used by refundMatch's team
@@ -649,6 +669,7 @@ async function notify(
     title: string;
     body?: string;
     matchId?: number | null;
+    challengeId?: number | null;
   },
 ) {
   await db.insert(schema.notifications).values({
@@ -657,6 +678,7 @@ async function notify(
     title: args.title,
     body: args.body ?? "",
     matchId: args.matchId ?? null,
+    challengeId: args.challengeId ?? null,
   });
 }
 
@@ -2280,8 +2302,8 @@ function settingsOut(s: Record<string, string>, adminView = false) {
   return {
     announcement_my: s["announcement_my"] ?? "",
     announcement_en: s["announcement_en"] ?? "",
-    banner_title: s["banner_title"] ?? "FIGHT FOR GLORY",
-    banner_subtitle: s["banner_subtitle"] ?? "PLAY • COMPETE • WIN",
+    banner_title: s["banner_title"] ?? "",
+    banner_subtitle: s["banner_subtitle"] ?? "",
     fee_1v1_type: s["fee_1v1_type"] ?? "percent",
     fee_1v1_value: s["fee_1v1_value"] ?? "5",
     fee_classic_type: s["fee_classic_type"] ?? "percent",
@@ -3314,6 +3336,8 @@ export const Actions = {
 
   listChallenges: defineAction({
     request: z.object({
+      player_id: z.number().default(0),
+      session_token: z.string().default(""),
       arena: z.string().default("all"),
       hero_rule: z.string().default("all"),
       rank: z.string().default("all"),
@@ -3337,6 +3361,7 @@ export const Actions = {
           payout_preview: z.number(),
           status: z.string(),
           created_at: z.string(),
+          creator_friend_state: z.enum(["friend", "added_you", "none"]),
         }),
       ),
     }),
@@ -3349,6 +3374,18 @@ export const Actions = {
         .where(eq(schema.challenges.status, "open"))
         .orderBy(desc(schema.challenges.id));
       const all = await db.select().from(schema.players);
+      // Batch 13: viewer-relative friendship state for each creator —
+      // same one-directional sets as searchAll; "none" when anonymous.
+      const lcViewer = args.player_id
+        ? await playerBySession(db, args.player_id, args.session_token)
+        : null;
+      const lcFriendRows = lcViewer ? await db.select().from(schema.friends) : [];
+      const lcMyFriendIds = new Set(
+        lcFriendRows.filter((f) => f.playerId === lcViewer?.id).map((f) => f.friendId),
+      );
+      const lcAddedMeIds = new Set(
+        lcFriendRows.filter((f) => f.friendId === lcViewer?.id).map((f) => f.playerId),
+      );
       const out = [];
       for (const c of rows) {
         if (args.arena !== "all" && c.arena !== args.arena) continue;
@@ -3388,6 +3425,13 @@ export const Actions = {
           payout_preview: calcF.share,
           status: c.status,
           created_at: iso(c.createdAt) ?? "",
+          creator_friend_state: (lcViewer
+            ? lcMyFriendIds.has(c.creatorId)
+              ? "friend"
+              : lcAddedMeIds.has(c.creatorId)
+                ? "added_you"
+                : "none"
+            : "none") as "friend" | "added_you" | "none",
         });
       }
       return { challenges: out };
@@ -3446,17 +3490,8 @@ export const Actions = {
       // and may not open a new lobby while one of their matches is still
       // unfinished. They must cancel the open lobby (cancelChallenge) or
       // finish the live match first.
-      const myOpen = await db
-        .select()
-        .from(schema.challenges)
-        .where(
-          and(
-            eq(schema.challenges.creatorId, p.id),
-            eq(schema.challenges.status, "open"),
-          ),
-        )
-        .limit(1);
-      if (myOpen.length > 0)
+      const myOpen = await ownOpenChallenge(db, p.id);
+      if (myOpen)
         return { ok: false, error: "သင့်မှာ ဖွင့်ထားတဲ့ lobby တစ်ခု ရှိနေပါတယ် — အရင် အဲ့ဒီ lobby ကို ဖျက်ပြီးမှ အသစ် ထောင်လို့ရပါမယ် (You already have an open lobby — cancel it first)", challenge_id: 0 };
       const myMatchesAll = await db.select().from(schema.matches);
       const myLive = myMatchesAll.find(
@@ -3533,6 +3568,11 @@ export const Actions = {
       // MLBB ID gate (Batch 6): no profile IDs → no accepting either.
       if (!idsComplete(acceptor))
         return { ok: false, error: IDS_GATE_ERR, match_id: 0 };
+      // Own-lobby join block (Batch 13): a player holding an OPEN lobby
+      // of their own cannot accept someone else's — shared helper with
+      // createChallenge's one-lobby rule.
+      const ownAcc = await ownOpenChallenge(db, acceptor.id);
+      if (ownAcc) return { ok: false, error: OWN_LOBBY_JOIN_ERR, match_id: 0 };
       // No rank gate on accepting: rank restrictions were removed, so any
       // player may accept any open challenge regardless of rank.
       if (acceptor.balance < ch.stake || creator.balance < ch.stake)
@@ -3943,6 +3983,7 @@ export const Actions = {
       // Batch 11: the side the session viewer may still join via
       // joinMatchSlot right now (progressive fill), or null.
       viewer_join_side: z.enum(["A", "B"]).nullable(),
+      friend_states: z.record(z.string(), z.enum(["friend", "added_you", "none"])),
       heroes: z.array(z.object({ name: z.string(), role: z.string(), banned: z.boolean() })),
       ice_servers: z.array(
         z.object({ urls: z.array(z.string()), username: z.string(), credential: z.string() }),
@@ -3968,7 +4009,7 @@ export const Actions = {
         .limit(1);
       const m = rows[0];
       if (!m)
-        return { match: null, chat: [], result_unlocked: false, unlock_at: null, viewer_join_side: null, heroes: heroesFor(""), ice_servers: iceServersFor(s, false) };
+        return { match: null, chat: [], result_unlocked: false, unlock_at: null, viewer_join_side: null, friend_states: {}, heroes: heroesFor(""), ice_servers: iceServersFor(s, false) };
       // Privacy gate (M3): chat history and evidence URLs go ONLY to the
       // match's participants or staff. Match ids are sequential, so an
       // ungated read would leak every room's chat + screenshots to anyone.
@@ -3997,7 +4038,25 @@ export const Actions = {
       for (const cp of chatPlayers) { chatAvatarMap.set(cp.id, await blobUrlSafe(ctx, cp.avatarBlobKey ?? "")); chatColorMap.set(cp.id, cp.avatarColor); }
       // Fixed rule (in code): results unlock exactly 6 minutes after start.
       const unlockAt = m.startedAt ? new Date(m.startedAt.getTime() + RESULT_UNLOCK_MS) : null;
+      // Batch 13: viewer-relative friendship states for every OTHER
+      // player in the room (leaders + snapshot participants) — same
+      // one-directional sets as searchAll. No viewer → empty record.
+      const friendStates: Record<string, "friend" | "added_you" | "none"> = {};
+      if (viewer) {
+        const gmParts = await participantsFor(db, m.id);
+        const gmIds = new Set<number>([m.playerAId, m.playerBId, ...gmParts.map((pt) => pt.playerId)]);
+        gmIds.delete(viewer.id);
+        if (gmIds.size > 0) {
+          const gmFriendRows = await db.select().from(schema.friends);
+          const gmMy = new Set(gmFriendRows.filter((f) => f.playerId === viewer.id).map((f) => f.friendId));
+          const gmAddedMe = new Set(gmFriendRows.filter((f) => f.friendId === viewer.id).map((f) => f.playerId));
+          for (const pid of gmIds) {
+            friendStates[String(pid)] = gmMy.has(pid) ? "friend" : gmAddedMe.has(pid) ? "added_you" : "none";
+          }
+        }
+      }
       return {
+        friend_states: friendStates,
         heroes: heroesFor(m.bannedHeroes),
         match: await matchOut(ctx, db, m, viewer?.id ?? null, priv),
         chat: chat.map((c) => ({
@@ -4659,7 +4718,8 @@ export const Actions = {
   // throttled retry writes no notification.
   inviteToMatch: defineAction({
     request: z.object({
-      match_id: z.number(),
+      match_id: z.number().int().default(0),
+      challenge_id: z.number().int().default(0),
       player_id: z.number(),
       friend_id: z.number(),
       session_token: z.string().default(""),
@@ -4671,6 +4731,54 @@ export const Actions = {
       if (!me) return { ok: false, error: AUTH_ERR };
       const obI = ownerPlayerBlock(me);
       if (obI) return { ok: false, error: obI };
+      // Batch 13: exactly ONE target — a match (ready_check) or an open
+      // challenge (open lobby). Both or neither is a malformed invite.
+      const hasMatch = args.match_id > 0;
+      const hasChallenge = args.challenge_id > 0;
+      if (hasMatch === hasChallenge)
+        return { ok: false, error: "ဖိတ်မယ့် lobby ကို တိတိကျကျ ရွေးပါ (Pick exactly one lobby to invite to)" };
+      if (hasChallenge) {
+        const chRows = await db
+          .select()
+          .from(schema.challenges)
+          .where(eq(schema.challenges.id, args.challenge_id))
+          .limit(1);
+        const ch = chRows[0];
+        if (!ch || ch.status !== "open")
+          return { ok: false, error: "ဒီ lobby က ဖိတ်လို့ရတဲ့ အဆင့် မဟုတ်တော့ပါ" };
+        if (ch.creatorId !== me.id)
+          return { ok: false, error: "Lobby ထောင်သူပဲ ဖိတ်လို့ရပါတယ်" };
+        if (args.friend_id === me.id)
+          return { ok: false, error: "ကိုယ့်ကိုယ်ကို ဖိတ်လို့ မရပါ" };
+        const chTarget = await getPlayer(db, args.friend_id);
+        if (!chTarget) return { ok: false, error: "Player မတွေ့ပါ" };
+        if (effectiveRole(chTarget) === "owner")
+          return { ok: false, error: "ဒီ player ကို ဖိတ်လို့ မရပါ" };
+        const frCh = await db
+          .select()
+          .from(schema.friends)
+          .where(
+            and(
+              eq(schema.friends.playerId, me.id),
+              eq(schema.friends.friendId, chTarget.id),
+            ),
+          );
+        if (frCh.length === 0)
+          return { ok: false, error: "သူငယ်ချင်း မဟုတ်သူကို ဖိတ်လို့ မရပါ — အရင် Add Friend လုပ်ပါ" };
+        const rlCh = await rateLimit(db, `invite-ch:${ch.id}:${chTarget.id}`, 1, 5 * 60 * 1000);
+        if (rlCh)
+          return { ok: false, error: "ဒီ friend ကို ခုနကပဲ ဖိတ်ပြီးပါပြီ — ၅ မိနစ် စောင့်ပြီးမှ ပြန်ဖိတ်ပါ" };
+        await notify(db, {
+          playerId: chTarget.id,
+          type: "invite",
+          title: "📩 Lobby ဖိတ်ခေါ်ချက်",
+          body: `${me.name} က သင့်ကို lobby ထဲ ဖိတ်ပါတယ် — Lobby ထဲ ဝင်ကြည့်ရန် နှိပ်ပါ`,
+          challengeId: ch.id,
+          matchId: null,
+        });
+        ctx.invalidateQueries();
+        return { ok: true, error: "" };
+      }
       const rows = await db
         .select()
         .from(schema.matches)
@@ -4743,6 +4851,9 @@ export const Actions = {
       if (me.status === "perm_banned" || me.status === "temp_banned")
         return { ok: false, error: "Account ban ခံထားရပါတယ်" };
       if (!idsComplete(me)) return { ok: false, error: IDS_GATE_ERR };
+      // Own-lobby join block (Batch 13): same shared guard as accept.
+      const ownJoin = await ownOpenChallenge(db, me.id);
+      if (ownJoin) return { ok: false, error: OWN_LOBBY_JOIN_ERR };
       const rows = await db
         .select()
         .from(schema.matches)
@@ -7109,6 +7220,7 @@ export const Actions = {
           title: z.string(),
           body: z.string(),
           match_id: z.number().nullable(),
+          challenge_id: z.number().nullable(),
           is_read: z.boolean(),
           created_at: z.string(),
           // Batch 11: for type "invite" notifications with a match, the
@@ -7164,6 +7276,27 @@ export const Actions = {
         }
       >();
       for (const n of mine) {
+        if (n.type === "invite" && n.challengeId) {
+          const chRowsN = await db
+            .select()
+            .from(schema.challenges)
+            .where(eq(schema.challenges.id, n.challengeId))
+            .limit(1);
+          const chN = chRowsN[0];
+          if (!chN) continue;
+          const creatorN = await getPlayer(db, chN.creatorId);
+          if (!creatorN) continue;
+          inviteInfoOf.set(n.id, {
+            inviter_id: creatorN.id,
+            inviter_name: creatorN.name,
+            inviter_avatar_url: await blobUrlSafe(ctx, creatorN.avatarBlobKey ?? ""),
+            inviter_avatar_color: creatorN.avatarColor,
+            team_size: chN.teamSize,
+            arena: chN.arena,
+            hero_rule: chN.heroRule,
+          });
+          continue;
+        }
         if (n.type !== "invite" || !n.matchId) continue;
         const mRows = await db
           .select()
@@ -7199,6 +7332,7 @@ export const Actions = {
           title: n.title,
           body: n.body,
           match_id: n.matchId ?? null,
+          challenge_id: n.challengeId ?? null,
           is_read: isReadOf(n),
           created_at: iso(n.createdAt) ?? "",
           invite_info: inviteInfoOf.get(n.id) ?? null,
