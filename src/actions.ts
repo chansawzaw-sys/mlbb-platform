@@ -1199,6 +1199,31 @@ function arenaSizeError(arena: string, teamSize: number): string | null {
   return null;
 }
 
+/** FINAL hero-rule table by team size (user, 2026-10-28 Batch 7 B) —
+ *  the wizard and this server check enforce exactly the same table:
+ *  fighter/assassin/mage/marksman at ANY size; "same" / "same:<Name>"
+ *  ONLY at size 1; "any" / "discuss" ONLY at sizes 2–5; "open" and
+ *  anything else rejected everywhere. CREATION-ONLY: legacy rows
+ *  (incl. legacy same:* at sizes ≥2) are never re-validated — accept /
+ *  render / play paths do not call this. */
+function heroRuleSizeError(heroRule: string, teamSize: number): string | null {
+  const isSame = heroRule === "same" || heroRule.startsWith("same:");
+  if (heroRule === "open")
+    return "\"Open\" hero rule ကို ဖယ်ရှားထားပါတယ် — size 1v1 မှာ Fighter / Assassin / Mage / Marksman / Same Hero, size 2v2–5v5 မှာ Fighter / Assassin / Mage / Marksman / Any Hero / 💬 Chatbox မှာ ဆွေးနွေးမည် ထဲက ရွေးပါ";
+  if (isSame) {
+    if (teamSize !== 1)
+      return "Same Hero ကို 1v1 မှာပဲ ရွေးလို့ရပါတယ် — 2v2–5v5 မှာ Fighter / Assassin / Mage / Marksman / Any Hero / 💬 Chatbox မှာ ဆွေးနွေးမည် ထဲက ရွေးပါ (Same Hero is only available at 1v1)";
+    return null;
+  }
+  if (heroRule === "any" || heroRule === "discuss") {
+    if (teamSize < 2)
+      return `${heroRule === "any" ? "Any Hero" : "💬 Chatbox မှာ ဆွေးနွေးမည်"} ကို 2v2–5v5 မှာပဲ ရွေးလို့ရပါတယ် — 1v1 မှာ Fighter / Assassin / Mage / Marksman / Same Hero ထဲက ရွေးပါ`;
+    return null;
+  }
+  if (["fighter", "assassin", "mage", "marksman"].includes(heroRule)) return null;
+  return "Hero rule မမှန်ပါ — size 1v1 မှာ Fighter / Assassin / Mage / Marksman / Same Hero, size 2v2–5v5 မှာ Fighter / Assassin / Mage / Marksman / Any Hero / 💬 Chatbox မှာ ဆွေးနွေးမည် ထဲက ရွေးပါ";
+}
+
 /** Payout ACCOUNT NAME (Batch 6): the KPay/Wave account holder's name.
  *  Required, ≥3 chars, letters (incl. Myanmar) + spaces; symbols are
  *  rejected and a mostly-digits value is not a name. Admin-only data. */
@@ -2736,11 +2761,12 @@ export const Actions = {
         return { ok: false, error: `လောင်းကြေး နည်းလွန်းပါတယ် — အနည်းဆုံး ${minStake.toLocaleString()} coins လောင်းရပါမယ် (Admin သတ်မှတ်ထား)`, challenge_id: 0 };
       if (p.balance < args.stake)
         return { ok: false, error: "Coin မလုံလောက်ပါ — Wallet မှာ အရင်ဝယ်ပါ", challenge_id: 0 };
-      // "Open" hero rule was removed by the Owner — it is no longer a
-      // creatable option anywhere. Legacy rows already stored with it
-      // still render (with no restriction label) but cannot be created.
-      if (args.hero_rule === "open")
-        return { ok: false, error: "\"Open\" hero rule ကို ဖယ်ရှားထားပါတယ် — Fighter / Assassin / Mage / Marksman / Same Hero ထဲက ရွေးပါ", challenge_id: 0 };
+      // Hero-rule × size table (FINAL Batch 7 B): fighter/assassin/mage/
+      // marksman at any size; same:* only size 1; any/discuss only
+      // sizes 2–5; "open" and anything else rejected. Legacy rows
+      // already stored are never re-validated here.
+      const heroErr = heroRuleSizeError(args.hero_rule, args.team_size);
+      if (heroErr) return { ok: false, error: heroErr, challenge_id: 0 };
       const ins = await db
         .insert(schema.challenges)
         .values({
