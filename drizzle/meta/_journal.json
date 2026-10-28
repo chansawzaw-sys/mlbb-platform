@@ -71,6 +71,13 @@
       "when": 1793500000000,
       "tag": "0010_add_sender_name_to_purchase_requests",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1793600000000,
+      "tag": "0011_batch6_payout_account_name_and_game_name",
+      "breakpoints": true
     }
   ]
 }

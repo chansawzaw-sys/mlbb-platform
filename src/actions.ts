@@ -344,6 +344,7 @@ function playerOut(p: PlayerRow, avatarUrl = "") {
     name: p.name,
     mlbb_id: p.mlbbId,
     server_id: p.serverId,
+    game_name: p.gameName,
     rank: rankFromWins(p.wins),
     avatar_color: p.avatarColor,
     avatar_url: avatarUrl,
@@ -372,7 +373,9 @@ function playerOut(p: PlayerRow, avatarUrl = "") {
 }
 
 /** Sanitized view: balances, locked coins and email are private. Only the
- *  viewer themself sees them; the fixed owner's email is public by design. */
+ *  viewer themself sees them. NO email — including the fixed admin email —
+ *  ever ships to another viewer (Batch 4/6 rule: zero admin traces in
+ *  player/public payloads). */
 function playerPublicOut(p: PlayerRow, viewerId: number | null, avatarUrl = "") {
   const full = playerOut(p, avatarUrl);
   if (viewerId !== null && viewerId === p.id) return full;
@@ -380,7 +383,7 @@ function playerPublicOut(p: PlayerRow, viewerId: number | null, avatarUrl = "") 
     ...full,
     balance: 0,
     locked_coins: 0,
-    email: isFixedAdminEmail(p.email) ? p.email : "",
+    email: "",
     // Internal moderation/security fields never leak to other players:
     // the suspicious reason and the 2FA flag are self-view / staff-only.
     totp_enabled: false,
@@ -405,6 +408,7 @@ const playerShape = z.object({
   name: z.string(),
   mlbb_id: z.string(),
   server_id: z.string(),
+  game_name: z.string(),
   rank: z.string(),
   avatar_color: z.string(),
   avatar_url: z.string(),
@@ -790,7 +794,7 @@ async function requireOwner(
   const r = await requireRole(db, actorPlayerId, token, ["owner"]);
   if (r.error) return r;
   if (!r.actor || !isFixedAdminEmail(r.actor.email))
-    return { error: "Owner လုပ်ဆောင်ချက်ကို fixed Admin Gmail (nnominalhuman@gmail.com) နဲ့ ဝင်ထားသူပဲ လုပ်နိုင်ပါတယ်", actor: null };
+    return { error: "Owner လုပ်ဆောင်ချက်ကို fixed Admin Gmail နဲ့ ဝင်ထားသူပဲ လုပ်နိုင်ပါတယ်", actor: null };
   return r;
 }
 
@@ -1084,6 +1088,93 @@ async function rateLimit(
   if (recent.length >= limit)
     return "ခဏခဏ လုပ်ဆောင်နေပါတယ် — ခဏစောင့်ပြီး ပြန်ကြိုးစားပါ (spam protection)";
   await db.insert(schema.rateEvents).values({ key });
+  return null;
+}
+
+/* ---------- Batch 6 shared validators (single source of truth) ----------
+ * MLBB ID + Server ID live ONLY on players.mlbbId / players.serverId —
+ * registration, Profile edit, the create/accept gate, match-room copy
+ * buttons, the duplicate-ID fraud flag and the IGN lookup all read/write
+ * these same two columns through these same validators. */
+
+/** Plausible MLBB ID + Server ID: both present, digits only. Returns a
+ *  Myanmar error string, or null when valid. */
+function validMlbbIds(mlbbId: string, serverId: string): string | null {
+  const id = (mlbbId ?? "").trim();
+  const zone = (serverId ?? "").trim();
+  if (!id || !zone)
+    return "MLBB ID နဲ့ Server ID ထည့်ပါ — ပွဲတွေ ထောင်/လက်ခံ နိုင်ဖို့ လိုပါတယ် (MLBB ID and Server ID are required)";
+  if (!/^\d{5,12}$/.test(id))
+    return "MLBB ID မမှန်ပါ — ဂဏန်း ၅ လုံးမှ ၁၂ လုံး အတွင်း ဖြစ်ရပါမယ် (MLBB ID must be 5–12 digits)";
+  if (!/^\d{3,8}$/.test(zone))
+    return "Server ID မမှန်ပါ — ဂဏန်း ၃ လုံးမှ ၈ လုံး အတွင်း ဖြစ်ရပါမယ် (Server ID must be 3–8 digits)";
+  return null;
+}
+
+function idsComplete(p: PlayerRow): boolean {
+  return (p.mlbbId ?? "").trim() !== "" && (p.serverId ?? "").trim() !== "";
+}
+
+const IDS_GATE_ERR =
+  "အရင် Profile မှာ MLBB ID နဲ့ Server ID ဖြည့်ပါ — ပြီးမှ ပွဲတွေ ထောင်/လက်ခံ လို့ရပါမယ် (Complete your MLBB ID + Server ID in Profile first)";
+
+/* Item 8: the Owner account is ADMIN-ONLY. Player actions called with
+ * an Owner session are rejected SERVER-SIDE (not merely hidden in the
+ * UI), and Owner balances never move through player flows. Admin verbs
+ * and shared reads are unaffected. Classification of every action:
+ *  PLAYER (owner-blocked): updateProfile, createChallenge,
+ *    acceptChallenge, cancelChallenge, saveRule, deleteSavedRule,
+ *    sendChat, setReady, submitResult, cancelMatch, buyCoins,
+ *    uploadPurchaseProof, requestWithdraw, buyDiamonds, createTeam,
+ *    teamMemberAction, friendsAction, registerTournament (as player),
+ *    createReport, ticketsAction (create), uploadAvatar, deleteAvatar,
+ *    uploadTeamLogo, deleteTeamLogo, voiceSignalSend
+ *  ADMIN (role-gated separately): decidePurchase, decideWithdraw,
+ *    decideDiamondOrder, saveDiamondPackage, deleteDiamondPackage,
+ *    uploadPaymentQr, deletePaymentQr, uploadSlideImage,
+ *    deleteSlideImage, resolveDispute, listDisputes, createTournament,
+ *    generateBracket, setBracketWinner, listReports, resolveReport,
+ *    getAdmin, updateSettings, adminPlayerAction, telegramPost,
+ *    telegramTest, telegramCallback, totpAction, backupAction,
+ *    listPurchaseRequests, listWithdrawRequests, listDiamondOrders
+ *  SHARED / READ / AUTH (keep working for Owner): getBootstrap,
+ *    registerPlayer, googleLogin, heartbeat, searchAll, listChallenges,
+ *    listSavedRules, myMatches, getMatch, getWallet, feePreview,
+ *    sweepTimeouts, listTournaments, leaderboard, matchHistory,
+ *    listTeams, getReferral, listNotifications, markNotificationsRead,
+ *    voiceSignalPoll, lookupMlbbName */
+const OWNER_PLAYER_ERR =
+  "Admin အကောင့်ဖြင့် ကစားသမား လုပ်ဆောင်ချက် မလုပ်နိုင်ပါ — Admin dashboard ပဲ သုံးပါ (The admin account cannot perform player actions)";
+
+function ownerPlayerBlock(p: PlayerRow | null | undefined): string | null {
+  return p && effectiveRole(p) === "owner" ? OWNER_PLAYER_ERR : null;
+}
+
+/** Arena ↔ team-size coupling (Batch 6): the create wizard, the board
+ *  filters, the fixed-rules stamping and this server check all use the
+ *  SAME rule — 1v1 arena allows ONLY size 1; Classic allows ONLY 2–5;
+ *  Brawl keeps every size. Legacy rows are never re-validated. */
+function arenaSizeError(arena: string, teamSize: number): string | null {
+  if (arena === "1v1" && teamSize !== 1)
+    return "1v1 Arena မှာ team size က 1v1 ပဲ ရပါတယ် — တခြား size မရှိပါ (The 1v1 arena allows only the 1v1 size)";
+  if (arena === "classic" && teamSize === 1)
+    return "Classic mode မှာ 1v1 မရှိပါ — 2v2 ကနေ 5v5 အထိ ရွေးပါ (Classic offers 2v2–5v5 only, no 1v1)";
+  return null;
+}
+
+/** Payout ACCOUNT NAME (Batch 6): the KPay/Wave account holder's name.
+ *  Required, ≥3 chars, letters (incl. Myanmar) + spaces; symbols are
+ *  rejected and a mostly-digits value is not a name. Admin-only data. */
+function validPayoutAccountName(raw: string): string | null {
+  const n = (raw ?? "").trim();
+  if (n.length < 3)
+    return "ငွေလက်ခံမယ့် အကောင့် နာမည် ထည့်ပါ — အနည်းဆုံး စာလုံး ၃ လုံး ရှိရပါမယ် (Payout account name is required — at least 3 characters)";
+  if (/[^\p{L}\p{M}\d\s.'-]/u.test(n))
+    return "အကောင့် နာမည်မှာ စာလုံးနဲ့ space ပဲ ပါရပါမယ် — သင်္ကေတ မထည့်ပါနဲ့ (Account name: letters and spaces only, no symbols)";
+  const letters = (n.match(/\p{L}/gu) ?? []).length;
+  const digits = (n.match(/\d/g) ?? []).length;
+  if (letters < 3 || digits > letters)
+    return "အကောင့် နာမည် အမှန် ရေးပါ — KPay/Wave အကောင့်ပိုင်ရှင် နာမည် ဖြစ်ရပါမယ် (Enter the real account holder name)";
   return null;
 }
 
@@ -1427,6 +1518,7 @@ async function matchOut(
     name: "Unknown",
     mlbbId: "",
     serverId: "",
+    gameName: "",
     rank: "",
     avatarColor: "#475569",
     avatarBlobKey: "",
@@ -1559,7 +1651,10 @@ const settingsShape = z.object({
   terms_version: z.string(),
   terms_text: z.string(),
   rules_text: z.string(),
-  fixed_admin_email: z.string(),
+  // Optional: present ONLY in the gated admin payload (adminView). The
+  // public/player settings object omits the key entirely so the public
+  // payload contains neither the address nor the key name.
+  fixed_admin_email: z.string().optional(),
   match_timeout_min: z.number(),
   kpay_phone: z.string(),
   kpay_qr: z.string(),
@@ -1650,14 +1745,14 @@ function settingsOut(s: Record<string, string>, adminView = false) {
     terms_version: s["terms_version"] ?? "1",
     terms_text: s["terms_text"] ?? "",
     rules_text: s["rules_text"] ?? "",
-    // The fixed admin email is public ONLY while the Google setup is
-    // unconfirmed (the pre-Owner bootstrap flow needs it client-side).
-    // Once confirmed it leaves the public payload; the gated admin
-    // payload (adminView) always carries it for the Owner's own view.
-    fixed_admin_email:
-      adminView || (s["google_setup_state"] ?? "") !== "confirmed"
-        ? FIXED_ADMIN_EMAIL
-        : "",
+    // The fixed admin email is an ADMIN IDENTIFIER: it must NEVER ship
+    // in the public/player payload in ANY setup state (Batch 4 rule:
+    // players/public see zero admin traces) — the key is OMITTED
+    // entirely there. Only the gated admin payload (adminView) carries
+    // it, for the Owner's own dashboard. Owner determination never
+    // reads this field — it compares against the server-side
+    // FIXED_ADMIN_EMAIL constant in googleLogin.
+    ...(adminView ? { fixed_admin_email: FIXED_ADMIN_EMAIL } : {}),
     match_timeout_min: numSetting(s, "match_timeout_min", 180),
     kpay_phone: s["kpay_phone"] ?? "",
     kpay_qr: s["kpay_qr"] ?? "",
@@ -1982,6 +2077,14 @@ function withdrawOut(r: WithdrawRow, playerName: string) {
   };
 }
 
+/** ADMIN-ONLY withdraw view: the base row PLUS the payout account name.
+ *  Used solely by listWithdrawRequests (role-gated). The player's own
+ *  wallet payload (getWallet → withdrawOut) and the public payouts feed
+ *  never carry payout_account_name. */
+function withdrawAdminOut(r: WithdrawRow, playerName: string) {
+  return { ...withdrawOut(r, playerName), payout_account_name: r.payoutAccountName };
+}
+
 const purchaseReqShape = z.object({
   id: z.number(),
   player_id: z.number(),
@@ -2017,6 +2120,10 @@ const withdrawReqShape = z.object({
   decided_by: z.string(),
   created_at: z.string(),
   decided_at: z.string().nullable(),
+});
+
+const withdrawAdminShape = withdrawReqShape.extend({
+  payout_account_name: z.string(),
 });
 
 type DiamondPackageRow = typeof schema.diamondPackages.$inferSelect;
@@ -2181,7 +2288,10 @@ export const Actions = {
       const viewerId = viewer?.id ?? null;
       return {
         settings: settingsOut(s),
-        players: await playersPublicOutAsync(ctx, allPlayers, viewerId),
+        // Public player lists exclude the admin-only Owner account (it
+        // is not a playable opponent / teammate); current_player above
+        // still resolves the Owner's own session for the admin shell.
+        players: await playersPublicOutAsync(ctx, allPlayers.filter((p) => effectiveRole(p) !== "owner"), viewerId),
         current_player: current ? await playerOutAsync(ctx, current) : null,
         stats: {
           online_players: online,
@@ -2201,7 +2311,7 @@ export const Actions = {
             }
           : null,
         live_matches: liveOut,
-        top_players: await playersPublicOutAsync(ctx, allPlayers.slice(0, 5), viewerId),
+        top_players: await playersPublicOutAsync(ctx, allPlayers.filter((p) => effectiveRole(p) !== "owner").slice(0, 5), viewerId),
         recent_payouts: await (async () => {
           // Public trust feed: PAID withdrawals only, names masked, and
           // NEVER a phone number or full name.
@@ -2260,6 +2370,7 @@ export const Actions = {
       name: z.string().min(1).max(60),
       mlbb_id: z.string().max(30).default(""),
       server_id: z.string().max(30).default(""),
+      game_name: z.string().max(60).default(""),
       rank: z.string().default("Bronze"),
       referral_code: z.string().max(30).default(""),
       avatar_color: z.string().default("#7c3aed"),
@@ -2274,6 +2385,10 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const rl = await rateLimit(db, "register", 10, 10 * 60 * 1000);
       if (rl) return { ok: false, player: null, error: rl, session_token: "" };
+      // MLBB ID + Server ID are REQUIRED from registration (Batch 6) —
+      // plausible digits only; the same columns the match room copies.
+      const idErr = validMlbbIds(args.mlbb_id, args.server_id);
+      if (idErr) return { ok: false, player: null, error: idErr, session_token: "" };
       const existing = await db.select().from(schema.players);
       if (nameTaken(existing, args.name))
         return { ok: false, player: null, error: NAME_TAKEN_ERR, session_token: "" };
@@ -2296,6 +2411,7 @@ export const Actions = {
           name: args.name.trim(),
           mlbbId: args.mlbb_id.trim(),
           serverId: args.server_id.trim(),
+          gameName: args.game_name.trim(),
           // Rank is earned from wins (rankFromWins) — new accounts start at
           // the bottom of the ladder; the stored column is never displayed.
           rank: "Bronze",
@@ -2330,28 +2446,39 @@ export const Actions = {
       name: z.string().min(1).max(60),
       mlbb_id: z.string().max(30),
       server_id: z.string().max(30),
+      game_name: z.string().max(60).default(""),
       rank: z.string().default("Bronze"),
       avatar_color: z.string(),
     }),
-    response: z.object({ ok: z.boolean() }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const me = await playerBySession(db, args.player_id, args.session_token);
-      if (!me) return { ok: false };
+      if (!me) return { ok: false, error: AUTH_ERR };
+      const obU = ownerPlayerBlock(me);
+      if (obU) return { ok: false, error: obU };
+      // IDs may stay empty here (the create/accept gate then applies),
+      // but a half-filled or non-numeric pair is never stored — the same
+      // validator registration uses, writing the same two columns.
+      if (args.mlbb_id.trim() !== "" || args.server_id.trim() !== "") {
+        const idErr = validMlbbIds(args.mlbb_id, args.server_id);
+        if (idErr) return { ok: false, error: idErr };
+      }
       const allPlayers = await db.select().from(schema.players);
-      if (nameTaken(allPlayers, args.name, me.id)) return { ok: false };
+      if (nameTaken(allPlayers, args.name, me.id)) return { ok: false, error: NAME_TAKEN_ERR };
       await db
         .update(schema.players)
         .set({
           name: args.name.trim(),
           mlbbId: args.mlbb_id.trim(),
           serverId: args.server_id.trim(),
+          gameName: args.game_name.trim(),
           // Rank is NOT editable — it is earned from wins (rankFromWins).
           avatarColor: args.avatar_color,
         })
         .where(eq(schema.players.id, args.player_id));
       ctx.invalidateQueries();
-      return { ok: true };
+      return { ok: true, error: "" };
     },
   }),
 
@@ -2472,6 +2599,8 @@ export const Actions = {
         if (args.team_size > 0 && c.teamSize !== args.team_size) continue;
         const creator = all.find((p) => p.id === c.creatorId);
         if (!creator) continue;
+        // The Owner is admin-only — never a playable opponent on the board.
+        if (effectiveRole(creator) === "owner") continue;
         const pot = c.stake * 2;
         const { fee, label } = feeFor(s, c.arena, pot);
         out.push({
@@ -2517,8 +2646,20 @@ export const Actions = {
         return { ok: false, error: "Maintenance လုပ်နေပါတယ်", challenge_id: 0 };
       const p = await playerBySession(db, args.player_id, args.session_token);
       if (!p) return { ok: false, error: AUTH_ERR, challenge_id: 0 };
+      const obC = ownerPlayerBlock(p);
+      if (obC) return { ok: false, error: obC, challenge_id: 0 };
       if (p.status === "perm_banned" || p.status === "temp_banned")
         return { ok: false, error: "Account ban ခံထားရပါတယ်", challenge_id: 0 };
+      // MLBB ID gate (Batch 6): no profile IDs → no creating. The same
+      // two profile columns registration/Profile write and the match
+      // room copies — one single source.
+      if (!idsComplete(p))
+        return { ok: false, error: IDS_GATE_ERR, challenge_id: 0 };
+      // Arena ↔ size coupling (Batch 6): same rule the wizard and the
+      // board filters enforce — a mismatched combo can never be created,
+      // so the fixed rules stamped below always match a legal combo.
+      const sizeErr = arenaSizeError(args.arena, args.team_size);
+      if (sizeErr) return { ok: false, error: sizeErr, challenge_id: 0 };
       // One lobby at a time: a creator may hold at most ONE open challenge,
       // and may not open a new lobby while one of their matches is still
       // unfinished. They must cancel the open lobby (cancelChallenge) or
@@ -2605,11 +2746,16 @@ export const Actions = {
       const acceptor = await playerBySession(db, args.player_id, args.session_token);
       if (!acceptor)
         return { ok: false, error: AUTH_ERR, match_id: 0 };
+      const obA = ownerPlayerBlock(acceptor);
+      if (obA) return { ok: false, error: obA, match_id: 0 };
       const creator = await getPlayer(db, ch.creatorId);
       if (!acceptor || !creator)
         return { ok: false, error: "Player မတွေ့ပါ", match_id: 0 };
       if (acceptor.status === "perm_banned" || acceptor.status === "temp_banned")
         return { ok: false, error: "Account ban ခံထားရပါတယ်", match_id: 0 };
+      // MLBB ID gate (Batch 6): no profile IDs → no accepting either.
+      if (!idsComplete(acceptor))
+        return { ok: false, error: IDS_GATE_ERR, match_id: 0 };
       // No rank gate on accepting: rank restrictions were removed, so any
       // player may accept any open challenge regardless of rank.
       if (acceptor.balance < ch.stake || creator.balance < ch.stake)
@@ -2752,6 +2898,8 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const me = await playerBySession(db, args.player_id, args.session_token);
       if (!me) return { ok: false, error: AUTH_ERR };
+      const obX = ownerPlayerBlock(me);
+      if (obX) return { ok: false, error: obX };
       const chRows = await db
         .select()
         .from(schema.challenges)
@@ -2788,11 +2936,13 @@ export const Actions = {
       hero_rule: z.string(),
       custom_rules: z.string().max(500).default(""),
     }),
-    response: z.object({ ok: z.boolean() }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const me = await playerBySession(db, args.player_id, args.session_token);
-      if (!me) return { ok: false };
+      if (!me) return { ok: false, error: AUTH_ERR };
+      const obS = ownerPlayerBlock(me);
+      if (obS) return { ok: false, error: obS };
       await db.insert(schema.savedRules).values({
         playerId: args.player_id,
         name: args.name,
@@ -2802,7 +2952,7 @@ export const Actions = {
         customRules: args.custom_rules,
       });
       ctx.invalidateQueries();
-      return { ok: true };
+      return { ok: true, error: "" };
     },
   }),
 
@@ -2848,11 +2998,13 @@ export const Actions = {
       session_token: z.string().default(""),
       rule_id: z.number(),
     }),
-    response: z.object({ ok: z.boolean() }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const me = await playerBySession(db, args.player_id, args.session_token);
-      if (!me) return { ok: false };
+      if (!me) return { ok: false, error: AUTH_ERR };
+      const obD = ownerPlayerBlock(me);
+      if (obD) return { ok: false, error: obD };
       await db
         .delete(schema.savedRules)
         .where(
@@ -2862,7 +3014,7 @@ export const Actions = {
           ),
         );
       ctx.invalidateQueries();
-      return { ok: true };
+      return { ok: true, error: "" };
     },
   }),
 
@@ -2984,17 +3136,19 @@ export const Actions = {
       session_token: z.string().default(""),
       text: z.string().min(1).max(500),
     }),
-    response: z.object({ ok: z.boolean() }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const p = await playerBySession(db, args.player_id, args.session_token);
-      if (!p) return { ok: false };
+      if (!p) return { ok: false, error: AUTH_ERR };
+      const obChat = ownerPlayerBlock(p);
+      if (obChat) return { ok: false, error: obChat };
       const mRows = await db.select().from(schema.matches)
         .where(eq(schema.matches.id, args.match_id)).limit(1);
       const mm = mRows[0];
-      if (!mm || (mm.playerAId !== p.id && mm.playerBId !== p.id)) return { ok: false };
+      if (!mm || (mm.playerAId !== p.id && mm.playerBId !== p.id)) return { ok: false, error: "ဒီ match မှာ မပါဝင်ပါ" };
       const rl = await rateLimit(db, `chat:${args.player_id}`, 40, 60 * 1000);
-      if (rl) return { ok: false };
+      if (rl) return { ok: false, error: rl };
       await db.insert(schema.chatMessages).values({
         matchId: args.match_id,
         senderId: args.player_id,
@@ -3002,7 +3156,7 @@ export const Actions = {
         text: args.text.trim(),
       });
       ctx.invalidateQueries();
-      return { ok: true };
+      return { ok: true, error: "" };
     },
   }),
 
@@ -3017,6 +3171,8 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const meReady = await playerBySession(db, args.player_id, args.session_token);
       if (!meReady) return { ok: false, error: AUTH_ERR, started: false };
+      const obR = ownerPlayerBlock(meReady);
+      if (obR) return { ok: false, error: obR, started: false };
       const rows = await db
         .select()
         .from(schema.matches)
@@ -3101,6 +3257,8 @@ export const Actions = {
       if (!m) return { ok: false, error: "Match မတွေ့ပါ", outcome: "" };
       const meSub = await playerBySession(db, args.player_id, args.session_token);
       if (!meSub) return { ok: false, error: AUTH_ERR, outcome: "" };
+      const obSub = ownerPlayerBlock(meSub);
+      if (obSub) return { ok: false, error: obSub, outcome: "" };
       if (meSub.status === "temp_banned") return { ok: false, error: TEMP_BAN_ERR, outcome: "" };
       if (m.status !== "live" && m.status !== "result_pending")
         return { ok: false, error: "ရလဒ် တင်လို့ မရသေးပါ", outcome: "" };
@@ -3220,6 +3378,8 @@ export const Actions = {
       if (!m) return { ok: false, error: "Match မတွေ့ပါ" };
       const meCan = await playerBySession(db, args.player_id, args.session_token);
       if (!meCan) return { ok: false, error: AUTH_ERR };
+      const obCan = ownerPlayerBlock(meCan);
+      if (obCan) return { ok: false, error: obCan };
       if (meCan.status === "temp_banned") return { ok: false, error: TEMP_BAN_ERR };
       if (m.status === "completed" || m.status === "cancelled")
         return { ok: false, error: "ပြီးဆုံးပြီး match ပါ" };
@@ -3405,6 +3565,8 @@ export const Actions = {
         return fail("Emergency mode — wallet transaction ယာယီပိတ်ထားပါတယ်");
       const p = await playerBySession(db, args.player_id, args.session_token);
       if (!p) return fail(AUTH_ERR);
+      const obBuy = ownerPlayerBlock(p);
+      if (obBuy) return fail(obBuy);
       if (p.status === "temp_banned") return fail(TEMP_BAN_ERR);
       const rl = await rateLimit(db, `buy:${p.id}`, 20, 10 * 60 * 1000);
       if (rl) return fail(rl);
@@ -3413,9 +3575,9 @@ export const Actions = {
       const minCoins = numSetting(s, "topup_min_coins", 10);
       const maxCoins = numSetting(s, "topup_max_coins", 1000000);
       if (args.coins < minCoins)
-        return fail(`အနည်းဆုံး ${minCoins.toLocaleString()} coins မှ စပြီး ဝယ်လို့ရပါတယ် (Minimum top-up is ${minCoins} coins)`);
+        return fail(`အနည်းဆုံး ${minCoins.toLocaleString()} coins မှ စပြီး ဝယ်လို့ရပါတယ် (Minimum top-up is ${minCoins.toLocaleString()} coins)`);
       if (args.coins > maxCoins)
-        return fail(`တစ်ကြိမ်ကို အများဆုံး ${maxCoins.toLocaleString()} coins ပဲ ဝယ်လို့ရပါတယ် (Maximum top-up is ${maxCoins} coins)`);
+        return fail(`တစ်ကြိမ်ကို အများဆုံး ${maxCoins.toLocaleString()} coins ပဲ ဝယ်လို့ရပါတယ် (Maximum top-up is ${maxCoins.toLocaleString()} coins)`);
       // Sender name is REQUIRED (Owner rule): the name on the KPay/Wave
       // account the money was sent from, so the admin can match the
       // request against the incoming transfer/screenshot.
@@ -3565,6 +3727,8 @@ export const Actions = {
       const fail = (error: string) => ({ ok: false, error, proof_key: "", proof_url: "", proof_hash: "" });
       const me = await playerBySession(db, args.player_id, args.session_token);
       if (!me) return fail(AUTH_ERR);
+      const obProof = ownerPlayerBlock(me);
+      if (obProof) return fail(obProof);
       const rl = await rateLimit(db, `proof:${me.id}`, 30, 60 * 60 * 1000);
       if (rl) return fail(rl);
       const v = validateImage(args.image_base64, args.image_mime);
@@ -3592,6 +3756,7 @@ export const Actions = {
       coins: z.number().int().min(1).max(10000000),
       method: z.enum(["kpay", "wave"]).default("kpay"),
       payout_phone: z.string().max(30).default(""),
+      payout_account_name: z.string().max(80).default(""),
     }),
     response: z.object({
       ok: z.boolean(),
@@ -3610,6 +3775,8 @@ export const Actions = {
         return fail("Emergency mode — wallet transaction ယာယီပိတ်ထားပါတယ်");
       const p = await playerBySession(db, args.player_id, args.session_token);
       if (!p) return fail(AUTH_ERR);
+      const obWd = ownerPlayerBlock(p);
+      if (obWd) return fail(obWd);
       if (p.status === "temp_banned") return fail(TEMP_BAN_ERR);
       const rl = await rateLimit(db, `withdraw:${p.id}`, 20, 10 * 60 * 1000);
       if (rl) return fail(rl);
@@ -3624,12 +3791,18 @@ export const Actions = {
       const phoneDigits = phone.replace(/[\s-]/g, "");
       if (!/^\+?\d{7,15}$/.test(phoneDigits))
         return fail("ငွေလက်ခံမယ့် ဖုန်းနံပါတ် အမှန် ထည့်ပါ — KPay/Wave နံပါတ် ဖြစ်ရပါမယ် (A valid payout phone number is required)");
+      // Payout ACCOUNT NAME is REQUIRED too (Batch 6), validated BEFORE
+      // any balance/min mutation — it is stored on the request and shown
+      // ONLY to admins (in-app queue + Telegram note), never publicly.
+      const acctName = (args.payout_account_name ?? "").trim();
+      const acctErr = validPayoutAccountName(acctName);
+      if (acctErr) return fail(acctErr);
       const rate = Math.floor(numSetting(s, "coin_rate_kyat", 0));
       if (rate <= 0)
         return fail("ငွေထုတ် စနစ် မဖွင့်ရသေးပါ — admin က လဲနှုန်း မသတ်မှတ်ရသေးပါ (Withdrawals are not configured yet)");
       const minCoins = numSetting(s, "withdraw_min_coins", 1000);
       if (args.coins < minCoins)
-        return fail(`အနည်းဆုံး ${minCoins.toLocaleString()} coins မှ ထုတ်လို့ရပါတယ် (Minimum withdrawal is ${minCoins} coins)`);
+        return fail(`အနည်းဆုံး ${minCoins.toLocaleString()} coins မှ ထုတ်လို့ရပါတယ် (Minimum withdrawal is ${minCoins.toLocaleString()} coins)`);
       if (p.balance < args.coins)
         return fail(`Balance မလုံလောက်ပါ — သုံးနိုင်သော coin: ${p.balance.toLocaleString()} (Insufficient balance)`);
       // Daily cap: today's pending + paid withdrawals (UTC day) count
@@ -3686,6 +3859,7 @@ export const Actions = {
             netKyat: net,
             method: args.method,
             payoutPhone: phone,
+            payoutAccountName: acctName,
             status: "pending",
             txnCode: code,
           })
@@ -3712,7 +3886,7 @@ export const Actions = {
           playerId: ownerRow.id,
           type: "wallet",
           title: "💸 ငွေထုတ် တောင်းဆိုချက် အသစ်",
-          body: `${p.name} က ${args.coins} coins (${net.toLocaleString()} ကျပ်) ထုတ်ဖို့ တောင်းဆိုထားပါတယ် — Admin မှာ စစ်ပြီး ပေးပါ။`,
+          body: `${p.name} က ${args.coins} coins (${net.toLocaleString()} ကျပ်) ထုတ်ဖို့ တောင်းဆိုထားပါတယ် — လက်ခံမယ့် အကောင့်: ${acctName} (${phone})။ Admin မှာ စစ်ပြီး ပေးပါ။`,
         });
       }
       if (telegramConfigured(s) && requestId > 0) {
@@ -3720,7 +3894,7 @@ export const Actions = {
           `💸 ငွေထုတ် တောင်းဆိုချက် #${requestId}\n` +
           `Player: ${p.name}\nCoins: ${args.coins.toLocaleString()} × ${rate} = ${gross.toLocaleString()} ကျပ်\n` +
           `Fee: ${fee.toLocaleString()} ကျပ် (${feePct}%)\nပေးရန်: ${net.toLocaleString()} ကျပ်\n` +
-          `${args.method === "wave" ? "Wave Pay" : "KBZPay"}: ${phone}\nငွေလွှဲပြီးမှ Paid နှိပ်ပါ။`;
+          `${args.method === "wave" ? "Wave Pay" : "KBZPay"}: ${phone}\nအကောင့် နာမည်: ${acctName}\nငွေလွှဲပြီးမှ Paid နှိပ်ပါ။`;
         await telegramSend(s, text, moneyKeyboard("wd", requestId));
       }
       ctx.invalidateQueries();
@@ -3733,7 +3907,7 @@ export const Actions = {
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
     }),
-    response: z.object({ requests: z.array(withdrawReqShape) }),
+    response: z.object({ requests: z.array(withdrawAdminShape) }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const auth = await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin"]);
@@ -3743,7 +3917,7 @@ export const Actions = {
         .orderBy(desc(schema.withdrawRequests.id)).limit(100);
       const all = await db.select().from(schema.players);
       return {
-        requests: rows.map((w) => withdrawOut(w, all.find((x) => x.id === w.playerId)?.name ?? "?")),
+        requests: rows.map((w) => withdrawAdminOut(w, all.find((x) => x.id === w.playerId)?.name ?? "?")),
       };
     },
   }),
@@ -3794,6 +3968,8 @@ export const Actions = {
         return fail("Emergency mode — wallet transaction ယာယီပိတ်ထားပါတယ်");
       const p = await playerBySession(db, args.player_id, args.session_token);
       if (!p) return fail(AUTH_ERR);
+      const obDia = ownerPlayerBlock(p);
+      if (obDia) return fail(obDia);
       const rl = await rateLimit(db, `dia:${p.id}`, 20, 10 * 60 * 1000);
       if (rl) return fail(rl);
       await expireMoneyRequestsInternal(db).catch(() => 0);
@@ -4460,6 +4636,10 @@ export const Actions = {
       if (args.player_id) {
         const meT = await playerBySession(db, args.player_id, args.session_token);
         if (!meT) return { ok: false, error: AUTH_ERR };
+        const obT = ownerPlayerBlock(meT);
+        if (obT) return { ok: false, error: obT };
+        // Same MLBB ID gate as create/accept (Batch 6).
+        if (!idsComplete(meT)) return { ok: false, error: IDS_GATE_ERR };
       }
       const t = await db
         .select()
@@ -4610,6 +4790,12 @@ export const Actions = {
               ? 30 * 24 * 3600 * 1000
               : Number.POSITIVE_INFINITY;
       const since = new Date(now - windowMs);
+      // The Owner (admin-only account) never appears in player rankings.
+      const ownerIdSet = new Set(
+        (await db.select().from(schema.players))
+          .filter((p) => effectiveRole(p) === "owner")
+          .map((p) => p.id),
+      );
       const completed = await db
         .select()
         .from(schema.matches)
@@ -4692,6 +4878,7 @@ export const Actions = {
             }
           }
           rows = [...best.entries()]
+            .filter(([pid]) => !ownerIdSet.has(pid))
             .sort((a, b) => b[1] - a[1])
             .slice(0, 20)
             .map(([pid, v], i) => {
@@ -4707,6 +4894,7 @@ export const Actions = {
             });
         } else {
           rows = [...winsMap.entries()]
+            .filter(([pid]) => !ownerIdSet.has(pid))
             .sort((a, b) => b[1] - a[1])
             .slice(0, 20)
             .map(([pid, w], i) => {
@@ -4816,6 +5004,8 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const meTeam = await playerBySession(db, args.leader_id, args.session_token);
       if (!meTeam) return { ok: false, error: AUTH_ERR };
+      const obTeam = ownerPlayerBlock(meTeam);
+      if (obTeam) return { ok: false, error: obTeam };
       const ins = await db
         .insert(schema.teams)
         .values({ name: args.name.trim(), color: args.color, leaderId: args.leader_id })
@@ -4849,6 +5039,8 @@ export const Actions = {
       // only be set for oneself; add is leader-only; remove is leader-or-self.
       const actorTm = await playerBySession(db, args.actor_player_id, args.session_token);
       if (!actorTm) return { ok: false, error: AUTH_ERR };
+      const obTm = ownerPlayerBlock(actorTm);
+      if (obTm) return { ok: false, error: obTm };
       const teamRows = await db.select().from(schema.teams)
         .where(eq(schema.teams.id, args.team_id)).limit(1);
       const teamRow = teamRows[0];
@@ -4920,6 +5112,7 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const meFr = await playerBySession(db, args.player_id, args.session_token);
       if (!meFr) return { friends: [], ok: false };
+      if (ownerPlayerBlock(meFr)) return { friends: [], ok: false };
       if (args.action === "add" && args.friend_id && args.friend_id !== args.player_id) {
         const ex = await db
           .select()
@@ -5124,19 +5317,21 @@ export const Actions = {
       reason: z.string().min(1).max(60),
       detail: z.string().max(1000).default(""),
     }),
-    response: z.object({ ok: z.boolean(), case_code: z.string() }),
+    response: z.object({ ok: z.boolean(), case_code: z.string(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       let reporterName = "";
       let reporterId: number | null = null;
       if (args.reporter_id) {
         const meR = await playerBySession(db, args.reporter_id, args.session_token);
-        if (!meR) return { ok: false, case_code: "" };
+        if (!meR) return { ok: false, case_code: "", error: AUTH_ERR };
+        const obRep = ownerPlayerBlock(meR);
+        if (obRep) return { ok: false, case_code: "", error: obRep };
         reporterName = meR.name;
         reporterId = meR.id;
       }
       const rl = await rateLimit(db, `report:${reporterId ?? "anon"}`, 10, 60 * 60 * 1000);
-      if (rl) return { ok: false, case_code: "" };
+      if (rl) return { ok: false, case_code: "", error: rl };
       const caseCode = uid("CASE");
       await db.insert(schema.reports).values({
         caseCode,
@@ -5147,7 +5342,7 @@ export const Actions = {
         detail: args.detail,
       });
       ctx.invalidateQueries();
-      return { ok: true, case_code: caseCode };
+      return { ok: true, case_code: caseCode, error: "" };
     },
   }),
 
@@ -5327,6 +5522,7 @@ export const Actions = {
         if (args.player_id) {
           const meTk = await playerBySession(db, args.player_id, args.session_token);
           if (!meTk) return { ok: false, tickets: [] };
+          if (ownerPlayerBlock(meTk)) return { ok: false, tickets: [] };
         }
         const rl = await rateLimit(db, `ticket:${args.player_id ?? "anon"}`, 10, 60 * 60 * 1000);
         if (rl) return { ok: false, tickets: [] };
@@ -5441,7 +5637,7 @@ export const Actions = {
         return {
           // Explicit blanks on top of the empty-map output: the zero
           // payload must not leak even the pre-confirmation public fields.
-          settings: { ...settingsOut({}), fixed_admin_email: "", telegram_chat_id: "" },
+          settings: { ...settingsOut({}), telegram_chat_id: "" },
           health: { total_players: 0, online_players: 0, active_matches: 0, pending_disputes: 0, pending_reports: 0, open_tickets: 0, total_transactions: 0, total_fees: 0, db_status: "FORBIDDEN" },
           money: { topups_today_count: 0, topups_today_coins: 0, withdrawals_today_count: 0, withdrawals_today_kyat: 0, fees_today_coins: 0, pending_topups: 0, pending_withdrawals: 0 },
           activity: [], players: [], suspicious_players: [], terms_history: [], backups: [],
@@ -5561,7 +5757,7 @@ export const Actions = {
       // verified from the DB via the session, never from the client actor.
       // The fixed admin email itself can never be written into settings.
       if (Object.keys(args.values).some((k) => ["admin_email", "owner_email", "fixed_admin_email"].includes(k)))
-        return { ok: false, error: "Admin Gmail (nnominalhuman@gmail.com) က အသေ သတ်မှတ်ထားတာပါ — settings မှာ ပြောင်းလို့ မရပါ" };
+        return { ok: false, error: "Admin Gmail က အသေ သတ်မှတ်ထားတာပါ — settings မှာ ပြောင်းလို့ မရပါ" };
       const before = await getSettingsMap(db);
       const valueKeys = Object.keys(args.values);
       const googleKeys = ["google_client_id", "google_enabled"];
@@ -5765,7 +5961,7 @@ export const Actions = {
       } else if (args.action === "set_role") {
         // Owner role can only ever belong to the fixed admin Gmail.
         if (args.role === "owner" && !isFixedAdminEmail(p.email))
-          return { ok: false, error: "Owner role ကို fixed Admin Gmail (nnominalhuman@gmail.com) အကောင့်ပဲ ရနိုင်ပါတယ်" };
+          return { ok: false, error: "Owner role ကို fixed Admin Gmail အကောင့်ပဲ ရနိုင်ပါတယ်" };
         const role = ["player", "owner", "admin", "moderator", "support"].includes(args.role)
           ? (args.role as "player" | "owner" | "admin" | "moderator" | "support")
           : "player";
@@ -5917,7 +6113,7 @@ export const Actions = {
             ok: false,
             player: null,
             session_token: "",
-            error: "ဒီ Google setup က pending (အတည်မပြုရသေး) ပါ — ပထမဆုံး ဝင်ရမယ့်သူက fixed Admin Gmail (nnominalhuman@gmail.com) ပဲ ဖြစ်ရပါမယ်။ တခြား Gmail နဲ့ ဝင်လို့ setup ကို ပယ်ပြီး pending ကို ရှင်းလိုက်ပါပြီ။ Owner ကိုယ်တိုင် ပြန်တင်ပါ။",
+            error: "ဒီ Google setup က pending (အတည်မပြုရသေး) ပါ — ပထမဆုံး ဝင်ရမယ့်သူက fixed Admin Gmail ပဲ ဖြစ်ရပါမယ်။ တခြား Gmail နဲ့ ဝင်လို့ setup ကို ပယ်ပြီး pending ကို ရှင်းလိုက်ပါပြီ။ Owner ကိုယ်တိုင် ပြန်တင်ပါ။",
           };
         }
         if (info.email_verified !== "true" && info.email_verified !== undefined && String(info.email_verified) !== "true") {
@@ -6070,6 +6266,7 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const meV = await playerBySession(db, args.from_player_id, args.session_token);
       if (!meV) return { ok: false };
+      if (ownerPlayerBlock(meV)) return { ok: false };
       const mRows = await db.select().from(schema.matches)
         .where(eq(schema.matches.id, args.match_id)).limit(1);
       const mm = mRows[0];
@@ -6323,6 +6520,8 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const me = await playerBySession(db, args.player_id, args.session_token);
       if (!me) return { ok: false, error: AUTH_ERR, avatar_url: "" };
+      const obAv = ownerPlayerBlock(me);
+      if (obAv) return { ok: false, error: obAv, avatar_url: "" };
       // Only own avatar: session player must equal target (playerBySession already binds token to player_id)
       if (me.id !== args.player_id) return { ok: false, error: "ကိုယ့် profile ပုံပဲ ပြောင်းနိုင်ပါတယ် — သူများပုံ ပြောင်းလို့ မရပါ", avatar_url: "" };
       const rl = await rateLimit(db, `avatar:${me.id}`, 20, 60*60*1000);
@@ -6346,6 +6545,8 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const me = await playerBySession(db, args.player_id, args.session_token);
       if (!me) return { ok: false, error: AUTH_ERR };
+      const obAvD = ownerPlayerBlock(me);
+      if (obAvD) return { ok: false, error: obAvD };
       if (me.id !== args.player_id) return { ok: false, error: "ကိုယ့် profile ပုံပဲ ဖျက်နိုင်ပါတယ်" };
       const oldKey = me.avatarBlobKey ?? "";
       await db.update(schema.players).set({ avatarBlobKey: "" }).where(eq(schema.players.id, me.id));
@@ -6368,6 +6569,8 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const actor = await playerBySession(db, args.actor_player_id, args.session_token);
       if (!actor) return { ok: false, error: AUTH_ERR, logo_url: "" };
+      const obLogo = ownerPlayerBlock(actor);
+      if (obLogo) return { ok: false, error: obLogo, logo_url: "" };
       const rows = await db.select().from(schema.teams).where(eq(schema.teams.id, args.team_id)).limit(1);
       const team = rows[0];
       if (!team) return { ok: false, error: "Team မတွေ့ပါ", logo_url: "" };
@@ -6397,6 +6600,8 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const actor = await playerBySession(db, args.actor_player_id, args.session_token);
       if (!actor) return { ok: false, error: AUTH_ERR };
+      const obLogoD = ownerPlayerBlock(actor);
+      if (obLogoD) return { ok: false, error: obLogoD };
       const rows = await db.select().from(schema.teams).where(eq(schema.teams.id, args.team_id)).limit(1);
       const team = rows[0];
       if (!team) return { ok: false, error: "Team မတွေ့ပါ" };
@@ -6406,6 +6611,77 @@ export const Actions = {
       if (oldKey) { try { await ctx.blobs.delete(oldKey); } catch { /* ignore */ } }
       ctx.invalidateQueries();
       return { ok: true, error: "" };
+    },
+  }),
+
+  /* ---------- MLBB in-game name lookup (Batch 6) ----------
+   * Moonton has NO official public API. This uses the same public
+   * order-validation route the diamond top-up shops use: Codashop's
+   * initPayment endpoint (order-sg.codashop.com) with voucherTypeName
+   * "MOBILE_LEGENDS" — a valid (userId, zoneId) pair comes back with
+   * confirmationFields.username. No secrets, no API key. Every failure
+   * is a graceful { found: false, reason } — the caller falls back to
+   * typing the game name manually; a lookup NEVER blocks registration
+   * or profile saving. Rate-limited per player (or a shared anonymous
+   * bucket) so it cannot be abused as a free proxy. */
+  lookupMlbbName: defineAction({
+    request: z.object({
+      mlbb_id: z.string().max(30).default(""),
+      server_id: z.string().max(30).default(""),
+      player_id: z.number().default(0),
+      session_token: z.string().default(""),
+    }),
+    response: z.object({
+      found: z.boolean(),
+      name: z.string(),
+      // "" when found; otherwise: invalid | not_found | rate_limited | unavailable
+      reason: z.string(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const fail = (reason: string) => ({ found: false, name: "", reason });
+      if (validMlbbIds(args.mlbb_id, args.server_id)) return fail("invalid");
+      const rlKey = args.player_id > 0 ? `ign:${args.player_id}` : "ign:anon";
+      const rl = await rateLimit(db, rlKey, 10, 10 * 60 * 1000);
+      if (rl) return fail("rate_limited");
+      const userId = args.mlbb_id.trim();
+      const zoneId = args.server_id.trim();
+      try {
+        const form = new URLSearchParams();
+        form.set("voucherTypeName", "MOBILE_LEGENDS");
+        form.set("user.userId", userId);
+        form.set("user.zoneId", zoneId);
+        form.set("MOBILE_LEGENDS(userId,zoneId)", `${userId}(${zoneId})`);
+        const res = await fetch("https://order-sg.codashop.com/initPayment.action", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+          },
+          body: form.toString(),
+          signal: AbortSignal.timeout(8000),
+        });
+        if (res.status === 429) return fail("rate_limited");
+        if (!res.ok) return fail("unavailable");
+        const data = (await res.json()) as {
+          success?: boolean;
+          errorCode?: number;
+          confirmationFields?: { username?: string };
+        };
+        const rawName = (data.confirmationFields?.username ?? "").trim();
+        if (rawName) {
+          let name = rawName;
+          try { name = decodeURIComponent(rawName); } catch { /* keep raw */ }
+          name = name.trim();
+          if (name) return { found: true, name, reason: "" };
+        }
+        // Codashop answered but rejected the pair (e.g. errorCode -100
+        // "Invalid user ID") — the ID/Server combo does not resolve.
+        return fail("not_found");
+      } catch {
+        // Network error / timeout / non-JSON body — service unavailable.
+        return fail("unavailable");
+      }
     },
   }),
 

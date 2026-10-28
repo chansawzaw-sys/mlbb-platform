@@ -10,6 +10,7 @@ export const players = sqliteTable("players", {
   name: text("name").notNull(),
   mlbbId: text("mlbb_id").notNull().default(""),
   serverId: text("server_id").notNull().default(""),
+  gameName: text("game_name").notNull().default(""),
   rank: text("rank").notNull().default("Epic"),
   avatarColor: text("avatar_color").notNull().default("#7c3aed"),
   avatarBlobKey: text("avatar_blob_key").notNull().default(""),
@@ -323,6 +324,7 @@ export const withdrawRequests = sqliteTable("withdraw_requests", {
   netKyat: integer("net_kyat").notNull().default(0),
   method: text("method", { enum: ["kpay", "wave"] }).notNull().default("kpay"),
   payoutPhone: text("payout_phone").notNull().default(""),
+  payoutAccountName: text("payout_account_name").notNull().default(""),
   status: text("status", { enum: ["pending", "paid", "rejected", "expired"] })
     .notNull()
     .default("pending"),
