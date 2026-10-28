@@ -6660,15 +6660,17 @@ export const Actions = {
   }),
 
   /* ---------- MLBB in-game name lookup (Batch 6) ----------
-   * Moonton has NO official public API. This uses the same public
-   * order-validation route the diamond top-up shops use: Codashop's
-   * initPayment endpoint (order-sg.codashop.com) with voucherTypeName
-   * "MOBILE_LEGENDS" — a valid (userId, zoneId) pair comes back with
-   * confirmationFields.username. No secrets, no API key. Every failure
-   * is a graceful { found: false, reason } — the caller falls back to
-   * typing the game name manually; a lookup NEVER blocks registration
-   * or profile saving. Rate-limited per player (or a shared anonymous
-   * bucket) so it cannot be abused as a free proxy. */
+   * Moonton has NO official public API. Primary route is the public
+   * proxy endpoint the JS game-username-checker library delegates to
+   * (mlbb-api.isan.eu.org/find) — it resolves real pairs that Codashop
+   * refuses from server egress IPs. Codashop's initPayment endpoint
+   * (order-sg.codashop.com, voucherTypeName "MOBILE_LEGENDS",
+   * confirmationFields.username) is kept as fallback. No secrets, no
+   * API key, and only the numeric id + zone are ever sent upstream.
+   * Every failure is a graceful { found: false, reason } — the caller
+   * falls back to typing the game name manually; a lookup NEVER blocks
+   * registration or profile saving. Rate-limited per player (or a
+   * shared anonymous bucket) so it cannot be abused as a free proxy. */
   lookupMlbbName: defineAction({
     request: z.object({
       mlbb_id: z.string().max(30).default(""),
@@ -6691,6 +6693,59 @@ export const Actions = {
       if (rl) return fail("rate_limited");
       const userId = args.mlbb_id.trim();
       const zoneId = args.server_id.trim();
+      // PRIMARY — proxy GET (mlbb-api.isan.eu.org/find). Only the numeric
+      // id + zone are sent; no session tokens, emails, or other user data.
+      try {
+        const proxyRes = await fetch(
+          `https://mlbb-api.isan.eu.org/find?id=${encodeURIComponent(userId)}&zone=${encodeURIComponent(zoneId)}`,
+          { method: "GET", signal: AbortSignal.timeout(8000) },
+        );
+        if (proxyRes.status === 200 || proxyRes.status === 404) {
+          let proxyData: { success?: unknown; name?: unknown; message?: unknown } | null = null;
+          try {
+            proxyData = (await proxyRes.json()) as {
+              success?: unknown;
+              name?: unknown;
+              message?: unknown;
+            };
+          } catch {
+            proxyData = null;
+          }
+          if (proxyData) {
+            if (
+              proxyRes.status === 200 &&
+              proxyData.success === true &&
+              typeof proxyData.name === "string" &&
+              proxyData.name.trim()
+            ) {
+              let name = proxyData.name.replace(/\\u002B/g, "%20");
+              if (name.includes("%")) {
+                try { name = decodeURIComponent(name); } catch { /* keep raw */ }
+              }
+              if (!name.includes(" ") && name.includes("+")) {
+                name = name.replace(/\+/g, " ");
+              }
+              name = name.trim();
+              if (name) return { found: true, name, reason: "" };
+              // Empty after decoding — treat as not resolved, fall through.
+            } else if (
+              proxyRes.status === 404 &&
+              proxyData.success === false &&
+              proxyData.message === "Not found"
+            ) {
+              // The proxy demonstrably resolves real accounts and agrees
+              // with Codashop on nonexistent pairs — authoritative.
+              return fail("not_found");
+            }
+          }
+        }
+        // Any other proxy outcome (network error, timeout, non-JSON,
+        // 429/5xx, other success:false, missing/empty name) falls through
+        // to the Codashop fallback below.
+      } catch {
+        // Proxy unreachable / timed out — fall through to fallback.
+      }
+      // FALLBACK — Codashop initPayment, unchanged precise mapping.
       try {
         // The exact validation request the maintained check-ign libraries
         // (CodashopProvider) use: a JSON body WITH a voucher price point.
