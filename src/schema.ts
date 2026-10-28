@@ -11,6 +11,10 @@ export const players = sqliteTable("players", {
   mlbbId: text("mlbb_id").notNull().default(""),
   serverId: text("server_id").notNull().default(""),
   gameName: text("game_name").notNull().default(""),
+  /** Batch 14: 1 when gameName was adopted from a successful IGN lookup
+   *  (authoritative — the looked-up in-game name wins over manual edits
+   *  until the MLBB ID pair changes). */
+  gameNameLocked: integer("game_name_locked").notNull().default(0),
   rank: text("rank").notNull().default("Epic"),
   avatarColor: text("avatar_color").notNull().default("#7c3aed"),
   avatarBlobKey: text("avatar_blob_key").notNull().default(""),
@@ -42,6 +46,20 @@ export const players = sqliteTable("players", {
   suspiciousReason: text("suspicious_reason").notNull().default(""),
   lastSeenAt: ts("last_seen_at"),
   createdAt: ts("created_at"),
+});
+
+/** Batch 14: a Google sign-in that verified but has no player yet.
+ *  googleLogin stores the verified Google identity here (keyed by the
+ *  sha256 of a one-time token handed to the client) instead of creating
+ *  a player; completeGoogleProfile consumes the row once the profile
+ *  form (MLBB ID + Server ID) is submitted. Times are ms epoch. */
+export const googlePending = sqliteTable("google_pending", {
+  tokenHash: text("token_hash").primaryKey(),
+  googleSub: text("google_sub").notNull().default(""),
+  email: text("email").notNull().default(""),
+  name: text("name").notNull().default(""),
+  createdAt: integer("created_at").notNull(),
+  expiresAt: integer("expires_at").notNull(),
 });
 
 export const settings = sqliteTable("settings", {

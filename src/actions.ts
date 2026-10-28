@@ -570,6 +570,7 @@ function playerOut(p: PlayerRow, avatarUrl = "") {
     mlbb_id: p.mlbbId,
     server_id: p.serverId,
     game_name: p.gameName,
+    game_name_locked: p.gameNameLocked === 1,
     rank: rankFromWins(p.wins),
     is_online: isOnline(p),
     avatar_color: p.avatarColor,
@@ -635,6 +636,7 @@ const playerShape = z.object({
   mlbb_id: z.string(),
   server_id: z.string(),
   game_name: z.string(),
+  game_name_locked: z.boolean(),
   rank: z.string(),
   is_online: z.boolean(),
   avatar_color: z.string(),
@@ -704,6 +706,47 @@ const playerSummaryShape = z.object({
   avatar_url: z.string(),
   is_online: z.boolean(),
   friend_state: z.enum(["friend", "added_you", "none", "self"]),
+});
+
+/** Batch 14 (M7): SPECTATOR payload shapes for getLiveMatches — built
+ *  field-by-field, never reused from playerShape / matchShape. The
+ *  spectator player carries ONLY public identity fields (no email,
+ *  balance, locked coins, role, status, 2FA or moderation data), and the
+ *  spectator match carries NO results, NO evidence, NO chat. */
+const spectatorPlayerShape = z.object({
+  id: z.number(),
+  name: z.string(),
+  game_name: z.string(),
+  rank: z.string(),
+  wins: z.number(),
+  avatar_color: z.string(),
+  avatar_url: z.string(),
+});
+
+const spectatorMatchShape = z.object({
+  id: z.number(),
+  code: z.string(),
+  arena: z.string(),
+  team_size: z.number(),
+  hero_rule: z.string(),
+  custom_rules: z.string(),
+  stake: z.number(),
+  fee_amount: z.number(),
+  fee_label: z.string(),
+  pot: z.number(),
+  per_winner_share: z.number(),
+  status: z.string(),
+  started_at: z.string().nullable(),
+  created_at: z.string(),
+  player_a: spectatorPlayerShape,
+  player_b: spectatorPlayerShape,
+  participants: z.array(
+    z.object({
+      player_id: z.number(),
+      side: z.string(),
+      player: spectatorPlayerShape,
+    }),
+  ),
 });
 
 async function getPlayer(db: Db, id: number) {
@@ -1635,6 +1678,32 @@ function uniqueDisplayName(all: PlayerRow[], base: string): string {
 const NAME_TAKEN_ERR =
   "ဒီနာမည် သုံးပြီးသား ဖြစ်နေပါတယ် — တခြားနာမည် တစ်ခု ရွေးပါ (This name is already taken — please choose a different name)";
 
+/** Batch 14 (M6): ONE game account = ONE app account. Finds the player
+ *  who owns the trimmed (mlbbId, serverId) pair, or null. An empty pair
+ *  never matches (pair uniqueness only applies to filled pairs; the DB
+ *  unique index players_mlbb_pair_unique is the backstop). */
+function pairOwner(
+  all: PlayerRow[],
+  mlbbId: string,
+  serverId: string,
+  exceptId?: number,
+): PlayerRow | null {
+  const id = (mlbbId ?? "").trim();
+  const zone = (serverId ?? "").trim();
+  if (!id || !zone) return null;
+  return (
+    all.find(
+      (p) =>
+        p.id !== exceptId &&
+        (p.mlbbId ?? "").trim() === id &&
+        (p.serverId ?? "").trim() === zone,
+    ) ?? null
+  );
+}
+
+const PAIR_TAKEN_ERR =
+  "ဒီ MLBB ID + Server ID က အကောင့် ရှိပြီးသားပါ — ဂိမ်း အကောင့် တစ်ခုကို app အကောင့် တစ်ခုပဲ ဖွင့်လို့ ရပါတယ်";
+
 /** Settle a match: payout winner, platform fee, referral commission. */
 async function settleMatch(
   ctx: Ctx | null,
@@ -2129,6 +2198,7 @@ async function matchOut(
     mlbbId: "",
     serverId: "",
     gameName: "",
+    gameNameLocked: 0,
     rank: "",
     avatarColor: "#475569",
     avatarBlobKey: "",
@@ -2913,6 +2983,156 @@ const dmMessageShape = z.object({
   created_at: z.string(),
 });
 
+/** Batch 14 (M7): SINGLE SOURCE for "currently playing" — matches with
+ *  status EXACTLY "live". Used by getBootstrap's stats.live_matches count
+ *  AND by the public getLiveMatches spectator list, so the Home count
+ *  line and the spectator view can never disagree. */
+function liveMatchRows<T extends { status: string }>(allMatches: T[]): T[] {
+  return allMatches.filter((m) => m.status === "live");
+}
+
+/** Batch 14 (M2): the IGN resolution core, factored out of the
+ *  lookupMlbbName action so registration / profile / Google-completion
+ *  can adopt the looked-up name through the SAME upstream logic (proxy
+ *  primary, Codashop fallback, identical outcome mapping). The caller
+ *  validates the pair first (validMlbbIds) and picks the rate-limit key:
+ *  the public action uses ign:<player_id> / ign:anon; internal adoption
+ *  calls use ignadopt:<playerId|"new"> — same 10-per-10-min budget,
+ *  separate bucket. Returns { found, name, reason } with reason "" when
+ *  found, else invalid | not_found | rate_limited | unavailable. */
+async function resolveMlbbName(
+  db: Db,
+  userId: string,
+  zoneId: string,
+  rlKey: string,
+): Promise<{ found: boolean; name: string; reason: string }> {
+  const fail = (reason: string) => ({ found: false, name: "", reason });
+  const rl = await rateLimit(db, rlKey, 10, 10 * 60 * 1000);
+  if (rl) return fail("rate_limited");
+  const uidTrim = userId.trim();
+  const zoneTrim = zoneId.trim();
+  // PRIMARY — proxy GET (mlbb-api.isan.eu.org/find). Only the numeric
+  // id + zone are sent; no session tokens, emails, or other user data.
+  try {
+    const proxyRes = await fetch(
+      `https://mlbb-api.isan.eu.org/find?id=${encodeURIComponent(uidTrim)}&zone=${encodeURIComponent(zoneTrim)}`,
+      { method: "GET", signal: AbortSignal.timeout(8000) },
+    );
+    if (proxyRes.status === 200 || proxyRes.status === 404) {
+      let proxyData: { success?: unknown; name?: unknown; message?: unknown } | null = null;
+      try {
+        proxyData = (await proxyRes.json()) as {
+          success?: unknown;
+          name?: unknown;
+          message?: unknown;
+        };
+      } catch {
+        proxyData = null;
+      }
+      if (proxyData) {
+        if (
+          proxyRes.status === 200 &&
+          proxyData.success === true &&
+          typeof proxyData.name === "string" &&
+          proxyData.name.trim()
+        ) {
+          let name = proxyData.name.replace(/\\u002B/g, "%20");
+          if (name.includes("%")) {
+            try { name = decodeURIComponent(name); } catch { /* keep raw */ }
+          }
+          if (!name.includes(" ") && name.includes("+")) {
+            name = name.replace(/\+/g, " ");
+          }
+          name = name.trim();
+          if (name) return { found: true, name, reason: "" };
+          // Empty after decoding — treat as not resolved, fall through.
+        } else if (
+          proxyRes.status === 404 &&
+          proxyData.success === false &&
+          proxyData.message === "Not found"
+        ) {
+          // The proxy demonstrably resolves real accounts and agrees
+          // with Codashop on nonexistent pairs — authoritative.
+          return fail("not_found");
+        }
+      }
+    }
+    // Any other proxy outcome (network error, timeout, non-JSON,
+    // 429/5xx, other success:false, missing/empty name) falls through
+    // to the Codashop fallback below.
+  } catch {
+    // Proxy unreachable / timed out — fall through to fallback.
+  }
+  // FALLBACK — Codashop initPayment, unchanged precise mapping.
+  try {
+    // The exact validation request the maintained check-ign libraries
+    // (CodashopProvider) use: a JSON body WITH a voucher price point.
+    // Without the price-point fields Codashop answers errorCode -32602
+    // "Invalid Request Parameter(s)" for every pair — real IDs too.
+    const res = await fetch("https://order-sg.codashop.com/initPayment.action", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Origin": "https://www.codashop.com",
+        "Referer": "https://www.codashop.com/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.63 Mobile Safari/537.36",
+      },
+      body: JSON.stringify({
+        "voucherPricePoint.id": 27684,
+        "voucherPricePoint.price": 527250,
+        "voucherPricePoint.variablePrice": 0,
+        "user.userId": uidTrim,
+        "user.zoneId": zoneTrim,
+        "voucherTypeName": "MOBILE_LEGENDS",
+        "lvtId": "",
+        "shopLang": "id_ID",
+        "dynamicSkuToken": "",
+        "pricePointDynamicSkuToken": "",
+        "voucherTypeId": "",
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.status === 429) return fail("rate_limited");
+    if (!res.ok) return fail("unavailable");
+    const data = (await res.json()) as {
+      success?: boolean;
+      errorCode?: number | string;
+      RESULT_CODE?: number | string;
+      confirmationFields?: { username?: string };
+    };
+    // Codashop-level throttle (RESULT_CODE 10001) → rate_limited.
+    if (data.RESULT_CODE !== undefined && String(data.RESULT_CODE) === "10001") {
+      return fail("rate_limited");
+    }
+    const rawName = data.confirmationFields?.username ?? "";
+    if (rawName.trim()) {
+      // Decode like PHP urldecode: "+" → " ", then percent-decode.
+      let name = rawName.replace(/\+/g, " ");
+      try { name = decodeURIComponent(name); } catch { /* keep raw */ }
+      name = name.trim();
+      if (name) return { found: true, name, reason: "" };
+    }
+    const errNum =
+      data.errorCode === undefined ||
+      (typeof data.errorCode === "string" && data.errorCode.trim() === "")
+        ? NaN
+        : Number(data.errorCode);
+    // -32602 means OUR request was malformed — never report not_found.
+    if (errNum === -32602) return fail("unavailable");
+    // A well-formed request for a nonexistent pair is rejected with
+    // success:false + a numeric errorCode (e.g. 1003 "Error_Role_Null",
+    // -100, -200) — that is the only true not_found signal.
+    if (data.success === false && !Number.isNaN(errNum)) return fail("not_found");
+    // Everything else (unknown RESULT_CODE, success without a username,
+    // missing fields) is an upstream oddity — unavailable, not a verdict
+    // on the player's ID.
+    return fail("unavailable");
+  } catch {
+    // Network error / timeout / non-JSON body — service unavailable.
+    return fail("unavailable");
+  }
+}
+
 const dmConversationShape = z.object({
   partner: playerShape,
   is_friend: z.boolean(),
@@ -3044,7 +3264,7 @@ export const Actions = {
           online_players: online,
           total_players: allPlayers.length,
           active_matches: active.length,
-          live_matches: allMatches.filter((m) => m.status === "live").length,
+          live_matches: liveMatchRows(allMatches).length,
           completed_matches: allMatches.filter((m) => m.status === "completed")
             .length,
           open_challenges: openCh.length,
@@ -3203,6 +3423,14 @@ export const Actions = {
       const existing = await db.select().from(schema.players);
       if (nameTaken(existing, args.name))
         return { ok: false, player: null, error: NAME_TAKEN_ERR, session_token: "" };
+      // Batch 14 (M6): one game account = one app account.
+      if (pairOwner(existing, args.mlbb_id, args.server_id))
+        return { ok: false, player: null, error: PAIR_TAKEN_ERR, session_token: "" };
+      // Batch 14 (M5): the looked-up in-game name is AUTHORITATIVE — a
+      // successful lookup overrides whatever name was typed.
+      const adopt = await resolveMlbbName(db, args.mlbb_id, args.server_id, "ignadopt:new");
+      const finalGameName = adopt.found ? adopt.name : args.game_name.trim();
+      const finalGameNameLocked = adopt.found ? 1 : 0;
       let referredById: number | null = null;
       const code = args.referral_code.trim().toUpperCase();
       if (code) {
@@ -3222,7 +3450,8 @@ export const Actions = {
           name: args.name.trim(),
           mlbbId: args.mlbb_id.trim(),
           serverId: args.server_id.trim(),
-          gameName: args.game_name.trim(),
+          gameName: finalGameName,
+          gameNameLocked: finalGameNameLocked,
           // Rank is earned from wins (rankFromWins) — new accounts start at
           // the bottom of the ladder; the stored column is never displayed.
           rank: "Bronze",
@@ -3277,13 +3506,40 @@ export const Actions = {
       }
       const allPlayers = await db.select().from(schema.players);
       if (nameTaken(allPlayers, args.name, me.id)) return { ok: false, error: NAME_TAKEN_ERR };
+      const newMlbb = args.mlbb_id.trim();
+      const newServer = args.server_id.trim();
+      // Batch 14 (M6): one game account = one app account.
+      if (pairOwner(allPlayers, newMlbb, newServer, me.id))
+        return { ok: false, error: PAIR_TAKEN_ERR };
+      // Batch 14 (M5): game-name adoption. A changed (or newly filled)
+      // pair re-resolves the in-game name and a successful lookup is
+      // authoritative; an unchanged pair with a locked name keeps the
+      // locked name no matter what was submitted.
+      const newPair = newMlbb !== "" && newServer !== "" ? `${newMlbb}|${newServer}` : "";
+      const storedMlbb = (me.mlbbId ?? "").trim();
+      const storedServer = (me.serverId ?? "").trim();
+      const storedPair =
+        storedMlbb !== "" && storedServer !== "" ? `${storedMlbb}|${storedServer}` : "";
+      let finalGameName = args.game_name.trim();
+      let finalLocked = 0;
+      if (newPair !== "" && (newPair !== storedPair || me.gameName === "")) {
+        const adopt = await resolveMlbbName(db, newMlbb, newServer, `ignadopt:${me.id}`);
+        if (adopt.found) {
+          finalGameName = adopt.name;
+          finalLocked = 1;
+        }
+      } else if (newPair !== "" && newPair === storedPair && me.gameNameLocked === 1) {
+        finalGameName = me.gameName;
+        finalLocked = 1;
+      }
       await db
         .update(schema.players)
         .set({
           name: args.name.trim(),
-          mlbbId: args.mlbb_id.trim(),
-          serverId: args.server_id.trim(),
-          gameName: args.game_name.trim(),
+          mlbbId: newMlbb,
+          serverId: newServer,
+          gameName: finalGameName,
+          gameNameLocked: finalLocked,
           // Rank is NOT editable — it is earned from wins (rankFromWins).
           avatarColor: args.avatar_color,
         })
@@ -8425,15 +8681,35 @@ export const Actions = {
   }),
 
   googleLogin: defineAction({
-    request: z.object({ id_token: z.string().min(10).max(4000) }),
+    request: z.object({
+      id_token: z.string().min(10).max(4000),
+      // Batch 14 (M3): LINK MODE — a signed-in player attaching this
+      // Google identity to their existing account presents their session.
+      player_id: z.number().default(0),
+      session_token: z.string().default(""),
+    }),
     response: z.object({
       ok: z.boolean(),
       player: playerShape.nullable(),
       error: z.string(),
       session_token: z.string(),
+      // Batch 14 (M3): when a verified Google identity has no player
+      // yet, needs_profile=true and the client completes the profile
+      // (MLBB ID + Server ID) via completeGoogleProfile with the
+      // one-time google_pending_token.
+      needs_profile: z.boolean(),
+      google_pending_token: z.string(),
+      google_name: z.string(),
+      google_email: z.string(),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      const noProfile = {
+        needs_profile: false,
+        google_pending_token: "",
+        google_name: "",
+        google_email: "",
+      };
       const s = await getSettingsMap(db);
       const gs = googleState(s);
       if (!gs.effectiveEnabled || !gs.effectiveId)
@@ -8441,6 +8717,7 @@ export const Actions = {
           ok: false,
           player: null,
           session_token: "",
+          ...noProfile,
           error: "Google login မချိတ်ရသေးပါ — Admin မှာ Google Client ID အရင် တင်ပါ (pending)၊ Owner က fixed Gmail နဲ့ ဝင်ပြီး အတည်ပြုပါ။ ပုံမှန် အကောင့်နဲ့ ဆက်ဝင်နိုင်ပါတယ်။",
         };
       type GoogleInfo = { sub?: string; email?: string; name?: string; aud?: string; email_verified?: string };
@@ -8449,13 +8726,13 @@ export const Actions = {
         const res = await fetch(
           `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(args.id_token)}`,
         );
-        if (!res.ok) return { ok: false, player: null, session_token: "", error: "Google token စစ်ဆေးမှု မအောင်မြင်ပါ — ပြန်ကြိုးစားပါ" };
+        if (!res.ok) return { ok: false, player: null, session_token: "", ...noProfile, error: "Google token စစ်ဆေးမှု မအောင်မြင်ပါ — ပြန်ကြိုးစားပါ" };
         info = (await res.json()) as GoogleInfo;
       } catch {
-        return { ok: false, player: null, session_token: "", error: "Google server နဲ့ ချိတ်ဆက်လို့ မရပါ" };
+        return { ok: false, player: null, session_token: "", ...noProfile, error: "Google server နဲ့ ချိတ်ဆက်လို့ မရပါ" };
       }
       if (!info?.sub)
-        return { ok: false, player: null, session_token: "", error: "Google token မမှန်ပါ" };
+        return { ok: false, player: null, session_token: "", ...noProfile, error: "Google token မမှန်ပါ" };
       const email = (info.email ?? "").trim();
       const aud = (info.aud ?? "").trim();
       if (gs.activeEnabled && aud === gs.activeId) {
@@ -8474,11 +8751,12 @@ export const Actions = {
             ok: false,
             player: null,
             session_token: "",
+            ...noProfile,
             error: "ဒီ Google setup က pending (အတည်မပြုရသေး) ပါ — ပထမဆုံး ဝင်ရမယ့်သူက fixed Admin Gmail ပဲ ဖြစ်ရပါမယ်။ တခြား Gmail နဲ့ ဝင်လို့ setup ကို ပယ်ပြီး pending ကို ရှင်းလိုက်ပါပြီ။ Owner ကိုယ်တိုင် ပြန်တင်ပါ။",
           };
         }
         if (info.email_verified !== "true" && info.email_verified !== undefined && String(info.email_verified) !== "true") {
-          return { ok: false, player: null, session_token: "", error: "Google email verified မဖြစ်သေးပါ" };
+          return { ok: false, player: null, session_token: "", ...noProfile, error: "Google email verified မဖြစ်သေးပါ" };
         }
         // Fixed Owner confirmed the pending setup → promote it to ACTIVE.
         await setSetting(db, "google_client_id", gs.pendingId);
@@ -8489,68 +8767,298 @@ export const Actions = {
         await setSetting(db, "google_setup_at", new Date().toISOString());
         await logAct(db, "system", "Google setup CONFIRMED by fixed admin Gmail — pending Client ID promoted to active; setup window closed");
       } else {
-        return { ok: false, player: null, session_token: "", error: "Google token က ဒီ app အတွက် မဟုတ်ပါ (client ID မကိုက်ပါ)" };
+        return { ok: false, player: null, session_token: "", ...noProfile, error: "Google token က ဒီ app အတွက် မဟုတ်ပါ (client ID မကိုက်ပါ)" };
       }
       // HARD-FIXED rule: only this exact Gmail becomes Owner. Every other
       // Google account is a normal player — no exceptions, no bootstrap.
       const roleFor = (em: string): "owner" | "player" =>
         isFixedAdminEmail(em) ? "owner" : "player";
+      const sub = info.sub;
       const all = await db.select().from(schema.players);
-      let p = all.find((x) => x.googleSub === info!.sub) ?? null;
-      if (!p && email) p = all.find((x) => x.email !== "" && x.email === email) ?? null;
-      if (p) {
-        const fixedRole = roleFor(email || p.email);
+      const gFail = (error: string) => ({
+        ok: false as const,
+        player: null,
+        error,
+        session_token: "",
+        ...noProfile,
+      });
+      // The shared sign-in: attaches this Google identity, corrects the
+      // role exactly as before, enforces the ban check, and issues a
+      // FRESH session token.
+      const signIn = async (p0: PlayerRow) => {
+        const fixedRole = roleFor(email || p0.email);
         // Keep any admin-granted staff role for non-fixed accounts, but a
         // stored "owner" on a non-fixed account is always corrected.
-        const correctedRole =
-          fixedRole === "owner" ? "owner" : p.role === "owner" ? "player" : p.role;
+        const correctedRole: PlayerRow["role"] =
+          fixedRole === "owner" ? "owner" : p0.role === "owner" ? "player" : p0.role;
         await db
           .update(schema.players)
           .set({
-            googleSub: info.sub,
-            email: email || p.email,
+            googleSub: sub,
+            email: email || p0.email,
             role: correctedRole,
             lastSeenAt: new Date(),
           })
-          .where(eq(schema.players.id, p.id));
-        p = { ...p, googleSub: info.sub, email: email || p.email, role: correctedRole };
+          .where(eq(schema.players.id, p0.id));
+        const p = { ...p0, googleSub: sub, email: email || p0.email, role: correctedRole };
         if (p.status === "perm_banned" || p.status === "temp_banned")
-          return { ok: false, player: null, session_token: "", error: "ဒီ account က ban ခံထားရပါတယ်" };
+          return gFail("ဒီ account က ban ခံထားရပါတယ်");
         const token = await createSession(db, p.id);
         ctx.invalidateQueries();
-        return { ok: true, player: await playerOutAsync(ctx, p), error: "", session_token: token };
+        return {
+          ok: true as const,
+          player: await playerOutAsync(ctx, p),
+          error: "",
+          session_token: token,
+          ...noProfile,
+        };
+      };
+      // (a) Fixed admin Gmail → EXACTLY the pre-Batch-14 behavior: find
+      // by sub/email, else create the Owner player. Never needs_profile.
+      if (isFixedAdminEmail(email)) {
+        let p = all.find((x) => x.googleSub === sub) ?? null;
+        if (!p && email) p = all.find((x) => x.email !== "" && x.email === email) ?? null;
+        if (p) return signIn(p);
+        const rlA = await rateLimit(db, "register", 10, 10 * 60 * 1000);
+        if (rlA) return gFail(rlA);
+        // A name collision must never block a Google signup — least of
+        // all the fixed-Gmail Owner confirmation — so suffix instead.
+        const displayName = uniqueDisplayName(
+          all,
+          (info.name || email.split("@")[0] || "Player").slice(0, 60),
+        );
+        const myCode = `${displayName.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "MLBB"}${Math.floor(1000 + Math.random() * 9000)}`;
+        const inserted = await db
+          .insert(schema.players)
+          .values({
+            name: displayName,
+            rank: "Bronze",
+            role: roleFor(email),
+            referralCode: myCode,
+            googleSub: sub,
+            email,
+          })
+          .returning();
+        const np = inserted[0];
+        if (!np) return gFail("Account ဖွင့်လို့ မရပါ");
+        await notify(db, {
+          playerId: np.id,
+          type: "info",
+          title: "ကြိုဆိုပါတယ် 🎮",
+          body: "Google နဲ့ အကောင့် ဖွင့်ပြီးပါပြီ။ Profile မှာ MLBB ID / Server ID ဖြည့်ပါ။",
+        });
+        const npToken = await createSession(db, np.id);
+        ctx.invalidateQueries();
+        return {
+          ok: true,
+          player: await playerOutAsync(ctx, np),
+          error: "",
+          session_token: npToken,
+          ...noProfile,
+        };
       }
+      // (b) Player found by googleSub → sign in as before.
+      const bySub = all.find((x) => x.googleSub === sub) ?? null;
+      if (bySub) return signIn(bySub);
+      // (c) LINK MODE: a valid session was presented — the Google
+      // identity attaches to THAT player (or is rejected when they
+      // already carry a different Google identity).
+      const q = args.player_id
+        ? await playerBySession(db, args.player_id, args.session_token)
+        : null;
+      if (q) {
+        if (q.googleSub === sub) return signIn(q);
+        if (q.googleSub !== "")
+          return gFail("ဒီ အကောင့်မှာ တခြား Google ချိတ်ထားပြီးသားပါ");
+        return signIn(q);
+      }
+      // (d) Email match — only when no valid session was presented.
+      if (email) {
+        const byEmail = all.find((x) => x.email !== "" && x.email === email) ?? null;
+        if (byEmail) return signIn(byEmail);
+      }
+      // (e) No player for this Google identity — do NOT auto-create.
+      // Park the verified identity in google_pending and let the client
+      // complete the profile (MLBB ID + Server ID) first.
       const rl = await rateLimit(db, "register", 10, 10 * 60 * 1000);
-      if (rl) return { ok: false, player: null, session_token: "", error: rl };
-      // A name collision must never block a Google signup — least of all
-      // the fixed-Gmail Owner confirmation — so suffix instead of failing.
-      const displayName = uniqueDisplayName(
-        all,
-        (info.name || email.split("@")[0] || "Player").slice(0, 60),
-      );
-      const myCode = `${displayName.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "MLBB"}${Math.floor(1000 + Math.random() * 9000)}`;
+      if (rl) return gFail(rl);
+      const nowMs = Date.now();
+      await db
+        .delete(schema.googlePending)
+        .where(sql`${schema.googlePending.expiresAt} <= ${nowMs}`);
+      const tokenBytes = new Uint8Array(32);
+      crypto.getRandomValues(tokenBytes);
+      const pendingToken = Array.from(tokenBytes)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      const tokenHash = await sha256Hex(new TextEncoder().encode(pendingToken));
+      await db.insert(schema.googlePending).values({
+        tokenHash,
+        googleSub: sub,
+        email,
+        name: info.name ?? "",
+        createdAt: nowMs,
+        expiresAt: nowMs + 30 * 60 * 1000,
+      });
+      return {
+        ok: false,
+        player: null,
+        error: "",
+        session_token: "",
+        needs_profile: true,
+        google_pending_token: pendingToken,
+        google_name: info.name ?? "",
+        google_email: email,
+      };
+    },
+  }),
+
+  /** Batch 14 (M4): completes a Google-first sign-up. The pending row
+   *  (minted by googleLogin path (e)) proves the verified Google
+   *  identity; the submitted MLBB ID + Server ID decide the outcome:
+   *  pair already owned by the SAME Google identity → sign in; owned by
+   *  a DIFFERENT Google identity → hard error; owned by a form account
+   *  (no Google) → link only with that account's live session as proof;
+   *  pair free → create the player (with M5 name adoption). */
+  completeGoogleProfile: defineAction({
+    request: z.object({
+      pending_token: z.string().min(1).max(200),
+      name: z.string().min(1).max(60),
+      mlbb_id: z.string().max(30),
+      server_id: z.string().max(30),
+      game_name: z.string().max(60).default(""),
+      referral_code: z.string().max(30).default(""),
+      avatar_color: z.string().default("#7c3aed"),
+      link_player_id: z.number().default(0),
+      link_session_token: z.string().default(""),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      player: playerShape.nullable(),
+      error: z.string(),
+      session_token: z.string(),
+      link_required: z.boolean(),
+      link_player_id: z.number(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const noLink = { link_required: false, link_player_id: 0 };
+      const fail = (error: string) => ({
+        ok: false,
+        player: null,
+        error,
+        session_token: "",
+        ...noLink,
+      });
+      const tokenHash = await sha256Hex(new TextEncoder().encode(args.pending_token));
+      const pendRows = await db
+        .select()
+        .from(schema.googlePending)
+        .where(eq(schema.googlePending.tokenHash, tokenHash))
+        .limit(1);
+      const pend = pendRows[0];
+      if (!pend || pend.expiresAt <= Date.now())
+        return fail("Google session သက်တမ်း ကုန်သွားပါပြီ — Google နဲ့ ပြန် ဝင်ပါ");
+      const idErr = validMlbbIds(args.mlbb_id, args.server_id);
+      if (idErr) return fail(idErr);
+      const all = await db.select().from(schema.players);
+      const P = pairOwner(all, args.mlbb_id, args.server_id);
+      const consumePending = () =>
+        db
+          .delete(schema.googlePending)
+          .where(eq(schema.googlePending.tokenHash, tokenHash));
+      const finishSignIn = async (p0: PlayerRow) => {
+        if (p0.status === "perm_banned" || p0.status === "temp_banned")
+          return fail("ဒီ account က ban ခံထားရပါတယ်");
+        const token = await createSession(db, p0.id);
+        ctx.invalidateQueries();
+        return {
+          ok: true,
+          player: await playerOutAsync(ctx, p0),
+          error: "",
+          session_token: token,
+          ...noLink,
+        };
+      };
+      if (P) {
+        if (P.googleSub === pend.googleSub) {
+          await consumePending();
+          return finishSignIn(P);
+        }
+        if (P.googleSub !== "")
+          // Zero state change — the pending row is NOT consumed.
+          return fail("ဒီ MLBB ID + Server ID က တခြား Google အကောင့်နဲ့ ချိတ်ထားတဲ့ အကောင့် ဖြစ်နေပါတယ်");
+        // LINK path: the pair belongs to a form account — ownership
+        // proof is that account's live session on this device.
+        const proof =
+          args.link_player_id === P.id
+            ? await playerBySession(db, args.link_player_id, args.link_session_token)
+            : null;
+        if (!proof || proof.id !== P.id)
+          return {
+            ok: false,
+            player: null,
+            error:
+              "ဒီ MLBB ID + Server ID အကောင့် ရှိပြီးသားပါ — အဲ့အကောင့်နဲ့ ဝင်ထားတဲ့ session ရှိမှ Google ချိတ်လို့ ရပါမယ်",
+            session_token: "",
+            link_required: true,
+            link_player_id: P.id,
+          };
+        await db
+          .update(schema.players)
+          .set({ googleSub: pend.googleSub, email: pend.email, lastSeenAt: new Date() })
+          .where(eq(schema.players.id, P.id));
+        await consumePending();
+        return finishSignIn({ ...P, googleSub: pend.googleSub, email: pend.email });
+      }
+      // CREATE path — same discipline as registerPlayer.
+      const rl = await rateLimit(db, "register", 10, 10 * 60 * 1000);
+      if (rl) return fail(rl);
+      if (nameTaken(all, args.name)) return fail(NAME_TAKEN_ERR);
+      let referredById: number | null = null;
+      const code = args.referral_code.trim().toUpperCase();
+      if (code) {
+        const ref = all.find((p) => p.referralCode.toUpperCase() === code);
+        if (ref) referredById = ref.id;
+      }
+      const myCode = `${args.name.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "MLBB"}${Math.floor(1000 + Math.random() * 9000)}`;
+      const suspicion = suspiciousCheck(all, {
+        name: args.name.trim(),
+        mlbbId: args.mlbb_id.trim(),
+        serverId: args.server_id.trim(),
+        referredById,
+      });
+      // M5 adoption (pair is new): a successful lookup is authoritative.
+      const adopt = await resolveMlbbName(db, args.mlbb_id, args.server_id, "ignadopt:new");
       const inserted = await db
         .insert(schema.players)
         .values({
-          name: displayName,
+          name: args.name.trim(),
+          mlbbId: args.mlbb_id.trim(),
+          serverId: args.server_id.trim(),
+          gameName: adopt.found ? adopt.name : args.game_name.trim(),
+          gameNameLocked: adopt.found ? 1 : 0,
           rank: "Bronze",
-          role: roleFor(email),
+          avatarColor: args.avatar_color,
+          role: "player",
           referralCode: myCode,
-          googleSub: info.sub,
-          email,
+          referredById,
+          googleSub: pend.googleSub,
+          email: pend.email,
+          suspicious: suspicion ? 1 : 0,
+          suspiciousReason: suspicion,
         })
         .returning();
       const np = inserted[0];
-      if (!np) return { ok: false, player: null, session_token: "", error: "Account ဖွင့်လို့ မရပါ" };
+      if (!np) return fail("Account ဖွင့်လို့ မရပါ");
       await notify(db, {
         playerId: np.id,
         type: "info",
         title: "ကြိုဆိုပါတယ် 🎮",
-        body: "Google နဲ့ အကောင့် ဖွင့်ပြီးပါပြီ။ Profile မှာ MLBB ID / Server ID ဖြည့်ပါ။",
+        body: "Profile ဆောက်ပြီးပါပြီ။ Challenge စတင်နိုင်ပါပြီ။",
       });
-      const npToken = await createSession(db, np.id);
-      ctx.invalidateQueries();
-      return { ok: true, player: await playerOutAsync(ctx, np), error: "", session_token: npToken };
+      await consumePending();
+      return finishSignIn(np);
     },
   }),
 
@@ -9002,133 +9510,81 @@ export const Actions = {
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      const fail = (reason: string) => ({ found: false, name: "", reason });
-      if (validMlbbIds(args.mlbb_id, args.server_id)) return fail("invalid");
+      if (validMlbbIds(args.mlbb_id, args.server_id))
+        return { found: false, name: "", reason: "invalid" };
+      // Batch 14 (M2): resolution core lives in resolveMlbbName; this
+      // action keeps its exact behavior and rate-limit keys.
       const rlKey = args.player_id > 0 ? `ign:${args.player_id}` : "ign:anon";
-      const rl = await rateLimit(db, rlKey, 10, 10 * 60 * 1000);
-      if (rl) return fail("rate_limited");
-      const userId = args.mlbb_id.trim();
-      const zoneId = args.server_id.trim();
-      // PRIMARY — proxy GET (mlbb-api.isan.eu.org/find). Only the numeric
-      // id + zone are sent; no session tokens, emails, or other user data.
-      try {
-        const proxyRes = await fetch(
-          `https://mlbb-api.isan.eu.org/find?id=${encodeURIComponent(userId)}&zone=${encodeURIComponent(zoneId)}`,
-          { method: "GET", signal: AbortSignal.timeout(8000) },
+      return resolveMlbbName(db, args.mlbb_id, args.server_id, rlKey);
+    },
+  }),
+
+  /** Batch 14 (M7): public spectator list of matches with status
+   *  EXACTLY "live" — who is playing whom, under what descriptor and
+   *  fixed rules, for what stake/pot. The payload is built FIELD BY
+   *  FIELD in the spectator shapes above: no results, no evidence, no
+   *  chat, no private player fields anywhere. No session required. */
+  getLiveMatches: defineAction({
+    request: z.object({}),
+    response: z.object({
+      matches: z.array(spectatorMatchShape),
+      count: z.number(),
+    }),
+    async handler(ctx, args) {
+      void args;
+      const db = ctx.db<typeof schema>();
+      const allMatches = await db.select().from(schema.matches);
+      const live = liveMatchRows(allMatches)
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+        .slice(0, 20);
+      const spectatorPlayer = async (p: PlayerRow | null, fallbackId: number) => ({
+        id: p?.id ?? fallbackId,
+        name: p?.name ?? "Unknown",
+        game_name: p?.gameName ?? "",
+        rank: rankFromWins(p?.wins ?? 0),
+        wins: p?.wins ?? 0,
+        avatar_color: p?.avatarColor ?? "#475569",
+        avatar_url: p ? await blobUrlSafe(ctx, p.avatarBlobKey ?? "") : "",
+      });
+      const out = [];
+      for (const m of live) {
+        const pa = await getPlayer(db, m.playerAId);
+        const pb = await getPlayer(db, m.playerBId);
+        const snap = await participantsFor(db, m.id);
+        const calc = payoutCalc(m.stake, m.teamSize, m.feeAmount);
+        const participants = [];
+        const ordered = [...snap].sort((x, y) =>
+          x.side === y.side ? x.id - y.id : x.side === "A" ? -1 : 1,
         );
-        if (proxyRes.status === 200 || proxyRes.status === 404) {
-          let proxyData: { success?: unknown; name?: unknown; message?: unknown } | null = null;
-          try {
-            proxyData = (await proxyRes.json()) as {
-              success?: unknown;
-              name?: unknown;
-              message?: unknown;
-            };
-          } catch {
-            proxyData = null;
-          }
-          if (proxyData) {
-            if (
-              proxyRes.status === 200 &&
-              proxyData.success === true &&
-              typeof proxyData.name === "string" &&
-              proxyData.name.trim()
-            ) {
-              let name = proxyData.name.replace(/\\u002B/g, "%20");
-              if (name.includes("%")) {
-                try { name = decodeURIComponent(name); } catch { /* keep raw */ }
-              }
-              if (!name.includes(" ") && name.includes("+")) {
-                name = name.replace(/\+/g, " ");
-              }
-              name = name.trim();
-              if (name) return { found: true, name, reason: "" };
-              // Empty after decoding — treat as not resolved, fall through.
-            } else if (
-              proxyRes.status === 404 &&
-              proxyData.success === false &&
-              proxyData.message === "Not found"
-            ) {
-              // The proxy demonstrably resolves real accounts and agrees
-              // with Codashop on nonexistent pairs — authoritative.
-              return fail("not_found");
-            }
-          }
+        for (const pt of ordered) {
+          const pp = await getPlayer(db, pt.playerId);
+          participants.push({
+            player_id: pt.playerId,
+            side: pt.side,
+            player: await spectatorPlayer(pp, pt.playerId),
+          });
         }
-        // Any other proxy outcome (network error, timeout, non-JSON,
-        // 429/5xx, other success:false, missing/empty name) falls through
-        // to the Codashop fallback below.
-      } catch {
-        // Proxy unreachable / timed out — fall through to fallback.
-      }
-      // FALLBACK — Codashop initPayment, unchanged precise mapping.
-      try {
-        // The exact validation request the maintained check-ign libraries
-        // (CodashopProvider) use: a JSON body WITH a voucher price point.
-        // Without the price-point fields Codashop answers errorCode -32602
-        // "Invalid Request Parameter(s)" for every pair — real IDs too.
-        const res = await fetch("https://order-sg.codashop.com/initPayment.action", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Origin": "https://www.codashop.com",
-            "Referer": "https://www.codashop.com/",
-            "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.63 Mobile Safari/537.36",
-          },
-          body: JSON.stringify({
-            "voucherPricePoint.id": 27684,
-            "voucherPricePoint.price": 527250,
-            "voucherPricePoint.variablePrice": 0,
-            "user.userId": userId,
-            "user.zoneId": zoneId,
-            "voucherTypeName": "MOBILE_LEGENDS",
-            "lvtId": "",
-            "shopLang": "id_ID",
-            "dynamicSkuToken": "",
-            "pricePointDynamicSkuToken": "",
-            "voucherTypeId": "",
-          }),
-          signal: AbortSignal.timeout(8000),
+        out.push({
+          id: m.id,
+          code: m.code,
+          arena: m.arena,
+          team_size: m.teamSize,
+          hero_rule: m.heroRule,
+          custom_rules: m.customRules,
+          stake: m.stake,
+          fee_amount: m.feeAmount,
+          fee_label: m.feeLabel,
+          pot: m.stake * 2 * m.teamSize,
+          per_winner_share: snap.length > 0 ? calc.share : m.stake * 2 - m.feeAmount,
+          status: m.status,
+          started_at: iso(m.startedAt),
+          created_at: iso(m.createdAt) ?? "",
+          player_a: await spectatorPlayer(pa, m.playerAId),
+          player_b: await spectatorPlayer(pb, m.playerBId),
+          participants,
         });
-        if (res.status === 429) return fail("rate_limited");
-        if (!res.ok) return fail("unavailable");
-        const data = (await res.json()) as {
-          success?: boolean;
-          errorCode?: number | string;
-          RESULT_CODE?: number | string;
-          confirmationFields?: { username?: string };
-        };
-        // Codashop-level throttle (RESULT_CODE 10001) → rate_limited.
-        if (data.RESULT_CODE !== undefined && String(data.RESULT_CODE) === "10001") {
-          return fail("rate_limited");
-        }
-        const rawName = data.confirmationFields?.username ?? "";
-        if (rawName.trim()) {
-          // Decode like PHP urldecode: "+" → " ", then percent-decode.
-          let name = rawName.replace(/\+/g, " ");
-          try { name = decodeURIComponent(name); } catch { /* keep raw */ }
-          name = name.trim();
-          if (name) return { found: true, name, reason: "" };
-        }
-        const errNum =
-          data.errorCode === undefined ||
-          (typeof data.errorCode === "string" && data.errorCode.trim() === "")
-            ? NaN
-            : Number(data.errorCode);
-        // -32602 means OUR request was malformed — never report not_found.
-        if (errNum === -32602) return fail("unavailable");
-        // A well-formed request for a nonexistent pair is rejected with
-        // success:false + a numeric errorCode (e.g. 1003 "Error_Role_Null",
-        // -100, -200) — that is the only true not_found signal.
-        if (data.success === false && !Number.isNaN(errNum)) return fail("not_found");
-        // Everything else (unknown RESULT_CODE, success without a username,
-        // missing fields) is an upstream oddity — unavailable, not a verdict
-        // on the player's ID.
-        return fail("unavailable");
-      } catch {
-        // Network error / timeout / non-JSON body — service unavailable.
-        return fail("unavailable");
       }
+      return { matches: out, count: out.length };
     },
   }),
 
