@@ -366,6 +366,18 @@ function feeFor(
 
 type PlayerRow = typeof schema.players.$inferSelect;
 
+/** Presence — ONE shared definition for the whole app: a player is online
+ *  when players.lastSeenAt is within the last 2 minutes. lastSeenAt is
+ *  touched by the heartbeat action and by getBootstrap for the signed-in
+ *  viewer. This helper backs the bootstrap online_players stat, the admin
+ *  health stat, the Telegram stats line, and every is_online flag shipped
+ *  in player payloads (friends, search, leaderboard, rooms) — do not
+ *  re-derive the window anywhere else. */
+const ONLINE_WINDOW_MS = 2 * 60 * 1000;
+function isOnline(p: PlayerRow): boolean {
+  return !!p.lastSeenAt && p.lastSeenAt.getTime() >= Date.now() - ONLINE_WINDOW_MS;
+}
+
 function playerOut(p: PlayerRow, avatarUrl = "") {
   const total = p.wins + p.losses;
   return {
@@ -375,6 +387,7 @@ function playerOut(p: PlayerRow, avatarUrl = "") {
     server_id: p.serverId,
     game_name: p.gameName,
     rank: rankFromWins(p.wins),
+    is_online: isOnline(p),
     avatar_color: p.avatarColor,
     avatar_url: avatarUrl,
     avatar_blob_key: (p as PlayerRow & { avatarBlobKey?: string }).avatarBlobKey ?? "",
@@ -439,6 +452,7 @@ const playerShape = z.object({
   server_id: z.string(),
   game_name: z.string(),
   rank: z.string(),
+  is_online: z.boolean(),
   avatar_color: z.string(),
   avatar_url: z.string(),
   avatar_blob_key: z.string(),
@@ -462,6 +476,26 @@ const playerShape = z.object({
   suspicious: z.boolean(),
   suspicious_reason: z.string(),
   created_at: z.string(),
+});
+
+/** Friend-search result card: PUBLIC profile fields only — the same set
+ *  already shown in match rooms. Never email, balances, locked coins or
+ *  session data. friend_state mirrors the one-directional friendsAction
+ *  model (add is instant, there are no pending requests): "friend" = the
+ *  player is already in the searcher's list; "added_you" = they have the
+ *  searcher in theirs, so the button offers an add-back; "none" = no link. */
+const searchPlayerShape = z.object({
+  id: z.number(),
+  name: z.string(),
+  game_name: z.string(),
+  mlbb_id: z.string(),
+  server_id: z.string(),
+  rank: z.string(),
+  wins: z.number(),
+  avatar_color: z.string(),
+  avatar_url: z.string(),
+  is_online: z.boolean(),
+  friend_state: z.enum(["friend", "added_you", "none"]),
 });
 
 async function getPlayer(db: Db, id: number) {
@@ -862,6 +896,49 @@ async function teamFillFor(db: Db, playerId: number, teamSize: number): Promise<
       .where(eq(schema.teamMembers.teamId, ms.teamId));
     const ready = members.filter((mm) => mm.ready === 1).length;
     best = Math.max(best, Math.min(ready, teamSize));
+  }
+  return best;
+}
+
+/** Roster for one side of a team match: the members of the side player's
+ *  "best" team — most members first, most Team-section readies as the
+ *  tiebreak (the same membership pool the team gate/fill read) — with the
+ *  side's match player first, capped at teamSize. Each entry carries the
+ *  member's public profile + their own Team-section ready flag, so the
+ *  match room can render a real profile card per filled slot. Empty for
+ *  1v1 matches and when the player has no team at all. */
+async function teamRosterFor(
+  db: Db,
+  playerId: number,
+  teamSize: number,
+): Promise<{ player: PlayerRow; ready: boolean }[]> {
+  if (teamSize <= 1) return [];
+  const memberships = await db
+    .select()
+    .from(schema.teamMembers)
+    .where(eq(schema.teamMembers.playerId, playerId));
+  let best: { player: PlayerRow; ready: boolean }[] = [];
+  let bestScore = -1;
+  for (const ms of memberships) {
+    const members = await db
+      .select()
+      .from(schema.teamMembers)
+      .where(eq(schema.teamMembers.teamId, ms.teamId));
+    const score =
+      members.length * 100 + members.filter((mm) => mm.ready === 1).length;
+    if (score <= bestScore) continue;
+    const ordered = [...members].sort(
+      (x, y) =>
+        (x.playerId === playerId ? 0 : 1) - (y.playerId === playerId ? 0 : 1) ||
+        x.id - y.id,
+    );
+    const out: { player: PlayerRow; ready: boolean }[] = [];
+    for (const mm of ordered.slice(0, teamSize)) {
+      const p = await getPlayer(db, mm.playerId);
+      if (p) out.push({ player: p, ready: mm.ready === 1 });
+    }
+    best = out;
+    bestScore = score;
   }
   return best;
 }
@@ -1542,6 +1619,8 @@ const matchShape = z.object({
   team_b_ready: z.boolean(),
   team_a_fill: z.number(),
   team_b_fill: z.number(),
+  team_a_roster: z.array(z.object({ player: playerShape, ready: z.boolean() })),
+  team_b_roster: z.array(z.object({ player: playerShape, ready: z.boolean() })),
   a_evidence_url: z.string(),
   b_evidence_url: z.string(),
   winner_id: z.number().nullable(),
@@ -1602,7 +1681,8 @@ async function matchOut(
     totpEnabled: 0,
     suspicious: 0,
     suspiciousReason: "",
-    lastSeenAt: new Date(),
+    // Unknown/deleted player placeholder is never "online".
+    lastSeenAt: new Date(0),
     createdAt: new Date(),
   });
   return {
@@ -1637,6 +1717,18 @@ async function matchOut(
     team_b_ready: await teamGateFor(db, m.playerBId, m.teamSize),
     team_a_fill: await teamFillFor(db, m.playerAId, m.teamSize),
     team_b_fill: await teamFillFor(db, m.playerBId, m.teamSize),
+    team_a_roster: await (async () => {
+      const out = [];
+      for (const e of await teamRosterFor(db, m.playerAId, m.teamSize))
+        out.push({ player: await playerPublicOutAsync(ctx, e.player, viewerId), ready: e.ready });
+      return out;
+    })(),
+    team_b_roster: await (async () => {
+      const out = [];
+      for (const e of await teamRosterFor(db, m.playerBId, m.teamSize))
+        out.push({ player: await playerPublicOutAsync(ctx, e.player, viewerId), ready: e.ready });
+      return out;
+    })(),
     a_evidence_url: priv ? await evUrl(m.aEvidence) : "",
     b_evidence_url: priv ? await evUrl(m.bEvidence) : "",
     winner_id: m.winnerId ?? null,
@@ -2333,8 +2425,7 @@ export const Actions = {
           .set({ lastSeenAt: new Date() })
           .where(eq(schema.players.id, viewer.id));
       }
-      const cutoff = new Date(Date.now() - 10 * 60 * 1000);
-      const online = allPlayers.filter((p) => p.lastSeenAt >= cutoff).length;
+      const online = allPlayers.filter((p) => isOnline(p)).length;
       const allMatches = await db.select().from(schema.matches);
       const active = allMatches.filter((m) =>
         ["ready_check", "live", "result_pending", "disputed"].includes(m.status),
@@ -2567,9 +2658,14 @@ export const Actions = {
   }),
 
   searchAll: defineAction({
-    request: z.object({ q: z.string().min(1).max(60) }),
+    request: z.object({
+      q: z.string().min(1).max(60),
+      player_id: z.number().default(0),
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+    }),
     response: z.object({
-      players: z.array(playerShape),
+      players: z.array(searchPlayerShape),
       challenges: z.array(
         z.object({
           id: z.number(),
@@ -2582,15 +2678,72 @@ export const Actions = {
       tournaments: z.array(
         z.object({ id: z.number(), name: z.string(), prize: z.number() }),
       ),
+      error: z.string(),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      const q = args.q.toLowerCase();
+      // Player directory search is session-gated: anonymous callers get an
+      // error and NO directory data (the player list is not public).
+      const searcherId = args.player_id || args.actor_player_id;
+      const viewer = searcherId
+        ? await playerBySession(db, searcherId, args.session_token)
+        : null;
+      if (!viewer)
+        return { players: [], challenges: [], tournaments: [], error: AUTH_ERR };
+      const obSearch = ownerPlayerBlock(viewer);
+      if (obSearch)
+        return { players: [], challenges: [], tournaments: [], error: obSearch };
+      // Spam guard, same DB-backed pattern as chat/report: 30 searches
+      // per minute per player.
+      const rlSearch = await rateLimit(db, `search:${viewer.id}`, 30, 60 * 1000);
+      if (rlSearch)
+        return { players: [], challenges: [], tournaments: [], error: rlSearch };
+      const q = args.q.trim().toLowerCase();
       const all = await db.select().from(schema.players);
-      const players = all.filter(
-        (p) =>
-          p.name.toLowerCase().includes(q) || p.mlbbId.toLowerCase().includes(q),
+      const friendRows = await db.select().from(schema.friends);
+      const myFriendIds = new Set(
+        friendRows.filter((f) => f.playerId === viewer.id).map((f) => f.friendId),
       );
+      const addedMeIds = new Set(
+        friendRows.filter((f) => f.friendId === viewer.id).map((f) => f.playerId),
+      );
+      // Match by display name, in-game name, or MLBB ID — the ID match is a
+      // substring match, so exact IDs and partial (prefix/substring) IDs
+      // both hit. The Owner (admin-only) never appears, and the searcher
+      // never gets their own card.
+      const matched = all.filter(
+        (p) =>
+          p.id !== viewer.id &&
+          effectiveRole(p) !== "owner" &&
+          (p.name.toLowerCase().includes(q) ||
+            p.gameName.toLowerCase().includes(q) ||
+            p.mlbbId.toLowerCase().includes(q)),
+      );
+      // Exact MLBB ID first, then partial-ID hits, then name-only hits;
+      // wins break ties inside a group. One page: at most 20 results.
+      const idRank = (p: PlayerRow) =>
+        p.mlbbId.toLowerCase() === q ? 0 : p.mlbbId.toLowerCase().includes(q) ? 1 : 2;
+      matched.sort((a, b) => idRank(a) - idRank(b) || b.wins - a.wins);
+      const players = [];
+      for (const p of matched.slice(0, 20)) {
+        players.push({
+          id: p.id,
+          name: p.name,
+          game_name: p.gameName,
+          mlbb_id: p.mlbbId,
+          server_id: p.serverId,
+          rank: rankFromWins(p.wins),
+          wins: p.wins,
+          avatar_color: p.avatarColor,
+          avatar_url: await blobUrlSafe(ctx, p.avatarBlobKey ?? ""),
+          is_online: isOnline(p),
+          friend_state: (myFriendIds.has(p.id)
+            ? "friend"
+            : addedMeIds.has(p.id)
+              ? "added_you"
+              : "none") as "friend" | "added_you" | "none",
+        });
+      }
       const chs = await db
         .select()
         .from(schema.challenges)
@@ -2607,11 +2760,12 @@ export const Actions = {
         }));
       const tours = await db.select().from(schema.tournaments);
       return {
-        players: await playersPublicOutAsync(ctx, players, null),
+        players,
         challenges,
         tournaments: tours
           .filter((t) => t.name.toLowerCase().includes(q))
           .map((t) => ({ id: t.id, name: t.name, prize: t.prize })),
+        error: "",
       };
     },
   }),
@@ -4851,6 +5005,7 @@ export const Actions = {
           value: z.number(),
           color: z.string(),
           image_url: z.string(),
+          is_online: z.boolean(),
         }),
       ),
     }),
@@ -4892,7 +5047,7 @@ export const Actions = {
       for (const tm of allTeamsForLb) teamLogoMap.set(tm.name, await blobUrlSafe(ctx, tm.logoBlobKey ?? ""));
       const playerAvatarByName = new Map<string, string>();
       for (const pl of playersAll) playerAvatarByName.set(pl.name, avatarUrlMap.get(pl.id) ?? "");
-      type Row = { rank_no: number; name: string; detail: string; value: number; color: string; image_url: string };
+      type Row = { rank_no: number; name: string; detail: string; value: number; color: string; image_url: string; is_online: boolean };
       let rows: Row[] = [];
       if (args.category === "top_team") {
         const allTeams = await db
@@ -4911,6 +5066,8 @@ export const Actions = {
           value: t.wins,
           color: t.color,
           image_url: teamLogoMap.get(t.name) ?? "",
+          // Team rows are not a player — no presence.
+          is_online: false,
         }));
       } else if (args.category === "champion") {
         const tours = await db
@@ -4928,6 +5085,12 @@ export const Actions = {
             value: t.prize,
             color: "#f59e0b",
             image_url: teamLogoMap.get(t.champion) ?? playerAvatarByName.get(t.champion) ?? "",
+            // Champion is a display name; presence resolves only when it
+            // matches a current player exactly.
+            is_online: (() => {
+              const cp = playersAll.find((x) => x.name === t.champion);
+              return cp ? isOnline(cp) : false;
+            })(),
           }));
       } else {
         const winsMap = new Map<number, number>();
@@ -4966,6 +5129,7 @@ export const Actions = {
                 value: v,
                 color: colorOf(pid),
                 image_url: avatarUrlMap.get(pid) ?? "",
+                is_online: p ? isOnline(p) : false,
               };
             });
         } else {
@@ -4982,6 +5146,7 @@ export const Actions = {
                 value: w,
                 color: colorOf(pid),
                 image_url: avatarUrlMap.get(pid) ?? "",
+                is_online: p ? isOnline(p) : false,
               };
             });
           if (args.category === "top_player") {
@@ -5721,7 +5886,6 @@ export const Actions = {
       }
       const s = await getSettingsMap(db);
       const all = await db.select().from(schema.players);
-      const cutoff = new Date(Date.now() - 10 * 60 * 1000);
       const matchRows = await db.select().from(schema.matches);
       const reportRows = await db
         .select()
@@ -5751,7 +5915,7 @@ export const Actions = {
         settings: settingsOut(s, true),
         health: {
           total_players: all.length,
-          online_players: all.filter((p) => p.lastSeenAt >= cutoff).length,
+          online_players: all.filter((p) => isOnline(p)).length,
           active_matches: matchRows.filter((m) =>
             ["ready_check", "live", "result_pending", "disputed"].includes(m.status),
           ).length,
@@ -6120,7 +6284,6 @@ export const Actions = {
       let text = "✅ MLBB Platform — Telegram bot test message အောင်မြင်ပါတယ်။";
       if (args.mode === "stats") {
         const all = await db.select().from(schema.players);
-        const cutoff = new Date(Date.now() - 10 * 60 * 1000);
         const matchRows = await db.select().from(schema.matches);
         const reportRows = await db
           .select()
@@ -6128,7 +6291,7 @@ export const Actions = {
           .where(eq(schema.reports.status, "open"));
         text = [
           "📊 MLBB Platform Stats",
-          `Online: ${all.filter((p) => p.lastSeenAt >= cutoff).length} / Players: ${all.length}`,
+          `Online: ${all.filter((p) => isOnline(p)).length} / Players: ${all.length}`,
           `Active matches: ${matchRows.filter((m) => ["ready_check", "live", "result_pending", "disputed"].includes(m.status)).length}`,
           `Pending reports: ${reportRows.length} • Disputes: ${matchRows.filter((m) => m.status === "disputed").length}`,
         ].join("\n");
