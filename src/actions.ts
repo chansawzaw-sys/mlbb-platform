@@ -2958,6 +2958,11 @@ export const Actions = {
     },
   }),
 
+  // Batch 7 D.2: the creator may cancel ONLY an OPEN lobby. Once the
+  // lobby is accepted/full (status no longer "open") this action rejects
+  // with a Myanmar error and changes no state — the match then resolves
+  // only through the match-room rules. The UI mirrors this: the cancel
+  // button exists only on open-lobby cards.
   cancelChallenge: defineAction({
     request: z.object({
       player_id: z.number(),
