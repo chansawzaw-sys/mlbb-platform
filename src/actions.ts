@@ -1364,14 +1364,28 @@ function arenaSizeError(arena: string, teamSize: number): string | null {
   return null;
 }
 
-/** FINAL hero-rule table by team size (user, 2026-10-28 Batch 7 B) —
+/** Brawl's hero rule is FIXED to Mage only (user, 2026-10-28 Batch 9) —
+ *  ONE shared constant: the create wizard auto-stamps exactly this value
+ *  for Brawl (its hero step is skipped), this server check enforces it,
+ *  and the shared match descriptor renders hero_rule "mage" as
+ *  "Mage only", so the three can never diverge. CREATION-ONLY: legacy
+ *  brawl rows stored with other hero rules still display and play. */
+const BRAWL_HERO_RULE = "mage";
+const BRAWL_HERO_RULE_ERR = "Brawl က Mage only ပါ (Brawl is Mage only)";
+
+/** FINAL hero-rule table (user, 2026-10-28 Batch 7 B + Batch 9) —
  *  the wizard and this server check enforce exactly the same table:
- *  fighter/assassin/mage/marksman at ANY size; "same" / "same:<Name>"
- *  ONLY at size 1; "any" / "discuss" ONLY at sizes 2–5; "open" and
+ *  Brawl (size 1) → Mage only, FORCED (any other hero_rule rejected);
+ *  1v1 Room / Classic at size 1 → Fighter / Assassin / Mage / Marksman /
+ *  Same Hero ("same" / "same:<Name>"); Classic at sizes 2–5 → Fighter /
+ *  Assassin / Mage / Marksman / Any Hero / 💬 Discuss; "open" and
  *  anything else rejected everywhere. CREATION-ONLY: legacy rows
- *  (incl. legacy same:* at sizes ≥2) are never re-validated — accept /
- *  render / play paths do not call this. */
-function heroRuleSizeError(heroRule: string, teamSize: number): string | null {
+ *  (incl. legacy same:* at sizes ≥2 and legacy brawl rules) are never
+ *  re-validated — accept / render / play paths do not call this. */
+function heroRuleSizeError(heroRule: string, teamSize: number, arena: string): string | null {
+  if (arena === "brawl") {
+    return heroRule === BRAWL_HERO_RULE ? null : BRAWL_HERO_RULE_ERR;
+  }
   const isSame = heroRule === "same" || heroRule.startsWith("same:");
   if (heroRule === "open")
     return "\"Open\" hero rule ကို ဖယ်ရှားထားပါတယ် — size 1v1 မှာ Fighter / Assassin / Mage / Marksman / Same Hero, size 2v2–5v5 မှာ Fighter / Assassin / Mage / Marksman / Any Hero / 💬 Chatbox မှာ ဆွေးနွေးမည် ထဲက ရွေးပါ";
@@ -3206,6 +3220,15 @@ export const Actions = {
       // match a legal combo. Creation-only; legacy rows unaffected.
       const sizeErr = arenaSizeError(args.arena, args.team_size);
       if (sizeErr) return { ok: false, error: sizeErr, challenge_id: 0 };
+      // Hero-rule table (FINAL Batch 7 B + Batch 9): Brawl REQUIRES
+      // hero_rule "mage" exactly (BRAWL_HERO_RULE) — anything else is
+      // rejected before any state change; 1v1 Room / Classic at size 1
+      // allow same:*; Classic sizes 2–5 allow any/discuss; "open" and
+      // anything else rejected. Pure validation, checked up front with
+      // the arena/size matrix. Legacy rows already stored are never
+      // re-validated here.
+      const heroErr = heroRuleSizeError(args.hero_rule, args.team_size, args.arena);
+      if (heroErr) return { ok: false, error: heroErr, challenge_id: 0 };
       // One lobby at a time: a creator may hold at most ONE open challenge,
       // and may not open a new lobby while one of their matches is still
       // unfinished. They must cancel the open lobby (cancelChallenge) or
@@ -3237,12 +3260,6 @@ export const Actions = {
         return { ok: false, error: `လောင်းကြေး နည်းလွန်းပါတယ် — အနည်းဆုံး ${minStake.toLocaleString()} coins လောင်းရပါမယ် (Admin သတ်မှတ်ထား)`, challenge_id: 0 };
       if (p.balance < args.stake)
         return { ok: false, error: "Coin မလုံလောက်ပါ — Wallet မှာ အရင်ဝယ်ပါ", challenge_id: 0 };
-      // Hero-rule × size table (FINAL Batch 7 B): fighter/assassin/mage/
-      // marksman at any size; same:* only size 1; any/discuss only
-      // sizes 2–5; "open" and anything else rejected. Legacy rows
-      // already stored are never re-validated here.
-      const heroErr = heroRuleSizeError(args.hero_rule, args.team_size);
-      if (heroErr) return { ok: false, error: heroErr, challenge_id: 0 };
       const ins = await db
         .insert(schema.challenges)
         .values({
