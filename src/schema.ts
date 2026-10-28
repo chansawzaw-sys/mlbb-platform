@@ -109,6 +109,32 @@ export const matches = sqliteTable("matches", {
   completedAt: integer("completed_at", { mode: "timestamp_ms" }),
 });
 
+/** Batch 8 TEAM PAYOUT MODEL: frozen per-member snapshot of a team match
+ *  (team_size ≥ 2), written at acceptChallenge from both leaders' qualifying
+ *  team rosters. Every participant locks their own stake; settlement pays
+ *  each winning-side participant an equal share of (pot − fee). A match with
+ *  NO participant rows is a 1v1 match or a pre-Batch-8 in-flight match and
+ *  keeps the old two-player semantics exactly. */
+export const matchParticipants = sqliteTable("match_participants", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  matchId: integer("match_id").notNull(),
+  playerId: integer("player_id").notNull(),
+  side: text("side", { enum: ["A", "B"] }).notNull(),
+  stake: integer("stake").notNull().default(0),
+  // The participant's own ready state for the start gate — synced from the
+  // Team-section ready flag by teamMemberAction and seeded at accept from
+  // the roster's ready flags. Leaders are additionally covered by the
+  // match's own a_ready / b_ready room-Ready flow.
+  ready: integer("ready").notNull().default(0),
+  state: text("state", {
+    enum: ["locked", "paid", "lost", "refunded", "kicked"],
+  })
+    .notNull()
+    .default("locked"),
+  payoutAmount: integer("payout_amount").notNull().default(0),
+  createdAt: ts("created_at"),
+});
+
 export const chatMessages = sqliteTable("chat_messages", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   matchId: integer("match_id").notNull(),

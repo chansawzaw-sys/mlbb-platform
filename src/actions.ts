@@ -364,6 +364,94 @@ function feeFor(
   return { fee, label: `${value}% of pot` };
 }
 
+/** TEAM PAYOUT MODEL (Batch 8) — ONE shared calculator used by every
+ *  display (board cards, wizard fee preview, match room) AND by settlement,
+ *  so a preview can never drift from what is actually paid.
+ *  pot = stake × every staking player (2 sides × team_size; for 1v1 that is
+ *  stake × 2, exactly the old model). fee comes from feeFor on the FULL pot.
+ *  Winners split (pot − fee) equally: share = floor((pot − fee) / team_size);
+ *  the indivisible remainder goes to the platform (added to the recorded
+ *  fee take) so winners×share + fee + remainder = pot exactly.
+ *  For team_size 1: share = pot − fee and remainder = 0 — the old model. */
+function payoutCalc(stake: number, teamSize: number, fee: number) {
+  const size = Math.max(1, Math.floor(teamSize) || 1);
+  const pot = stake * 2 * size;
+  const share = Math.floor((pot - fee) / size);
+  const remainder = pot - fee - share * size;
+  return { pot, fee, share, remainder };
+}
+
+type ParticipantRow = typeof schema.matchParticipants.$inferSelect;
+
+/** The frozen participant snapshot of a match (Batch 8). Empty for 1v1
+ *  matches and for matches accepted before the team payout model — those
+ *  keep the old two-player semantics (cut-over rule). */
+async function participantsFor(db: Db, matchId: number): Promise<ParticipantRow[]> {
+  return db
+    .select()
+    .from(schema.matchParticipants)
+    .where(eq(schema.matchParticipants.matchId, matchId))
+    .orderBy(schema.matchParticipants.id);
+}
+
+/** Refund EVERY still-locked participant of a snapshot match (balance
+ *  +stake, locked −stake, refund txn, participant state → refunded) and
+ *  cancel the match's pending referral rows. Used by refundMatch's team
+ *  branch and by kickParticipant's void path — money never moves twice
+ *  for one participant because only state="locked" rows are refunded.
+ *  `skipNotify` players (e.g. the kicked leader) get their own message. */
+async function refundAllParticipants(
+  db: Db,
+  match: MatchRow,
+  reason: string,
+  skipNotify: number[] = [],
+): Promise<void> {
+  const parts = await participantsFor(db, match.id);
+  for (const pt of parts) {
+    if (pt.state !== "locked") continue;
+    const p = await getPlayer(db, pt.playerId);
+    await db
+      .update(schema.matchParticipants)
+      .set({ state: "refunded" })
+      .where(eq(schema.matchParticipants.id, pt.id));
+    if (!p) continue;
+    const nb = p.balance + pt.stake;
+    await db
+      .update(schema.players)
+      .set({
+        balance: nb,
+        lockedCoins: Math.max(0, p.lockedCoins - pt.stake),
+      })
+      .where(eq(schema.players.id, pt.playerId));
+    await addTxn(db, {
+      playerId: pt.playerId,
+      type: "refund",
+      amount: pt.stake,
+      balanceAfter: nb,
+      note: `${reason} — ${match.code}`,
+      matchId: match.id,
+    });
+    if (!skipNotify.includes(pt.playerId)) {
+      await notify(db, {
+        playerId: pt.playerId,
+        type: "match",
+        title: "Match cancel ဖြစ်သွားပါတယ်",
+        body: `${match.code} — ${pt.stake} coins ပြန်အမ်းပြီးပါပြီ။`,
+        matchId: match.id,
+      });
+    }
+  }
+  await db
+    .update(schema.referralCommissions)
+    .set({ status: "cancelled" })
+    .where(
+      and(
+        eq(schema.referralCommissions.matchId, match.id),
+        eq(schema.referralCommissions.status, "pending"),
+      ),
+    );
+}
+
 type PlayerRow = typeof schema.players.$inferSelect;
 
 /** Presence — ONE shared definition for the whole app: a player is online
@@ -1389,6 +1477,179 @@ async function settleMatch(
     )
     .returning({ id: schema.matches.id });
   if (claim.length === 0) return false;
+
+  // TEAM BRANCH (Batch 8): a match with a participant snapshot settles
+  // per-member. winnerId is one of the two leaders; their SIDE wins.
+  // share = floor((pot − fee) / winning-side count) to EVERY winning
+  // participant; the indivisible remainder is added to the platform fee
+  // take so winners×share + fee + remainder = pot exactly. Losers lose
+  // their lock, nothing more. The claim above already flipped the match
+  // to completed, so a replayed settle pays nobody twice.
+  const snapParts = await participantsFor(db, match.id);
+  if (match.teamSize > 1 && snapParts.length > 0) {
+    const winSide = winnerId === match.playerAId ? "A" : "B";
+    const feeT = match.feeAmount;
+    const potT = match.stake * snapParts.length;
+    const winners = snapParts.filter((pt) => pt.side === winSide);
+    const losers = snapParts.filter((pt) => pt.side !== winSide);
+    const share = winners.length > 0 ? Math.floor((potT - feeT) / winners.length) : 0;
+    const remainder = potT - feeT - share * winners.length;
+    const pctXT = match.referralPercentX100 ?? 100;
+    for (const pt of winners) {
+      if (pt.state !== "locked") continue;
+      const p = await getPlayer(db, pt.playerId);
+      await db
+        .update(schema.matchParticipants)
+        .set({ state: "paid", payoutAmount: share })
+        .where(eq(schema.matchParticipants.id, pt.id));
+      if (!p) continue;
+      const nb = p.balance + share;
+      await db
+        .update(schema.players)
+        .set({
+          balance: nb,
+          lockedCoins: Math.max(0, p.lockedCoins - pt.stake),
+          wins: p.wins + 1,
+          winStreak: p.winStreak + 1,
+          bestStreak: Math.max(p.bestStreak, p.winStreak + 1),
+        })
+        .where(eq(schema.players.id, pt.playerId));
+      await addTxn(db, {
+        playerId: pt.playerId,
+        type: "payout",
+        amount: share,
+        balanceAfter: nb,
+        note: `Match ${match.code} team prize — your share (pot ${potT} − fee ${feeT}) ÷ ${winners.length}`,
+        matchId: match.id,
+      });
+      await notify(db, {
+        playerId: pt.playerId,
+        type: "result",
+        title: "Match အနိုင်ရပါတယ် 🏆",
+        body: `${match.code} — အသင်းလိုက် အနိုင်ရလို့ သင့်ဝေစု ${share} coins ရရှိပါတယ်။`,
+        matchId: match.id,
+      });
+      // Referral — counted PER referred WINNING participant, exactly
+      // once: each winning participant whose account was referred earns
+      // their own referrer floor(fee × snapshot% / 100) (default 1% of
+      // the FULL match fee — fee 300 → 3 coins), under the same rules
+      // as 1v1 (suspicious winners earn nothing; their pending row is
+      // cancelled). Losing participants never earn a commission.
+      if (p.referredById) {
+        const pendingRows = await db
+          .select()
+          .from(schema.referralCommissions)
+          .where(
+            and(
+              eq(schema.referralCommissions.matchId, match.id),
+              eq(schema.referralCommissions.status, "pending"),
+              eq(schema.referralCommissions.referredId, pt.playerId),
+            ),
+          );
+        const ownPending = pendingRows[0];
+        if (p.suspicious === 1) {
+          if (ownPending) {
+            await db
+              .update(schema.referralCommissions)
+              .set({ status: "cancelled" })
+              .where(eq(schema.referralCommissions.id, ownPending.id));
+          }
+          await logAct(db, "system", `Referral commission held/cancelled for suspicious winner ${p.name} (${match.code})`);
+        } else {
+          const referrer = await getPlayer(db, p.referredById);
+          const pctX100 = ownPending?.percent ?? pctXT;
+          const commission = Math.floor((feeT * pctX100) / 10000);
+          if (referrer && commission > 0) {
+            if (ownPending) {
+              await db
+                .update(schema.referralCommissions)
+                .set({ status: "completed", commission, feeAmount: feeT, percent: pctX100 })
+                .where(eq(schema.referralCommissions.id, ownPending.id));
+            } else {
+              await db.insert(schema.referralCommissions).values({
+                referrerId: referrer.id,
+                referredId: pt.playerId,
+                matchId: match.id,
+                feeAmount: feeT,
+                percent: pctX100,
+                commission,
+                status: "completed",
+              });
+            }
+            const rBalance = referrer.balance + commission;
+            await db
+              .update(schema.players)
+              .set({ balance: rBalance })
+              .where(eq(schema.players.id, referrer.id));
+            await addTxn(db, {
+              playerId: referrer.id,
+              type: "referral_commission",
+              amount: commission,
+              balanceAfter: rBalance,
+              note: `Referral commission from ${match.code} (${pctX100 / 100}% of fee ${feeT})`,
+              matchId: match.id,
+            });
+            await notify(db, {
+              playerId: referrer.id,
+              type: "referral",
+              title: "Referral commission ရရှိပါတယ်",
+              body: `${match.code} မှ ${commission} coins commission ရရှိပါတယ်။`,
+              matchId: match.id,
+            });
+          } else if (ownPending) {
+            await db
+              .update(schema.referralCommissions)
+              .set({ status: "cancelled" })
+              .where(eq(schema.referralCommissions.id, ownPending.id));
+          }
+        }
+      }
+    }
+    for (const pt of losers) {
+      if (pt.state !== "locked") continue;
+      const p = await getPlayer(db, pt.playerId);
+      await db
+        .update(schema.matchParticipants)
+        .set({ state: "lost", payoutAmount: 0 })
+        .where(eq(schema.matchParticipants.id, pt.id));
+      if (!p) continue;
+      await db
+        .update(schema.players)
+        .set({
+          lockedCoins: Math.max(0, p.lockedCoins - pt.stake),
+          losses: p.losses + 1,
+          winStreak: 0,
+        })
+        .where(eq(schema.players.id, pt.playerId));
+      await notify(db, {
+        playerId: pt.playerId,
+        type: "result",
+        title: "Match ပြီးဆုံးပါပြီ",
+        body: `${match.code} — နောက်ပွဲမှာ ပြန်ကြိုးစားပါ။`,
+        matchId: match.id,
+      });
+    }
+    await addTxn(db, {
+      playerId: null,
+      type: "platform_fee",
+      amount: feeT + remainder,
+      note: `Platform fee from ${match.code} (${match.feeLabel})${remainder > 0 ? ` + split remainder ${remainder}` : ""}`,
+      matchId: match.id,
+    });
+    // Any pending referral rows left (losing participants') are closed.
+    await db
+      .update(schema.referralCommissions)
+      .set({ status: "cancelled" })
+      .where(
+        and(
+          eq(schema.referralCommissions.matchId, match.id),
+          eq(schema.referralCommissions.status, "pending"),
+        ),
+      );
+    if (ctx) ctx.invalidateQueries();
+    return true;
+  }
+
   void (await getSettingsMap(db)); // settings intentionally NOT used for the locked referral %
   const loserId = winnerId === match.playerAId ? match.playerBId : match.playerAId;
   const winner = await getPlayer(db, winnerId);
@@ -1549,6 +1810,14 @@ async function refundMatch(
     )
     .returning({ id: schema.matches.id });
   if (claim.length === 0) return false;
+  // TEAM BRANCH (Batch 8): a snapshot match refunds EVERY participant's
+  // own lock — not just the two leaders. Pre-change matches (no
+  // snapshot) fall through to the original two-player refund below.
+  const refundParts = await participantsFor(db, match.id);
+  if (refundParts.length > 0) {
+    await refundAllParticipants(db, match, reason);
+    return true;
+  }
   for (const pid of [match.playerAId, match.playerBId]) {
     const p = await getPlayer(db, pid);
     if (!p) continue;
@@ -1619,6 +1888,16 @@ const matchShape = z.object({
   team_b_ready: z.boolean(),
   team_a_fill: z.number(),
   team_b_fill: z.number(),
+  per_winner_share: z.number(),
+  participants: z.array(
+    z.object({
+      player_id: z.number(),
+      side: z.string(),
+      stake: z.number(),
+      ready: z.boolean(),
+      state: z.string(),
+    }),
+  ),
   team_a_roster: z.array(z.object({ player: playerShape, ready: z.boolean() })),
   team_b_roster: z.array(z.object({ player: playerShape, ready: z.boolean() })),
   a_evidence_url: z.string(),
@@ -1685,6 +1964,29 @@ async function matchOut(
     lastSeenAt: new Date(0),
     createdAt: new Date(),
   });
+  // Batch 8: with a participant snapshot the pot is stake × every
+  // staking participant and the payout preview is the PER-MEMBER winning
+  // share (shared calculator). Without a snapshot (1v1 or pre-change
+  // in-flight team match) the old two-player figures stand byte-for-byte.
+  const snap = await participantsFor(db, m.id);
+  const hasSnap = snap.length > 0;
+  const calc = payoutCalc(m.stake, m.teamSize, m.feeAmount);
+  const potOut = hasSnap ? m.stake * snap.length : m.stake * 2;
+  const snapSide = (side: "A" | "B") => snap.filter((pt) => pt.side === side);
+  const snapReady = (side: "A" | "B") => {
+    const rows = snapSide(side);
+    return rows.length > 0 && rows.every((pt) => pt.ready === 1);
+  };
+  const snapFill = (side: "A" | "B") =>
+    snapSide(side).filter((pt) => pt.ready === 1).length;
+  const snapRoster = async (side: "A" | "B") => {
+    const out = [];
+    for (const pt of snapSide(side)) {
+      const p = await getPlayer(db, pt.playerId);
+      if (p) out.push({ player: await playerPublicOutAsync(ctx, p, viewerId), ready: pt.ready === 1 });
+    }
+    return out;
+  };
   return {
     id: m.id,
     code: m.code,
@@ -1696,8 +1998,16 @@ async function matchOut(
     stake: m.stake,
     fee_amount: m.feeAmount,
     fee_label: m.feeLabel,
-    pot: m.stake * 2,
-    payout_preview: m.stake * 2 - m.feeAmount,
+    pot: potOut,
+    payout_preview: hasSnap ? calc.share : m.stake * 2 - m.feeAmount,
+    per_winner_share: hasSnap ? calc.share : m.stake * 2 - m.feeAmount,
+    participants: snap.map((pt) => ({
+      player_id: pt.playerId,
+      side: pt.side,
+      stake: pt.stake,
+      ready: pt.ready === 1,
+      state: pt.state,
+    })),
     status: m.status,
     a_ready: m.aReady === 1,
     b_ready: m.bReady === 1,
@@ -1713,22 +2023,28 @@ async function matchOut(
     b_hero: m.bHero,
     banned_heroes: m.bannedHeroes,
     team_gate_required: m.teamSize > 1,
-    team_a_ready: await teamGateFor(db, m.playerAId, m.teamSize),
-    team_b_ready: await teamGateFor(db, m.playerBId, m.teamSize),
-    team_a_fill: await teamFillFor(db, m.playerAId, m.teamSize),
-    team_b_fill: await teamFillFor(db, m.playerBId, m.teamSize),
-    team_a_roster: await (async () => {
-      const out = [];
-      for (const e of await teamRosterFor(db, m.playerAId, m.teamSize))
-        out.push({ player: await playerPublicOutAsync(ctx, e.player, viewerId), ready: e.ready });
-      return out;
-    })(),
-    team_b_roster: await (async () => {
-      const out = [];
-      for (const e of await teamRosterFor(db, m.playerBId, m.teamSize))
-        out.push({ player: await playerPublicOutAsync(ctx, e.player, viewerId), ready: e.ready });
-      return out;
-    })(),
+    // Snapshot matches read gate/fill/roster from the FROZEN participant
+    // rows (Batch 8); pre-change matches keep reading the live teams.
+    team_a_ready: hasSnap ? snapReady("A") : await teamGateFor(db, m.playerAId, m.teamSize),
+    team_b_ready: hasSnap ? snapReady("B") : await teamGateFor(db, m.playerBId, m.teamSize),
+    team_a_fill: hasSnap ? snapFill("A") : await teamFillFor(db, m.playerAId, m.teamSize),
+    team_b_fill: hasSnap ? snapFill("B") : await teamFillFor(db, m.playerBId, m.teamSize),
+    team_a_roster: hasSnap
+      ? await snapRoster("A")
+      : await (async () => {
+          const out = [];
+          for (const e of await teamRosterFor(db, m.playerAId, m.teamSize))
+            out.push({ player: await playerPublicOutAsync(ctx, e.player, viewerId), ready: e.ready });
+          return out;
+        })(),
+    team_b_roster: hasSnap
+      ? await snapRoster("B")
+      : await (async () => {
+          const out = [];
+          for (const e of await teamRosterFor(db, m.playerBId, m.teamSize))
+            out.push({ player: await playerPublicOutAsync(ctx, e.player, viewerId), ready: e.ready });
+          return out;
+        })(),
     a_evidence_url: priv ? await evUrl(m.aEvidence) : "",
     b_evidence_url: priv ? await evUrl(m.bEvidence) : "",
     winner_id: m.winnerId ?? null,
@@ -2791,6 +3107,7 @@ export const Actions = {
           stake: z.number(),
           fee_amount: z.number(),
           fee_label: z.string(),
+          pot: z.number(),
           payout_preview: z.number(),
           status: z.string(),
           created_at: z.string(),
@@ -2824,8 +3141,12 @@ export const Actions = {
         if (!creator) continue;
         // The Owner is admin-only — never a playable opponent on the board.
         if (effectiveRole(creator) === "owner") continue;
-        const pot = c.stake * 2;
-        const { fee, label } = feeFor(s, c.arena, pot);
+        // Batch 8 shared calculator: for team sizes the pot is
+        // stake × 2 × team_size (every roster player stakes) and the
+        // preview is the PER-MEMBER winning share. Size 1 is unchanged.
+        const calc = payoutCalc(c.stake, c.teamSize, 0);
+        const { fee, label } = feeFor(s, c.arena, calc.pot);
+        const calcF = payoutCalc(c.stake, c.teamSize, fee);
         out.push({
           id: c.id,
           creator: await playerPublicOutAsync(ctx, creator, null),
@@ -2837,7 +3158,8 @@ export const Actions = {
           stake: c.stake,
           fee_amount: fee,
           fee_label: label,
-          payout_preview: pot - fee,
+          pot: calcF.pot,
+          payout_preview: calcF.share,
           status: c.status,
           created_at: iso(c.createdAt) ?? "",
         });
@@ -2986,6 +3308,33 @@ export const Actions = {
       if (acceptor.balance < ch.stake || creator.balance < ch.stake)
         return { ok: false, error: "Coin မလုံလောက်ပါ (နှစ်ဖက်လုံး stake ရှိရပါမယ်)", match_id: 0 };
 
+      // TEAM SNAPSHOT (Batch 8): for team_size ≥ 2, freeze both rosters
+      // from each leader's qualifying team (the same team teamRosterFor
+      // selects — most members, most Team-section readies as tiebreak —
+      // leader first, capped at team_size). Accept REQUIRES both rosters
+      // determinable NOW, because every roster player stakes when they
+      // take a slot: a leader whose team is short is rejected here,
+      // before any state changes.
+      let rosterA: { player: PlayerRow; ready: boolean }[] = [];
+      let rosterB: { player: PlayerRow; ready: boolean }[] = [];
+      if (ch.teamSize >= 2) {
+        rosterA = await teamRosterFor(db, creator.id, ch.teamSize);
+        rosterB = await teamRosterFor(db, acceptor.id, ch.teamSize);
+        if (rosterA.length < ch.teamSize || rosterB.length < ch.teamSize)
+          return {
+            ok: false,
+            error: `အသင်းလိုက် ပွဲအတွက် နှစ်ဖက်လုံးမှာ အဖွဲ့သား ${ch.teamSize} ယောက် အပြည့် ရှိရပါမယ် — အရင် Team section မှာ အဖွဲ့ ဖွဲ့ပြီး member အပြည့် ထည့်ပြီးမှ လက်ခံပါ (Both leaders must complete their ${ch.teamSize}-player team in the Team section first)`,
+            match_id: 0,
+          };
+        const idsA = new Set(rosterA.map((e) => e.player.id));
+        if (rosterB.some((e) => idsA.has(e.player.id)))
+          return {
+            ok: false,
+            error: "ကစားသမား တစ်ယောက်တည်း နှစ်ဖက်လုံးမှာ ပါနေပါတယ် — အဖွဲ့တွေ ပြန်စစ်ပါ (A player cannot be on both teams)",
+            match_id: 0,
+          };
+      }
+
       // Atomic claim: only succeeds while still open (double-accept prevention).
       const claimed = await db
         .update(schema.challenges)
@@ -3030,10 +3379,27 @@ export const Actions = {
           })
           .where(eq(schema.players.id, p.id));
       };
-      const nbCreator = await lockSide(creator);
-      const nbAcceptor = nbCreator !== undefined ? await lockSide(acceptor) : undefined;
-      if (nbCreator === undefined || nbAcceptor === undefined) {
-        if (nbCreator !== undefined) await unlockSide(creator);
+      // PER-MEMBER LOCKS (Batch 8): the staking set is the two leaders
+      // for size 1, and EVERY snapshotted roster member for team sizes.
+      // Locks are the same guarded atomic updates; if ANY member cannot
+      // cover the stake, every lock already taken is compensated and
+      // the challenge claim released — no lock survives a failed accept.
+      const lockList: PlayerRow[] =
+        ch.teamSize >= 2
+          ? [...rosterA.map((e) => e.player), ...rosterB.map((e) => e.player)]
+          : [creator, acceptor];
+      const lockedOk: { p: PlayerRow; nb: number }[] = [];
+      let lockFailed = false;
+      for (const p of lockList) {
+        const nb = await lockSide(p);
+        if (nb === undefined) {
+          lockFailed = true;
+          break;
+        }
+        lockedOk.push({ p, nb });
+      }
+      if (lockFailed) {
+        for (const { p } of lockedOk) await unlockSide(p);
         await db
           .update(schema.challenges)
           .set({ status: "open" })
@@ -3043,9 +3409,16 @@ export const Actions = {
               eq(schema.challenges.status, "matched"),
             ),
           );
-        return { ok: false, error: "Coin မလုံလောက်ပါ (နှစ်ဖက်လုံး stake ရှိရပါမယ်)", match_id: 0 };
+        return {
+          ok: false,
+          error:
+            ch.teamSize >= 2
+              ? "Coin မလုံလောက်ပါ — အဖွဲ့သား အားလုံး stake ဖိုး coin ရှိရပါမယ် (Every team member must cover the stake)"
+              : "Coin မလုံလောက်ပါ (နှစ်ဖက်လုံး stake ရှိရပါမယ်)",
+          match_id: 0,
+        };
       }
-      for (const [p, nb] of [[creator, nbCreator], [acceptor, nbAcceptor]] as const) {
+      for (const { p, nb } of lockedOk) {
         await addTxn(db, {
           playerId: p.id,
           type: "lock",
@@ -3055,7 +3428,11 @@ export const Actions = {
         });
       }
 
-      const pot = ch.stake * 2;
+      // Batch 8: the pot counts EVERY staking player (stake × 2 ×
+      // team_size for team matches; stake × 2 for 1v1 — unchanged), and
+      // the fee is computed on that FULL pot with the existing feeFor
+      // semantics, snapshotted onto the match as before.
+      const pot = payoutCalc(ch.stake, ch.teamSize, 0).pot;
       const { fee, label } = feeFor(s, ch.arena, pot);
       const readyTimeout = numSetting(s, "ready_timeout_min", 3);
       const lockedRefPct = Number(s["referral_percent_x100"] ?? "100") || 0;
@@ -3079,8 +3456,29 @@ export const Actions = {
         })
         .returning({ id: schema.matches.id });
       const matchId = ins[0]?.id ?? 0;
-      // Pending referral commission if either side was referred (settled at result).
-      for (const side of [creator, acceptor]) {
+      // Freeze the participant snapshot (Batch 8): one row per staking
+      // roster member, leader first per side, each carrying their own
+      // stake and their Team-section ready flag at accept time.
+      const allParts: { player: PlayerRow; side: "A" | "B"; ready: boolean }[] =
+        ch.teamSize >= 2
+          ? [
+              ...rosterA.map((e) => ({ player: e.player, side: "A" as const, ready: e.ready })),
+              ...rosterB.map((e) => ({ player: e.player, side: "B" as const, ready: e.ready })),
+            ]
+          : [];
+      for (const pt of allParts) {
+        await db.insert(schema.matchParticipants).values({
+          matchId,
+          playerId: pt.player.id,
+          side: pt.side,
+          stake: ch.stake,
+          ready: pt.ready ? 1 : 0,
+          state: "locked",
+        });
+      }
+      // Pending referral commission if any staking player was referred
+      // (settled at result — per winning participant in team matches).
+      for (const side of ch.teamSize >= 2 ? allParts.map((x) => x.player) : [creator, acceptor]) {
         if (side.referredById) {
           await db.insert(schema.referralCommissions).values({
             referrerId: side.referredById,
@@ -3107,6 +3505,18 @@ export const Actions = {
         body: `${creator.name} နဲ့ ပွဲစရန် Ready နှိပ်ပါ။`,
         matchId,
       });
+      // Team matches: every other snapshotted roster member is told
+      // they are in the match and that their own stake was locked.
+      for (const pt of allParts) {
+        if (pt.player.id === ch.creatorId || pt.player.id === args.player_id) continue;
+        await notify(db, {
+          playerId: pt.player.id,
+          type: "challenge_accepted",
+          title: "အသင်းလိုက် Match မှာ ပါဝင်ထားပါတယ် ⚔️",
+          body: `${creator.name} vs ${acceptor.name} ပွဲမှာ သင် ပါဝင်ပြီး stake ${ch.stake} coins lock လုပ်ထားပါတယ် — Team section မှာ Ready နှိပ်ပေးပါ။`,
+          matchId,
+        });
+      }
       ctx.invalidateQueries();
       return { ok: true, error: "", match_id: matchId };
     },
@@ -3420,16 +3830,64 @@ export const Actions = {
       // section) before the match may start — individual Ready is not enough.
       let gateNote = "";
       if (m.teamSize > 1) {
-        const gA = await teamGateFor(db, m.playerAId, m.teamSize);
-        const gB = await teamGateFor(db, m.playerBId, m.teamSize);
-        if (!(gA && gB)) {
-          gateNote = "အဖွဲ့လိုက် ပွဲမှာ Team section မှာ အဖွဲ့သား အားလုံး Ready ဖြစ်မှ ပွဲစနိုင်ပါတယ် — ကိုယ့် အဖွဲ့ကို အရင် ဖွဲ့ပြီး member အားလုံး Ready နှိပ်ခိုင်းပါ။";
-          await db
-            .update(schema.matches)
-            .set({ aReady, bReady })
-            .where(eq(schema.matches.id, m.id));
-          ctx.invalidateQueries();
-          return { ok: true, error: gateNote, started: false };
+        // Batch 8 snapshot matches: the start gate reads the FROZEN
+        // participant rows (ready state synced from the Team section by
+        // teamMemberAction; the two leaders are covered by this room's
+        // own Ready flow). The LIVE team membership must still match
+        // the snapshot — if a roster changed since accept, the start
+        // is rejected with a clear error instead of starting a match
+        // whose locks no longer match its players.
+        const gateParts = await participantsFor(db, m.id);
+        if (gateParts.length > 0) {
+          // Membership invariant: every snapshotted player must still
+          // belong to their leader's (full, uncapped) team, and that
+          // team must still field at least team_size members. Compared
+          // against the FULL roster — not the capped one — so a
+          // kick-refill (snapshot member drawn from beyond the cap)
+          // does not read as a membership change.
+          const stillMembers = (live: number[], snap: number[]) =>
+            live.length >= m.teamSize && snap.every((x) => live.includes(x));
+          const liveA = (await teamRosterFor(db, m.playerAId, 5)).map((e) => e.player.id);
+          const liveB = (await teamRosterFor(db, m.playerBId, 5)).map((e) => e.player.id);
+          const snapA = gateParts.filter((pt) => pt.side === "A").map((pt) => pt.playerId);
+          const snapB = gateParts.filter((pt) => pt.side === "B").map((pt) => pt.playerId);
+          if (!stillMembers(liveA, snapA) || !stillMembers(liveB, snapB)) {
+            await db
+              .update(schema.matches)
+              .set({ aReady, bReady })
+              .where(eq(schema.matches.id, m.id));
+            ctx.invalidateQueries();
+            return {
+              ok: false,
+              error: "အသင်းသား စာရင်း ပြောင်းသွားပါတယ် — ပွဲလက်ခံတုန်းက အဖွဲ့နဲ့ အခု အဖွဲ့ မတူတော့ပါ။ Team section မှာ အဖွဲ့ကို ပြန်စစ်ပြီးမှ Ready နှိပ်ပါ (Team membership changed since accept — check your team first)",
+              started: false,
+            };
+          }
+          const allMembersReady = gateParts.every(
+            (pt) =>
+              pt.playerId === m.playerAId || pt.playerId === m.playerBId || pt.ready === 1,
+          );
+          if (!allMembersReady) {
+            gateNote = "အဖွဲ့လိုက် ပွဲမှာ အဖွဲ့သား အားလုံး Team section မှာ Ready ဖြစ်မှ ပွဲစနိုင်ပါတယ် — အဖွဲ့သားတွေကို Ready နှိပ်ခိုင်းပါ။";
+            await db
+              .update(schema.matches)
+              .set({ aReady, bReady })
+              .where(eq(schema.matches.id, m.id));
+            ctx.invalidateQueries();
+            return { ok: true, error: gateNote, started: false };
+          }
+        } else {
+          const gA = await teamGateFor(db, m.playerAId, m.teamSize);
+          const gB = await teamGateFor(db, m.playerBId, m.teamSize);
+          if (!(gA && gB)) {
+            gateNote = "အဖွဲ့လိုက် ပွဲမှာ Team section မှာ အဖွဲ့သား အားလုံး Ready ဖြစ်မှ ပွဲစနိုင်ပါတယ် — ကိုယ့် အဖွဲ့ကို အရင် ဖွဲ့ပြီး member အားလုံး Ready နှိပ်ခိုင်းပါ။";
+            await db
+              .update(schema.matches)
+              .set({ aReady, bReady })
+              .where(eq(schema.matches.id, m.id));
+            ctx.invalidateQueries();
+            return { ok: true, error: gateNote, started: false };
+          }
         }
       }
       const both = aReady === 1 && bReady === 1;
@@ -3647,19 +4105,18 @@ export const Actions = {
     },
   }),
 
-  // Batch 7 E: the lobby CREATOR may kick the other participant while
-  // the match is still in ready_check. In the current match model the
-  // accepting side holds exactly ONE seat (playerB) — team rosters are
-  // display/team-gate only and hold no match seat or coin lock — so a
-  // successful kick always empties the accepting side: the match is
-  // cancelled via an atomic ready_check -> cancelled claim
-  // (exactly-once), EVERY lock placed for the match is released in full
-  // (an open lobby holds no locks), pending referral rows are
-  // cancelled, and the challenge returns to "open" so anyone —
-  // including the kicked player — may accept it again. No punishment
-  // or ban state is written. Every guard rejects with zero state
-  // change: non-creator caller, self-kick, match no longer in
-  // ready_check, target not the match's other participant.
+  // Batch 7 E + Batch 8: kicking while the match is in ready_check.
+  // Two shapes: (1) kicking the ACCEPTING LEADER (playerB, creator
+  // only) cancels the match via an atomic ready_check -> cancelled
+  // claim (exactly-once), releases EVERY lock placed for the match —
+  // all snapshot participants in a team match — cancels pending
+  // referral rows, and returns the challenge to "open". (2) Kicking a
+  // NON-LEADER snapshot participant (creator or that side's leader)
+  // refunds just that member and removes their row; the match
+  // continues only if a team member outside the snapshot refills the
+  // slot with their own lock, otherwise the match is voided exactly
+  // like (1). No punishment or ban state is ever written, and every
+  // guard rejects with zero state change.
   kickParticipant: defineAction({
     request: z.object({
       match_id: z.number(),
@@ -3686,20 +4143,202 @@ export const Actions = {
         .limit(1);
       const m = rows[0];
       if (!m) return { ok: false, error: "Match မတွေ့ပါ" };
-      if (m.playerAId !== me.id)
-        return { ok: false, error: "Lobby ထောင်သူပဲ ကန်ထုတ်လို့ရပါတယ် (Only the lobby creator can kick)" };
       if (args.player_id === me.id)
         return { ok: false, error: "ကိုယ့်ကိုယ်ကို ကန်ထုတ်လို့ မရပါ" };
       if (m.status !== "ready_check")
         return { ok: false, error: "ကန်ထုတ်တာကို Ready အဆင့် (ready_check) မှာပဲ လုပ်လို့ရပါတယ် — ပွဲစပြီးရင် မရပါ" };
-      if (args.player_id !== m.playerBId)
-        return { ok: false, error: "ဒီ player က ဒီ match ထဲမှာ မပါဝင်ပါ" };
+      if (args.player_id === m.playerAId)
+        return { ok: false, error: "Lobby ထောင်သူကို ကန်ထုတ်လို့ မရပါ" };
       const target = await getPlayer(db, args.player_id);
       if (!target) return { ok: false, error: "Player မတွေ့ပါ" };
-      // Exactly-once claim FIRST (same discipline as refundMatch): flip
-      // ready_check -> cancelled atomically; a racing second kick or a
-      // settle/cancel loses the claim and changes nothing more.
-      const claim = await db
+      // Batch 8: the kickable set is the accepting leader (playerB —
+      // the original Batch 7 kick) PLUS, in a snapshot team match, any
+      // non-leader participant row. Anyone else is not in this match.
+      const kickParts = await participantsFor(db, m.id);
+      const targetPart = kickParts.find((pt) => pt.playerId === args.player_id);
+      if (args.player_id !== m.playerBId && (!targetPart || targetPart.state !== "locked"))
+        return { ok: false, error: "ဒီ player က ဒီ match ထဲမှာ မပါဝင်ပါ" };
+      // ── LEADER KICK (target = the accepting leader, playerB) ──────
+      // The proven Batch 7 semantics, extended to the snapshot: claim
+      // ready_check -> cancelled atomically (exactly-once), refund
+      // EVERY lock placed for the match (all participants when a
+      // snapshot exists, otherwise the two leaders), cancel pending
+      // referral rows, reopen the challenge. Only the lobby creator
+      // may kick the accepting leader.
+      if (args.player_id === m.playerBId) {
+        if (m.playerAId !== me.id)
+          return { ok: false, error: "Lobby ထောင်သူပဲ ကန်ထုတ်လို့ရပါတယ် (Only the lobby creator can kick)" };
+        const claim = await db
+          .update(schema.matches)
+          .set({ status: "cancelled" })
+          .where(
+            and(
+              eq(schema.matches.id, m.id),
+              eq(schema.matches.status, "ready_check"),
+            ),
+          )
+          .returning({ id: schema.matches.id });
+        if (claim.length === 0)
+          return { ok: false, error: "Match အခြေအနေ ပြောင်းသွားပါပြီ — ပြန်စစ်ပါ" };
+        if (kickParts.length > 0) {
+          await refundAllParticipants(db, m, "Kick — lobby reopened, lock released", [target.id]);
+        } else {
+          for (const pid of [m.playerBId, m.playerAId]) {
+            const p = await getPlayer(db, pid);
+            if (!p) continue;
+            const nb = p.balance + m.stake;
+            await db
+              .update(schema.players)
+              .set({
+                balance: nb,
+                lockedCoins: Math.max(0, p.lockedCoins - m.stake),
+              })
+              .where(eq(schema.players.id, pid));
+            await addTxn(db, {
+              playerId: pid,
+              type: "refund",
+              amount: m.stake,
+              balanceAfter: nb,
+              note: `Kick — lobby reopened, lock released — ${m.code}`,
+              matchId: m.id,
+            });
+          }
+          await db
+            .update(schema.referralCommissions)
+            .set({ status: "cancelled" })
+            .where(
+              and(
+                eq(schema.referralCommissions.matchId, m.id),
+                eq(schema.referralCommissions.status, "pending"),
+              ),
+            );
+        }
+        // Re-list the challenge as an open lobby.
+        await db
+          .update(schema.challenges)
+          .set({ status: "open" })
+          .where(
+            and(
+              eq(schema.challenges.id, m.challengeId),
+              eq(schema.challenges.status, "matched"),
+            ),
+          );
+        await notify(db, {
+          playerId: target.id,
+          type: "match",
+          title: "🚪 Lobby မှ ကန်ထုတ်ခံရပါတယ်",
+          body: `${me.name} (lobby ထောင်သူ) က သင့်ကို ${m.code} lobby မှ ကန်ထုတ်ပါတယ် — lock ထားတဲ့ ${m.stake} coins အပြည့် ပြန်အမ်းပြီးပါပြီ။ Lobby ပြန်ပွင့်နေပါတယ် — ပြန်ဝင်ချင်ရင် ပြန် accept လို့ရပါတယ်။`,
+        });
+        await logAct(db, me.name, `Kicked ${target.name} from ${m.code}; locks released, lobby reopened`);
+        ctx.invalidateQueries();
+        return { ok: true, error: "" };
+      }
+
+      // ── ROSTER KICK (target = a non-leader snapshot participant) ──
+      // Caller: the lobby creator, or the leader of the target's own
+      // side. The kicked member's lock is refunded exactly once and
+      // their participant row removed. The match then continues ONLY
+      // if the side still fields team_size staking players: a team
+      // member outside the snapshot who can cover the stake refills
+      // the slot (and locks). Otherwise the match is void — everyone
+      // else is refunded and the challenge reopens, like a leader kick.
+      if (!targetPart) return { ok: false, error: "ဒီ player က ဒီ match ထဲမှာ မပါဝင်ပါ" };
+      const sideLeaderId = targetPart.side === "A" ? m.playerAId : m.playerBId;
+      if (me.id !== m.playerAId && me.id !== sideLeaderId)
+        return { ok: false, error: "Lobby ထောင်သူ (သို့) အသင်းခေါင်းဆောင်ပဲ ကန်ထုတ်လို့ရပါတယ်" };
+      {
+        const nb = target.balance + targetPart.stake;
+        await db
+          .update(schema.players)
+          .set({
+            balance: nb,
+            lockedCoins: Math.max(0, target.lockedCoins - targetPart.stake),
+          })
+          .where(eq(schema.players.id, target.id));
+        await addTxn(db, {
+          playerId: target.id,
+          type: "refund",
+          amount: targetPart.stake,
+          balanceAfter: nb,
+          note: `Kick — lock released — ${m.code}`,
+          matchId: m.id,
+        });
+        await db
+          .delete(schema.matchParticipants)
+          .where(eq(schema.matchParticipants.id, targetPart.id));
+        await db
+          .update(schema.referralCommissions)
+          .set({ status: "cancelled" })
+          .where(
+            and(
+              eq(schema.referralCommissions.matchId, m.id),
+              eq(schema.referralCommissions.status, "pending"),
+              eq(schema.referralCommissions.referredId, target.id),
+            ),
+          );
+      }
+      const inMatch = new Set(
+        kickParts.filter((pt) => pt.id !== targetPart.id).map((pt) => pt.playerId),
+      );
+      const candidates = (await teamRosterFor(db, sideLeaderId, 5)).filter(
+        (e) => !inMatch.has(e.player.id) && e.player.id !== target.id,
+      );
+      let refilled = false;
+      for (const cand of candidates) {
+        const lock = await db
+          .update(schema.players)
+          .set({
+            balance: sql`${schema.players.balance} - ${m.stake}`,
+            lockedCoins: sql`${schema.players.lockedCoins} + ${m.stake}`,
+          })
+          .where(
+            and(
+              eq(schema.players.id, cand.player.id),
+              gte(schema.players.balance, m.stake),
+            ),
+          )
+          .returning({ balance: schema.players.balance });
+        const nbC = lock[0]?.balance;
+        if (nbC === undefined) continue;
+        await db.insert(schema.matchParticipants).values({
+          matchId: m.id,
+          playerId: cand.player.id,
+          side: targetPart.side,
+          stake: m.stake,
+          ready: cand.ready ? 1 : 0,
+          state: "locked",
+        });
+        await addTxn(db, {
+          playerId: cand.player.id,
+          type: "lock",
+          amount: -m.stake,
+          balanceAfter: nbC,
+          note: `Coin lock — match ${m.code} (slot refill)`,
+        });
+        await notify(db, {
+          playerId: cand.player.id,
+          type: "challenge_accepted",
+          title: "အသင်းလိုက် Match မှာ နေရာ ရပါတယ် ⚔️",
+          body: `${m.code} မှာ လစ်လပ်နေတဲ့ နေရာကို သင် ဝင်ပြီး stake ${m.stake} coins lock လုပ်ထားပါတယ် — Team section မှာ Ready နှိပ်ပေးပါ။`,
+          matchId: m.id,
+        });
+        refilled = true;
+        break;
+      }
+      if (refilled) {
+        await notify(db, {
+          playerId: target.id,
+          type: "match",
+          title: "🚪 Lobby မှ ကန်ထုတ်ခံရပါတယ်",
+          body: `${me.name} က သင့်ကို ${m.code} lobby မှ ကန်ထုတ်ပါတယ် — lock ထားတဲ့ ${m.stake} coins အပြည့် ပြန်အမ်းပြီးပါပြီ။`,
+        });
+        await logAct(db, me.name, `Kicked roster member ${target.name} from ${m.code}; slot refilled`);
+        ctx.invalidateQueries();
+        return { ok: true, error: "" };
+      }
+      // No refill: void the match (exactly-once claim), refund every
+      // remaining participant, reopen the challenge.
+      const claim2 = await db
         .update(schema.matches)
         .set({ status: "cancelled" })
         .where(
@@ -3709,40 +4348,9 @@ export const Actions = {
           ),
         )
         .returning({ id: schema.matches.id });
-      if (claim.length === 0)
+      if (claim2.length === 0)
         return { ok: false, error: "Match အခြေအနေ ပြောင်းသွားပါပြီ — ပြန်စစ်ပါ" };
-      // Release EVERY lock placed for this match (kicked player AND
-      // creator) back to balances — an open lobby holds no locks.
-      for (const pid of [m.playerBId, m.playerAId]) {
-        const p = await getPlayer(db, pid);
-        if (!p) continue;
-        const nb = p.balance + m.stake;
-        await db
-          .update(schema.players)
-          .set({
-            balance: nb,
-            lockedCoins: Math.max(0, p.lockedCoins - m.stake),
-          })
-          .where(eq(schema.players.id, pid));
-        await addTxn(db, {
-          playerId: pid,
-          type: "refund",
-          amount: m.stake,
-          balanceAfter: nb,
-          note: `Kick — lobby reopened, lock released — ${m.code}`,
-          matchId: m.id,
-        });
-      }
-      await db
-        .update(schema.referralCommissions)
-        .set({ status: "cancelled" })
-        .where(
-          and(
-            eq(schema.referralCommissions.matchId, m.id),
-            eq(schema.referralCommissions.status, "pending"),
-          ),
-        );
-      // Re-list the challenge as an open lobby.
+      await refundAllParticipants(db, m, "Kick — lobby reopened, lock released", [target.id]);
       await db
         .update(schema.challenges)
         .set({ status: "open" })
@@ -3756,9 +4364,9 @@ export const Actions = {
         playerId: target.id,
         type: "match",
         title: "🚪 Lobby မှ ကန်ထုတ်ခံရပါတယ်",
-        body: `${me.name} (lobby ထောင်သူ) က သင့်ကို ${m.code} lobby မှ ကန်ထုတ်ပါတယ် — lock ထားတဲ့ ${m.stake} coins အပြည့် ပြန်အမ်းပြီးပါပြီ။ Lobby ပြန်ပွင့်နေပါတယ် — ပြန်ဝင်ချင်ရင် ပြန် accept လို့ရပါတယ်။`,
+        body: `${me.name} က သင့်ကို ${m.code} lobby မှ ကန်ထုတ်ပါတယ် — lock ထားတဲ့ ${m.stake} coins အပြည့် ပြန်အမ်းပြီးပါပြီ။ Lobby ပြန်ပွင့်နေပါတယ်။`,
       });
-      await logAct(db, me.name, `Kicked ${target.name} from ${m.code}; locks released, lobby reopened`);
+      await logAct(db, me.name, `Kicked roster member ${target.name} from ${m.code}; no refill — match voided, lobby reopened`);
       ctx.invalidateQueries();
       return { ok: true, error: "" };
     },
@@ -4898,25 +5506,39 @@ export const Actions = {
   }),
 
   feePreview: defineAction({
-    request: z.object({ arena: z.enum(["1v1", "classic", "brawl"]), stake: z.number().int().min(0) }),
+    request: z.object({
+      arena: z.enum(["1v1", "classic", "brawl"]),
+      stake: z.number().int().min(0),
+      // Batch 8: the wizard passes the chosen team size so the preview
+      // uses the same shared calculator as settlement. Defaults to 1
+      // (the old two-player preview) for older callers.
+      team_size: z.number().int().min(1).max(5).default(1),
+    }),
     response: z.object({
       pot: z.number(),
       fee_amount: z.number(),
       fee_label: z.string(),
       payout: z.number(),
+      per_winner_share: z.number(),
+      team_size: z.number(),
       referral_example: z.number(),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const s = await getSettingsMap(db);
-      const pot = args.stake * 2;
-      const { fee, label } = feeFor(s, args.arena, pot);
+      const pot0 = payoutCalc(args.stake, args.team_size, 0).pot;
+      const { fee, label } = feeFor(s, args.arena, pot0);
+      const calc = payoutCalc(args.stake, args.team_size, fee);
       const pctX100 = Number(s["referral_percent_x100"] ?? "100") || 0;
       return {
-        pot,
+        pot: calc.pot,
         fee_amount: fee,
         fee_label: label,
-        payout: pot - fee,
+        // For size 1, payout is the winner's whole prize (unchanged);
+        // for team sizes it is the per-member winning share.
+        payout: calc.share,
+        per_winner_share: calc.share,
+        team_size: args.team_size,
         referral_example: Math.floor((fee * pctX100) / 10000),
       };
     },
@@ -5522,6 +6144,31 @@ export const Actions = {
               eq(schema.teamMembers.playerId, args.player_id),
             ),
           );
+        // Batch 8: mirror the ready flag onto this player's FROZEN
+        // participant rows in ready_check matches — the match start
+        // gate reads the snapshot, so a Team-section Ready must land
+        // there too. (Leaders are additionally covered by the room's
+        // own Ready flow.)
+        const myParts = await db
+          .select()
+          .from(schema.matchParticipants)
+          .where(eq(schema.matchParticipants.playerId, args.player_id));
+        for (const pt of myParts) {
+          if (pt.state !== "locked") continue;
+          const mm = (
+            await db
+              .select()
+              .from(schema.matches)
+              .where(eq(schema.matches.id, pt.matchId))
+              .limit(1)
+          )[0];
+          if (mm && mm.status === "ready_check") {
+            await db
+              .update(schema.matchParticipants)
+              .set({ ready: args.ready ? 1 : 0 })
+              .where(eq(schema.matchParticipants.id, pt.id));
+          }
+        }
       }
       ctx.invalidateQueries();
       return { ok: true, error: "" };

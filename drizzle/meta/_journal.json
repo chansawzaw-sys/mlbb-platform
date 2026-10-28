@@ -85,6 +85,13 @@
       "when": 1793700000000,
       "tag": "0012_purge_non_owner_players",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1793800000000,
+      "tag": "0013_add_match_participants",
+      "breakpoints": true
     }
   ]
 }
