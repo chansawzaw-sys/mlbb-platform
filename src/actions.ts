@@ -211,6 +211,16 @@ const DEFAULT_SETTINGS: Record<string, string> = {
     "Hero အကုန် ကိုင်ခွင့်ရှိ",
   ]),
   rules_classic_4_5: JSON.stringify(["Hero အကုန် ကိုင်ခွင့်ရှိ", "ကြိုက်သလိုဆော့"]),
+  // Per-size Classic sets (2026-10-28): EMPTY default is the "never saved"
+  // sentinel — parseFixedRules falls back to the grouped set
+  // (rules_classic_2_3 / rules_classic_4_5) until the Owner saves the
+  // per-size key, so no existing text changes until then. The keys must
+  // exist here or updateSettings' allowlist (k in DEFAULT_SETTINGS)
+  // would refuse to store them.
+  rules_classic_2: "",
+  rules_classic_3: "",
+  rules_classic_4: "",
+  rules_classic_5: "",
   challenge_min_stake_coins: "100",
 };
 
@@ -250,13 +260,30 @@ function parseRuleList(raw: string | undefined, defaults: string[]): string[] {
   return [...defaults];
 }
 
-function parseFixedRules(s: Record<string, string>): { mode_1v1: string[]; brawl: string[]; classic_1: string[]; classic_2_3: string[]; classic_4_5: string[] } {
+/** Per-size Classic resolution (2026-10-28): a per-size key that was
+ *  never saved (absent, or the "" DEFAULT_SETTINGS sentinel) falls back
+ *  to the GROUPED set; a saved key (any stored JSON, including "[]")
+ *  wins. This is the ONE resolution used by fixedRulesFor (server
+ *  stamping), settingsOut (bootstrap + admin display) — so what the
+ *  Owner sees in Admin → Content is exactly what new challenges stamp. */
+function resolvePerSize(raw: string | undefined, grouped: string[]): string[] {
+  if (raw === undefined || raw.trim() === "") return [...grouped];
+  return parseRuleList(raw, grouped);
+}
+
+function parseFixedRules(s: Record<string, string>): { mode_1v1: string[]; brawl: string[]; classic_1: string[]; classic_2: string[]; classic_3: string[]; classic_4: string[]; classic_5: string[]; classic_2_3: string[]; classic_4_5: string[] } {
+  const classic_2_3 = parseRuleList(s["rules_classic_2_3"], DEFAULT_FIXED_RULES.classic_2_3);
+  const classic_4_5 = parseRuleList(s["rules_classic_4_5"], DEFAULT_FIXED_RULES.classic_4_5);
   return {
     mode_1v1: parseRuleList(s["rules_1v1"], DEFAULT_FIXED_RULES.mode_1v1),
     brawl: parseRuleList(s["rules_brawl"], DEFAULT_FIXED_RULES.brawl),
     classic_1: parseRuleList(s["rules_classic_1"], DEFAULT_FIXED_RULES.classic_1),
-    classic_2_3: parseRuleList(s["rules_classic_2_3"], DEFAULT_FIXED_RULES.classic_2_3),
-    classic_4_5: parseRuleList(s["rules_classic_4_5"], DEFAULT_FIXED_RULES.classic_4_5),
+    classic_2: resolvePerSize(s["rules_classic_2"], classic_2_3),
+    classic_3: resolvePerSize(s["rules_classic_3"], classic_2_3),
+    classic_4: resolvePerSize(s["rules_classic_4"], classic_4_5),
+    classic_5: resolvePerSize(s["rules_classic_5"], classic_4_5),
+    classic_2_3,
+    classic_4_5,
   };
 }
 
@@ -267,8 +294,10 @@ function fixedRulesFor(s: Record<string, string>, arena: string, teamSize: numbe
   if (arena === "brawl") return sets.brawl;
   if (arena === "1v1") return sets.mode_1v1;
   if (teamSize <= 1) return sets.classic_1;
-  if (teamSize <= 3) return sets.classic_2_3;
-  return sets.classic_4_5;
+  if (teamSize === 2) return sets.classic_2;
+  if (teamSize === 3) return sets.classic_3;
+  if (teamSize === 4) return sets.classic_4;
+  return sets.classic_5;
 }
 
 async function getSettingsMap(db: Db): Promise<Record<string, string>> {
@@ -1150,15 +1179,23 @@ function ownerPlayerBlock(p: PlayerRow | null | undefined): string | null {
   return p && effectiveRole(p) === "owner" ? OWNER_PLAYER_ERR : null;
 }
 
-/** Arena ↔ team-size coupling (Batch 6): the create wizard, the board
- *  filters, the fixed-rules stamping and this server check all use the
- *  SAME rule — 1v1 arena allows ONLY size 1; Classic allows ONLY 2–5;
- *  Brawl keeps every size. Legacy rows are never re-validated. */
+/** Arena ↔ team-size matrix (FINAL, user 2026-10-28 — supersedes the
+ *  Batch 6 coupling): the create wizard, the board filters, the
+ *  fixed-rules stamping and this server check all use the SAME rule —
+ *  size 1v1 offers ALL THREE modes (1v1 Room / Classic / Brawl); sizes
+ *  2v2–5v5 offer Classic ONLY. Allowed creation combos (7 of 15):
+ *  (1v1,1), (classic,1), (brawl,1), (classic,2–5). (classic,1) is newly
+ *  allowed (stamps rules_classic_1); (brawl,2–5) is newly rejected.
+ *  CREATION-ONLY: legacy rows are never re-validated — accept/render/
+ *  play paths do not call this. Display labels come from the client's
+ *  single ARENAS mapping ('1v1' → "1v1 Room"); keys unchanged. */
 function arenaSizeError(arena: string, teamSize: number): string | null {
   if (arena === "1v1" && teamSize !== 1)
-    return "1v1 Arena မှာ team size က 1v1 ပဲ ရပါတယ် — တခြား size မရှိပါ (The 1v1 arena allows only the 1v1 size)";
-  if (arena === "classic" && teamSize === 1)
-    return "Classic mode မှာ 1v1 မရှိပါ — 2v2 ကနေ 5v5 အထိ ရွေးပါ (Classic offers 2v2–5v5 only, no 1v1)";
+    return "1v1 Room မှာ team size က 1v1 ပဲ ရပါတယ် — တခြား size မရှိပါ (1v1 Room allows only the 1v1 size)";
+  if (arena === "brawl" && teamSize !== 1)
+    return "Brawl မှာ team size က 1v1 ပဲ ရပါတယ် — 2v2–5v5 မှာ Classic ပဲ ရပါတယ် (Brawl allows only the 1v1 size — at 2v2–5v5 only Classic is available)";
+  if (arena === "classic" && (teamSize < 1 || teamSize > 5))
+    return "Classic မှာ team size က 1v1 ကနေ 5v5 အထိ ရပါတယ် (Classic allows sizes 1v1 to 5v5)";
   return null;
 }
 
@@ -1679,6 +1716,10 @@ const settingsShape = z.object({
   preset_rules: z.array(z.string()),
   fixed_rules: z.object({
     classic_1: z.array(z.string()),
+    classic_2: z.array(z.string()),
+    classic_3: z.array(z.string()),
+    classic_4: z.array(z.string()),
+    classic_5: z.array(z.string()),
     classic_2_3: z.array(z.string()),
     classic_4_5: z.array(z.string()),
     brawl: z.array(z.string()),
@@ -1776,6 +1817,9 @@ function settingsOut(s: Record<string, string>, adminView = false) {
     slide_image_10: s["slide_image_10"] ?? "",
     // Back-compat alias: preset_rules mirrors the Classic 4–5 fixed list
     // (the tournament pick-list; challenges use fixed_rules via the server).
+    // NOTE (2026-10-28): this flat tournament pick-list intentionally stays
+    // the GROUPED classic_4_5 set — it is not per-size, so the per-size
+    // Classic resolution (classic_2..5) does not apply to it.
     preset_rules: fixedRules.classic_4_5,
     fixed_rules: fixedRules,
     challenge_min_stake_coins: numSetting(s, "challenge_min_stake_coins", 100),
@@ -2655,9 +2699,10 @@ export const Actions = {
       // room copies — one single source.
       if (!idsComplete(p))
         return { ok: false, error: IDS_GATE_ERR, challenge_id: 0 };
-      // Arena ↔ size coupling (Batch 6): same rule the wizard and the
-      // board filters enforce — a mismatched combo can never be created,
-      // so the fixed rules stamped below always match a legal combo.
+      // Arena ↔ size matrix (FINAL 2026-10-28): same rule the wizard and
+      // the board filters enforce — a combo outside the 7 allowed ones
+      // can never be created, so the fixed rules stamped below always
+      // match a legal combo. Creation-only; legacy rows unaffected.
       const sizeErr = arenaSizeError(args.arena, args.team_size);
       if (sizeErr) return { ok: false, error: sizeErr, challenge_id: 0 };
       // One lobby at a time: a creator may hold at most ONE open challenge,
