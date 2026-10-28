@@ -152,9 +152,11 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   google_setup_by_name: "",
   google_setup_at: "",
   kpay_phone: "",
+  kpay_name: "",
   kpay_qr: "",
   kpay_qr_key: "",
   wave_phone: "",
+  wave_name: "",
   wave_qr: "",
   wave_qr_key: "",
   coin_rate_kyat: "8",
@@ -1006,19 +1008,16 @@ async function teamFillFor(db: Db, playerId: number, teamSize: number): Promise<
   return best;
 }
 
-/** Roster for one side of a team match: the members of the side player's
- *  "best" team — most members first, most Team-section readies as the
- *  tiebreak (the same membership pool the team gate/fill read) — with the
- *  side's match player first, capped at teamSize. Each entry carries the
- *  member's public profile + their own Team-section ready flag, so the
- *  match room can render a real profile card per filled slot. Empty for
- *  1v1 matches and when the player has no team at all. */
-async function teamRosterFor(
+/** The UNCAPPED membership pool behind teamRosterFor: every member of
+ *  the player's "best" team (most members first, most Team-section
+ *  readies as tiebreak), the player themself first. This is the pool
+ *  joinMatchSlot draws late slot-fillers from and the setReady union
+ *  membership check reads — a snapshot member drawn from beyond the
+ *  team_size cap must still read as a member here. */
+async function teamPoolFor(
   db: Db,
   playerId: number,
-  teamSize: number,
 ): Promise<{ player: PlayerRow; ready: boolean }[]> {
-  if (teamSize <= 1) return [];
   const memberships = await db
     .select()
     .from(schema.teamMembers)
@@ -1039,7 +1038,7 @@ async function teamRosterFor(
         x.id - y.id,
     );
     const out: { player: PlayerRow; ready: boolean }[] = [];
-    for (const mm of ordered.slice(0, teamSize)) {
+    for (const mm of ordered) {
       const p = await getPlayer(db, mm.playerId);
       if (p) out.push({ player: p, ready: mm.ready === 1 });
     }
@@ -1049,11 +1048,55 @@ async function teamRosterFor(
   return best;
 }
 
+/** Roster for one side of a team match: the members of the side player's
+ *  "best" team — most members first, most Team-section readies as the
+ *  tiebreak (the same membership pool the team gate/fill read) — with the
+ *  side's match player first, capped at teamSize. Each entry carries the
+ *  member's public profile + their own Team-section ready flag, so the
+ *  match room can render a real profile card per filled slot. Empty for
+ *  1v1 matches and when the player has no team at all. */
+async function teamRosterFor(
+  db: Db,
+  playerId: number,
+  teamSize: number,
+): Promise<{ player: PlayerRow; ready: boolean }[]> {
+  if (teamSize <= 1) return [];
+  return (await teamPoolFor(db, playerId)).slice(0, teamSize);
+}
+
+/** Which side (if any) `viewerId` may still join in this match under the
+ *  progressive-fill rules (Batch 11, item 5): a ready_check team match,
+ *  the viewer not already a leader or snapshot participant, the viewer in
+ *  exactly ONE leader's (uncapped) team pool, and that side still holding
+ *  an empty slot (locked participant count < team_size). getMatch ships
+ *  this as viewer_join_side; joinMatchSlot re-checks the same rules with
+ *  per-reason errors before locking the stake. */
+async function joinableSideFor(
+  db: Db,
+  m: MatchRow,
+  viewerId: number,
+): Promise<"A" | "B" | null> {
+  if (m.teamSize < 2 || m.status !== "ready_check") return null;
+  if (viewerId === m.playerAId || viewerId === m.playerBId) return null;
+  const parts = await participantsFor(db, m.id);
+  if (parts.some((pt) => pt.playerId === viewerId)) return null;
+  const poolA = await teamPoolFor(db, m.playerAId);
+  const poolB = await teamPoolFor(db, m.playerBId);
+  const inA = poolA.some((e) => e.player.id === viewerId);
+  const inB = poolB.some((e) => e.player.id === viewerId);
+  if (inA === inB) return null;
+  const side = inA ? ("A" as const) : ("B" as const);
+  const count = parts.filter(
+    (pt) => pt.side === side && pt.state === "locked",
+  ).length;
+  return count < m.teamSize ? side : null;
+}
+
 /** FIXED result-timing rules (Owner decision, in code — not admin settings):
- *  results unlock exactly 10 minutes after the match starts; once the FIRST
+ *  results unlock exactly 6 minutes after the match starts; once the FIRST
  *  player submits, the other player has exactly 5 minutes to submit, after
  *  which the first submitter wins automatically (see the sweep below). */
-const RESULT_UNLOCK_MS = 10 * 60 * 1000;
+const RESULT_UNLOCK_MS = 6 * 60 * 1000;
 const SECOND_RESULT_MS = 5 * 60 * 1000;
 
 /** Timeout sweep: ready-check warning -> cancel+refund; stale live matches;
@@ -1391,7 +1434,7 @@ function arenaSizeError(arena: string, teamSize: number): string | null {
  *  never diverge. CREATION-ONLY: legacy brawl rows stored with other
  *  hero rules still display and play. */
 const BRAWL_HERO_RULE = "any";
-const BRAWL_HERO_RULE_ERR = "Brawl မှာ hero rule မရှိပါ (Brawl has no hero rule)";
+const BRAWL_HERO_RULE_ERR = "Brawl မှာ hero role မရှိပါ (Brawl has no hero role)";
 
 /** FINAL hero-rule table (user, 2026-10-28 Batch 7 B + Batch 10) —
  *  the wizard and this server check enforce exactly the same table:
@@ -1409,7 +1452,7 @@ function heroRuleSizeError(heroRule: string, teamSize: number, arena: string): s
   }
   const isSame = heroRule === "same" || heroRule.startsWith("same:");
   if (heroRule === "open")
-    return "\"Open\" hero rule ကို ဖယ်ရှားထားပါတယ် — size 1v1 မှာ Fighter / Assassin / Mage / Marksman / Same Hero, size 2v2–5v5 မှာ Fighter / Assassin / Mage / Marksman / Any Hero / 💬 Chatbox မှာ ဆွေးနွေးမည် ထဲက ရွေးပါ";
+    return "\"Open\" hero role ကို ဖယ်ရှားထားပါတယ် — size 1v1 မှာ Fighter / Assassin / Mage / Marksman / Same Hero, size 2v2–5v5 မှာ Fighter / Assassin / Mage / Marksman / Any Hero / 💬 Chatbox မှာ ဆွေးနွေးမည် ထဲက ရွေးပါ";
   if (isSame) {
     if (teamSize !== 1)
       return "Same Hero ကို 1v1 မှာပဲ ရွေးလို့ရပါတယ် — 2v2–5v5 မှာ Fighter / Assassin / Mage / Marksman / Any Hero / 💬 Chatbox မှာ ဆွေးနွေးမည် ထဲက ရွေးပါ (Same Hero is only available at 1v1)";
@@ -1421,7 +1464,7 @@ function heroRuleSizeError(heroRule: string, teamSize: number, arena: string): s
     return null;
   }
   if (["fighter", "assassin", "mage", "marksman"].includes(heroRule)) return null;
-  return "Hero rule မမှန်ပါ — size 1v1 မှာ Fighter / Assassin / Mage / Marksman / Same Hero, size 2v2–5v5 မှာ Fighter / Assassin / Mage / Marksman / Any Hero / 💬 Chatbox မှာ ဆွေးနွေးမည် ထဲက ရွေးပါ";
+  return "Hero role မမှန်ပါ — size 1v1 မှာ Fighter / Assassin / Mage / Marksman / Same Hero, size 2v2–5v5 မှာ Fighter / Assassin / Mage / Marksman / Any Hero / 💬 Chatbox မှာ ဆွေးနွေးမည် ထဲက ရွေးပါ";
 }
 
 /** Payout ACCOUNT NAME (Batch 6): the KPay/Wave account holder's name.
@@ -1522,7 +1565,17 @@ async function settleMatch(
   // to completed, so a replayed settle pays nobody twice.
   const snapParts = await participantsFor(db, match.id);
   if (match.teamSize > 1 && snapParts.length > 0) {
-    const winSide = winnerId === match.playerAId ? "A" : "B";
+    // Batch 11 (team swap): the winning side is the side the WINNING
+    // LEADER's participant row sits on NOW — a leader who swapped sides
+    // mid-lobby wins for the side they ended on, not the side their
+    // playerAId/playerBId column implies. Fallback to the column mapping
+    // only when the leader holds no participant row.
+    const winLeaderRow = snapParts.find((pt) => pt.playerId === winnerId);
+    const winSide = winLeaderRow
+      ? winLeaderRow.side
+      : winnerId === match.playerAId
+        ? "A"
+        : "B";
     const feeT = match.feeAmount;
     const potT = match.stake * snapParts.length;
     const winners = snapParts.filter((pt) => pt.side === winSide);
@@ -2162,8 +2215,10 @@ const settingsShape = z.object({
   fixed_admin_email: z.string().optional(),
   match_timeout_min: z.number(),
   kpay_phone: z.string(),
+  kpay_name: z.string(),
   kpay_qr: z.string(),
   wave_phone: z.string(),
+  wave_name: z.string(),
   wave_qr: z.string(),
   coin_rate_kyat: z.number(),
   withdraw_fee_percent: z.number(),
@@ -2273,8 +2328,12 @@ function settingsOut(s: Record<string, string>, adminView = false) {
     ...(adminView ? { fixed_admin_email: FIXED_ADMIN_EMAIL } : {}),
     match_timeout_min: numSetting(s, "match_timeout_min", 180),
     kpay_phone: s["kpay_phone"] ?? "",
+    // Receiving account names are PUBLIC by design (shown with the phone
+    // on the top-up screen so players can verify the transfer target).
+    kpay_name: s["kpay_name"] ?? "",
     kpay_qr: s["kpay_qr"] ?? "",
     wave_phone: s["wave_phone"] ?? "",
+    wave_name: s["wave_name"] ?? "",
     wave_qr: s["wave_qr"] ?? "",
     coin_rate_kyat: numSetting(s, "coin_rate_kyat", 8),
     withdraw_fee_percent: numSetting(s, "withdraw_fee_percent", 0),
@@ -2761,6 +2820,19 @@ export const Actions = {
           decided_at: z.string(),
         }),
       ),
+      // Batch 11: public recent-winners feed — public-safe fields only
+      // (winner display names, per-winner amount, match descriptor
+      // fields, completion time). Never balances, phones or locks.
+      recent_winners: z.array(
+        z.object({
+          winner_names: z.array(z.string()),
+          amount: z.number(),
+          team_size: z.number(),
+          arena: z.string(),
+          hero_rule: z.string(),
+          completed_at: z.string(),
+        }),
+      ),
       total_paid_kyat: z.number(),
       diamond_packages: z.array(diamondPackageShape),
       diamond_orders: z.array(diamondOrderShape),
@@ -2850,7 +2922,7 @@ export const Actions = {
             .from(schema.withdrawRequests)
             .where(eq(schema.withdrawRequests.status, "paid"))
             .orderBy(desc(schema.withdrawRequests.decidedAt))
-            .limit(30);
+            .limit(10);
           return paid.map((w) => ({
             masked_name: maskName(
               allPlayers.find((x) => x.id === w.playerId)?.name ?? "Player",
@@ -2868,6 +2940,66 @@ export const Actions = {
             .from(schema.withdrawRequests)
             .where(eq(schema.withdrawRequests.status, "paid"));
           return paidAll.reduce((a, w) => a + w.netKyat, 0);
+        })(),
+        recent_winners: await (async () => {
+          // Latest 10 completed matches WITH a winner, newest first.
+          // Snapshot (team) matches: the winning side is the winning
+          // LEADER's participant-row side (post-swap correct, same rule
+          // as settleMatch); winner_names are that side's PAID rows —
+          // falling back to the side's rows when none are marked paid —
+          // and amount is the per-winner payout share. Non-snapshot
+          // matches: the single winner and pot − fee.
+          const done = await db
+            .select()
+            .from(schema.matches)
+            .where(eq(schema.matches.status, "completed"))
+            .orderBy(desc(schema.matches.completedAt))
+            .limit(40);
+          const nameOf = (id: number) =>
+            allPlayers.find((x) => x.id === id)?.name ?? "Player";
+          const out: {
+            winner_names: string[];
+            amount: number;
+            team_size: number;
+            arena: string;
+            hero_rule: string;
+            completed_at: string;
+          }[] = [];
+          for (const cm of done) {
+            if (out.length >= 10) break;
+            if (cm.winnerId == null) continue;
+            const parts = await participantsFor(db, cm.id);
+            if (parts.length > 0) {
+              const leaderRow = parts.find((pt) => pt.playerId === cm.winnerId);
+              const winSide = leaderRow
+                ? leaderRow.side
+                : cm.winnerId === cm.playerAId
+                  ? "A"
+                  : "B";
+              const sideRows = parts.filter((pt) => pt.side === winSide);
+              const paidRows = sideRows.filter((pt) => pt.state === "paid");
+              const winRows = paidRows.length > 0 ? paidRows : sideRows;
+              if (winRows.length === 0) continue;
+              out.push({
+                winner_names: winRows.map((pt) => nameOf(pt.playerId)),
+                amount: winRows[0]!.payoutAmount,
+                team_size: cm.teamSize,
+                arena: cm.arena,
+                hero_rule: cm.heroRule,
+                completed_at: iso(cm.completedAt) ?? iso(cm.createdAt) ?? "",
+              });
+            } else {
+              out.push({
+                winner_names: [nameOf(cm.winnerId)],
+                amount: cm.stake * 2 - cm.feeAmount,
+                team_size: cm.teamSize,
+                arena: cm.arena,
+                hero_rule: cm.heroRule,
+                completed_at: iso(cm.completedAt) ?? iso(cm.createdAt) ?? "",
+              });
+            }
+          }
+          return out;
         })(),
         // Diamond shop: enabled packages (sorted) for everyone; the
         // viewer's own orders only (empty when logged out).
@@ -3366,24 +3498,33 @@ export const Actions = {
       if (acceptor.balance < ch.stake || creator.balance < ch.stake)
         return { ok: false, error: "Coin မလုံလောက်ပါ (နှစ်ဖက်လုံး stake ရှိရပါမယ်)", match_id: 0 };
 
-      // TEAM SNAPSHOT (Batch 8): for team_size ≥ 2, freeze both rosters
-      // from each leader's qualifying team (the same team teamRosterFor
-      // selects — most members, most Team-section readies as tiebreak —
-      // leader first, capped at team_size). Accept REQUIRES both rosters
-      // determinable NOW, because every roster player stakes when they
-      // take a slot: a leader whose team is short is rejected here,
-      // before any state changes.
+      // TEAM SNAPSHOT (Batch 8, progressive fill per Batch 11 item 5):
+      // for team_size ≥ 2, freeze both rosters from each leader's
+      // qualifying team pool (the same team teamRosterFor selects — most
+      // members, most Team-section readies as tiebreak). Each roster is
+      // LEADER-FIRST: the leader is ALWAYS snapshotted, even with no
+      // Team-section team at all, then that leader's pool members in
+      // order, capped at team_size. The snapshot may be PARTIAL — there
+      // is NO fill-order gate: a short side fills later through
+      // joinMatchSlot while the match sits in ready_check. The only
+      // roster rejection left is a player appearing on BOTH sides.
       let rosterA: { player: PlayerRow; ready: boolean }[] = [];
       let rosterB: { player: PlayerRow; ready: boolean }[] = [];
       if (ch.teamSize >= 2) {
-        rosterA = await teamRosterFor(db, creator.id, ch.teamSize);
-        rosterB = await teamRosterFor(db, acceptor.id, ch.teamSize);
-        if (rosterA.length < ch.teamSize || rosterB.length < ch.teamSize)
-          return {
-            ok: false,
-            error: `အသင်းလိုက် ပွဲအတွက် နှစ်ဖက်လုံးမှာ အဖွဲ့သား ${ch.teamSize} ယောက် အပြည့် ရှိရပါမယ် — အရင် Team section မှာ အဖွဲ့ ဖွဲ့ပြီး member အပြည့် ထည့်ပြီးမှ လက်ခံပါ (Both leaders must complete their ${ch.teamSize}-player team in the Team section first)`,
-            match_id: 0,
-          };
+        const leaderFirst = async (leader: PlayerRow) => {
+          const pool = await teamPoolFor(db, leader.id);
+          const out: { player: PlayerRow; ready: boolean }[] = [];
+          const lead = pool.find((e) => e.player.id === leader.id);
+          out.push({ player: leader, ready: lead?.ready ?? false });
+          for (const e of pool) {
+            if (out.length >= ch.teamSize) break;
+            if (e.player.id === leader.id) continue;
+            out.push(e);
+          }
+          return out;
+        };
+        rosterA = await leaderFirst(creator);
+        rosterB = await leaderFirst(acceptor);
         const idsA = new Set(rosterA.map((e) => e.player.id));
         if (rosterB.some((e) => idsA.has(e.player.id)))
           return {
@@ -3759,6 +3900,9 @@ export const Actions = {
       ),
       result_unlocked: z.boolean(),
       unlock_at: z.string().nullable(),
+      // Batch 11: the side the session viewer may still join via
+      // joinMatchSlot right now (progressive fill), or null.
+      viewer_join_side: z.enum(["A", "B"]).nullable(),
       heroes: z.array(z.object({ name: z.string(), role: z.string(), banned: z.boolean() })),
       ice_servers: z.array(
         z.object({ urls: z.array(z.string()), username: z.string(), credential: z.string() }),
@@ -3784,12 +3928,17 @@ export const Actions = {
         .limit(1);
       const m = rows[0];
       if (!m)
-        return { match: null, chat: [], result_unlocked: false, unlock_at: null, heroes: heroesFor(""), ice_servers: iceServersFor(s, false) };
+        return { match: null, chat: [], result_unlocked: false, unlock_at: null, viewer_join_side: null, heroes: heroesFor(""), ice_servers: iceServersFor(s, false) };
       // Privacy gate (M3): chat history and evidence URLs go ONLY to the
       // match's participants or staff. Match ids are sequential, so an
       // ungated read would leak every room's chat + screenshots to anyone.
+      // Batch 11: snapshot participants (joinMatchSlot fillers included)
+      // count as participants, not just the two leaders.
       const isParticipant =
-        !!viewer && (viewer.id === m.playerAId || viewer.id === m.playerBId);
+        !!viewer &&
+        (viewer.id === m.playerAId ||
+          viewer.id === m.playerBId ||
+          (await participantsFor(db, m.id)).some((pt) => pt.playerId === viewer.id));
       const isStaff =
         !!viewer &&
         ["owner", "admin", "moderator", "support"].includes(effectiveRole(viewer));
@@ -3806,7 +3955,7 @@ export const Actions = {
       const chatAvatarMap = new Map<number, string>();
       const chatColorMap = new Map<number, string>();
       for (const cp of chatPlayers) { chatAvatarMap.set(cp.id, await blobUrlSafe(ctx, cp.avatarBlobKey ?? "")); chatColorMap.set(cp.id, cp.avatarColor); }
-      // Fixed rule (in code): results unlock exactly 10 minutes after start.
+      // Fixed rule (in code): results unlock exactly 6 minutes after start.
       const unlockAt = m.startedAt ? new Date(m.startedAt.getTime() + RESULT_UNLOCK_MS) : null;
       return {
         heroes: heroesFor(m.bannedHeroes),
@@ -3822,6 +3971,7 @@ export const Actions = {
         })),
         result_unlocked: unlockAt ? Date.now() >= unlockAt.getTime() : false,
         unlock_at: unlockAt ? unlockAt.toISOString() : null,
+        viewer_join_side: viewer ? await joinableSideFor(db, m, viewer.id) : null,
         ice_servers: iceServersFor(s, priv),
       };
     },
@@ -3844,7 +3994,17 @@ export const Actions = {
       const mRows = await db.select().from(schema.matches)
         .where(eq(schema.matches.id, args.match_id)).limit(1);
       const mm = mRows[0];
-      if (!mm || (mm.playerAId !== p.id && mm.playerBId !== p.id)) return { ok: false, error: "ဒီ match မှာ မပါဝင်ပါ" };
+      // Batch 11: snapshot participants (not only the two leaders) may
+      // chat — they hold a locked slot in this room. Pre-snapshot legacy
+      // matches have no participant rows, so leaders keep working as
+      // before and nobody else gains access.
+      if (
+        !mm ||
+        (mm.playerAId !== p.id &&
+          mm.playerBId !== p.id &&
+          !(await participantsFor(db, mm.id)).some((pt) => pt.playerId === p.id))
+      )
+        return { ok: false, error: "ဒီ match မှာ မပါဝင်ပါ" };
       const rl = await rateLimit(db, `chat:${args.player_id}`, 40, 60 * 1000);
       if (rl) return { ok: false, error: rl };
       await db.insert(schema.chatMessages).values({
@@ -3897,19 +4057,19 @@ export const Actions = {
         // whose locks no longer match its players.
         const gateParts = await participantsFor(db, m.id);
         if (gateParts.length > 0) {
-          // Membership invariant: every snapshotted player must still
-          // belong to their leader's (full, uncapped) team, and that
-          // team must still field at least team_size members. Compared
-          // against the FULL roster — not the capped one — so a
-          // kick-refill (snapshot member drawn from beyond the cap)
-          // does not read as a membership change.
-          const stillMembers = (live: number[], snap: number[]) =>
-            live.length >= m.teamSize && snap.every((x) => live.includes(x));
-          const liveA = (await teamRosterFor(db, m.playerAId, 5)).map((e) => e.player.id);
-          const liveB = (await teamRosterFor(db, m.playerBId, 5)).map((e) => e.player.id);
-          const snapA = gateParts.filter((pt) => pt.side === "A").map((pt) => pt.playerId);
-          const snapB = gateParts.filter((pt) => pt.side === "B").map((pt) => pt.playerId);
-          if (!stillMembers(liveA, snapA) || !stillMembers(liveB, snapB)) {
+          // Membership invariant (Batch 11, relaxed to its protective
+          // core): every snapshotted player must still belong to AT
+          // LEAST ONE of the two leaders' full (uncapped) team pools —
+          // the union of both pools. swapTeamSlot lets a participant
+          // change sides, so per-side membership is no longer the
+          // invariant; a player who left BOTH teams still blocks the
+          // start with the membership-changed error below.
+          const poolUnion = new Set<number>();
+          for (const e of await teamPoolFor(db, m.playerAId)) poolUnion.add(e.player.id);
+          for (const e of await teamPoolFor(db, m.playerBId)) poolUnion.add(e.player.id);
+          poolUnion.add(m.playerAId);
+          poolUnion.add(m.playerBId);
+          if (!gateParts.every((pt) => poolUnion.has(pt.playerId))) {
             await db
               .update(schema.matches)
               .set({ aReady, bReady })
@@ -3920,6 +4080,21 @@ export const Actions = {
               error: "အသင်းသား စာရင်း ပြောင်းသွားပါတယ် — ပွဲလက်ခံတုန်းက အဖွဲ့နဲ့ အခု အဖွဲ့ မတူတော့ပါ။ Team section မှာ အဖွဲ့ကို ပြန်စစ်ပြီးမှ Ready နှိပ်ပါ (Team membership changed since accept — check your team first)",
               started: false,
             };
+          }
+          // FULLNESS GATE (Batch 11 item 5d): progressive filling means
+          // a snapshot may still be short at Ready time — the match may
+          // only go live once EACH side's locked participant count
+          // equals team_size. The leaders' Ready flags are still saved.
+          const lockedCount = (side: "A" | "B") =>
+            gateParts.filter((pt) => pt.side === side && pt.state === "locked").length;
+          if (lockedCount("A") !== m.teamSize || lockedCount("B") !== m.teamSize) {
+            gateNote = `အသင်းလိုက် ပွဲမှာ နှစ်ဖက်လုံး လူ အပြည့် (${m.teamSize} ယောက် စီ) ဖြစ်မှ ပွဲစနိုင်ပါတယ် — လက်ရှိ A: ${lockedCount("A")}/${m.teamSize}, B: ${lockedCount("B")}/${m.teamSize}။ လိုနေတဲ့ နေရာတွေကို အဖွဲ့သားတွေ ဝင်ဖြည့်ပြီးမှ Ready နှိပ်ပါ (Both sides must be full before the match can start)`;
+            await db
+              .update(schema.matches)
+              .set({ aReady, bReady })
+              .where(eq(schema.matches.id, m.id));
+            ctx.invalidateQueries();
+            return { ok: true, error: gateNote, started: false };
           }
           const allMembersReady = gateParts.every(
             (pt) =>
@@ -4009,11 +4184,11 @@ export const Actions = {
       if (m.status !== "live" && m.status !== "result_pending")
         return { ok: false, error: "ရလဒ် တင်လို့ မရသေးပါ", outcome: "" };
       if (!m.startedAt) return { ok: false, error: "Match မစသေးပါ", outcome: "" };
-      // Fixed rule (in code): results unlock exactly 10 minutes after start.
+      // Fixed rule (in code): results unlock exactly 6 minutes after start.
       if (Date.now() - m.startedAt.getTime() < RESULT_UNLOCK_MS)
         return {
           ok: false,
-          error: "ရလဒ်တင်ခွင့် မပွင့်သေးပါ — ပွဲစပြီး ၁၀ မိနစ် ပြည့်မှ တင်နိုင်ပါတယ်",
+          error: "ရလဒ်တင်ခွင့် မပွင့်သေးပါ — ပွဲစပြီး ၆ မိနစ် ပြည့်မှ တင်နိုင်ပါတယ်",
           outcome: "",
         };
       const isA = m.playerAId === args.player_id;
@@ -4201,6 +4376,9 @@ export const Actions = {
         .limit(1);
       const m = rows[0];
       if (!m) return { ok: false, error: "Match မတွေ့ပါ" };
+      // Batch 11: kick does NOT exist in 1v1 — team matches (2v2–5v5) only.
+      if (m.teamSize === 1)
+        return { ok: false, error: "1v1 ပွဲမှာ ကန်ထုတ်တာ မရှိပါ — Kick ကို အသင်းလိုက် ပွဲ (2v2–5v5) မှာပဲ သုံးလို့ရပါတယ် (Kick is not available in 1v1)" };
       if (args.player_id === me.id)
         return { ok: false, error: "ကိုယ့်ကိုယ်ကို ကန်ထုတ်လို့ မရပါ" };
       if (m.status !== "ready_check")
@@ -4495,6 +4673,203 @@ export const Actions = {
         body: `${me.name} က သင့်ကို lobby ထဲ ဖိတ်ပါတယ် — Match Room ထဲ ဝင်ကြည့်ရန် နှိပ်ပါ`,
         matchId: m.id,
       });
+      ctx.invalidateQueries();
+      return { ok: true, error: "" };
+    },
+  }),
+
+  // Batch 11 item 5b: PROGRESSIVE FILL — a member of one leader's team
+  // pool takes an EMPTY snapshot slot of a ready_check team match after
+  // accept (accept no longer requires full rosters). The caller locks
+  // the match stake with the same guarded atomic update acceptChallenge
+  // uses; a failed lock changes nothing. Referral pending rows mirror
+  // acceptChallenge exactly, and both leaders are notified.
+  joinMatchSlot: defineAction({
+    request: z.object({
+      match_id: z.number(),
+      player_id: z.number(),
+      session_token: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const s = await getSettingsMap(db);
+      if (s["emergency"] === "1")
+        return { ok: false, error: "Emergency mode — slot ဝင်ခြင်း ယာယီပိတ်ထားပါတယ်" };
+      const me = await playerBySession(db, args.player_id, args.session_token);
+      if (!me) return { ok: false, error: AUTH_ERR };
+      const obJ = ownerPlayerBlock(me);
+      if (obJ) return { ok: false, error: obJ };
+      if (me.status === "perm_banned" || me.status === "temp_banned")
+        return { ok: false, error: "Account ban ခံထားရပါတယ်" };
+      if (!idsComplete(me)) return { ok: false, error: IDS_GATE_ERR };
+      const rows = await db
+        .select()
+        .from(schema.matches)
+        .where(eq(schema.matches.id, args.match_id))
+        .limit(1);
+      const m = rows[0];
+      if (!m) return { ok: false, error: "Match မတွေ့ပါ" };
+      if (m.teamSize < 2)
+        return { ok: false, error: "Slot ဝင်တာကို အသင်းလိုက် ပွဲ (2v2–5v5) မှာပဲ လုပ်လို့ရပါတယ်" };
+      if (m.status !== "ready_check")
+        return { ok: false, error: "ဒီ match က slot ဝင်လို့ရတဲ့ အဆင့် မဟုတ်တော့ပါ — Ready အဆင့်မှာပဲ ဝင်လို့ရပါတယ်" };
+      const parts = await participantsFor(db, m.id);
+      if (
+        me.id === m.playerAId ||
+        me.id === m.playerBId ||
+        parts.some((pt) => pt.playerId === me.id)
+      )
+        return { ok: false, error: "သင် ဒီ match မှာ ပါဝင်ပြီးသားပါ" };
+      const poolA = await teamPoolFor(db, m.playerAId);
+      const poolB = await teamPoolFor(db, m.playerBId);
+      const inA = poolA.find((e) => e.player.id === me.id);
+      const inB = poolB.find((e) => e.player.id === me.id);
+      if (inA && inB)
+        return { ok: false, error: "သင် နှစ်ဖက်လုံးရဲ့ အဖွဲ့ထဲမှာ ပါနေပါတယ် — တစ်ဖက်တည်းမှာ ရှိနေမှ slot ဝင်လို့ရပါမယ် (You are in both leaders' teams — stay in exactly one)" };
+      if (!inA && !inB)
+        return { ok: false, error: "ဒီ match ရဲ့ အဖွဲ့ နှစ်ဖက်လုံးထဲမှာ သင် မပါဝင်ပါ — အရင် Team section မှာ leader တစ်ယောက်ရဲ့ အဖွဲ့ထဲ ဝင်ပြီးမှ slot ယူလို့ရပါမယ် (Join one of the two leaders' teams first)" };
+      const side: "A" | "B" = inA ? "A" : "B";
+      const myPoolEntry = inA ?? inB;
+      const sideCount = parts.filter(
+        (pt) => pt.side === side && pt.state === "locked",
+      ).length;
+      if (sideCount >= m.teamSize)
+        return { ok: false, error: `Team ${side} မှာ လူ ပြည့်နေပါပြီ — slot မလွတ်တော့ပါ` };
+      // Guarded stake lock: balance and locked move together, only
+      // while the CURRENT balance still covers the stake.
+      const lock = await db
+        .update(schema.players)
+        .set({
+          balance: sql`${schema.players.balance} - ${m.stake}`,
+          lockedCoins: sql`${schema.players.lockedCoins} + ${m.stake}`,
+        })
+        .where(
+          and(
+            eq(schema.players.id, me.id),
+            gte(schema.players.balance, m.stake),
+          ),
+        )
+        .returning({ balance: schema.players.balance });
+      const nb = lock[0]?.balance;
+      if (nb === undefined)
+        return { ok: false, error: "Coin မလုံလောက်ပါ — stake ဖိုး coin ရှိရပါမယ်" };
+      // Re-check the slot after locking: if a racing join filled the
+      // side meanwhile, compensate the lock and reject — no state change.
+      const freshParts = await participantsFor(db, m.id);
+      const freshCount = freshParts.filter(
+        (pt) => pt.side === side && pt.state === "locked",
+      ).length;
+      if (freshCount >= m.teamSize) {
+        await db
+          .update(schema.players)
+          .set({
+            balance: sql`${schema.players.balance} + ${m.stake}`,
+            lockedCoins: sql`${schema.players.lockedCoins} - ${m.stake}`,
+          })
+          .where(eq(schema.players.id, me.id));
+        return { ok: false, error: `Team ${side} မှာ လူ ပြည့်သွားပါပြီ — slot မလွတ်တော့ပါ` };
+      }
+      await addTxn(db, {
+        playerId: me.id,
+        type: "lock",
+        amount: -m.stake,
+        balanceAfter: nb,
+        note: `Coin lock — match ${m.code} (slot join)`,
+      });
+      await db.insert(schema.matchParticipants).values({
+        matchId: m.id,
+        playerId: me.id,
+        side,
+        stake: m.stake,
+        ready: myPoolEntry?.ready ? 1 : 0,
+        state: "locked",
+      });
+      if (me.referredById) {
+        await db.insert(schema.referralCommissions).values({
+          referrerId: me.referredById,
+          referredId: me.id,
+          matchId: m.id,
+          feeAmount: m.feeAmount,
+          percent: m.referralPercentX100,
+          commission: 0,
+          status: "pending",
+        });
+      }
+      for (const lid of [m.playerAId, m.playerBId]) {
+        await notify(db, {
+          playerId: lid,
+          type: "match",
+          title: "👥 Slot တစ်ခု ပြည့်ပါပြီ",
+          body: `${m.code} — ${me.name} က Team ${side} မှာ ဝင်ပြီး slot ဖြည့်လိုက်ပါတယ်။`,
+          matchId: m.id,
+        });
+      }
+      ctx.invalidateQueries();
+      return { ok: true, error: "" };
+    },
+  }),
+
+  // Batch 11 item 10: TEAM SWAP — a locked snapshot participant (either
+  // leader included) moves to an EMPTY slot on the OPPOSING side during
+  // ready_check. Only the participant row's side flips and its ready
+  // flag clears (a leader's a_ready/b_ready column clears too); the
+  // stake lock and the ownership columns (playerAId / playerBId /
+  // challenge creator) never move. Settlement derives the winning side
+  // from the winning leader's row, so a swapped leader wins for the
+  // side they ended on.
+  swapTeamSlot: defineAction({
+    request: z.object({
+      match_id: z.number(),
+      player_id: z.number(),
+      session_token: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const me = await playerBySession(db, args.player_id, args.session_token);
+      if (!me) return { ok: false, error: AUTH_ERR };
+      const obS = ownerPlayerBlock(me);
+      if (obS) return { ok: false, error: obS };
+      const rows = await db
+        .select()
+        .from(schema.matches)
+        .where(eq(schema.matches.id, args.match_id))
+        .limit(1);
+      const m = rows[0];
+      if (!m) return { ok: false, error: "Match မတွေ့ပါ" };
+      if (m.teamSize < 2)
+        return { ok: false, error: "ဘက် ပြောင်းတာကို အသင်းလိုက် ပွဲ (2v2–5v5) မှာပဲ လုပ်လို့ရပါတယ်" };
+      if (m.status !== "ready_check")
+        return { ok: false, error: "ဘက် ပြောင်းတာကို Ready အဆင့်မှာပဲ လုပ်လို့ရပါတယ် — ပွဲစပြီးရင် မရပါ" };
+      const parts = await participantsFor(db, m.id);
+      const mine = parts.find(
+        (pt) => pt.playerId === me.id && pt.state === "locked",
+      );
+      if (!mine)
+        return { ok: false, error: "သင် ဒီ match မှာ slot မရှိပါ — participant တွေပဲ ဘက် ပြောင်းလို့ရပါတယ်" };
+      const targetSide: "A" | "B" = mine.side === "A" ? "B" : "A";
+      const targetCount = parts.filter(
+        (pt) => pt.side === targetSide && pt.state === "locked",
+      ).length;
+      if (targetCount >= m.teamSize)
+        return { ok: false, error: `Team ${targetSide} မှာ လူ ပြည့်နေပါတယ် — အဲဒီဘက်ကို ပြောင်းလို့ မရပါ` };
+      await db
+        .update(schema.matchParticipants)
+        .set({ side: targetSide, ready: 0 })
+        .where(eq(schema.matchParticipants.id, mine.id));
+      if (me.id === m.playerAId) {
+        await db
+          .update(schema.matches)
+          .set({ aReady: 0 })
+          .where(eq(schema.matches.id, m.id));
+      }
+      if (me.id === m.playerBId) {
+        await db
+          .update(schema.matches)
+          .set({ bReady: 0 })
+          .where(eq(schema.matches.id, m.id));
+      }
       ctx.invalidateQueries();
       return { ok: true, error: "" };
     },
@@ -6469,6 +6844,20 @@ export const Actions = {
           match_id: z.number().nullable(),
           is_read: z.boolean(),
           created_at: z.string(),
+          // Batch 11: for type "invite" notifications with a match, the
+          // inviter + match descriptor the App shell's one-time popup
+          // renders. Null for every other notification.
+          invite_info: z
+            .object({
+              inviter_id: z.number(),
+              inviter_name: z.string(),
+              inviter_avatar_url: z.string(),
+              inviter_avatar_color: z.string(),
+              team_size: z.number(),
+              arena: z.string(),
+              hero_rule: z.string(),
+            })
+            .nullable(),
         }),
       ),
       unread: z.number(),
@@ -6490,6 +6879,52 @@ export const Actions = {
       const readSet = new Set(reads.map((r) => r.notificationId));
       const isReadOf = (n: (typeof mine)[number]) =>
         n.playerId === null ? readSet.has(n.id) : n.isRead === 1;
+      // Invite popup payload (Batch 11): the inviter is always one of
+      // the match's two leaders (inviteToMatch enforces leader
+      // inviters). Resolve WHICH leader by matching the notification
+      // body's leading name ("<name> က သင့်ကို lobby ထဲ ဖိတ်ပါတယ်…")
+      // against playerA / playerB; ambiguous → playerA.
+      const inviteInfoOf = new Map<
+        number,
+        {
+          inviter_id: number;
+          inviter_name: string;
+          inviter_avatar_url: string;
+          inviter_avatar_color: string;
+          team_size: number;
+          arena: string;
+          hero_rule: string;
+        }
+      >();
+      for (const n of mine) {
+        if (n.type !== "invite" || !n.matchId) continue;
+        const mRows = await db
+          .select()
+          .from(schema.matches)
+          .where(eq(schema.matches.id, n.matchId))
+          .limit(1);
+        const mm = mRows[0];
+        if (!mm) continue;
+        const pa = await getPlayer(db, mm.playerAId);
+        if (!pa) continue;
+        const pb = await getPlayer(db, mm.playerBId);
+        let inviter = pa;
+        if (
+          pb &&
+          n.body.startsWith(`${pb.name} `) &&
+          !n.body.startsWith(`${pa.name} `)
+        )
+          inviter = pb;
+        inviteInfoOf.set(n.id, {
+          inviter_id: inviter.id,
+          inviter_name: inviter.name,
+          inviter_avatar_url: await blobUrlSafe(ctx, inviter.avatarBlobKey ?? ""),
+          inviter_avatar_color: inviter.avatarColor,
+          team_size: mm.teamSize,
+          arena: mm.arena,
+          hero_rule: mm.heroRule,
+        });
+      }
       return {
         notifications: mine.map((n) => ({
           id: n.id,
@@ -6499,6 +6934,7 @@ export const Actions = {
           match_id: n.matchId ?? null,
           is_read: isReadOf(n),
           created_at: iso(n.createdAt) ?? "",
+          invite_info: inviteInfoOf.get(n.id) ?? null,
         })),
         unread: mine.filter((n) => !isReadOf(n)).length,
       };
@@ -7049,7 +7485,7 @@ export const Actions = {
         "coin_rate_kyat", "withdraw_fee_percent", "withdraw_min_coins",
         "withdraw_max_coins_per_day", "topup_min_coins", "topup_max_coins",
         "challenge_min_stake_coins",
-        "kpay_phone", "wave_phone",
+        "kpay_phone", "wave_phone", "kpay_name", "wave_name",
       ];
       const touchesCritical = Object.keys(args.values).some((k) => critical.includes(k));
       if (touchesCritical && !args.confirmed)
