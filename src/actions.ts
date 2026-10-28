@@ -186,6 +186,24 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   slide_image_9_key: "",
   slide_image_10: "",
   slide_image_10_key: "",
+  // Wizard selection art (Batch 10): admin-replaceable slots for the 7
+  // Batch 9 wizard images. Empty = the baked bundle crop is the default;
+  // the _key fields are server-side only (never exposed, like
+  // slide_image_N_key).
+  wizard_art_mode_1v1: "",
+  wizard_art_mode_1v1_key: "",
+  wizard_art_mode_classic: "",
+  wizard_art_mode_classic_key: "",
+  wizard_art_mode_brawl: "",
+  wizard_art_mode_brawl_key: "",
+  wizard_art_role_fighter: "",
+  wizard_art_role_fighter_key: "",
+  wizard_art_role_assassin: "",
+  wizard_art_role_assassin_key: "",
+  wizard_art_role_mage: "",
+  wizard_art_role_mage_key: "",
+  wizard_art_role_marksman: "",
+  wizard_art_role_marksman_key: "",
   preset_rules: JSON.stringify([
     "ပထမ tower ရသူ နိုင်",
     "Lord မသတ်ရ",
@@ -1364,18 +1382,21 @@ function arenaSizeError(arena: string, teamSize: number): string | null {
   return null;
 }
 
-/** Brawl's hero rule is FIXED to Mage only (user, 2026-10-28 Batch 9) —
- *  ONE shared constant: the create wizard auto-stamps exactly this value
- *  for Brawl (its hero step is skipped), this server check enforces it,
- *  and the shared match descriptor renders hero_rule "mage" as
- *  "Mage only", so the three can never diverge. CREATION-ONLY: legacy
- *  brawl rows stored with other hero rules still display and play. */
-const BRAWL_HERO_RULE = "mage";
-const BRAWL_HERO_RULE_ERR = "Brawl က Mage only ပါ (Brawl is Mage only)";
+/** Brawl simply has NO hero restriction (user, 2026-10-28 Batch 10,
+ *  correcting Batch 9's Mage-only forcing) — ONE shared constant: the
+ *  create wizard auto-stamps exactly this value for Brawl (its hero
+ *  step is skipped entirely — there is no hero-selection step for
+ *  Brawl), this server check enforces it, and the shared match
+ *  descriptor renders hero_rule "any" as "Any Hero", so the three can
+ *  never diverge. CREATION-ONLY: legacy brawl rows stored with other
+ *  hero rules still display and play. */
+const BRAWL_HERO_RULE = "any";
+const BRAWL_HERO_RULE_ERR = "Brawl မှာ hero rule မရှိပါ (Brawl has no hero rule)";
 
-/** FINAL hero-rule table (user, 2026-10-28 Batch 7 B + Batch 9) —
+/** FINAL hero-rule table (user, 2026-10-28 Batch 7 B + Batch 10) —
  *  the wizard and this server check enforce exactly the same table:
- *  Brawl (size 1) → Mage only, FORCED (any other hero_rule rejected);
+ *  Brawl (size 1) → no hero rule at all, FIXED to "any" (any other
+ *  hero_rule rejected — Brawl has no hero-selection step);
  *  1v1 Room / Classic at size 1 → Fighter / Assassin / Mage / Marksman /
  *  Same Hero ("same" / "same:<Name>"); Classic at sizes 2–5 → Fighter /
  *  Assassin / Mage / Marksman / Any Hero / 💬 Discuss; "open" and
@@ -2160,6 +2181,15 @@ const settingsShape = z.object({
   slide_image_8: z.string(),
   slide_image_9: z.string(),
   slide_image_10: z.string(),
+  // Wizard art slots (Batch 10): URL only — the wizard_art_<slot>_key
+  // fields stay server-side, exactly like slide_image_N_key.
+  wizard_art_mode_1v1: z.string(),
+  wizard_art_mode_classic: z.string(),
+  wizard_art_mode_brawl: z.string(),
+  wizard_art_role_fighter: z.string(),
+  wizard_art_role_assassin: z.string(),
+  wizard_art_role_mage: z.string(),
+  wizard_art_role_marksman: z.string(),
   preset_rules: z.array(z.string()),
   fixed_rules: z.object({
     classic_1: z.array(z.string()),
@@ -2262,6 +2292,16 @@ function settingsOut(s: Record<string, string>, adminView = false) {
     slide_image_8: s["slide_image_8"] ?? "",
     slide_image_9: s["slide_image_9"] ?? "",
     slide_image_10: s["slide_image_10"] ?? "",
+    // Wizard art (Batch 10): players need the URL to render the create
+    // wizard, so it ships in BOTH the public bootstrap and the admin
+    // view — same treatment as slide_image_N.
+    wizard_art_mode_1v1: s["wizard_art_mode_1v1"] ?? "",
+    wizard_art_mode_classic: s["wizard_art_mode_classic"] ?? "",
+    wizard_art_mode_brawl: s["wizard_art_mode_brawl"] ?? "",
+    wizard_art_role_fighter: s["wizard_art_role_fighter"] ?? "",
+    wizard_art_role_assassin: s["wizard_art_role_assassin"] ?? "",
+    wizard_art_role_mage: s["wizard_art_role_mage"] ?? "",
+    wizard_art_role_marksman: s["wizard_art_role_marksman"] ?? "",
     // Back-compat alias: preset_rules mirrors the Classic 4–5 fixed list
     // (the tournament pick-list; challenges use fixed_rules via the server).
     // NOTE (2026-10-28): this flat tournament pick-list intentionally stays
@@ -3220,8 +3260,9 @@ export const Actions = {
       // match a legal combo. Creation-only; legacy rows unaffected.
       const sizeErr = arenaSizeError(args.arena, args.team_size);
       if (sizeErr) return { ok: false, error: sizeErr, challenge_id: 0 };
-      // Hero-rule table (FINAL Batch 7 B + Batch 9): Brawl REQUIRES
-      // hero_rule "mage" exactly (BRAWL_HERO_RULE) — anything else is
+      // Hero-rule table (FINAL Batch 7 B + Batch 10): Brawl REQUIRES
+      // hero_rule "any" exactly (BRAWL_HERO_RULE — Brawl has no hero
+      // rule at all) — anything else is
       // rejected before any state change; 1v1 Room / Classic at size 1
       // allow same:*; Classic sizes 2–5 allow any/discuss; "open" and
       // anything else rejected. Pure validation, checked up front with
@@ -5387,6 +5428,102 @@ export const Actions = {
         try { await ctx.blobs.delete(oldKey); } catch { /* best-effort */ }
       }
       await logAct(db, auth.actor.name, `Slideshow image removed (slot ${args.slot}) — default hero restored`);
+      ctx.invalidateQueries();
+      return { ok: true, error: "" };
+    },
+  }),
+
+  /* Wizard art slots (Batch 10): the 7 Batch 9 baked wizard images
+   * (3 mode cards + 4 role medallions) become admin-replaceable,
+   * following the slideshow pattern exactly — Owner-only, security
+   * confirmation + TOTP, validated image, timestamped blob key (so the
+   * URL changes on every replacement = cache-busting). Empty setting =
+   * the baked bundle crop is shown as the default. */
+  uploadWizardArt: defineAction({
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+      slot: z.enum([
+        "mode_1v1",
+        "mode_classic",
+        "mode_brawl",
+        "role_fighter",
+        "role_assassin",
+        "role_mage",
+        "role_marksman",
+      ]),
+      image_base64: z.string().max(12_000_000).default(""),
+      image_mime: z.string().max(60).default(""),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string(), image_url: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const fail = (error: string) => ({ ok: false, error, image_url: "" });
+      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor) return fail(auth.error ?? AUTH_ERR);
+      if (!args.confirmed) return fail("Wizard ပုံ ပြောင်းရန် security confirmation လိုပါတယ်");
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return fail(err2fa);
+      const v = validateImage(args.image_base64, args.image_mime);
+      if (v.error || !v.bytes) return fail(v.error || "ပုံ မမှန်ပါ");
+      const s = await getSettingsMap(db);
+      const keyField = `wizard_art_${args.slot}_key`;
+      const urlField = `wizard_art_${args.slot}`;
+      const oldKey = s[keyField] ?? "";
+      const key = `wizard-art/${args.slot}-${Date.now()}.${v.ext}`;
+      try {
+        await ctx.blobs.put(key, v.bytes, { contentType: v.mime });
+      } catch {
+        return fail("ပုံ သိမ်းလို့ မရပါ — ပြန်ကြိုးစားပါ");
+      }
+      const url = await blobUrlSafe(ctx, key);
+      await setSetting(db, urlField, url);
+      await setSetting(db, keyField, key);
+      if (oldKey && oldKey !== key) {
+        try { await ctx.blobs.delete(oldKey); } catch { /* best-effort */ }
+      }
+      await logAct(db, auth.actor.name, `Wizard art updated (slot ${args.slot})`);
+      ctx.invalidateQueries();
+      return { ok: true, error: "", image_url: url };
+    },
+  }),
+
+  deleteWizardArt: defineAction({
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+      slot: z.enum([
+        "mode_1v1",
+        "mode_classic",
+        "mode_brawl",
+        "role_fighter",
+        "role_assassin",
+        "role_mage",
+        "role_marksman",
+      ]),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
+      if (!args.confirmed) return { ok: false, error: "Wizard ပုံ ဖျက်ရန် security confirmation လိုပါတယ်" };
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return { ok: false, error: err2fa };
+      const s = await getSettingsMap(db);
+      const keyField = `wizard_art_${args.slot}_key`;
+      const urlField = `wizard_art_${args.slot}`;
+      const oldKey = s[keyField] ?? "";
+      await setSetting(db, urlField, "");
+      await setSetting(db, keyField, "");
+      if (oldKey) {
+        try { await ctx.blobs.delete(oldKey); } catch { /* best-effort */ }
+      }
+      await logAct(db, auth.actor.name, `Wizard art removed (slot ${args.slot}) — default restored`);
       ctx.invalidateQueries();
       return { ok: true, error: "" };
     },
