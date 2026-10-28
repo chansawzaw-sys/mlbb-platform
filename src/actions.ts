@@ -3647,6 +3647,193 @@ export const Actions = {
     },
   }),
 
+  // Batch 7 E: the lobby CREATOR may kick the other participant while
+  // the match is still in ready_check. In the current match model the
+  // accepting side holds exactly ONE seat (playerB) — team rosters are
+  // display/team-gate only and hold no match seat or coin lock — so a
+  // successful kick always empties the accepting side: the match is
+  // cancelled via an atomic ready_check -> cancelled claim
+  // (exactly-once), EVERY lock placed for the match is released in full
+  // (an open lobby holds no locks), pending referral rows are
+  // cancelled, and the challenge returns to "open" so anyone —
+  // including the kicked player — may accept it again. No punishment
+  // or ban state is written. Every guard rejects with zero state
+  // change: non-creator caller, self-kick, match no longer in
+  // ready_check, target not the match's other participant.
+  kickParticipant: defineAction({
+    request: z.object({
+      match_id: z.number(),
+      // The player to remove (the brief's { match_id, player_id }). The
+      // CALLER is the session actor: actor_player_id is injected by the
+      // client proxy and validated against session_token, exactly like
+      // every other action — player_id here is never trusted as caller.
+      player_id: z.number(),
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const me = await playerBySession(db, args.actor_player_id, args.session_token);
+      if (!me) return { ok: false, error: AUTH_ERR };
+      const obK = ownerPlayerBlock(me);
+      if (obK) return { ok: false, error: obK };
+      if (me.status === "temp_banned") return { ok: false, error: TEMP_BAN_ERR };
+      const rows = await db
+        .select()
+        .from(schema.matches)
+        .where(eq(schema.matches.id, args.match_id))
+        .limit(1);
+      const m = rows[0];
+      if (!m) return { ok: false, error: "Match မတွေ့ပါ" };
+      if (m.playerAId !== me.id)
+        return { ok: false, error: "Lobby ထောင်သူပဲ ကန်ထုတ်လို့ရပါတယ် (Only the lobby creator can kick)" };
+      if (args.player_id === me.id)
+        return { ok: false, error: "ကိုယ့်ကိုယ်ကို ကန်ထုတ်လို့ မရပါ" };
+      if (m.status !== "ready_check")
+        return { ok: false, error: "ကန်ထုတ်တာကို Ready အဆင့် (ready_check) မှာပဲ လုပ်လို့ရပါတယ် — ပွဲစပြီးရင် မရပါ" };
+      if (args.player_id !== m.playerBId)
+        return { ok: false, error: "ဒီ player က ဒီ match ထဲမှာ မပါဝင်ပါ" };
+      const target = await getPlayer(db, args.player_id);
+      if (!target) return { ok: false, error: "Player မတွေ့ပါ" };
+      // Exactly-once claim FIRST (same discipline as refundMatch): flip
+      // ready_check -> cancelled atomically; a racing second kick or a
+      // settle/cancel loses the claim and changes nothing more.
+      const claim = await db
+        .update(schema.matches)
+        .set({ status: "cancelled" })
+        .where(
+          and(
+            eq(schema.matches.id, m.id),
+            eq(schema.matches.status, "ready_check"),
+          ),
+        )
+        .returning({ id: schema.matches.id });
+      if (claim.length === 0)
+        return { ok: false, error: "Match အခြေအနေ ပြောင်းသွားပါပြီ — ပြန်စစ်ပါ" };
+      // Release EVERY lock placed for this match (kicked player AND
+      // creator) back to balances — an open lobby holds no locks.
+      for (const pid of [m.playerBId, m.playerAId]) {
+        const p = await getPlayer(db, pid);
+        if (!p) continue;
+        const nb = p.balance + m.stake;
+        await db
+          .update(schema.players)
+          .set({
+            balance: nb,
+            lockedCoins: Math.max(0, p.lockedCoins - m.stake),
+          })
+          .where(eq(schema.players.id, pid));
+        await addTxn(db, {
+          playerId: pid,
+          type: "refund",
+          amount: m.stake,
+          balanceAfter: nb,
+          note: `Kick — lobby reopened, lock released — ${m.code}`,
+          matchId: m.id,
+        });
+      }
+      await db
+        .update(schema.referralCommissions)
+        .set({ status: "cancelled" })
+        .where(
+          and(
+            eq(schema.referralCommissions.matchId, m.id),
+            eq(schema.referralCommissions.status, "pending"),
+          ),
+        );
+      // Re-list the challenge as an open lobby.
+      await db
+        .update(schema.challenges)
+        .set({ status: "open" })
+        .where(
+          and(
+            eq(schema.challenges.id, m.challengeId),
+            eq(schema.challenges.status, "matched"),
+          ),
+        );
+      await notify(db, {
+        playerId: target.id,
+        type: "match",
+        title: "🚪 Lobby မှ ကန်ထုတ်ခံရပါတယ်",
+        body: `${me.name} (lobby ထောင်သူ) က သင့်ကို ${m.code} lobby မှ ကန်ထုတ်ပါတယ် — lock ထားတဲ့ ${m.stake} coins အပြည့် ပြန်အမ်းပြီးပါပြီ။ Lobby ပြန်ပွင့်နေပါတယ် — ပြန်ဝင်ချင်ရင် ပြန် accept လို့ရပါတယ်။`,
+      });
+      await logAct(db, me.name, `Kicked ${target.name} from ${m.code}; locks released, lobby reopened`);
+      ctx.invalidateQueries();
+      return { ok: true, error: "" };
+    },
+  }),
+
+  // Batch 7 H: invite a FRIEND into this lobby. Choice: the inviter may
+  // be the creator OR the other participant (both are match
+  // participants in this model). Only while the match is in ready_check
+  // (the lobby phase — a match row exists only once a lobby is
+  // accepted, and the notification deep-link needs its match_id; the
+  // invited friend lands in the room and takes a slot through the
+  // normal team/accept flows). Anti-spam: at most ONE invite per
+  // (match, friend) per 5 minutes via the shared DB rate limiter — a
+  // throttled retry writes no notification.
+  inviteToMatch: defineAction({
+    request: z.object({
+      match_id: z.number(),
+      player_id: z.number(),
+      friend_id: z.number(),
+      session_token: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const me = await playerBySession(db, args.player_id, args.session_token);
+      if (!me) return { ok: false, error: AUTH_ERR };
+      const obI = ownerPlayerBlock(me);
+      if (obI) return { ok: false, error: obI };
+      const rows = await db
+        .select()
+        .from(schema.matches)
+        .where(eq(schema.matches.id, args.match_id))
+        .limit(1);
+      const m = rows[0];
+      if (!m) return { ok: false, error: "Match မတွေ့ပါ" };
+      if (m.status !== "ready_check")
+        return { ok: false, error: "ဒီ lobby က ဖိတ်လို့ရတဲ့ အဆင့် မဟုတ်တော့ပါ — Ready အဆင့်မှာပဲ ဖိတ်လို့ရပါတယ်" };
+      if (m.playerAId !== me.id && m.playerBId !== me.id)
+        return { ok: false, error: "ဒီ match မှာ ပါဝင်သူပဲ ဖိတ်လို့ရပါတယ်" };
+      if (args.friend_id === me.id)
+        return { ok: false, error: "ကိုယ့်ကိုယ်ကို ဖိတ်လို့ မရပါ" };
+      if (args.friend_id === m.playerAId || args.friend_id === m.playerBId)
+        return { ok: false, error: "ဒီ player က match ထဲမှာ ရှိနှင့်ပြီးသားပါ" };
+      const target = await getPlayer(db, args.friend_id);
+      if (!target) return { ok: false, error: "Player မတွေ့ပါ" };
+      if (effectiveRole(target) === "owner")
+        return { ok: false, error: "ဒီ player ကို ဖိတ်လို့ မရပါ" };
+      // Friends only — the same one-directional friends rows the rest
+      // of the app uses (inviter added the target).
+      const fr = await db
+        .select()
+        .from(schema.friends)
+        .where(
+          and(
+            eq(schema.friends.playerId, me.id),
+            eq(schema.friends.friendId, target.id),
+          ),
+        );
+      if (fr.length === 0)
+        return { ok: false, error: "သူငယ်ချင်း မဟုတ်သူကို ဖိတ်လို့ မရပါ — အရင် Add Friend လုပ်ပါ" };
+      const rl = await rateLimit(db, `invite:${m.id}:${target.id}`, 1, 5 * 60 * 1000);
+      if (rl)
+        return { ok: false, error: "ဒီ friend ကို ခုနကပဲ ဖိတ်ပြီးပါပြီ — ၅ မိနစ် စောင့်ပြီးမှ ပြန်ဖိတ်ပါ" };
+      await notify(db, {
+        playerId: target.id,
+        type: "invite",
+        title: "📩 Lobby ဖိတ်ခေါ်ချက်",
+        body: `${me.name} က သင့်ကို lobby ထဲ ဖိတ်ပါတယ် — Match Room ထဲ ဝင်ကြည့်ရန် နှိပ်ပါ`,
+        matchId: m.id,
+      });
+      ctx.invalidateQueries();
+      return { ok: true, error: "" };
+    },
+  }),
+
   resolveDispute: defineAction({
     request: z.object({
       match_id: z.number(),
