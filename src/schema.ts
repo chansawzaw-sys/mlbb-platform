@@ -95,6 +95,7 @@ export const matches = sqliteTable("matches", {
   startedAt: integer("started_at", { mode: "timestamp_ms" }),
   aResult: text("a_result").notNull().default(""),
   bResult: text("b_result").notNull().default(""),
+  firstResultAt: integer("first_result_at", { mode: "timestamp_ms" }),
   aHero: text("a_hero").notNull().default(""),
   bHero: text("b_hero").notNull().default(""),
   bannedHeroes: text("banned_heroes").notNull().default(""),
@@ -298,6 +299,7 @@ export const purchaseRequests = sqliteTable("purchase_requests", {
   playerId: integer("player_id").notNull(),
   coins: integer("coins").notNull(),
   label: text("label").notNull().default(""),
+  senderName: text("sender_name").notNull().default(""),
   status: text("status", { enum: ["pending", "approved", "rejected", "expired"] })
     .notNull()
     .default("pending"),

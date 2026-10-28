@@ -141,6 +141,9 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   telegram_bot: "",
   telegram_bot_token: "",
   telegram_chat_id: "",
+  turn_url: "",
+  turn_username: "",
+  turn_credential: "",
   google_client_id: "",
   google_enabled: "0",
   google_pending_client_id: "",
@@ -830,9 +833,18 @@ async function teamFillFor(db: Db, playerId: number, teamSize: number): Promise<
   return best;
 }
 
-/** Timeout sweep: ready-check warning -> cancel+refund; stale live matches.
- *  Runs lazily on reads (bootstrap/match/board) and via sweepTimeouts. */
-async function sweepTimeoutsInternal(db: Db): Promise<number> {
+/** FIXED result-timing rules (Owner decision, in code — not admin settings):
+ *  results unlock exactly 10 minutes after the match starts; once the FIRST
+ *  player submits, the other player has exactly 5 minutes to submit, after
+ *  which the first submitter wins automatically (see the sweep below). */
+const RESULT_UNLOCK_MS = 10 * 60 * 1000;
+const SECOND_RESULT_MS = 5 * 60 * 1000;
+
+/** Timeout sweep: ready-check warning -> cancel+refund; stale live matches;
+ *  single-submission auto-settle. Runs lazily on reads (bootstrap/match/
+ *  board) and via sweepTimeouts. `ctx` is optional — when present it is
+ *  forwarded to settleMatch for query invalidation. */
+async function sweepTimeoutsInternal(db: Db, ctx: Ctx | null = null): Promise<number> {
   let acted = 0;
   acted += await expireMoneyRequestsInternal(db);
   const now = Date.now();
@@ -880,6 +892,41 @@ async function sweepTimeoutsInternal(db: Db): Promise<number> {
         await refundMatch(db, fresh, "Match timeout — auto cancel");
         await logAct(db, "system", `Match timeout sweep cancelled ${fresh.code}`);
         acted++;
+      }
+    } else if (
+      m.status === "result_pending" && m.firstResultAt &&
+      now - m.firstResultAt.getTime() > SECOND_RESULT_MS
+    ) {
+      // Single-submission auto-settle: exactly one side submitted and the
+      // 5-minute second-submission deadline has passed. The FIRST
+      // submitter's claim decides: "win" → they win; "lose" → the opponent
+      // wins. settleMatch claims the status atomically, so this pays out
+      // exactly once even if several sweeps race.
+      const fresh = (await db.select().from(schema.matches).where(eq(schema.matches.id, m.id)).limit(1))[0];
+      if (fresh && fresh.status === "result_pending" && fresh.firstResultAt &&
+          now - fresh.firstResultAt.getTime() > SECOND_RESULT_MS) {
+        const aSub = fresh.aResult !== "";
+        const bSub = fresh.bResult !== "";
+        if (aSub !== bSub) {
+          const submitterId = aSub ? fresh.playerAId : fresh.playerBId;
+          const claim = aSub ? fresh.aResult : fresh.bResult;
+          const winnerId = claim === "win"
+            ? submitterId
+            : (aSub ? fresh.playerBId : fresh.playerAId);
+          const settled = await settleMatch(ctx, db, fresh, winnerId);
+          if (settled) {
+            for (const pid of [fresh.playerAId, fresh.playerBId]) {
+              await notify(db, {
+                playerId: pid, type: "result",
+                title: "⏰ ရလဒ်တင်ချိန် ကုန်ပါပြီ — အလိုအလျောက် ဆုံးဖြတ်ပြီး",
+                body: `${fresh.code} — ပထမ တင်သူ တင်ပြီး ၅ မိနစ်အတွင်း နောက်တစ်​ယောက် မတင်လို့ ပထမ တင်သူရဲ့ ရလဒ်အတိုင်း အနိုင်ရသူကို ဆုံးဖြတ်ပြီးပါပြီ။`,
+                matchId: fresh.id,
+              });
+            }
+            await logAct(db, "system", `Result deadline sweep auto-settled ${fresh.code} (winner ${winnerId})`);
+            acted++;
+          }
+        }
       }
     }
   }
@@ -1092,7 +1139,7 @@ const NAME_TAKEN_ERR =
 
 /** Settle a match: payout winner, platform fee, referral commission. */
 async function settleMatch(
-  ctx: Ctx,
+  ctx: Ctx | null,
   db: Db,
   match: typeof schema.matches.$inferSelect,
   winnerId: number,
@@ -1249,7 +1296,7 @@ async function settleMatch(
     body: `${match.code} — နောက်ပွဲမှာ ပြန်ကြိုးစားပါ။`,
     matchId: match.id,
   });
-  ctx.invalidateQueries();
+  if (ctx) ctx.invalidateQueries();
   return true;
 }
 
@@ -1332,6 +1379,8 @@ const matchShape = z.object({
   started_at: z.string().nullable(),
   a_result: z.string(),
   b_result: z.string(),
+  first_result_at: z.string().nullable(),
+  second_result_deadline: z.string().nullable(),
   a_hero: z.string(),
   b_hero: z.string(),
   banned_heroes: z.string(),
@@ -1422,6 +1471,10 @@ async function matchOut(
     started_at: iso(m.startedAt),
     a_result: m.aResult,
     b_result: m.bResult,
+    first_result_at: iso(m.firstResultAt),
+    second_result_deadline: m.firstResultAt
+      ? new Date(m.firstResultAt.getTime() + SECOND_RESULT_MS).toISOString()
+      : null,
     a_hero: m.aHero,
     b_hero: m.bHero,
     banned_heroes: m.bannedHeroes,
@@ -1437,6 +1490,36 @@ async function matchOut(
     player_a: await playerPublicOutAsync(ctx, a ?? fallback(m.playerAId), viewerId),
     player_b: await playerPublicOutAsync(ctx, b ?? fallback(m.playerBId), viewerId),
   };
+}
+
+/** ICE servers for voice: public STUN for everyone; the admin-configured
+ *  TURN relay ONLY for match participants/staff (priv) — TURN is what lets
+ *  two phones behind symmetric/carrier-grade NAT actually connect, and its
+ *  credential is handed out only to the two players in the room. */
+function iceServersFor(s: Record<string, string>, priv: boolean) {
+  const list: { urls: string[]; username: string; credential: string }[] = [
+    {
+      urls: [
+        "stun:stun.l.google.com:19302",
+        "stun:stun1.l.google.com:19302",
+        "stun:stun2.l.google.com:19302",
+        "stun:stun3.l.google.com:19302",
+        "stun:stun4.l.google.com:19302",
+      ],
+      username: "",
+      credential: "",
+    },
+    { urls: ["stun:stun.cloudflare.com:3478"], username: "", credential: "" },
+  ];
+  const turnUrl = (s["turn_url"] ?? "").trim();
+  if (priv && turnUrl) {
+    list.push({
+      urls: [turnUrl],
+      username: (s["turn_username"] ?? "").trim(),
+      credential: s["turn_credential"] ?? "",
+    });
+  }
+  return list;
 }
 
 const settingsShape = z.object({
@@ -1462,6 +1545,8 @@ const settingsShape = z.object({
   rules_version: z.string(),
   telegram_bot: z.string(),
   telegram_configured: z.boolean(),
+  turn_url: z.string(),
+  turn_configured: z.boolean(),
   telegram_chat_id: z.string(),
   google_client_id: z.string(),
   google_enabled: z.boolean(),
@@ -1544,6 +1629,11 @@ function settingsOut(s: Record<string, string>, adminView = false) {
     telegram_configured:
       (s["telegram_bot_token"] ?? "").trim() !== "" &&
       (s["telegram_chat_id"] ?? "").trim() !== "",
+    // Voice TURN relay: the URL is not a secret; the credential NEVER
+    // ships in settings output — it is handed only to match participants
+    // inside getMatch (ice_servers), who need it to place a voice call.
+    turn_url: s["turn_url"] ?? "",
+    turn_configured: (s["turn_url"] ?? "").trim() !== "",
     // C1: the admin chat id is a CREDENTIAL for Telegram decisions — it
     // must never ship in the public bootstrap settings. Only the gated
     // getAdmin payload (Owner's own dashboard) reveals it.
@@ -1858,6 +1948,7 @@ async function purchaseOut(ctx: Ctx, r: PurchaseRow, playerName: string) {
     player_name: playerName,
     coins: r.coins,
     label: r.label,
+    sender_name: r.senderName,
     status: r.status,
     txn_code: r.txnCode,
     proof_url: r.proofBlobKey ? await blobUrlSafe(ctx, r.proofBlobKey) : "",
@@ -1897,6 +1988,7 @@ const purchaseReqShape = z.object({
   player_name: z.string(),
   coins: z.number(),
   label: z.string(),
+  sender_name: z.string(),
   status: z.string(),
   txn_code: z.string(),
   proof_url: z.string(),
@@ -2027,6 +2119,7 @@ export const Actions = {
         z.object({
           masked_name: z.string(),
           net_kyat: z.number(),
+          method: z.string(),
           decided_at: z.string(),
         }),
       ),
@@ -2037,7 +2130,7 @@ export const Actions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const s = await getSettingsMap(db);
-      await sweepTimeoutsInternal(db).catch(() => 0);
+      await sweepTimeoutsInternal(db, ctx).catch(() => 0);
       // Enforce the fixed-admin rule on every load: the fixed Gmail is owner,
       // any other stored "owner" is demoted to a normal player.
       const rawPlayers = await db.select().from(schema.players);
@@ -2123,6 +2216,9 @@ export const Actions = {
               allPlayers.find((x) => x.id === w.playerId)?.name ?? "Player",
             ),
             net_kyat: w.netKyat,
+            // Payment method is public (KPay / Wave) — the payout PHONE
+            // number is never exposed here, only the method.
+            method: w.method,
             decided_at: iso(w.decidedAt) ?? iso(w.createdAt) ?? "",
           }));
         })(),
@@ -2454,6 +2550,11 @@ export const Actions = {
         return { ok: false, error: `လောင်းကြေး နည်းလွန်းပါတယ် — အနည်းဆုံး ${minStake.toLocaleString()} coins လောင်းရပါမယ် (Admin သတ်မှတ်ထား)`, challenge_id: 0 };
       if (p.balance < args.stake)
         return { ok: false, error: "Coin မလုံလောက်ပါ — Wallet မှာ အရင်ဝယ်ပါ", challenge_id: 0 };
+      // "Open" hero rule was removed by the Owner — it is no longer a
+      // creatable option anywhere. Legacy rows already stored with it
+      // still render (with no restriction label) but cannot be created.
+      if (args.hero_rule === "open")
+        return { ok: false, error: "\"Open\" hero rule ကို ဖယ်ရှားထားပါတယ် — Fighter / Assassin / Mage / Marksman / Same Hero ထဲက ရွေးပါ", challenge_id: 0 };
       const ins = await db
         .insert(schema.challenges)
         .values({
@@ -2772,7 +2873,7 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const me = await playerBySession(db, args.player_id, args.session_token);
       if (!me) return { matches: [] };
-      await sweepTimeoutsInternal(db).catch(() => 0);
+      await sweepTimeoutsInternal(db, ctx).catch(() => 0);
       const rows = await db
         .select()
         .from(schema.matches)
@@ -2809,10 +2910,13 @@ export const Actions = {
       result_unlocked: z.boolean(),
       unlock_at: z.string().nullable(),
       heroes: z.array(z.object({ name: z.string(), role: z.string(), banned: z.boolean() })),
+      ice_servers: z.array(
+        z.object({ urls: z.array(z.string()), username: z.string(), credential: z.string() }),
+      ),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      await sweepTimeoutsInternal(db).catch(() => 0);
+      await sweepTimeoutsInternal(db, ctx).catch(() => 0);
       const s = await getSettingsMap(db);
       const viewer = args.player_id
         ? await playerBySession(db, args.player_id, args.session_token)
@@ -2830,7 +2934,7 @@ export const Actions = {
         .limit(1);
       const m = rows[0];
       if (!m)
-        return { match: null, chat: [], result_unlocked: false, unlock_at: null, heroes: heroesFor("") };
+        return { match: null, chat: [], result_unlocked: false, unlock_at: null, heroes: heroesFor(""), ice_servers: iceServersFor(s, false) };
       // Privacy gate (M3): chat history and evidence URLs go ONLY to the
       // match's participants or staff. Match ids are sequential, so an
       // ungated read would leak every room's chat + screenshots to anyone.
@@ -2852,8 +2956,8 @@ export const Actions = {
       const chatAvatarMap = new Map<number, string>();
       const chatColorMap = new Map<number, string>();
       for (const cp of chatPlayers) { chatAvatarMap.set(cp.id, await blobUrlSafe(ctx, cp.avatarBlobKey ?? "")); chatColorMap.set(cp.id, cp.avatarColor); }
-      const delay = numSetting(s, "result_delay_min", 5) * 60 * 1000;
-      const unlockAt = m.startedAt ? new Date(m.startedAt.getTime() + delay) : null;
+      // Fixed rule (in code): results unlock exactly 10 minutes after start.
+      const unlockAt = m.startedAt ? new Date(m.startedAt.getTime() + RESULT_UNLOCK_MS) : null;
       return {
         heroes: heroesFor(m.bannedHeroes),
         match: await matchOut(ctx, db, m, viewer?.id ?? null, priv),
@@ -2868,6 +2972,7 @@ export const Actions = {
         })),
         result_unlocked: unlockAt ? Date.now() >= unlockAt.getTime() : false,
         unlock_at: unlockAt ? unlockAt.toISOString() : null,
+        ice_servers: iceServersFor(s, priv),
       };
     },
   }),
@@ -2975,66 +3080,6 @@ export const Actions = {
     },
   }),
 
-  pickHero: defineAction({
-    request: z.object({
-      match_id: z.number(),
-      player_id: z.number(),
-      session_token: z.string().default(""),
-      hero: z.string().min(1).max(40),
-    }),
-    response: z.object({ ok: z.boolean(), error: z.string(), hero: z.string() }),
-    async handler(ctx, args) {
-      const db = ctx.db<typeof schema>();
-      const me = await playerBySession(db, args.player_id, args.session_token);
-      if (!me) return { ok: false, error: AUTH_ERR, hero: "" };
-      const rows = await db.select().from(schema.matches)
-        .where(eq(schema.matches.id, args.match_id)).limit(1);
-      const m = rows[0];
-      if (!m) return { ok: false, error: "Match မတွေ့ပါ", hero: "" };
-      if (["completed", "cancelled"].includes(m.status))
-        return { ok: false, error: "ပြီးဆုံးပြီး match မှာ hero ရွေးလို့ မရပါ", hero: "" };
-      const isA = m.playerAId === me.id;
-      const isB = m.playerBId === me.id;
-      if (!isA && !isB) return { ok: false, error: "ဒီ match မှာ မပါဝင်ပါ", hero: "" };
-      const s = await getSettingsMap(db);
-      const bannedRaw = `${m.bannedHeroes},${s["banned_heroes"] ?? ""}`;
-      let hero = args.hero.trim();
-      // Random rule: the server assigns a random legal hero.
-      if (m.heroRule === "random") {
-        const legal = HERO_NAMES.filter((h) => !isHeroBanned(h, bannedRaw));
-        hero = legal[Math.floor(Math.random() * legal.length)] ?? hero;
-      }
-      const role = HERO_CATALOG[hero];
-      if (!role)
-        return { ok: false, error: `"${hero}" ကို hero စာရင်းမှာ မတွေ့ပါ — စာရင်းထဲက hero ပဲ ရွေးပါ`, hero: "" };
-      // HERO BAN ENFORCEMENT (server-side, not just display):
-      if (isHeroBanned(hero, bannedRaw))
-        return { ok: false, error: `🚫 ${hero} ကို admin က ban ထားပါတယ် — တခြား hero ရွေးပါ`, hero: "" };
-      const roleRules = ["fighter", "mage", "assassin", "marksman", "tank", "support"];
-      if (roleRules.includes(m.heroRule) && role !== m.heroRule)
-        return { ok: false, error: `ဒီပွဲက ${m.heroRule} only ပါ — ${hero} က ${role} ဖြစ်နေပါတယ်`, hero: "" };
-      const otherHero = isA ? m.bHero : m.aHero;
-      // Same-hero family: legacy "same_hero", the wizard's "same", and
-      // "same:<HeroName>" — with a name, both sides must play that hero.
-      const sameNamed = m.heroRule.startsWith("same:") ? m.heroRule.slice(5).trim() : "";
-      const namedHero = sameNamed
-        ? (HERO_NAMES.find((h) => h.toLowerCase() === sameNamed.toLowerCase()) ?? "")
-        : "";
-      const isSameRule = m.heroRule === "same_hero" || m.heroRule === "same" || m.heroRule.startsWith("same:");
-      if (isSameRule && namedHero && hero !== namedHero)
-        return { ok: false, error: `Same Hero — ဒီပွဲမှာ ${namedHero} ပဲ ကိုင်ရပါမယ်`, hero: "" };
-      if (isSameRule && otherHero && otherHero !== hero)
-        return { ok: false, error: `Same Hero only — opponent က ${otherHero} ရွေးထားပါတယ်`, hero: "" };
-      if (m.heroRule === "no_duplicate" && otherHero && otherHero === hero)
-        return { ok: false, error: `No Duplicate — opponent က ${hero} ရွေးပြီးသားပါ`, hero: "" };
-      await db.update(schema.matches)
-        .set(isA ? { aHero: hero } : { bHero: hero })
-        .where(eq(schema.matches.id, m.id));
-      ctx.invalidateQueries();
-      return { ok: true, error: "", hero };
-    },
-  }),
-
   submitResult: defineAction({
     request: z.object({
       match_id: z.number(),
@@ -3047,7 +3092,6 @@ export const Actions = {
     response: z.object({ ok: z.boolean(), error: z.string(), outcome: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      const s = await getSettingsMap(db);
       const rows = await db
         .select()
         .from(schema.matches)
@@ -3061,19 +3105,16 @@ export const Actions = {
       if (m.status !== "live" && m.status !== "result_pending")
         return { ok: false, error: "ရလဒ် တင်လို့ မရသေးပါ", outcome: "" };
       if (!m.startedAt) return { ok: false, error: "Match မစသေးပါ", outcome: "" };
-      const delay = numSetting(s, "result_delay_min", 5) * 60 * 1000;
-      if (Date.now() - m.startedAt.getTime() < delay)
+      // Fixed rule (in code): results unlock exactly 10 minutes after start.
+      if (Date.now() - m.startedAt.getTime() < RESULT_UNLOCK_MS)
         return {
           ok: false,
-          error: `ရလဒ်တင်ခွင့် မပွင့်သေးပါ — ပွဲစပြီး ${s["result_delay_min"]} မိနစ် ပြည့်မှ တင်နိုင်ပါတယ်`,
+          error: "ရလဒ်တင်ခွင့် မပွင့်သေးပါ — ပွဲစပြီး ၁၀ မိနစ် ပြည့်မှ တင်နိုင်ပါတယ်",
           outcome: "",
         };
       const isA = m.playerAId === args.player_id;
       const isB = m.playerBId === args.player_id;
       if (!isA && !isB) return { ok: false, error: "ဒီ match မှာ မပါဝင်ပါ", outcome: "" };
-      const myHero = isA ? m.aHero : m.bHero;
-      if (!myHero)
-        return { ok: false, error: "အရင် Hero ရွေးပါ — ban စာရင်းထဲ မပါတဲ့၊ စည်းကမ်းနဲ့ ကိုက်တဲ့ hero ဖြစ်ရပါမယ်", outcome: "" };
 
       let evKey = isA ? m.aEvidence : m.bEvidence;
       if (args.evidence_base64) {
@@ -3094,12 +3135,16 @@ export const Actions = {
       // submitting at the same moment must never overwrite each other.
       // The write is status-guarded: if a settle/refund claim already
       // finished the match, this submit is a no-op error, never a revive.
+      // The FIRST submission starts the fixed 5-minute clock for the other
+      // player (first_result_at) — the sweep auto-settles from this single
+      // submission if the deadline passes with no second one.
+      const isFirstSubmission = !m.aResult && !m.bResult;
       const wrote = await db
         .update(schema.matches)
         .set(
           isA
-            ? { aResult: args.result, aEvidence: evKey, status: "result_pending" }
-            : { bResult: args.result, bEvidence: evKey, status: "result_pending" },
+            ? { aResult: args.result, aEvidence: evKey, status: "result_pending", ...(isFirstSubmission ? { firstResultAt: new Date() } : {}) }
+            : { bResult: args.result, bEvidence: evKey, status: "result_pending", ...(isFirstSubmission ? { firstResultAt: new Date() } : {}) },
         )
         .where(
           and(
@@ -3180,6 +3225,12 @@ export const Actions = {
         return { ok: false, error: "ပြီးဆုံးပြီး match ပါ" };
       if (m.playerAId !== args.player_id && m.playerBId !== args.player_id)
         return { ok: false, error: "ဒီ match မှာ မပါဝင်ပါ" };
+      // READY = COMMITMENT (Owner rule): once EITHER player has pressed
+      // Ready, the match must be played — participant cancel is closed.
+      // The only remaining exit is the ready-timeout sweep (opponent never
+      // readies before the deadline → sweep cancels and refunds both).
+      if (m.aReady === 1 || m.bReady === 1)
+        return { ok: false, error: "Ready နှိပ်ပြီးသား ပွဲကို ဖျက်လို့ မရပါ — Ready နှိပ်ပြီးရင် ဆော့ကို ဆော့ရပါမယ် (Once either player presses Ready, the match must be played — cancel is closed)" };
       // H2 (loss-escape fix): participants may cancel ONLY before any
       // result exists — lobby / ready / live with neither side submitted.
       // result_pending and disputed matches resolve via admin alone.
@@ -3336,6 +3387,7 @@ export const Actions = {
       session_token: z.string().default(""),
       coins: z.number().int().min(1).max(10000000),
       label: z.string().max(80).default(""),
+      sender_name: z.string().max(80).default(""),
       proof_key: z.string().max(200).default(""),
     }),
     response: z.object({
@@ -3364,6 +3416,12 @@ export const Actions = {
         return fail(`အနည်းဆုံး ${minCoins.toLocaleString()} coins မှ စပြီး ဝယ်လို့ရပါတယ် (Minimum top-up is ${minCoins} coins)`);
       if (args.coins > maxCoins)
         return fail(`တစ်ကြိမ်ကို အများဆုံး ${maxCoins.toLocaleString()} coins ပဲ ဝယ်လို့ရပါတယ် (Maximum top-up is ${maxCoins} coins)`);
+      // Sender name is REQUIRED (Owner rule): the name on the KPay/Wave
+      // account the money was sent from, so the admin can match the
+      // request against the incoming transfer/screenshot.
+      const senderName = (args.sender_name ?? "").trim();
+      if (!senderName)
+        return fail("ငွေလွှဲသူ အမည် ထည့်ပါ — လွှဲခဲ့တဲ့ KPay/Wave အကောင့် နာမည်ကို ရေးပါ (Sender name is required — the name on the account you sent from)");
       // Payment proof: once the admin publishes any payment method, a
       // screenshot is REQUIRED. The proof blob key is content-addressed —
       // minted ONLY by uploadPurchaseProof as proofs/p<playerId>/<sha256>.<ext> —
@@ -3401,6 +3459,7 @@ export const Actions = {
           playerId: p.id,
           coins: args.coins,
           label: args.label || `Coin ဝယ်ယူမှု ${args.coins} coins`,
+          senderName,
           status: "pending",
           proofBlobKey: proofKey,
           proofHash,
@@ -3414,14 +3473,14 @@ export const Actions = {
           playerId: ownerRow.id,
           type: "wallet",
           title: "🪙 Coin ဝယ်ယူမှု တောင်းဆိုချက် အသစ်",
-          body: `${p.name} က ${args.coins} coins ဝယ်ဖို့ တောင်းဆိုထားပါတယ် — Admin မှာ အတည်ပြု/ပယ်ချ လုပ်ပါ။`,
+          body: `${p.name} က ${args.coins} coins ဝယ်ဖို့ တောင်းဆိုထားပါတယ် — လွှဲသူ: ${senderName}။ Admin မှာ အတည်ပြု/ပယ်ချ လုပ်ပါ။`,
         });
       }
       // Telegram: photo + one-tap decision buttons (fail-soft).
       if (telegramConfigured(s) && requestId > 0) {
         const caption =
           `🪙 Coin ဝယ်ယူမှု အသစ် #${requestId}\n` +
-          `Player: ${p.name}\nCoins: ${args.coins.toLocaleString()}\n${args.label || ""}\n` +
+          `Player: ${p.name}\nSender: ${senderName}\nCoins: ${args.coins.toLocaleString()}\n${args.label || ""}\n` +
           `Admin dashboard သို့မဟုတ် ဒီကပဲ ဆုံးဖြတ်နိုင်ပါတယ်။`;
         const kb = moneyKeyboard("pur", requestId);
         const bytes = proofKey ? await blobBytes(ctx, proofKey) : null;
@@ -3556,7 +3615,15 @@ export const Actions = {
       if (rl) return fail(rl);
       await expireMoneyRequestsInternal(db).catch(() => 0);
       const phone = (args.payout_phone ?? "").trim();
-      if (!phone) return fail("ငွေလက်ခံမယ့် ဖုန်းနံပါတ် ထည့်ပါ (Payout phone number is required)");
+      // Payout phone is REQUIRED and must be plausible (Owner rule): the
+      // KPay/Wave number the admin will actually pay. Digits with an
+      // optional leading +, 7–15 digits (spaces/dashes tolerated). This
+      // number is admin-only data — it is stored on the request, shown in
+      // the admin queue and the Telegram notice, and NEVER published in
+      // the public payouts list.
+      const phoneDigits = phone.replace(/[\s-]/g, "");
+      if (!/^\+?\d{7,15}$/.test(phoneDigits))
+        return fail("ငွေလက်ခံမယ့် ဖုန်းနံပါတ် အမှန် ထည့်ပါ — KPay/Wave နံပါတ် ဖြစ်ရပါမယ် (A valid payout phone number is required)");
       const rate = Math.floor(numSetting(s, "coin_rate_kyat", 0));
       if (rate <= 0)
         return fail("ငွေထုတ် စနစ် မဖွင့်ရသေးပါ — admin က လဲနှုန်း မသတ်မှတ်ရသေးပါ (Withdrawals are not configured yet)");
@@ -4231,7 +4298,7 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const auth = await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin", "moderator", "support"]);
       if (auth.error) return { ok: false, acted: 0, error: auth.error };
-      const acted = await sweepTimeoutsInternal(db);
+      const acted = await sweepTimeoutsInternal(db, ctx);
       ctx.invalidateQueries();
       return { ok: true, acted, error: "" };
     },
@@ -5553,6 +5620,7 @@ export const Actions = {
         "fee_1v1_type", "fee_1v1_value", "fee_classic_type", "fee_classic_value",
         "fee_brawl_type", "fee_brawl_value", "referral_percent_x100", "packages",
         "emergency", "maintenance", "telegram_bot_token", "telegram_chat_id",
+        "turn_url", "turn_username", "turn_credential",
         "google_client_id", "google_enabled",
         "coin_rate_kyat", "withdraw_fee_percent", "withdraw_min_coins",
         "withdraw_max_coins_per_day", "topup_min_coins", "topup_max_coins",
@@ -5570,7 +5638,7 @@ export const Actions = {
         if (!(k in DEFAULT_SETTINGS) && k !== "announcement_my" && k !== "announcement_en")
           continue;
         // Never wipe a stored secret with an empty value from a stale form.
-        if ((k === "telegram_bot_token" || k === "google_client_id") && v.trim() === "")
+        if ((k === "telegram_bot_token" || k === "google_client_id" || k === "turn_credential") && v.trim() === "")
           continue;
         await db
           .insert(schema.settings)
@@ -6183,7 +6251,7 @@ export const Actions = {
         lastSeenAt: iso(p.lastSeenAt),
       }));
       tables["settings"] = (await db.select().from(schema.settings)).map((r) =>
-        r.key === "telegram_bot_token" ? { ...r, value: "***" } : r,
+        r.key === "telegram_bot_token" || r.key === "turn_credential" ? { ...r, value: "***" } : r,
       );
       tables["challenges"] = (await db.select().from(schema.challenges)).map((r) => ({ ...r, createdAt: iso(r.createdAt) }));
       tables["matches"] = (await db.select().from(schema.matches)).map((r) => ({
