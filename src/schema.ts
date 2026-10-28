@@ -144,6 +144,29 @@ export const chatMessages = sqliteTable("chat_messages", {
   createdAt: ts("created_at"),
 });
 
+/** Batch 12 FRIEND CHAT: 1:1 direct messages between friends. A row is a
+ *  single message from senderId to recipientId; a conversation is the
+ *  unordered pair (both directions). The match-room chat (chat_messages)
+ *  is a separate table and stays untouched. */
+export const dmMessages = sqliteTable("dm_messages", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  senderId: integer("sender_id").notNull(),
+  recipientId: integer("recipient_id").notNull(),
+  text: text("text").notNull(),
+  createdAt: ts("created_at"),
+});
+
+/** Batch 12: per-conversation last-read marker — one row per
+ *  (player, partner) pair; unread = partner's messages with id greater
+ *  than lastReadMessageId. */
+export const dmReads = sqliteTable("dm_reads", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  playerId: integer("player_id").notNull(),
+  partnerId: integer("partner_id").notNull(),
+  lastReadMessageId: integer("last_read_message_id").notNull().default(0),
+  createdAt: ts("created_at"),
+});
+
 export const transactions = sqliteTable("transactions", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   code: text("code").notNull(),

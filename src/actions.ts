@@ -141,6 +141,10 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   telegram_bot: "",
   telegram_bot_token: "",
   telegram_chat_id: "",
+  // Batch 12: public Telegram CHANNEL link for the header "Channel Join"
+  // button. Default EMPTY — the Owner enters it later; the button only
+  // renders when a valid https URL is stored. Validated in updateSettings.
+  telegram_channel_url: "",
   turn_url: "",
   turn_username: "",
   turn_credential: "",
@@ -2198,6 +2202,7 @@ const settingsShape = z.object({
   turn_url: z.string(),
   turn_configured: z.boolean(),
   telegram_chat_id: z.string(),
+  telegram_channel_url: z.string(),
   google_client_id: z.string(),
   google_enabled: z.boolean(),
   google_setup_state: z.string(),
@@ -2306,6 +2311,9 @@ function settingsOut(s: Record<string, string>, adminView = false) {
     // must never ship in the public bootstrap settings. Only the gated
     // getAdmin payload (Owner's own dashboard) reveals it.
     telegram_chat_id: adminView ? (s["telegram_chat_id"] ?? "") : "",
+    // Batch 12: the channel link is PUBLIC by design — it is the target
+    // of the header "Channel Join" button, so it ships in every view.
+    telegram_channel_url: s["telegram_channel_url"] ?? "",
     google_client_id: s["google_client_id"] ?? "",
     google_enabled:
       s["google_enabled"] === "1" && (s["google_client_id"] ?? "").trim() !== "",
@@ -2782,6 +2790,38 @@ const diamondOrderShape = z.object({
   decided_by: z.string(),
   created_at: z.string(),
   decided_at: z.string().nullable(),
+});
+
+/* ---------- Batch 12 — Friend Chat (DM) helpers ----------
+ * Friendship uses the EXISTING one-directional friends table: a pair is
+ * "friends" when a row exists in EITHER direction (A added B, or B added
+ * A) — the same rows friendsAction writes. Removing BOTH directions ends
+ * the friendship: history stays readable, sending is blocked. */
+async function dmAreFriends(db: Db, a: number, b: number): Promise<boolean> {
+  const rows = await db.select().from(schema.friends);
+  return rows.some(
+    (r) =>
+      (r.playerId === a && r.friendId === b) ||
+      (r.playerId === b && r.friendId === a),
+  );
+}
+
+const dmMessageShape = z.object({
+  id: z.number(),
+  sender_id: z.number(),
+  recipient_id: z.number(),
+  text: z.string(),
+  mine: z.boolean(),
+  created_at: z.string(),
+});
+
+const dmConversationShape = z.object({
+  partner: playerShape,
+  is_friend: z.boolean(),
+  last_text: z.string(),
+  last_at: z.string(),
+  last_mine: z.boolean(),
+  unread: z.number(),
 });
 
 export const Actions = {
@@ -6758,6 +6798,233 @@ export const Actions = {
     },
   }),
 
+  /* ---------- Batch 12 — Friend Chat (DM) ----------
+   * Dedicated 1:1 messaging between friends. Every read/write is scoped
+   * to the session-verified caller: a conversation only ever exists
+   * between the caller and args.partner_id, so no third party's messages
+   * can be read or written (IDOR-proof by construction). The Owner is
+   * blocked like every other player action (ownerPlayerBlock). */
+  listConversations: defineAction({
+    request: z.object({
+      player_id: z.number(),
+      session_token: z.string().default(""),
+    }),
+    response: z.object({
+      conversations: z.array(dmConversationShape),
+      total_unread: z.number(),
+      ok: z.boolean(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const me = await playerBySession(db, args.player_id, args.session_token);
+      if (!me || ownerPlayerBlock(me))
+        return { conversations: [], total_unread: 0, ok: false };
+      const friendRows = await db.select().from(schema.friends);
+      const friendIds = new Set<number>();
+      for (const r of friendRows) {
+        if (r.playerId === me.id) friendIds.add(r.friendId);
+        if (r.friendId === me.id) friendIds.add(r.playerId);
+      }
+      const allMsgs = await db
+        .select()
+        .from(schema.dmMessages)
+        .orderBy(desc(schema.dmMessages.id));
+      const lastByPartner = new Map<number, (typeof allMsgs)[number]>();
+      const partnersWithHistory = new Set<number>();
+      for (const m of allMsgs) {
+        const partner =
+          m.senderId === me.id ? m.recipientId : m.recipientId === me.id ? m.senderId : null;
+        if (partner === null) continue;
+        partnersWithHistory.add(partner);
+        if (!lastByPartner.has(partner)) lastByPartner.set(partner, m);
+      }
+      const readRows = await db
+        .select()
+        .from(schema.dmReads)
+        .where(eq(schema.dmReads.playerId, me.id));
+      const lastRead = new Map(readRows.map((r) => [r.partnerId, r.lastReadMessageId]));
+      const allPlayers = await db.select().from(schema.players);
+      const partnerIds = new Set<number>([...friendIds, ...partnersWithHistory]);
+      partnerIds.delete(me.id);
+      const conversations = [];
+      let totalUnread = 0;
+      for (const pid of partnerIds) {
+        const p = allPlayers.find((x) => x.id === pid);
+        if (!p || effectiveRole(p) === "owner") continue;
+        const last = lastByPartner.get(pid);
+        const readMark = lastRead.get(pid) ?? 0;
+        const unread = allMsgs.filter(
+          (m) => m.senderId === pid && m.recipientId === me.id && m.id > readMark,
+        ).length;
+        totalUnread += unread;
+        conversations.push({
+          partner: await playerPublicOutAsync(ctx, p, me.id),
+          is_friend: friendIds.has(pid),
+          last_text: last?.text ?? "",
+          last_at: last ? (iso(last.createdAt) ?? "") : "",
+          last_mine: last ? last.senderId === me.id : false,
+          unread,
+        });
+      }
+      // Conversations with messages first, newest activity first;
+      // friends without any history follow, by name.
+      conversations.sort((a, b) => {
+        if (a.last_at && b.last_at) return b.last_at.localeCompare(a.last_at);
+        if (a.last_at) return -1;
+        if (b.last_at) return 1;
+        return a.partner.name.localeCompare(b.partner.name);
+      });
+      return { conversations, total_unread: totalUnread, ok: true };
+    },
+  }),
+
+  getDmThread: defineAction({
+    request: z.object({
+      player_id: z.number(),
+      session_token: z.string().default(""),
+      partner_id: z.number(),
+    }),
+    response: z.object({
+      messages: z.array(dmMessageShape),
+      is_friend: z.boolean(),
+      ok: z.boolean(),
+      error: z.string(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const me = await playerBySession(db, args.player_id, args.session_token);
+      if (!me) return { messages: [], is_friend: false, ok: false, error: AUTH_ERR };
+      const ob = ownerPlayerBlock(me);
+      if (ob) return { messages: [], is_friend: false, ok: false, error: ob };
+      if (args.partner_id === me.id)
+        return { messages: [], is_friend: false, ok: false, error: "ကိုယ့်ကိုယ်ကို message ပို့လို့ မရပါ" };
+      const partner = await getPlayer(db, args.partner_id);
+      if (!partner)
+        return { messages: [], is_friend: false, ok: false, error: "Player မတွေ့ပါ" };
+      const isFriend = await dmAreFriends(db, me.id, partner.id);
+      // History is readable by the two participants even after the
+      // friendship ends — but only when a conversation actually exists
+      // or the pair is (still) friends. Strangers get nothing.
+      const rows = await db
+        .select()
+        .from(schema.dmMessages)
+        .orderBy(schema.dmMessages.id);
+      const thread = rows.filter(
+        (m) =>
+          (m.senderId === me.id && m.recipientId === partner.id) ||
+          (m.senderId === partner.id && m.recipientId === me.id),
+      );
+      if (!isFriend && thread.length === 0)
+        return { messages: [], is_friend: false, ok: false, error: "သူငယ်ချင်း မဟုတ်သူနဲ့ စကားပြောလို့ မရပါ" };
+      return {
+        // Full history — the brief requires the complete persisted
+        // thread; no cap, no pagination cutoff.
+        messages: thread.map((m) => ({
+          id: m.id,
+          sender_id: m.senderId,
+          recipient_id: m.recipientId,
+          text: m.text,
+          mine: m.senderId === me.id,
+          created_at: iso(m.createdAt) ?? "",
+        })),
+        is_friend: isFriend,
+        ok: true,
+        error: "",
+      };
+    },
+  }),
+
+  sendDm: defineAction({
+    request: z.object({
+      player_id: z.number(),
+      session_token: z.string().default(""),
+      partner_id: z.number(),
+      // Same cap as the match-room chat (sendChat max 500).
+      text: z.string().min(1).max(500),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const me = await playerBySession(db, args.player_id, args.session_token);
+      if (!me) return { ok: false, error: AUTH_ERR };
+      const ob = ownerPlayerBlock(me);
+      if (ob) return { ok: false, error: ob };
+      if (args.partner_id === me.id)
+        return { ok: false, error: "ကိုယ့်ကိုယ်ကို message ပို့လို့ မရပါ" };
+      const partner = await getPlayer(db, args.partner_id);
+      if (!partner) return { ok: false, error: "Player မတွေ့ပါ" };
+      if (effectiveRole(partner) === "owner")
+        return { ok: false, error: "ဒီ player ကို message ပို့လို့ မရပါ" };
+      // Friends ONLY — a removed friendship blocks new messages while
+      // the history stays readable (getDmThread).
+      if (!(await dmAreFriends(db, me.id, partner.id)))
+        return { ok: false, error: "သူငယ်ချင်း မဟုတ်ပါ / မဟုတ်တော့ပါ — message အသစ် ပို့လို့ မရပါ (အရင် စာတွေ ရှိရင် ကြည့်လို့ရပါတယ်)" };
+      const rl = await rateLimit(db, `dm:${me.id}`, 40, 60 * 1000);
+      if (rl) return { ok: false, error: rl };
+      const text = args.text.trim();
+      if (!text) return { ok: false, error: "Message ရေးပါ" };
+      await db.insert(schema.dmMessages).values({
+        senderId: me.id,
+        recipientId: partner.id,
+        text,
+      });
+      ctx.invalidateQueries();
+      return { ok: true, error: "" };
+    },
+  }),
+
+  markDmRead: defineAction({
+    request: z.object({
+      player_id: z.number(),
+      session_token: z.string().default(""),
+      partner_id: z.number(),
+    }),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const me = await playerBySession(db, args.player_id, args.session_token);
+      if (!me || ownerPlayerBlock(me)) return { ok: false };
+      const rows = await db
+        .select()
+        .from(schema.dmMessages)
+        .where(
+          and(
+            eq(schema.dmMessages.senderId, args.partner_id),
+            eq(schema.dmMessages.recipientId, me.id),
+          ),
+        )
+        .orderBy(desc(schema.dmMessages.id))
+        .limit(1);
+      const latest = rows[0]?.id ?? 0;
+      const existing = await db
+        .select()
+        .from(schema.dmReads)
+        .where(
+          and(
+            eq(schema.dmReads.playerId, me.id),
+            eq(schema.dmReads.partnerId, args.partner_id),
+          ),
+        )
+        .limit(1);
+      if (existing[0]) {
+        if (latest > existing[0].lastReadMessageId) {
+          await db
+            .update(schema.dmReads)
+            .set({ lastReadMessageId: latest })
+            .where(eq(schema.dmReads.id, existing[0].id));
+        }
+      } else if (latest > 0) {
+        await db.insert(schema.dmReads).values({
+          playerId: me.id,
+          partnerId: args.partner_id,
+          lastReadMessageId: latest,
+        });
+      }
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
   getReferral: defineAction({
     request: z.object({ player_id: z.number(), session_token: z.string().default("") }),
     response: z.object({
@@ -7493,6 +7760,18 @@ export const Actions = {
       if (touchesCritical) {
         const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
         if (err2fa) return { ok: false, error: err2fa };
+      }
+      // Batch 12: the Telegram channel link must be a valid https URL
+      // (empty = cleared, button hidden). A bad value rejects the WHOLE
+      // save before anything is written, so the previous value is kept.
+      if (args.values["telegram_channel_url"] !== undefined) {
+        const url = args.values["telegram_channel_url"].trim();
+        if (url !== "") {
+          let parsed: URL | null = null;
+          try { parsed = new URL(url); } catch { parsed = null; }
+          if (!parsed || parsed.protocol !== "https:" || url.length > 500)
+            return { ok: false, error: "Channel link မမှန်ပါ — https:// နဲ့ စတဲ့ link အပြည့် ထည့်ပါ (ဥပမာ https://t.me/…)" };
+        }
       }
       for (const [k, v] of Object.entries(args.values)) {
         if (!(k in DEFAULT_SETTINGS) && k !== "announcement_my" && k !== "announcement_en")
