@@ -1680,8 +1680,14 @@ const NAME_TAKEN_ERR =
 
 /** Batch 14 (M6): ONE game account = ONE app account. Finds the player
  *  who owns the trimmed (mlbbId, serverId) pair, or null. An empty pair
- *  never matches (pair uniqueness only applies to filled pairs; the DB
- *  unique index players_mlbb_pair_unique is the backstop). */
+ *  never matches (pair uniqueness only applies to filled pairs).
+ *  Uniqueness is enforced at the application level by this check on
+ *  every write path (registerPlayer / completeGoogleProfile /
+ *  updateProfile); there is intentionally NO database unique index —
+ *  legacy duplicate pairs already exist in production data, so an index
+ *  can never be created (and a deploy attempting it crash-loops on
+ *  boot). Legacy duplicates are surfaced read-only via getAdmin's
+ *  duplicate_pairs for the Owner to resolve manually. */
 function pairOwner(
   all: PlayerRow[],
   mlbbId: string,
@@ -8210,6 +8216,18 @@ export const Actions = {
         z.object({ id: z.number(), actor: z.string(), action: z.string(), created_at: z.string() }),
       ),
       players: z.array(playerShape),
+      // Batch 14 fix: legacy duplicate (mlbb_id, server_id) pairs, listed
+      // READ-ONLY for the Owner to review manually (pair uniqueness is
+      // enforced at the application level; no DB unique index exists).
+      duplicate_pairs: z.array(
+        z.object({
+          mlbb_id: z.string(),
+          server_id: z.string(),
+          players: z.array(
+            z.object({ id: z.number(), name: z.string(), game_name: z.string() }),
+          ),
+        }),
+      ),
       suspicious_players: z.array(playerShape),
       terms_history: z.array(
         z.object({
@@ -8247,7 +8265,7 @@ export const Actions = {
           settings: { ...settingsOut({}), telegram_chat_id: "" },
           health: { total_players: 0, online_players: 0, active_matches: 0, pending_disputes: 0, pending_reports: 0, open_tickets: 0, total_transactions: 0, total_fees: 0, db_status: "FORBIDDEN" },
           money: { topups_today_count: 0, topups_today_coins: 0, withdrawals_today_count: 0, withdrawals_today_kyat: 0, fees_today_coins: 0, pending_topups: 0, pending_withdrawals: 0 },
-          activity: [], players: [], suspicious_players: [], terms_history: [], backups: [],
+          activity: [], players: [], duplicate_pairs: [], suspicious_players: [], terms_history: [], backups: [],
         };
       }
       const s = await getSettingsMap(db);
@@ -8327,6 +8345,21 @@ export const Actions = {
           created_at: iso(a.createdAt) ?? "",
         })),
         players: await (async () => { const arr = []; for (const pl of all) arr.push({ ...(await playerOutAsync(ctx, pl)), role: effectiveRole(pl) }); return arr; })(),
+        duplicate_pairs: (() => {
+          // Group the already-loaded players by their trimmed filled pair
+          // (same semantics as pairOwner) and keep only groups of 2+.
+          const byPair = new Map<string, { mlbb_id: string; server_id: string; players: { id: number; name: string; game_name: string }[] }>();
+          for (const pl of all) {
+            const id = (pl.mlbbId ?? "").trim();
+            const zone = (pl.serverId ?? "").trim();
+            if (!id || !zone) continue;
+            const key = `${id} ${zone}`;
+            const group = byPair.get(key) ?? { mlbb_id: id, server_id: zone, players: [] };
+            group.players.push({ id: pl.id, name: pl.name, game_name: pl.gameName ?? "" });
+            byPair.set(key, group);
+          }
+          return [...byPair.values()].filter((g) => g.players.length > 1);
+        })(),
         suspicious_players: await (async () => { const arr = []; for (const pl of all.filter((p) => p.suspicious === 1)) arr.push({ ...(await playerOutAsync(ctx, pl)), role: effectiveRole(pl) }); return arr; })(),
         terms_history: termsHist.map((t) => ({
           id: t.id,

@@ -8,5 +8,3 @@ CREATE TABLE `google_pending` (
 	`created_at` integer NOT NULL,
 	`expires_at` integer NOT NULL
 );
---> statement-breakpoint
-CREATE UNIQUE INDEX `players_mlbb_pair_unique` ON `players` (`mlbb_id`,`server_id`) WHERE `mlbb_id` <> '';
