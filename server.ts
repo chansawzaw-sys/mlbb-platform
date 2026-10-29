@@ -17,7 +17,7 @@
 //
 // Env: PORT (default 3000), DATA_DIR (default ./data)
 import { Database } from "bun:sqlite";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
@@ -43,6 +43,66 @@ const sqlite = new Database(DB_PATH, { create: true });
 sqlite.exec("PRAGMA journal_mode = WAL");
 sqlite.exec("PRAGMA foreign_keys = ON");
 const db = drizzle(sqlite, { schema });
+
+// --- Batch 14 fix: boot-safety reconciliation for migration 0017 --------
+// The first Batch 14 deploy crash-looped: migration 0017's CREATE UNIQUE
+// INDEX can never succeed on production data (legacy duplicate
+// (mlbb_id, server_id) pairs), and the fixed 0017 must boot from EVERY
+// state that saga can leave behind:
+//   (a) journal at 0016, no 0017 objects (the migrator's per-run
+//       transaction rolled the failed attempt back — the proven
+//       production state): the objects are created here;
+//   (b) 0017 objects present but journal still at 0016 (DDL applied
+//       outside the migrator): the raw migration would die with
+//       "duplicate column name", so only the journal row is recorded;
+//   (c) journal already at 0017: nothing to do.
+// The drizzle migrator selects purely by the latest recorded created_at
+// (hashes are stored, never verified), so recording 0017 here — with the
+// same sha256 the migrator computes over the migration file — makes
+// migrate() skip it cleanly. The guard fires ONLY when the journal sits
+// exactly at 0016 (created_at 1795000000000): older DBs (restored
+// backups) keep the normal migration path, and fresh DBs have no
+// players table yet.
+{
+  const WHEN_0016 = 1795000000000;
+  const WHEN_0017 = 1795100000000;
+  const tableExists = (name: string) =>
+    (
+      sqlite
+        .query("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name = ?")
+        .get(name) as { n: number }
+    ).n > 0;
+  if (tableExists("players") && tableExists("__drizzle_migrations")) {
+    const lastMig = sqlite
+      .query("SELECT created_at FROM __drizzle_migrations ORDER BY created_at DESC LIMIT 1")
+      .get() as { created_at: number } | null;
+    if (lastMig && Number(lastMig.created_at) === WHEN_0016) {
+      const cols = sqlite
+        .query("SELECT name FROM pragma_table_info('players')")
+        .all() as { name: string }[];
+      if (!cols.some((c) => c.name === "game_name_locked")) {
+        sqlite.exec(
+          "ALTER TABLE `players` ADD COLUMN `game_name_locked` integer DEFAULT 0 NOT NULL",
+        );
+      }
+      sqlite.exec(
+        "CREATE TABLE IF NOT EXISTS `google_pending` (`token_hash` text PRIMARY KEY NOT NULL, `google_sub` text DEFAULT '' NOT NULL, `email` text DEFAULT '' NOT NULL, `name` text DEFAULT '' NOT NULL, `created_at` integer NOT NULL, `expires_at` integer NOT NULL)",
+      );
+      const query0017 = readFileSync(
+        join(MIGRATIONS_DIR, "0017_batch14_game_name_lock_google_pending_pair_unique.sql"),
+        "utf8",
+      );
+      const hash0017 = createHash("sha256").update(query0017).digest("hex");
+      sqlite
+        .query('INSERT INTO `__drizzle_migrations` ("hash", "created_at") VALUES (?, ?)')
+        .run(hash0017, WHEN_0017);
+      console.log(
+        "[mlbb-standalone] migration 0017 reconciled at boot (objects ensured, journal recorded)",
+      );
+    }
+  }
+}
+
 await migrate(db, { migrationsFolder: MIGRATIONS_DIR });
 
 // --- blobs ---------------------------------------------------------------
