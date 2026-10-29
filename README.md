@@ -159,3 +159,5 @@ it contains the whole database and every uploaded image.
 - Voice chat uses WebRTC peer-to-peer with the app's DB signaling —
   no extra server component is needed here. STUN only, as in the
   original; add a TURN server later only if voice fails on some networks.
+
+<!-- redeploy trigger: no content change -->
