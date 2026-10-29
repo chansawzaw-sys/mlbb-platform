@@ -62,6 +62,15 @@ export const googlePending = sqliteTable("google_pending", {
   expiresAt: integer("expires_at").notNull(),
 });
 
+export const staffGrants = sqliteTable("staff_grants", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  email: text("email").notNull().default(""),
+  role: text("role", { enum: ["admin", "moderator", "support"] }).notNull().default("support"),
+  grantedBy: text("granted_by").notNull().default(""),
+  createdAt: ts("created_at"),
+  updatedAt: ts("updated_at"),
+});
+
 export const settings = sqliteTable("settings", {
   key: text("key").primaryKey(),
   value: text("value").notNull().default(""),

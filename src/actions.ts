@@ -805,6 +805,72 @@ async function logAct(db: Db, actor: string, action: string) {
   await db.insert(schema.activityLog).values({ actor, action });
 }
 
+/* ---------- Batch 15: Gmail staff grants ----------
+ * A grant maps a Gmail address to a staff role (admin / moderator /
+ * support — NEVER owner). Grants are Owner-only data: they appear only
+ * in getAdmin for the Owner and in staffGrantAction responses to the
+ * Owner, never in any public/bootstrap payload. A grant confers a role
+ * only after Google verifies the identity (googleLogin /
+ * completeGoogleProfile), plus the immediate effect in staffGrantAction
+ * for an already-Google-linked account. */
+type StaffGrantRow = typeof schema.staffGrants.$inferSelect;
+
+async function loadStaffGrants(db: Db): Promise<StaffGrantRow[]> {
+  const rows = await db.select().from(schema.staffGrants);
+  return rows.sort((a, b) => a.id - b.id);
+}
+
+function staffGrantsOut(rows: StaffGrantRow[]) {
+  return rows.map((g) => ({
+    email: g.email,
+    role: g.role,
+    granted_by: g.grantedBy,
+    created_at: iso(g.createdAt) ?? "",
+  }));
+}
+
+async function findStaffGrant(
+  db: Db,
+  emailRaw: string,
+): Promise<StaffGrantRow | null> {
+  const email = (emailRaw ?? "").trim().toLowerCase();
+  if (!email || isFixedAdminEmail(email)) return null;
+  const rows = await loadStaffGrants(db);
+  return rows.find((g) => g.email === email) ?? null;
+}
+
+/** Create a staff account for a Google-verified granted identity:
+ *  no MLBB pair (staff do not complete the player profile form),
+ *  role = the grant role. Mirrors googleLogin path (a)'s insert. */
+async function createStaffAccount(
+  db: Db,
+  all: PlayerRow[],
+  args: { nameBase: string; email: string; sub: string; role: "admin" | "moderator" | "support" },
+): Promise<PlayerRow | null> {
+  const displayName = uniqueDisplayName(all, args.nameBase.slice(0, 60));
+  const myCode = `${displayName.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "MLBB"}${Math.floor(1000 + Math.random() * 9000)}`;
+  const inserted = await db
+    .insert(schema.players)
+    .values({
+      name: displayName,
+      rank: "Bronze",
+      role: args.role,
+      referralCode: myCode,
+      googleSub: args.sub,
+      email: args.email,
+    })
+    .returning();
+  const np = inserted[0];
+  if (!np) return null;
+  await notify(db, {
+    playerId: np.id,
+    type: "info",
+    title: "ကြိုဆိုပါတယ် 🎮",
+    body: `Staff အကောင့် ဖွင့်ပြီးပါပြီ။ သင့်ကို ${args.role} role ပေးထားပါတယ်။`,
+  });
+  return np;
+}
+
 /* ---------- Integrations helpers (Google / Telegram / TOTP / rate limit) ---------- */
 
 async function telegramSend(
@@ -8185,6 +8251,104 @@ export const Actions = {
     },
   }),
 
+  staffGrantAction: defineAction({
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+      mode: z.enum(["add", "revoke"]),
+      email: z.string().max(160),
+      role: z.enum(["admin", "moderator", "support", "owner"]).default("support"),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string(),
+      grants: z.array(
+        z.object({
+          email: z.string(),
+          role: z.string(),
+          granted_by: z.string(),
+          created_at: z.string(),
+        }),
+      ),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const fail = async (error: string) => ({
+        ok: false,
+        error,
+        grants: staffGrantsOut(await loadStaffGrants(db)),
+      });
+      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor)
+        return { ok: false, error: auth.error ?? AUTH_ERR, grants: [] };
+      const actorName = auth.actor.name;
+      if (!args.confirmed)
+        return fail("security confirmation လိုပါတယ်");
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return fail(err2fa);
+      const email = (args.email ?? "").trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+        return fail("Gmail လိပ်စာ မမှန်ပါ — မှန်ကန်သော email ထည့်ပါ");
+      if (isFixedAdminEmail(email)) {
+        await logAct(db, actorName, `Staff grant attempt REJECTED (fixed admin Gmail target): ${email}`);
+        return fail("Fixed Admin Gmail က Owner ဖြစ်ပြီးသားပါ — grant ပေးရန် မလိုပါ");
+      }
+      if (args.mode === "add") {
+        if (args.role === "owner") {
+          await logAct(db, actorName, `Staff grant ADD REJECTED (owner role): ${email}`);
+          return fail("Owner role ကို grant ပေးလို့ မရပါ");
+        }
+        const grantRole = args.role as "admin" | "moderator" | "support";
+        const existing = (await loadStaffGrants(db)).find((g) => g.email === email) ?? null;
+        if (existing) {
+          await db
+            .update(schema.staffGrants)
+            .set({ role: grantRole, grantedBy: actorName, updatedAt: new Date() })
+            .where(eq(schema.staffGrants.id, existing.id));
+        } else {
+          await db.insert(schema.staffGrants).values({
+            email,
+            role: grantRole,
+            grantedBy: actorName,
+          });
+        }
+        // Immediate effect on an already-Google-linked account only.
+        const allPlayers = await db.select().from(schema.players);
+        for (const p of allPlayers) {
+          if (p.googleSub === "") continue;
+          if ((p.email ?? "").trim().toLowerCase() !== email) continue;
+          if (effectiveRole(p) === "owner") continue;
+          await db
+            .update(schema.players)
+            .set({ role: grantRole })
+            .where(eq(schema.players.id, p.id));
+        }
+        await logAct(db, actorName, `Staff grant ADD: ${email} → ${grantRole}`);
+        ctx.invalidateQueries();
+        return { ok: true, error: "", grants: staffGrantsOut(await loadStaffGrants(db)) };
+      }
+      // mode === "revoke"
+      const grant = (await loadStaffGrants(db)).find((g) => g.email === email) ?? null;
+      if (!grant) return fail("Grant မတွေ့ပါ");
+      await db.delete(schema.staffGrants).where(eq(schema.staffGrants.id, grant.id));
+      const allPlayers = await db.select().from(schema.players);
+      for (const p of allPlayers) {
+        if ((p.email ?? "").trim().toLowerCase() !== email) continue;
+        if (!["admin", "moderator", "support"].includes(p.role)) continue;
+        if (effectiveRole(p) === "owner") continue;
+        await db
+          .update(schema.players)
+          .set({ role: "player" })
+          .where(eq(schema.players.id, p.id));
+      }
+      await logAct(db, actorName, `Staff grant REVOKE: ${email}`);
+      ctx.invalidateQueries();
+      return { ok: true, error: "", grants: staffGrantsOut(await loadStaffGrants(db)) };
+    },
+  }),
+
   getAdmin: defineAction({
     request: z.object({
       actor_player_id: z.number().default(0),
@@ -8248,6 +8412,14 @@ export const Actions = {
           created_at: z.string(),
         }),
       ),
+      staff_grants: z.array(
+        z.object({
+          email: z.string(),
+          role: z.string(),
+          granted_by: z.string(),
+          created_at: z.string(),
+        }),
+      ),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
@@ -8265,7 +8437,7 @@ export const Actions = {
           settings: { ...settingsOut({}), telegram_chat_id: "" },
           health: { total_players: 0, online_players: 0, active_matches: 0, pending_disputes: 0, pending_reports: 0, open_tickets: 0, total_transactions: 0, total_fees: 0, db_status: "FORBIDDEN" },
           money: { topups_today_count: 0, topups_today_coins: 0, withdrawals_today_count: 0, withdrawals_today_kyat: 0, fees_today_coins: 0, pending_topups: 0, pending_withdrawals: 0 },
-          activity: [], players: [], duplicate_pairs: [], suspicious_players: [], terms_history: [], backups: [],
+          activity: [], players: [], duplicate_pairs: [], suspicious_players: [], terms_history: [], backups: [], staff_grants: [],
         };
       }
       const s = await getSettingsMap(db);
@@ -8376,6 +8548,10 @@ export const Actions = {
           actor: b.actor,
           created_at: iso(b.createdAt) ?? "",
         })),
+        staff_grants:
+          auth.actor && effectiveRole(auth.actor) === "owner"
+            ? staffGrantsOut(await loadStaffGrants(db))
+            : [],
       };
     },
   }),
@@ -8808,6 +8984,13 @@ export const Actions = {
         isFixedAdminEmail(em) ? "owner" : "player";
       const sub = info.sub;
       const all = await db.select().from(schema.players);
+      // Batch 15: staff grant for this verified email (never for the
+      // fixed admin Gmail — the fixed path below is untouched and a
+      // grant never applies to it).
+      const grant =
+        email && !isFixedAdminEmail(email)
+          ? await findStaffGrant(db, email)
+          : null;
       const gFail = (error: string) => ({
         ok: false as const,
         player: null,
@@ -8824,16 +9007,21 @@ export const Actions = {
         // stored "owner" on a non-fixed account is always corrected.
         const correctedRole: PlayerRow["role"] =
           fixedRole === "owner" ? "owner" : p0.role === "owner" ? "player" : p0.role;
+        // Batch 15: a staff grant wins over the stored role in both
+        // directions (promotion, and correction when the grant role
+        // was changed). The fixed-Gmail path never reaches this with a
+        // grant (grant is null for the fixed email).
+        const finalRole: PlayerRow["role"] = grant ? grant.role : correctedRole;
         await db
           .update(schema.players)
           .set({
             googleSub: sub,
             email: email || p0.email,
-            role: correctedRole,
+            role: finalRole,
             lastSeenAt: new Date(),
           })
           .where(eq(schema.players.id, p0.id));
-        const p = { ...p0, googleSub: sub, email: email || p0.email, role: correctedRole };
+        const p = { ...p0, googleSub: sub, email: email || p0.email, role: finalRole };
         if (p.status === "perm_banned" || p.status === "temp_banned")
           return gFail("ဒီ account က ban ခံထားရပါတယ်");
         const token = await createSession(db, p.id);
@@ -8909,6 +9097,29 @@ export const Actions = {
       if (email) {
         const byEmail = all.find((x) => x.email !== "" && x.email === email) ?? null;
         if (byEmail) return signIn(byEmail);
+      }
+      // (d2) Batch 15: a granted identity with no player yet gets a
+      // STAFF account — no MLBB pair, no profile-completion form, so a
+      // granted person never sees needs_profile.
+      if (grant) {
+        const rlGrant = await rateLimit(db, "register", 10, 10 * 60 * 1000);
+        if (rlGrant) return gFail(rlGrant);
+        const np = await createStaffAccount(db, all, {
+          nameBase: (info.name || email.split("@")[0] || "Staff").slice(0, 60),
+          email,
+          sub,
+          role: grant.role,
+        });
+        if (!np) return gFail("Account ဖွင့်လို့ မရပါ");
+        const npToken = await createSession(db, np.id);
+        ctx.invalidateQueries();
+        return {
+          ok: true,
+          player: await playerOutAsync(ctx, np),
+          error: "",
+          session_token: npToken,
+          ...noProfile,
+        };
       }
       // (e) No player for this Google identity — do NOT auto-create.
       // Park the verified identity in google_pending and let the client
@@ -8992,10 +9203,7 @@ export const Actions = {
       const pend = pendRows[0];
       if (!pend || pend.expiresAt <= Date.now())
         return fail("Google session သက်တမ်း ကုန်သွားပါပြီ — Google နဲ့ ပြန် ဝင်ပါ");
-      const idErr = validMlbbIds(args.mlbb_id, args.server_id);
-      if (idErr) return fail(idErr);
       const all = await db.select().from(schema.players);
-      const P = pairOwner(all, args.mlbb_id, args.server_id);
       const consumePending = () =>
         db
           .delete(schema.googlePending)
@@ -9013,6 +9221,48 @@ export const Actions = {
           ...noLink,
         };
       };
+      // Batch 15: a grant on the pending email short-circuits the whole
+      // profile form (staff need no MLBB pair; submitted mlbb fields are
+      // ignored). The pending row is consumed either way here.
+      const pendGrant = await findStaffGrant(db, pend.email);
+      if (pendGrant) {
+        await consumePending();
+        const existing =
+          all.find((x) => x.googleSub !== "" && x.googleSub === pend.googleSub) ??
+          (pend.email
+            ? all.find((x) => x.email !== "" && x.email === pend.email) ?? null
+            : null);
+        if (existing) {
+          await db
+            .update(schema.players)
+            .set({
+              googleSub: pend.googleSub,
+              email: pend.email || existing.email,
+              role: pendGrant.role,
+              lastSeenAt: new Date(),
+            })
+            .where(eq(schema.players.id, existing.id));
+          return finishSignIn({
+            ...existing,
+            googleSub: pend.googleSub,
+            email: pend.email || existing.email,
+            role: pendGrant.role,
+          });
+        }
+        const rlGrant = await rateLimit(db, "register", 10, 10 * 60 * 1000);
+        if (rlGrant) return fail(rlGrant);
+        const np = await createStaffAccount(db, all, {
+          nameBase: (pend.name || pend.email.split("@")[0] || "Staff").slice(0, 60),
+          email: pend.email,
+          sub: pend.googleSub,
+          role: pendGrant.role,
+        });
+        if (!np) return fail("Account ဖွင့်လို့ မရပါ");
+        return finishSignIn(np);
+      }
+      const idErr = validMlbbIds(args.mlbb_id, args.server_id);
+      if (idErr) return fail(idErr);
+      const P = pairOwner(all, args.mlbb_id, args.server_id);
       if (P) {
         if (P.googleSub === pend.googleSub) {
           await consumePending();
