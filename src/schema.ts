@@ -454,6 +454,32 @@ export const notificationReads = sqliteTable("notification_reads", {
   createdAt: ts("created_at"),
 });
 
+/** Batch 20: Web Push — the single VAPID keypair row (id = 1), generated
+ *  once by the server and persisted forever. publicKey is the base64url
+ *  uncompressed P-256 point (exposed via getBootstrap); privateJwk holds
+ *  the private JWK and must NEVER appear in any action response, backup
+ *  export, or settings payload. */
+export const pushConfig = sqliteTable("push_config", {
+  id: integer("id").primaryKey(),
+  publicKey: text("public_key").notNull().default(""),
+  privateJwk: text("private_jwk").notNull().default(""),
+  createdAt: ts("created_at"),
+});
+
+/** Batch 20: Web Push subscriptions — one row per browser endpoint.
+ *  An endpoint belongs to a browser; the latest signed-in player owns
+ *  it (pushSubscribe upserts by endpoint and rebinds playerId). Rows
+ *  are never returned by any action. */
+export const pushSubscriptions = sqliteTable("push_subscriptions", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  playerId: integer("player_id").notNull(),
+  endpoint: text("endpoint").notNull().default(""),
+  p256dh: text("p256dh").notNull().default(""),
+  auth: text("auth").notNull().default(""),
+  userAgent: text("user_agent").notNull().default(""),
+  createdAt: ts("created_at"),
+});
+
 export const backupSnapshots = sqliteTable("backup_snapshots", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   code: text("code").notNull(),

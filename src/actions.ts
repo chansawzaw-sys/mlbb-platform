@@ -968,6 +968,306 @@ async function notify(
     matchId: args.matchId ?? null,
     challengeId: args.challengeId ?? null,
   });
+  // Batch 20: real Web Push mirrors the in-app notification so it lands
+  // even with the app closed. Fire-and-forget — never awaited, never
+  // allowed to fail the notification write above.
+  if (args.playerId !== null) {
+    void sendPushToPlayer(db, args.playerId, {
+      title: "MLBB KING",
+      body: [args.title, args.body ?? ""].filter((x) => x !== "").join(" — "),
+      tag: args.matchId ? `match-${args.matchId}` : undefined,
+      url: args.matchId
+        ? `/?push_match=${args.matchId}`
+        : args.type === "invite" && args.challengeId
+          ? `/?push_challenge=${args.challengeId}`
+          : "/",
+      match_id: args.matchId ?? null,
+      challenge_id: args.challengeId ?? null,
+      dm_partner_id: null,
+    }).catch(() => {});
+  }
+}
+
+/* ---------- Batch 20: Web Push (VAPID + RFC 8291 aes128gcm) ----------
+ * Hand-rolled Web Push sender on the global WebCrypto API only — no
+ * node:crypto imports, no new dependencies, so this file runs unchanged
+ * in the artifact runtime and the Bun standalone. The VAPID keypair is
+ * generated ONCE, persisted in push_config (id = 1), and never
+ * regenerated while a row exists. The private JWK never leaves the
+ * server: it is not in any action response, settings, or backup export
+ * (push_config / push_subscriptions are excluded from backups). */
+
+type PushSubRow = typeof schema.pushSubscriptions.$inferSelect;
+
+type PushPayload = {
+  title: string;
+  body: string;
+  tag?: string;
+  url: string;
+  match_id: number | null;
+  challenge_id: number | null;
+  dm_partner_id: number | null;
+};
+
+function b64urlEncode(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString("base64url");
+}
+
+function b64urlDecode(s: string): Uint8Array {
+  return new Uint8Array(Buffer.from(s, "base64url"));
+}
+
+function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return out;
+}
+
+/** Detached ArrayBuffer copy — WebCrypto params accept BufferSource and
+ *  a subarray view's backing buffer would leak neighbouring bytes. */
+function toBuf(u8: Uint8Array): ArrayBuffer {
+  return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer;
+}
+
+async function hmacSha256(keyBytes: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    toBuf(keyBytes),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, toBuf(data));
+  return new Uint8Array(sig);
+}
+
+async function hkdfSha256(
+  salt: Uint8Array,
+  ikm: Uint8Array,
+  info: Uint8Array,
+  len: number,
+): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey("raw", toBuf(ikm), "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: toBuf(salt), info: toBuf(info) },
+    key,
+    len * 8,
+  );
+  return new Uint8Array(bits);
+}
+
+type VapidJwk = { kty?: string; crv?: string; x?: string; y?: string; d?: string };
+type VapidConfig = { publicKey: string; jwk: VapidJwk };
+
+async function getVapidConfig(db: Db): Promise<VapidConfig | null> {
+  try {
+    const rows = await db
+      .select()
+      .from(schema.pushConfig)
+      .where(eq(schema.pushConfig.id, 1))
+      .limit(1);
+    const existing = rows[0];
+    if (existing && existing.publicKey && existing.privateJwk) {
+      return {
+        publicKey: existing.publicKey,
+        jwk: JSON.parse(existing.privateJwk) as VapidJwk,
+      };
+    }
+    const pair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"],
+    );
+    const pubJwk = await crypto.subtle.exportKey("jwk", pair.publicKey);
+    const privJwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+    if (!pubJwk.x || !pubJwk.y || !privJwk.d) return null;
+    // VAPID public key = base64url(0x04 || x || y) — the uncompressed
+    // P-256 point; JWK x/y are already base64url coordinate strings.
+    const publicKey = b64urlEncode(
+      concatBytes(new Uint8Array([0x04]), b64urlDecode(pubJwk.x), b64urlDecode(pubJwk.y)),
+    );
+    const stored = {
+      kty: privJwk.kty,
+      crv: privJwk.crv,
+      x: privJwk.x,
+      y: privJwk.y,
+      d: privJwk.d,
+    };
+    await db
+      .insert(schema.pushConfig)
+      .values({ id: 1, publicKey, privateJwk: JSON.stringify(stored) })
+      .onConflictDoNothing();
+    const reread = await db
+      .select()
+      .from(schema.pushConfig)
+      .where(eq(schema.pushConfig.id, 1))
+      .limit(1);
+    const row = reread[0];
+    if (!row || !row.publicKey || !row.privateJwk) return null;
+    return { publicKey: row.publicKey, jwk: JSON.parse(row.privateJwk) as VapidJwk };
+  } catch {
+    return null;
+  }
+}
+
+async function getVapidPublicKey(db: Db): Promise<string> {
+  try {
+    const cfg = await getVapidConfig(db);
+    return cfg?.publicKey ?? "";
+  } catch {
+    return "";
+  }
+}
+
+const VAPID_SUBJECT = "https://mlbb-platform-production-df84.up.railway.app";
+
+async function buildVapidJwt(cfg: VapidConfig, endpoint: string): Promise<string> {
+  const enc = new TextEncoder();
+  const header = b64urlEncode(enc.encode(JSON.stringify({ typ: "JWT", alg: "ES256" })));
+  const claims = b64urlEncode(
+    enc.encode(
+      JSON.stringify({
+        aud: new URL(endpoint).origin,
+        exp: Math.floor(Date.now() / 1000) + 12 * 3600,
+        sub: VAPID_SUBJECT,
+      }),
+    ),
+  );
+  const signingInput = `${header}.${claims}`;
+  const key = await crypto.subtle.importKey(
+    "jwk",
+    cfg.jwk,
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["sign"],
+  );
+  // WebCrypto ES256 signatures are already the raw r||s form JWT needs.
+  const sig = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    key,
+    toBuf(enc.encode(signingInput)),
+  );
+  return `${signingInput}.${b64urlEncode(new Uint8Array(sig))}`;
+}
+
+/** RFC 8291 aes128gcm content encryption for one subscription. */
+async function encryptPushPayload(
+  p256dhB64: string,
+  authB64: string,
+  plaintext: Uint8Array,
+): Promise<Uint8Array> {
+  const enc = new TextEncoder();
+  const uaPublic = b64urlDecode(p256dhB64);
+  const authBytes = b64urlDecode(authB64);
+  const ephPair = await crypto.subtle.generateKey(
+    { name: "ECDH", namedCurve: "P-256" },
+    true,
+    ["deriveBits"],
+  );
+  const uaKey = await crypto.subtle.importKey(
+    "raw",
+    toBuf(uaPublic),
+    { name: "ECDH", namedCurve: "P-256" },
+    false,
+    [],
+  );
+  const ecdhSecret = new Uint8Array(
+    await crypto.subtle.deriveBits(
+      { name: "ECDH", public: uaKey },
+      ephPair.privateKey,
+      256,
+    ),
+  );
+  const ephPubJwk = await crypto.subtle.exportKey("jwk", ephPair.publicKey);
+  const ephPublicRaw = concatBytes(
+    new Uint8Array([0x04]),
+    b64urlDecode(ephPubJwk.x ?? ""),
+    b64urlDecode(ephPubJwk.y ?? ""),
+  );
+  const salt = cryptoRandomBytes(16);
+  const keyInfo = concatBytes(enc.encode("WebPush: info\0"), uaPublic, ephPublicRaw);
+  const ikm = await hkdfSha256(authBytes, ecdhSecret, keyInfo, 32);
+  const prk = await hmacSha256(salt, ikm);
+  const cek = (await hmacSha256(prk, concatBytes(enc.encode("Content-Encoding: aes128gcm\0"), new Uint8Array([0x01])))).slice(0, 16);
+  const nonce = (await hmacSha256(prk, concatBytes(enc.encode("Content-Encoding: nonce\0"), new Uint8Array([0x01])))).slice(0, 12);
+  // Single record: payload || 0x02 (last-record delimiter, no padding).
+  const padded = concatBytes(plaintext, new Uint8Array([0x02]));
+  const aesKey = await crypto.subtle.importKey("raw", toBuf(cek), { name: "AES-GCM" }, false, ["encrypt"]);
+  const ciphertext = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: toBuf(nonce), tagLength: 128 },
+      aesKey,
+      toBuf(padded),
+    ),
+  );
+  const rs = new Uint8Array(4);
+  new DataView(rs.buffer).setUint32(0, 4096, false);
+  return concatBytes(salt, rs, new Uint8Array([ephPublicRaw.length]), ephPublicRaw, ciphertext);
+}
+
+async function deliverPush(
+  db: Db,
+  cfg: VapidConfig,
+  sub: PushSubRow,
+  payloadJson: string,
+): Promise<void> {
+  try {
+    const jwt = await buildVapidJwt(cfg, sub.endpoint);
+    const body = await encryptPushPayload(
+      sub.p256dh,
+      sub.auth,
+      new TextEncoder().encode(payloadJson),
+    );
+    const timeoutSignal =
+      typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+        ? AbortSignal.timeout(10000)
+        : undefined;
+    const res = await fetch(sub.endpoint, {
+      method: "POST",
+      ...(timeoutSignal ? { signal: timeoutSignal } : {}),
+      headers: {
+        Authorization: `vapid t=${jwt}, k=${cfg.publicKey}`,
+        "Content-Encoding": "aes128gcm",
+        "Content-Type": "application/octet-stream",
+        TTL: "86400",
+      },
+      body: toBuf(body),
+    });
+    // Gone subscription (browser unsubscribed / endpoint expired):
+    // prune the row. Every other outcome keeps it.
+    if (res.status === 404 || res.status === 410) {
+      await db
+        .delete(schema.pushSubscriptions)
+        .where(eq(schema.pushSubscriptions.id, sub.id))
+        .catch(() => {});
+    }
+  } catch {
+    // Push delivery is best-effort — it must never throw into callers.
+  }
+}
+
+async function sendPushToPlayer(db: Db, playerId: number, payload: PushPayload): Promise<void> {
+  try {
+    const subs = await db
+      .select()
+      .from(schema.pushSubscriptions)
+      .where(eq(schema.pushSubscriptions.playerId, playerId));
+    if (subs.length === 0) return;
+    const cfg = await getVapidConfig(db);
+    if (!cfg) return;
+    const payloadJson = JSON.stringify(payload);
+    for (const sub of subs) {
+      await deliverPush(db, cfg, sub, payloadJson);
+    }
+  } catch {
+    // Never propagate: push is a side channel, not the source of truth.
+  }
 }
 
 async function logAct(db: Db, actor: string, action: string) {
@@ -1741,6 +2041,8 @@ async function rateLimit(
   await db.insert(schema.rateEvents).values({ key });
   return null;
 }
+
+/* ---------- Batch 19: per-source registration rate limiting ---------- */
 
 function clientSource(ctx: Ctx): string | null {
   // The standalone host attaches ctx.clientIp only on external dispatches
@@ -3485,6 +3787,9 @@ export const Actions = {
       total_paid_kyat: z.number(),
       diamond_packages: z.array(diamondPackageShape),
       diamond_orders: z.array(diamondOrderShape),
+      // Batch 20: the VAPID PUBLIC key only ("" when push config is
+      // unavailable) — the private key never appears in any response.
+      vapid_public_key: z.string(),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
@@ -3676,6 +3981,7 @@ export const Actions = {
             diamondOrderOut(o, viewer.name, viewer.mlbbId, viewer.serverId),
           );
         })(),
+        vapid_public_key: await getVapidPublicKey(db).catch(() => ""),
       };
     },
   }),
@@ -7905,6 +8211,18 @@ export const Actions = {
         recipientId: partner.id,
         text,
       });
+      // Batch 20: push the DM to the recipient's devices (fire-and-
+      // forget). No in-app notification row is created for DMs — the
+      // conversation unread badge remains the in-app signal.
+      void sendPushToPlayer(db, partner.id, {
+        title: "MLBB KING",
+        body: `${me.name}: ${text.slice(0, 80)}`,
+        tag: `dm-${me.id}`,
+        url: `/?push_dm=${me.id}`,
+        match_id: null,
+        challenge_id: null,
+        dm_partner_id: me.id,
+      }).catch(() => {});
       ctx.invalidateQueries();
       return { ok: true, error: "" };
     },
@@ -10097,6 +10415,115 @@ export const Actions = {
         });
       }
       return { matches: out, count: out.length };
+    },
+  }),
+
+  /** Batch 20: bind this browser's Web Push subscription to the
+   *  signed-in player. The client-supplied player_id is never trusted
+   *  for binding — playerBySession enforces the token↔player match and
+   *  the row is bound to the session player. Upsert is by endpoint (a
+   *  browser endpoint's latest signed-in player owns it). No action
+   *  ever returns subscription rows. */
+  pushSubscribe: defineAction({
+    request: z.object({
+      player_id: z.number(),
+      session_token: z.string().default(""),
+      endpoint: z.string().min(1).max(1024),
+      p256dh: z.string().min(1).max(255),
+      auth: z.string().min(1).max(255),
+      user_agent: z.string().max(255).default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const me = await playerBySession(db, args.player_id, args.session_token);
+      if (!me) return { ok: false, error: AUTH_ERR };
+      const ob = ownerPlayerBlock(me);
+      if (ob) return { ok: false, error: ob };
+      const PUSH_ERR = "Push endpoint မမှန်ပါ";
+      let endpointOk = false;
+      try {
+        endpointOk = new URL(args.endpoint).protocol === "https:";
+      } catch {
+        endpointOk = false;
+      }
+      if (!endpointOk) return { ok: false, error: PUSH_ERR };
+      let keysOk = false;
+      try {
+        keysOk =
+          b64urlDecode(args.p256dh).length === 65 &&
+          b64urlDecode(args.auth).length >= 16;
+      } catch {
+        keysOk = false;
+      }
+      if (!keysOk) return { ok: false, error: PUSH_ERR };
+      const existing = await db
+        .select()
+        .from(schema.pushSubscriptions)
+        .where(eq(schema.pushSubscriptions.endpoint, args.endpoint))
+        .limit(1);
+      if (existing[0]) {
+        await db
+          .update(schema.pushSubscriptions)
+          .set({
+            playerId: me.id,
+            p256dh: args.p256dh,
+            auth: args.auth,
+            userAgent: args.user_agent,
+          })
+          .where(eq(schema.pushSubscriptions.id, existing[0].id));
+      } else {
+        await db.insert(schema.pushSubscriptions).values({
+          playerId: me.id,
+          endpoint: args.endpoint,
+          p256dh: args.p256dh,
+          auth: args.auth,
+          userAgent: args.user_agent,
+        });
+      }
+      // Per-player cap of 5 devices: drop the oldest extras.
+      const mine = await db
+        .select()
+        .from(schema.pushSubscriptions)
+        .where(eq(schema.pushSubscriptions.playerId, me.id))
+        .orderBy(schema.pushSubscriptions.id);
+      if (mine.length > 5) {
+        const extras = mine.slice(0, mine.length - 5);
+        for (const extra of extras) {
+          await db
+            .delete(schema.pushSubscriptions)
+            .where(eq(schema.pushSubscriptions.id, extra.id));
+        }
+      }
+      ctx.invalidateQueries();
+      return { ok: true, error: "" };
+    },
+  }),
+
+  /** Batch 20: unbind one of the CALLER's own subscriptions (logout /
+   *  disable). Only rows owned by the session player are ever deleted;
+   *  idempotent — ok whether or not a row existed. */
+  pushUnsubscribe: defineAction({
+    request: z.object({
+      player_id: z.number(),
+      session_token: z.string().default(""),
+      endpoint: z.string().min(1).max(1024),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const me = await playerBySession(db, args.player_id, args.session_token);
+      if (!me) return { ok: false, error: AUTH_ERR };
+      await db
+        .delete(schema.pushSubscriptions)
+        .where(
+          and(
+            eq(schema.pushSubscriptions.playerId, me.id),
+            eq(schema.pushSubscriptions.endpoint, args.endpoint),
+          ),
+        );
+      ctx.invalidateQueries();
+      return { ok: true, error: "" };
     },
   }),
 

@@ -1,11 +1,12 @@
-// MLBB KING service worker — Batch 17.
+// MLBB KING service worker — Batch 20 (cache v3; Batch 17/18 fetch
+// policy unchanged, plus Web Push display + click routing).
 // Safety-first policy for a live-money app:
 //  - /actions is NEVER intercepted or cached (always fresh, always network).
 //  - Navigations are NETWORK-FIRST (online users always get the freshest
 //    HTML/bundle); the cached shell is only an offline fallback.
 //  - Same-origin static assets are CACHE-FIRST (they are content-hashed).
 //  - Non-GET requests and everything else are left completely untouched.
-const CACHE_NAME = "mlbb-shell-v2";
+const CACHE_NAME = "mlbb-shell-v3";
 
 const SHELL_URLS = [
   "./",
@@ -115,4 +116,65 @@ self.addEventListener("fetch", (event) => {
   }
 
   // Everything else: do not intercept.
+});
+
+// Batch 20: Web Push — the server sends an encrypted JSON payload
+// ({title, body, tag, url, match_id, challenge_id, dm_partner_id});
+// display it as a system notification even with the app fully closed.
+self.addEventListener("push", (event) => {
+  let payload = {};
+  if (event.data) {
+    try {
+      payload = event.data.json() || {};
+    } catch {
+      try {
+        payload = { body: event.data.text() };
+      } catch {
+        payload = {};
+      }
+    }
+  }
+  const title = payload.title || "MLBB KING";
+  const options = {
+    body: payload.body || "",
+    icon: "./assets/icon-192.png",
+    badge: "./assets/icon-192.png",
+    tag: payload.tag || undefined,
+    renotify: !!payload.tag,
+    data: {
+      url: payload.url || "/",
+      match_id: payload.match_id ?? null,
+      challenge_id: payload.challenge_id ?? null,
+      dm_partner_id: payload.dm_partner_id ?? null,
+    },
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+// Batch 20: tapping a push notification focuses the app (navigating
+// the existing window to the deep link) or opens a new window.
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const target = (event.notification.data && event.notification.data.url) || "/";
+  event.waitUntil(
+    self.clients
+      .matchAll({ type: "window", includeUncontrolled: true })
+      .then(async (clientList) => {
+        for (const client of clientList) {
+          if ("focus" in client) {
+            await client.focus();
+            if (typeof client.navigate === "function") {
+              try {
+                await client.navigate(target);
+              } catch {
+                // Navigation can fail cross-path; the focused window
+                // still lands the user in the app.
+              }
+            }
+            return;
+          }
+        }
+        if (self.clients.openWindow) return self.clients.openWindow(target);
+      }),
+  );
 });
