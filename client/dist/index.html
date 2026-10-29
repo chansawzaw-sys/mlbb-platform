@@ -10,16 +10,18 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="MLBB Platform" />
     <meta name="description" content="MLBB — Play • Compete • Win. Challenge, tournament, wallet and match rooms." />
-    <!-- PWA manifest (inline data URI — the artifact serves a single bundle,
-         so the manifest travels with the page; Add to Home Screen still
-         works via the meta tags above and the install prompt in-app). -->
-    <link rel="manifest" href='data:application/manifest+json,{"name":"MLBB Platform","short_name":"MLBB","start_url":".","display":"standalone","background_color":"%23070b1e","theme_color":"%23070b1e","description":"MLBB Play Compete Win"}' />
-    <!-- Empty inline icon: stops the browser fetching /favicon.ico, which
-         lives outside the space's routes and fails auth. -->
-    <link rel="icon" href="data:," />
+    <!-- PWA manifest: a real manifest file (./manifest.json) with real
+         PNG icons under ./assets/, so Chrome can offer the native
+         install prompt. The manifest, icons and sw.js are static files
+         copied into dist by client/build.mjs from client/public/. -->
+    <link rel="manifest" href="./manifest.json" />
+    <!-- App icon: the same PNG used by the manifest, for the browser
+         favicon and for iOS Add to Home Screen. -->
+    <link rel="icon" type="image/png" href="./assets/icon-192.png" />
+    <link rel="apple-touch-icon" href="./assets/icon-192.png" />
     <title>MLBB Platform</title>
     
-  <link rel="stylesheet" crossorigin href="./assets/index-46c7zvw6.css"><script type="module" crossorigin src="./assets/index-5prhspcg.js"></script></head>
+  <link rel="stylesheet" crossorigin href="./assets/index-byp3knna.css"><script type="module" crossorigin src="./assets/index-8wfs2vat.js"></script></head>
   <body>
     <div
       data-generated-space-root=""
