@@ -248,6 +248,142 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   challenge_min_stake_coins: "100",
 };
 
+/** Batch 16 — settings key classification for the updateSettings split.
+ *  A granted Admin (players.role = "admin") may change CONTENT and
+ *  PRICING keys only; everything else stays Owner-only. The slide /
+ *  wizard image keys are Owner-only VIA updateSettings because images
+ *  change through the dedicated upload/delete actions instead (those
+ *  actions accept Owner/Admin). There is NO default-allow: the checks
+ *  below throw at module load if any DEFAULT_SETTINGS key is missing
+ *  from the classification, classified twice, or a classified key does
+ *  not exist in DEFAULT_SETTINGS. */
+const SETTINGS_KEYS_CONTENT: string[] = [
+  "announcement_my",
+  "announcement_en",
+  "banner_title",
+  "banner_subtitle",
+  "accent",
+  "banned_heroes",
+  "custom_hero_rules",
+  "preset_rules",
+  "rules_1v1",
+  "rules_brawl",
+  "rules_classic_1",
+  "rules_classic_2",
+  "rules_classic_3",
+  "rules_classic_4",
+  "rules_classic_5",
+  "rules_classic_2_3",
+  "rules_classic_4_5",
+  "rules_text",
+  "rules_version",
+  "terms_text",
+  "terms_version",
+  "telegram_channel_url",
+  "ready_timeout_min",
+];
+const SETTINGS_KEYS_PRICING: string[] = [
+  "fee_1v1_type",
+  "fee_1v1_value",
+  "fee_classic_type",
+  "fee_classic_value",
+  "fee_brawl_type",
+  "fee_brawl_value",
+  "referral_percent_x100",
+  "packages",
+  "coin_rate_kyat",
+  "withdraw_fee_percent",
+  "withdraw_min_coins",
+  "withdraw_max_coins_per_day",
+  "topup_min_coins",
+  "topup_max_coins",
+  "challenge_min_stake_coins",
+];
+const SETTINGS_KEYS_OWNER_ONLY: string[] = [
+  "maintenance",
+  "emergency",
+  "result_delay_min",
+  "match_timeout_min",
+  "telegram_bot",
+  "telegram_bot_token",
+  "telegram_chat_id",
+  "turn_url",
+  "turn_username",
+  "turn_credential",
+  "google_client_id",
+  "google_enabled",
+  "google_pending_client_id",
+  "google_setup_state",
+  "google_setup_by_id",
+  "google_setup_by_name",
+  "google_setup_at",
+  "kpay_phone",
+  "kpay_name",
+  "kpay_qr",
+  "kpay_qr_key",
+  "wave_phone",
+  "wave_name",
+  "wave_qr",
+  "wave_qr_key",
+  "slide_image_1",
+  "slide_image_1_key",
+  "slide_image_2",
+  "slide_image_2_key",
+  "slide_image_3",
+  "slide_image_3_key",
+  "slide_image_4",
+  "slide_image_4_key",
+  "slide_image_5",
+  "slide_image_5_key",
+  "slide_image_6",
+  "slide_image_6_key",
+  "slide_image_7",
+  "slide_image_7_key",
+  "slide_image_8",
+  "slide_image_8_key",
+  "slide_image_9",
+  "slide_image_9_key",
+  "slide_image_10",
+  "slide_image_10_key",
+  "wizard_art_mode_1v1",
+  "wizard_art_mode_1v1_key",
+  "wizard_art_mode_classic",
+  "wizard_art_mode_classic_key",
+  "wizard_art_mode_brawl",
+  "wizard_art_mode_brawl_key",
+  "wizard_art_role_fighter",
+  "wizard_art_role_fighter_key",
+  "wizard_art_role_assassin",
+  "wizard_art_role_assassin_key",
+  "wizard_art_role_mage",
+  "wizard_art_role_mage_key",
+  "wizard_art_role_marksman",
+  "wizard_art_role_marksman_key",
+];
+const SETTINGS_KEYS_ADMIN_OK = new Set<string>([
+  ...SETTINGS_KEYS_CONTENT,
+  ...SETTINGS_KEYS_PRICING,
+]);
+{
+  const classified = [
+    ...SETTINGS_KEYS_CONTENT,
+    ...SETTINGS_KEYS_PRICING,
+    ...SETTINGS_KEYS_OWNER_ONLY,
+  ];
+  const seen = new Set<string>();
+  for (const k of classified) {
+    if (seen.has(k))
+      throw new Error(`Batch 16 settings classification: key classified twice: ${k}`);
+    seen.add(k);
+    if (!(k in DEFAULT_SETTINGS))
+      throw new Error(`Batch 16 settings classification: key not in DEFAULT_SETTINGS: ${k}`);
+  }
+  for (const k of Object.keys(DEFAULT_SETTINGS)) {
+    if (!seen.has(k))
+      throw new Error(`Batch 16 settings classification: DEFAULT_SETTINGS key unclassified: ${k}`);
+  }
+}
+
 export const DEFAULT_PRESET_RULES: string[] = [
   "ပထမ tower ရသူ နိုင်",
   "Lord မသတ်ရ",
@@ -1176,6 +1312,22 @@ async function requireOwner(
   const r = await requireRole(db, actorPlayerId, token, ["owner"]);
   if (r.error) return r;
   if (!r.actor || !isFixedAdminEmail(r.actor.email))
+    return { error: "Owner လုပ်ဆောင်ချက်ကို fixed Admin Gmail နဲ့ ဝင်ထားသူပဲ လုပ်နိုင်ပါတယ်", actor: null };
+  return r;
+}
+
+/** Batch 16: Owner-or-Admin gate for daily operations (money decisions,
+ *  diamond shop, images, perm_ban). Admits the fixed-Gmail Owner and any
+ *  player whose DB role is "admin"; a stored "owner" role without the
+ *  fixed Gmail is rejected exactly as requireOwner rejects it. */
+async function requireOwnerOrAdmin(
+  db: Db,
+  actorPlayerId: number,
+  token: string,
+): Promise<{ error: string | null; actor: PlayerRow | null }> {
+  const r = await requireRole(db, actorPlayerId, token, ["owner", "admin"]);
+  if (r.error) return r;
+  if (r.actor && effectiveRole(r.actor) === "owner" && !isFixedAdminEmail(r.actor.email))
     return { error: "Owner လုပ်ဆောင်ချက်ကို fixed Admin Gmail နဲ့ ဝင်ထားသူပဲ လုပ်နိုင်ပါတယ်", actor: null };
   return r;
 }
@@ -5796,11 +5948,12 @@ export const Actions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const fail = (error: string) => ({ ok: false, error, txn_code: "" });
-      // Wallet decisions are Owner-only (fixed admin Gmail) + confirmation,
-      // plus a real TOTP check when the owner has 2FA enabled. The state
+      // Wallet decisions are Owner/Admin (Batch 16: fixed admin Gmail
+      // Owner, or a granted Admin) + confirmation, plus a real TOTP check
+      // when the actor has 2FA enabled. The state
       // machine itself lives in decidePurchaseInternal (shared with the
       // Telegram callback path, which authenticates by chat id instead).
-      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      const auth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
       if (auth.error || !auth.actor) return fail(auth.error ?? AUTH_ERR);
       if (!args.confirmed) return fail("Coin အတည်ပြုရန် security confirmation လိုပါတယ်");
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
@@ -6038,8 +6191,8 @@ export const Actions = {
     response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      // Same gates as decidePurchase: Owner-only + confirmation + TOTP.
-      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      // Same gates as decidePurchase: Owner/Admin + confirmation + TOTP.
+      const auth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
       if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
       if (!args.confirmed) return { ok: false, error: "ငွေထုတ် ဆုံးဖြတ်ရန် security confirmation လိုပါတယ်" };
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
@@ -6215,8 +6368,8 @@ export const Actions = {
     response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      // Same gates as decideWithdraw: Owner-only + confirmation + TOTP.
-      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      // Same gates as decideWithdraw: Owner/Admin + confirmation + TOTP.
+      const auth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
       if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
       if (!args.confirmed) return { ok: false, error: "Diamond order ဆုံးဖြတ်ရန် security confirmation လိုပါတယ်" };
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
@@ -6244,7 +6397,7 @@ export const Actions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const fail = (error: string) => ({ ok: false, error, package_id: 0 });
-      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      const auth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
       if (auth.error || !auth.actor) return fail(auth.error ?? AUTH_ERR);
       if (!args.confirmed) return fail("Diamond package သိမ်းရန် security confirmation လိုပါတယ်");
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
@@ -6290,7 +6443,7 @@ export const Actions = {
     response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      const auth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
       if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
       if (!args.confirmed) return { ok: false, error: "Diamond package ဖျက်ရန် security confirmation လိုပါတယ်" };
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
@@ -6392,7 +6545,7 @@ export const Actions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const fail = (error: string) => ({ ok: false, error, image_url: "" });
-      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      const auth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
       if (auth.error || !auth.actor) return fail(auth.error ?? AUTH_ERR);
       if (!args.confirmed) return fail("Slideshow ပုံ ပြောင်းရန် security confirmation လိုပါတယ်");
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
@@ -6432,7 +6585,7 @@ export const Actions = {
     response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      const auth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
       if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
       if (!args.confirmed) return { ok: false, error: "Slideshow ပုံ ဖျက်ရန် security confirmation လိုပါတယ်" };
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
@@ -6454,10 +6607,10 @@ export const Actions = {
 
   /* Wizard art slots (Batch 10): the 7 Batch 9 baked wizard images
    * (3 mode cards + 4 role medallions) become admin-replaceable,
-   * following the slideshow pattern exactly — Owner-only, security
-   * confirmation + TOTP, validated image, timestamped blob key (so the
-   * URL changes on every replacement = cache-busting). Empty setting =
-   * the baked bundle crop is shown as the default. */
+   * following the slideshow pattern exactly — Owner/Admin (Batch 16),
+   * security confirmation + TOTP, validated image, timestamped blob key
+   * (so the URL changes on every replacement = cache-busting). Empty
+   * setting = the baked bundle crop is shown as the default. */
   uploadWizardArt: defineAction({
     request: z.object({
       actor_player_id: z.number().default(0),
@@ -6480,7 +6633,7 @@ export const Actions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const fail = (error: string) => ({ ok: false, error, image_url: "" });
-      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      const auth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
       if (auth.error || !auth.actor) return fail(auth.error ?? AUTH_ERR);
       if (!args.confirmed) return fail("Wizard ပုံ ပြောင်းရန် security confirmation လိုပါတယ်");
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
@@ -6528,7 +6681,7 @@ export const Actions = {
     response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      const auth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
       if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
       if (!args.confirmed) return { ok: false, error: "Wizard ပုံ ဖျက်ရန် security confirmation လိုပါတယ်" };
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
@@ -8086,11 +8239,12 @@ export const Actions = {
       const auth = await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin", "moderator"]);
       if (auth.error || !auth.actor) return { ok: false };
       // H3: a perm_ban outcome is exactly as powerful as adminPlayerAction's
-      // perm_ban, so it carries the SAME gate — fixed-Gmail Owner +
-      // security confirmation + TOTP. Moderators/admins keep the lesser
-      // report outcomes (warning / temp_ban) without it.
+      // perm_ban, so it carries the SAME gate — Owner/Admin (Batch 16:
+      // fixed-Gmail Owner or a granted Admin) + security confirmation +
+      // TOTP. Moderators keep the lesser report outcomes
+      // (warning / temp_ban) without it.
       if (args.action === "perm_ban") {
-        const ownerAuth = await requireOwner(db, args.actor_player_id, args.session_token);
+        const ownerAuth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
         if (ownerAuth.error || !ownerAuth.actor) return { ok: false };
         if (!args.confirmed) return { ok: false };
         const err2fa = await checkAdmin2fa(db, ownerAuth.actor.id, args.totp_code);
@@ -8568,9 +8722,13 @@ export const Actions = {
     response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      // ALL settings are Owner-only, and Owner means the fixed admin Gmail —
-      // verified from the DB via the session, never from the client actor.
-      // The fixed admin email itself can never be written into settings.
+      // Batch 16 split: the fixed-admin-Gmail Owner may change EVERY
+      // setting; a granted Admin (role "admin") may change only the
+      // CONTENT + PRICING keys (SETTINGS_KEYS_ADMIN_OK) — the key check
+      // below rejects a mixed payload whole, before any write. Owner
+      // identity is verified from the DB via the session, never from the
+      // client actor. The fixed admin email itself can never be written
+      // into settings.
       if (Object.keys(args.values).some((k) => ["admin_email", "owner_email", "fixed_admin_email"].includes(k)))
         return { ok: false, error: "Admin Gmail က အသေ သတ်မှတ်ထားတာပါ — settings မှာ ပြောင်းလို့ မရပါ" };
       const before = await getSettingsMap(db);
@@ -8624,8 +8782,16 @@ export const Actions = {
         return { ok: true, error: "" };
       }
 
-      const auth = await requireOwner(db, args.actor_player_id, args.session_token);
+      const auth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
       if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
+      // Batch 16: a non-Owner (granted Admin) may touch only CONTENT +
+      // PRICING keys. Any Owner-only key in the payload rejects the WHOLE
+      // save here — before any write — so a mixed payload changes nothing.
+      if (effectiveRole(auth.actor) !== "owner") {
+        const forbidden = Object.keys(args.values).filter((k) => !SETTINGS_KEYS_ADMIN_OK.has(k));
+        if (forbidden.length > 0)
+          return { ok: false, error: "ဒီ setting တွေကို Owner ပဲ ပြောင်းနိုင်ပါတယ်: " + forbidden.join(", ") };
+      }
       const actorName = auth.actor.name;
       const critical = [
         "fee_1v1_type", "fee_1v1_value", "fee_classic_type", "fee_classic_value",
@@ -8739,12 +8905,15 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const p = await getPlayer(db, args.player_id);
       if (!p) return { ok: false, error: "Player မတွေ့ပါ" };
-      // Role split: money + role changes are Owner(fixed Gmail)-only;
-      // moderation actions need owner/admin/moderator — all from DB session.
-      const ownerOnly = ["perm_ban", "adjust_coins", "set_role"].includes(args.action);
+      // Role split (Batch 16): coin adjustment + role changes stay
+      // Owner(fixed Gmail)-only; perm_ban is Owner/Admin; moderation
+      // actions need owner/admin/moderator — all from DB session.
+      const ownerOnly = ["adjust_coins", "set_role"].includes(args.action);
       const auth = ownerOnly
         ? await requireOwner(db, args.actor_player_id, args.session_token)
-        : await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin", "moderator"]);
+        : args.action === "perm_ban"
+          ? await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token)
+          : await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin", "moderator"]);
       if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
       const actorName = auth.actor.name;
       // Unban is stronger than banning: Owner/Admin ONLY (moderators can
