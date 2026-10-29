@@ -8,8 +8,41 @@ function getDb(ctx: Ctx) {
 type Db = ReturnType<typeof getDb>;
 
 const iso = (d: Date | null | undefined) => (d ? d.toISOString() : null);
+// Crypto-grade randomness — the predictable built-in PRNG is banned
+// from security paths in this file; use these helpers instead.
+function cryptoRandomBytes(n: number): Uint8Array {
+  const bytes = new Uint8Array(n);
+  crypto.getRandomValues(bytes);
+  return bytes;
+}
+const BASE36_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+function cryptoBase36(nChars: number): string {
+  let out = "";
+  while (out.length < nChars) {
+    const bytes = cryptoRandomBytes(Math.max(16, nChars - out.length + 8));
+    for (const b of bytes) {
+      if (out.length >= nChars) break;
+      if (b >= 252) continue;
+      out += BASE36_CHARS.charAt(b % 36);
+    }
+  }
+  return out;
+}
+function cryptoInt(bound: number): number {
+  if (bound <= 1) return 0;
+  const max = Math.floor(4294967296 / bound) * bound;
+  const arr = new Uint32Array(1);
+  for (;;) {
+    crypto.getRandomValues(arr);
+    const v = arr[0]!;
+    if (v < max) return v % bound;
+  }
+}
+export function newSessionToken(): string {
+  return `SES-${Date.now().toString(36).toUpperCase()}-${cryptoBase36(25)}`;
+}
 const uid = (p: string) =>
-  `${p}-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random() * 1e6)
+  `${p}-${Date.now().toString(36).toUpperCase()}-${cryptoInt(1000000)
     .toString(36)
     .toUpperCase()}`;
 
@@ -984,7 +1017,7 @@ async function createStaffAccount(
   args: { nameBase: string; email: string; sub: string; role: "admin" | "moderator" | "support" },
 ): Promise<PlayerRow | null> {
   const displayName = uniqueDisplayName(all, args.nameBase.slice(0, 60));
-  const myCode = `${displayName.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "MLBB"}${Math.floor(1000 + Math.random() * 9000)}`;
+  const myCode = `${displayName.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "MLBB"}${1000 + cryptoInt(9000)}`;
   const inserted = await db
     .insert(schema.players)
     .values({
@@ -1256,7 +1289,7 @@ async function totpValid(secret: string, code: string): Promise<boolean> {
 /* ---------- Session auth (server-side authorization) ---------- */
 
 async function createSession(db: Db, playerId: number): Promise<string> {
-  const token = `${uid("SES")}-${Math.floor(Math.random() * 1e12).toString(36).toUpperCase()}${Date.now().toString(36).toUpperCase()}`;
+  const token = newSessionToken();
   await db.insert(schema.sessions).values({
     token,
     playerId,
@@ -1707,6 +1740,33 @@ async function rateLimit(
     return "ခဏခဏ လုပ်ဆောင်နေပါတယ် — ခဏစောင့်ပြီး ပြန်ကြိုးစားပါ (spam protection)";
   await db.insert(schema.rateEvents).values({ key });
   return null;
+}
+
+function clientSource(ctx: Ctx): string | null {
+  // The standalone host attaches ctx.clientIp only on external dispatches
+  // from the trustworthy proxy hop; the managed runtime does not provide
+  // it, so null means "fall back to the global backstop alone"; the value
+  // is re-sanitized here, never trusted raw.
+  const raw = (ctx as unknown as { clientIp?: unknown }).clientIp;
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 64) return null;
+  if (!/^[0-9a-zA-Z:.\/]+$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+async function registerRateLimit(db: Db, ctx: Ctx): Promise<string | null> {
+  // Per-source 40/hour is generous for Myanmar carrier CGNAT (many real
+  // players share one public IP); the global bucket is now only a raised
+  // backstop (300/hour) so no single abusive source can exhaust
+  // registration for everyone (the old design was one global bucket of
+  // 10 per 10 minutes).
+  const src = clientSource(ctx);
+  if (src !== null) {
+    const srcErr = await rateLimit(db, "register:src:" + src, 40, 60 * 60 * 1000);
+    if (srcErr) return srcErr;
+  }
+  return await rateLimit(db, "register", 300, 60 * 60 * 1000);
 }
 
 /* ---------- Batch 6 shared validators (single source of truth) ----------
@@ -3638,7 +3698,7 @@ export const Actions = {
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      const rl = await rateLimit(db, "register", 10, 10 * 60 * 1000);
+      const rl = await registerRateLimit(db, ctx);
       if (rl) return { ok: false, player: null, error: rl, session_token: "" };
       // MLBB ID + Server ID are REQUIRED from registration (Batch 6) —
       // plausible digits only; the same columns the match room copies.
@@ -3661,7 +3721,7 @@ export const Actions = {
         const ref = existing.find((p) => p.referralCode.toUpperCase() === code);
         if (ref) referredById = ref.id;
       }
-      const myCode = `${args.name.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "MLBB"}${Math.floor(1000 + Math.random() * 9000)}`;
+      const myCode = `${args.name.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "MLBB"}${1000 + cryptoInt(9000)}`;
       const suspicion = suspiciousCheck(existing, {
         name: args.name.trim(),
         mlbbId: args.mlbb_id.trim(),
@@ -9209,7 +9269,7 @@ export const Actions = {
         let p = all.find((x) => x.googleSub === sub) ?? null;
         if (!p && email) p = all.find((x) => x.email !== "" && x.email === email) ?? null;
         if (p) return signIn(p);
-        const rlA = await rateLimit(db, "register", 10, 10 * 60 * 1000);
+        const rlA = await registerRateLimit(db, ctx);
         if (rlA) return gFail(rlA);
         // A name collision must never block a Google signup — least of
         // all the fixed-Gmail Owner confirmation — so suffix instead.
@@ -9217,7 +9277,7 @@ export const Actions = {
           all,
           (info.name || email.split("@")[0] || "Player").slice(0, 60),
         );
-        const myCode = `${displayName.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "MLBB"}${Math.floor(1000 + Math.random() * 9000)}`;
+        const myCode = `${displayName.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "MLBB"}${1000 + cryptoInt(9000)}`;
         const inserted = await db
           .insert(schema.players)
           .values({
@@ -9271,7 +9331,7 @@ export const Actions = {
       // STAFF account — no MLBB pair, no profile-completion form, so a
       // granted person never sees needs_profile.
       if (grant) {
-        const rlGrant = await rateLimit(db, "register", 10, 10 * 60 * 1000);
+        const rlGrant = await registerRateLimit(db, ctx);
         if (rlGrant) return gFail(rlGrant);
         const np = await createStaffAccount(db, all, {
           nameBase: (info.name || email.split("@")[0] || "Staff").slice(0, 60),
@@ -9293,7 +9353,7 @@ export const Actions = {
       // (e) No player for this Google identity — do NOT auto-create.
       // Park the verified identity in google_pending and let the client
       // complete the profile (MLBB ID + Server ID) first.
-      const rl = await rateLimit(db, "register", 10, 10 * 60 * 1000);
+      const rl = await registerRateLimit(db, ctx);
       if (rl) return gFail(rl);
       const nowMs = Date.now();
       await db
@@ -9418,7 +9478,7 @@ export const Actions = {
             role: pendGrant.role,
           });
         }
-        const rlGrant = await rateLimit(db, "register", 10, 10 * 60 * 1000);
+        const rlGrant = await registerRateLimit(db, ctx);
         if (rlGrant) return fail(rlGrant);
         const np = await createStaffAccount(db, all, {
           nameBase: (pend.name || pend.email.split("@")[0] || "Staff").slice(0, 60),
@@ -9464,7 +9524,7 @@ export const Actions = {
         return finishSignIn({ ...P, googleSub: pend.googleSub, email: pend.email });
       }
       // CREATE path — same discipline as registerPlayer.
-      const rl = await rateLimit(db, "register", 10, 10 * 60 * 1000);
+      const rl = await registerRateLimit(db, ctx);
       if (rl) return fail(rl);
       if (nameTaken(all, args.name)) return fail(NAME_TAKEN_ERR);
       let referredById: number | null = null;
@@ -9473,7 +9533,7 @@ export const Actions = {
         const ref = all.find((p) => p.referralCode.toUpperCase() === code);
         if (ref) referredById = ref.id;
       }
-      const myCode = `${args.name.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "MLBB"}${Math.floor(1000 + Math.random() * 9000)}`;
+      const myCode = `${args.name.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "MLBB"}${1000 + cryptoInt(9000)}`;
       const suspicion = suspiciousCheck(all, {
         name: args.name.trim(),
         mlbbId: args.mlbb_id.trim(),

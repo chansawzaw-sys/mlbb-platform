@@ -156,7 +156,76 @@ for (const [name, value] of Object.entries(Actions)) {
 // WITHOUT the secret (see handleAction vs invokeActionInternal).
 const TG_HOST_SECRET = `${randomUUID()}${randomUUID()}`;
 
-function buildCtx(internal = false) {
+// --- Client source identification (Batch 19) ------------------------------
+// Registration rate limiting is per-source, keyed on the address the
+// TRUSTED edge observed — never on a client-supplied header value alone.
+// Topology: browsers reach this process either directly (local/direct
+// hosting) or through Railway's edge proxy, the only proxy in front of
+// the production deployment. Rule:
+//   - Direct peer is a public address -> the peer IS the client; any
+//     x-forwarded-for is client-controlled and is ignored.
+//   - Direct peer is loopback/private (we sit behind the edge) -> the
+//     edge appends the address it observed as the LAST x-forwarded-for
+//     entry; earlier entries are client-supplied and ignored.
+// If the edge peer were ever public, every request would key on the edge
+// address and the limiter degrades to its global backstop — safe, just
+// coarser. IPv6 sources key on their /64 (one subscriber's addresses
+// rotate inside a /64; a whole neighbourhood never shares one).
+function isLoopbackOrPrivate(ip: string): boolean {
+  if (ip === "::1" || ip === "::") return true;
+  if (
+    ip.startsWith("127.") ||
+    ip.startsWith("10.") ||
+    ip.startsWith("192.168.") ||
+    ip.startsWith("169.254.")
+  )
+    return true;
+  if (ip.startsWith("172.")) {
+    const second = Number(ip.split(".")[1]);
+    if (second >= 16 && second <= 31) return true;
+  }
+  const low = ip.toLowerCase();
+  if (
+    low.startsWith("fc") ||
+    low.startsWith("fd") ||
+    low.startsWith("fe8") ||
+    low.startsWith("fe9") ||
+    low.startsWith("fea") ||
+    low.startsWith("feb")
+  )
+    return true;
+  return false;
+}
+
+function ipLike(s: string): boolean {
+  return (
+    s.length <= 45 &&
+    /^[0-9a-fA-F:.]+$/.test(s) &&
+    (s.includes(".") || s.includes(":"))
+  );
+}
+
+function clientSourceFor(req: Request, peer: string): string | null {
+  let source = peer;
+  if (isLoopbackOrPrivate(peer)) {
+    const xff = req.headers.get("x-forwarded-for");
+    if (xff) {
+      const parts = xff
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const last = parts[parts.length - 1] ?? "";
+      if (ipLike(last)) source = last;
+    }
+  }
+  if (!source || !ipLike(source)) return null;
+  if (source.includes(":")) {
+    return `${source.split(":").slice(0, 4).join(":")}::/64`;
+  }
+  return source;
+}
+
+function buildCtx(internal = false, clientIp?: string | null) {
   return {
     slug: SLUG,
     invocationId: randomUUID(),
@@ -164,6 +233,10 @@ function buildCtx(internal = false) {
     db: () => db,
     blobs,
     ...(internal ? { hostSecret: TG_HOST_SECRET } : {}),
+    // Batch 19: per-source rate-limit key, attached ONLY to external
+    // dispatches (see clientSourceFor above). Absent -> the actions fall
+    // back to the global registration backstop alone.
+    ...(clientIp ? { clientIp } : {}),
     // Host hook used by the money actions to read proof/QR image bytes
     // (e.g. to forward a top-up screenshot to Telegram via sendPhoto).
     // The portable BlobClient contract has no byte read, so the actions
@@ -187,7 +260,7 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
-async function handleAction(req: Request): Promise<Response> {
+async function handleAction(req: Request, clientIp: string | null): Promise<Response> {
   let body: { action?: unknown; args?: unknown };
   try {
     body = (await req.json()) as { action?: unknown; args?: unknown };
@@ -206,7 +279,7 @@ async function handleAction(req: Request): Promise<Response> {
     return json({ error: `invalid args: ${err instanceof Error ? err.message : String(err)}` }, 400);
   }
   try {
-    const result = await definition.handler(buildCtx() as never, parsedArgs as never);
+    const result = await definition.handler(buildCtx(false, clientIp) as never, parsedArgs as never);
     const validated = definition.response.parse(result);
     return json({ data: validated });
   } catch (err) {
@@ -452,7 +525,7 @@ const server = Bun.serve({
   port: PORT,
   // avatar uploads travel as base64 JSON (up to ~12M chars from the client)
   maxRequestBodySize: 64 * 1024 * 1024,
-  async fetch(req) {
+  async fetch(req, server) {
     const url = new URL(req.url);
     const path = url.pathname;
 
@@ -460,7 +533,8 @@ const server = Bun.serve({
       return json({ ok: true, slug: SLUG, actions: Object.keys(Actions).length, time: new Date().toISOString() });
     }
     if (req.method === "POST" && (path === "/actions" || path.endsWith("/actions"))) {
-      return handleAction(req);
+      const peer = server.requestIP(req)?.address ?? "";
+      return handleAction(req, clientSourceFor(req, peer));
     }
     if (req.method === "GET" && path.startsWith("/blobs/")) {
       const found = await blobs.fileForToken(decodeURIComponent(path.slice("/blobs/".length)));
