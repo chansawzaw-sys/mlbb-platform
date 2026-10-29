@@ -1,11 +1,11 @@
-// MLBB Platform service worker — Batch 17.
+// MLBB KING service worker — Batch 17.
 // Safety-first policy for a live-money app:
 //  - /actions is NEVER intercepted or cached (always fresh, always network).
 //  - Navigations are NETWORK-FIRST (online users always get the freshest
 //    HTML/bundle); the cached shell is only an offline fallback.
 //  - Same-origin static assets are CACHE-FIRST (they are content-hashed).
 //  - Non-GET requests and everything else are left completely untouched.
-const CACHE_NAME = "mlbb-shell-v1";
+const CACHE_NAME = "mlbb-shell-v2";
 
 const SHELL_URLS = [
   "./",

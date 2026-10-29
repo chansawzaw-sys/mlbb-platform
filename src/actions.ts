@@ -8881,7 +8881,7 @@ export const Actions = {
           body,
         });
         const after = await getSettingsMap(db);
-        if (body) await telegramSend(after, `📢 MLBB Platform ကြေညာချက်\n${body}`);
+        if (body) await telegramSend(after, `📢 MLBB KING ကြေညာချက်\n${body}`);
       }
       ctx.invalidateQueries();
       return { ok: true, error: "" };
@@ -8999,7 +8999,7 @@ export const Actions = {
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
       if (err2fa) return { ok: false, error: err2fa, telegram_sent: false };
       const s = await getSettingsMap(db);
-      const tg = await telegramSend(s, `📢 MLBB Platform\n${args.text}`);
+      const tg = await telegramSend(s, `📢 MLBB KING\n${args.text}`);
       await notify(db, {
         playerId: null,
         type: "announcement",
@@ -9037,7 +9037,7 @@ export const Actions = {
         (s["telegram_bot_token"] ?? "").trim() !== "" && (s["telegram_chat_id"] ?? "").trim() !== "";
       if (!configured)
         return { ok: false, error: "မချိတ်ရသေး — Bot Token နဲ့ Chat ID အရင် ထည့်ပြီး သိမ်းပါ", configured: false };
-      let text = "✅ MLBB Platform — Telegram bot test message အောင်မြင်ပါတယ်။";
+      let text = "✅ MLBB KING — Telegram bot test message အောင်မြင်ပါတယ်။";
       if (args.mode === "stats") {
         const all = await db.select().from(schema.players);
         const matchRows = await db.select().from(schema.matches);
@@ -9046,7 +9046,7 @@ export const Actions = {
           .from(schema.reports)
           .where(eq(schema.reports.status, "open"));
         text = [
-          "📊 MLBB Platform Stats",
+          "📊 MLBB KING Stats",
           `Online: ${all.filter((p) => isOnline(p)).length} / Players: ${all.length}`,
           `Active matches: ${matchRows.filter((m) => ["ready_check", "live", "result_pending", "disputed"].includes(m.status)).length}`,
           `Pending reports: ${reportRows.length} • Disputes: ${matchRows.filter((m) => m.status === "disputed").length}`,
@@ -9693,7 +9693,7 @@ export const Actions = {
         let parsed: BackupFile | null = null;
         try { parsed = JSON.parse(raw) as BackupFile; } catch { return fail("JSON ဖိုင် မမှန်ပါ"); }
         if (!parsed || parsed.app !== "mlbb-platform" || !parsed.tables)
-          return fail("ဒါက MLBB Platform backup ဖိုင် မဟုတ်ပါ");
+          return fail("ဒါက MLBB KING backup ဖိုင် မဟုတ်ပါ");
         const tablesIn = parsed.tables;
         let restored = 0;
         // Settings (secrets redacted as "***" in exports are never restored).
@@ -9821,7 +9821,7 @@ export const Actions = {
         actor: actorName,
       });
       await logAct(db, actorName, `Backup snapshot ${code} created (${size} bytes)`);
-      const tgText = `💾 MLBB Platform backup ${code} ဆောက်ပြီးပါပြီ (${size} bytes)`;
+      const tgText = `💾 MLBB KING backup ${code} ဆောက်ပြီးပါပြီ (${size} bytes)`;
       const s = await getSettingsMap(db);
       await telegramSend(s, tgText);
       ctx.invalidateQueries();
