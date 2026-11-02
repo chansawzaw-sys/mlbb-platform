@@ -6,7 +6,7 @@
 //    HTML/bundle); the cached shell is only an offline fallback.
 //  - Same-origin static assets are CACHE-FIRST (they are content-hashed).
 //  - Non-GET requests and everything else are left completely untouched.
-const CACHE_NAME = "mlbb-shell-v3";
+const CACHE_NAME = "mlbb-shell-v4";
 
 const SHELL_URLS = [
   "./",
