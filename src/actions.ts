@@ -169,7 +169,7 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   ready_timeout_min: "3",
   result_delay_min: "5",
   match_timeout_min: "180",
-  accent: "#22d3ee",
+  accent: "#e9c767",
   rules_version: "1",
   telegram_bot: "",
   telegram_bot_token: "",
@@ -1799,9 +1799,64 @@ const SECOND_RESULT_MS = 5 * 60 * 1000;
  *  single-submission auto-settle. Runs lazily on reads (bootstrap/match/
  *  board) and via sweepTimeouts. `ctx` is optional — when present it is
  *  forwarded to settleMatch for query invalidation. */
+/** Batch 21 (A) — 7-day retention sweep. Deletes:
+ *   - notifications older than 7 days, together with their
+ *     notification_reads markers;
+ *   - DECIDED purchase_requests (status approved / rejected / expired)
+ *     whose COALESCE(decidedAt, createdAt) is older than 7 days — the
+ *     attached proof blob is deleted best-effort first;
+ *   - DECIDED withdraw_requests (status paid / rejected / expired) on
+ *     the same clock.
+ *  "expired" is deliberately part of the decided set: it is a
+ *  system-decided terminal state with decidedAt stamped, so it ages
+ *  out exactly like an admin decision. PENDING rows are NEVER deleted,
+ *  at any age. Transactions, balances, matches, reports, DMs and
+ *  diamond_orders are untouched — the money ledger is permanent. */
+async function sweepRetentionInternal(db: Db, ctx: Ctx | null): Promise<number> {
+  const cutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000);
+  const decidedAtOrCreated = (r: { decidedAt: Date | null; createdAt: Date }) =>
+    (r.decidedAt ?? r.createdAt) < cutoff;
+  let nCount = 0;
+  const oldNotifs = (await db.select().from(schema.notifications))
+    .filter((n) => n.createdAt < cutoff);
+  if (oldNotifs.length > 0) {
+    const ids = oldNotifs.map((n) => n.id);
+    await db
+      .delete(schema.notificationReads)
+      .where(inArray(schema.notificationReads.notificationId, ids));
+    await db
+      .delete(schema.notifications)
+      .where(inArray(schema.notifications.id, ids));
+    nCount = ids.length;
+  }
+  let pCount = 0;
+  const decidedPurchases = (await db.select().from(schema.purchaseRequests))
+    .filter((r) => ["approved", "rejected", "expired"].includes(r.status) && decidedAtOrCreated(r));
+  for (const r of decidedPurchases) {
+    if (r.proofBlobKey && ctx) {
+      try { await ctx.blobs.delete(r.proofBlobKey); } catch { /* best-effort */ }
+    }
+    await db.delete(schema.purchaseRequests).where(eq(schema.purchaseRequests.id, r.id));
+    pCount++;
+  }
+  let wCount = 0;
+  const decidedWithdrawals = (await db.select().from(schema.withdrawRequests))
+    .filter((r) => ["paid", "rejected", "expired"].includes(r.status) && decidedAtOrCreated(r));
+  for (const r of decidedWithdrawals) {
+    await db.delete(schema.withdrawRequests).where(eq(schema.withdrawRequests.id, r.id));
+    wCount++;
+  }
+  const total = nCount + pCount + wCount;
+  if (total > 0) {
+    await logAct(db, "system", `Retention sweep (>7d): notifications ${nCount}, purchases ${pCount}, withdrawals ${wCount} deleted`);
+  }
+  return total;
+}
+
 async function sweepTimeoutsInternal(db: Db, ctx: Ctx | null = null): Promise<number> {
   let acted = 0;
   acted += await expireMoneyRequestsInternal(db);
+  await sweepRetentionInternal(db, ctx).catch(() => 0);
   const now = Date.now();
   const s = await getSettingsMap(db);
   const matchTimeoutMs = numSetting(s, "match_timeout_min", 180) * 60 * 1000;
@@ -2703,6 +2758,124 @@ async function refundMatch(
   return true;
 }
 
+/** Batch 21 (B): dispute resolution core — the post-gate logic of the
+ *  resolveDispute action, shared verbatim with the Telegram dsp
+ *  callback. Callers own their gates (the action: role + confirm +
+ *  TOTP; the callback: host secret + configured chat id). A match that
+ *  is no longer disputed returns !ok with ZERO money movement, so a
+ *  second tap / double delivery can never settle or refund twice —
+ *  settleMatch / refundMatch are themselves claim-guarded as well. */
+async function resolveDisputeInternal(
+  ctx: Ctx | null,
+  db: Db,
+  matchId: number,
+  winnerId: number,
+  actorName: string,
+): Promise<{ ok: boolean; error: string }> {
+  const rows = await db
+    .select()
+    .from(schema.matches)
+    .where(eq(schema.matches.id, matchId))
+    .limit(1);
+  const m = rows[0];
+  if (!m || m.status !== "disputed")
+    return { ok: false, error: "Dispute match မဟုတ်ပါ" };
+  if (winnerId === 0) {
+    await refundMatch(db, m, "Dispute — admin refund");
+  } else {
+    if (winnerId !== m.playerAId && winnerId !== m.playerBId)
+      return { ok: false, error: "Winner က match ထဲက player ဖြစ်ရပါမယ်" };
+    await settleMatch(ctx, db, m, winnerId);
+  }
+  await logAct(db, actorName, `Dispute ${m.code} resolved (winner: ${winnerId || "refund"})`);
+  return { ok: true, error: "" };
+}
+
+/** Batch 21 (B): inline resolve keyboard for a dispute in Telegram.
+ *  callback_data format: "dsp:<matchId>:<winnerId>" — ids only; the
+ *  names ride in the button text (truncated to keep buttons sane). */
+function disputeKeyboard(matchId: number, aId: number, bId: number, aName: string, bName: string) {
+  const short = (n: string) => (n.length > 20 ? `${n.slice(0, 20)}…` : n);
+  return {
+    inline_keyboard: [
+      [{ text: `🏆 ${short(aName)} အနိုင်`, callback_data: `dsp:${matchId}:${aId}` }],
+      [{ text: `🏆 ${short(bName)} အနိုင်`, callback_data: `dsp:${matchId}:${bId}` }],
+      [{ text: "↩️ နှစ်ဖက်စလုံး ပြန်အမ်း", callback_data: `dsp:${matchId}:0` }],
+    ],
+  };
+}
+
+/** English label mirrors of the client's ARENAS / heroRuleLabel maps
+ *  (client/src/App.tsx) — used ONLY for the Telegram dispute summary,
+ *  which is an admin-facing English descriptor. Keep in step with the
+ *  client maps: arena en labels 1v1→"1v1 Room", classic→"Classic",
+ *  brawl→"Brawl"; hero rules render exactly as heroRuleLabel does in
+ *  English, including "Same Hero: <name>" for "same:<name>" and ""
+ *  (no label) for the removed "open" rule. */
+const ARENA_EN: Record<string, string> = { "1v1": "1v1 Room", classic: "Classic", brawl: "Brawl" };
+const HERO_RULE_EN: Record<string, string> = {
+  fighter: "Fighter only",
+  assassin: "Assassin only",
+  mage: "Mage only",
+  marksman: "Marksman only",
+  same: "Same Hero",
+  any: "Any Hero",
+  discuss: "💬 Chatbox မှာ ဆွေးနွေးမည်",
+  tank: "Tank only",
+  support: "Support only",
+  random: "Random Hero",
+  same_hero: "Same Hero",
+  no_duplicate: "No Duplicate Hero",
+};
+function heroRuleEn(id: string): string {
+  if (id === "open") return "";
+  if (id.startsWith("same:")) {
+    const name = id.slice(5).trim();
+    return name ? `Same Hero: ${name}` : "Same Hero";
+  }
+  return HERO_RULE_EN[id] ?? id;
+}
+function matchDescriptorEn(m: { teamSize: number; arena: string; heroRule: string }): string {
+  const size = m.teamSize === 1 ? "1v1" : `${m.teamSize}vs${m.teamSize}`;
+  return [size, ARENA_EN[m.arena] ?? m.arena, heroRuleEn(m.heroRule)].filter(Boolean).join(" · ");
+}
+
+/** Batch 21 (B): best-effort Telegram dispatch for a NEW dispute —
+ *  summary + resolve buttons first, then each side's evidence photo.
+ *  Every send is individually fail-soft; a Telegram failure can never
+ *  affect the dispute flow. Silent when Telegram is not configured. */
+async function notifyTelegramDispute(ctx: Ctx, db: Db, m: MatchRow): Promise<void> {
+  try {
+    const s = await getSettingsMap(db);
+    if (!telegramConfigured(s)) return;
+    const pa = await getPlayer(db, m.playerAId);
+    const pb = await getPlayer(db, m.playerBId);
+    const aName = pa?.name ?? `#${m.playerAId}`;
+    const bName = pb?.name ?? `#${m.playerBId}`;
+    const pot = payoutCalc(m.stake, m.teamSize, m.feeAmount).pot;
+    const text =
+      `⚠️ Dispute အသစ် — Match ${m.code} (#${m.id})\n` +
+      `${matchDescriptorEn(m)}\n` +
+      `Stake 🪙 ${m.stake} • Pot 🪙 ${pot} • Fee 🪙 ${m.feeAmount}\n` +
+      `${aName} (${pa?.gameName ?? ""}): ${m.aResult}\n` +
+      `${bName} (${pb?.gameName ?? ""}): ${m.bResult}`;
+    try {
+      await telegramSend(s, text, disputeKeyboard(m.id, m.playerAId, m.playerBId, aName, bName));
+    } catch { /* summary send is best-effort */ }
+    const sides = [
+      { key: m.aEvidence, name: aName, result: m.aResult },
+      { key: m.bEvidence, name: bName, result: m.bResult },
+    ];
+    for (const side of sides) {
+      if (!side.key) continue;
+      try {
+        const bytes = await blobBytes(ctx, side.key);
+        if (bytes) await telegramSendPhoto(s, bytes, `${side.name} — evidence (${side.result})`);
+      } catch { /* each photo is best-effort */ }
+    }
+  } catch { /* dispatch is best-effort by design */ }
+}
+
 const matchShape = z.object({
   id: z.number(),
   code: z.string(),
@@ -3050,7 +3223,7 @@ function settingsOut(s: Record<string, string>, adminView = false) {
     emergency: s["emergency"] === "1",
     ready_timeout_min: numSetting(s, "ready_timeout_min", 3),
     result_delay_min: numSetting(s, "result_delay_min", 5),
-    accent: s["accent"] ?? "#22d3ee",
+    accent: s["accent"] ?? "#e9c767",
     rules_version: s["rules_version"] ?? "1",
     telegram_bot: s["telegram_bot"] ?? "",
     telegram_configured:
@@ -3730,6 +3903,7 @@ const dmConversationShape = z.object({
 
 export const Actions = {
   getBootstrap: defineAction({
+    description: "Load the initial app state: public settings, player list, current player, home stats, and the next tournament.",
     request: z.object({
       player_id: z.number().nullable().default(null),
       session_token: z.string().default(""),
@@ -3987,6 +4161,7 @@ export const Actions = {
   }),
 
   registerPlayer: defineAction({
+    description: "Register a new player account with name, MLBB ID, and server ID, optionally with a referral code.",
     request: z.object({
       name: z.string().min(1).max(60),
       mlbb_id: z.string().max(30).default(""),
@@ -4070,6 +4245,7 @@ export const Actions = {
   }),
 
   updateProfile: defineAction({
+    description: "Update the signed-in player's profile details such as name, MLBB ID, server ID, and game name.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -4140,6 +4316,7 @@ export const Actions = {
   }),
 
   heartbeat: defineAction({
+    description: "Record that the signed-in player is currently online.",
     request: z.object({ player_id: z.number(), session_token: z.string().default("") }),
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
@@ -4155,6 +4332,7 @@ export const Actions = {
   }),
 
   searchAll: defineAction({
+    description: "Search players, teams, and tournaments by name or ID for the global search box.",
     request: z.object({
       q: z.string().min(1).max(60),
       player_id: z.number().default(0),
@@ -4268,6 +4446,7 @@ export const Actions = {
   }),
 
   listChallenges: defineAction({
+    description: "List open challenges visible to the signed-in player, including friend-directed invites.",
     request: z.object({
       player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -4385,6 +4564,7 @@ export const Actions = {
   }),
 
   createChallenge: defineAction({
+    description: "Create a new challenge (arena, team size, hero rule, stake) and lock the creator's stake.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -4527,6 +4707,7 @@ export const Actions = {
   }),
 
   acceptChallenge: defineAction({
+    description: "Accept an open challenge, locking stakes for both sides and creating the match room.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -4812,6 +4993,7 @@ export const Actions = {
   // only through the match-room rules. The UI mirrors this: the cancel
   // button exists only on open-lobby cards.
   cancelChallenge: defineAction({
+    description: "Cancel the creator's own open challenge and refund the locked stake.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -4851,6 +5033,7 @@ export const Actions = {
   }),
 
   saveRule: defineAction({
+    description: "Save a named custom rules preset for reuse when creating challenges.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -4881,6 +5064,7 @@ export const Actions = {
   }),
 
   listSavedRules: defineAction({
+    description: "List the signed-in player's saved rules presets.",
     request: z.object({ player_id: z.number(), session_token: z.string().default("") }),
     response: z.object({
       rules: z.array(
@@ -4917,6 +5101,7 @@ export const Actions = {
   }),
 
   deleteSavedRule: defineAction({
+    description: "Delete one of the signed-in player's saved rules presets.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -4943,6 +5128,7 @@ export const Actions = {
   }),
 
   myMatches: defineAction({
+    description: "List the signed-in player's current and recent matches.",
     request: z.object({ player_id: z.number(), session_token: z.string().default("") }),
     response: z.object({ matches: z.array(matchShape) }),
     async handler(ctx, args) {
@@ -4965,6 +5151,7 @@ export const Actions = {
   }),
 
   getMatch: defineAction({
+    description: "Load one match room in full: players, participants, chat, and state.",
     request: z.object({
       match_id: z.number(),
       player_id: z.number().default(0),
@@ -5082,6 +5269,7 @@ export const Actions = {
   }),
 
   sendChat: defineAction({
+    description: "Send a message to a match room's chat.",
     request: z.object({
       match_id: z.number(),
       player_id: z.number(),
@@ -5123,6 +5311,7 @@ export const Actions = {
   }),
 
   setReady: defineAction({
+    description: "Mark the signed-in player ready (or unready) in a match room's ready check.",
     request: z.object({
       match_id: z.number(),
       player_id: z.number(),
@@ -5262,6 +5451,7 @@ export const Actions = {
   }),
 
   submitResult: defineAction({
+    description: "Submit a match result with hero and evidence; matching results settle the match, a mismatch opens a dispute.",
     request: z.object({
       match_id: z.number(),
       player_id: z.number(),
@@ -5358,8 +5548,11 @@ export const Actions = {
           return { ok: true, error: "", outcome: "confirmed" };
         }
         // Only a still-pending match can become disputed — never flip a
-        // match a concurrent settle already completed.
-        await db
+        // match a concurrent settle already completed. The guarded flip
+        // doubles as the exactly-once gate for the Telegram dispute
+        // dispatch (Batch 21): only the caller that actually flipped
+        // the row dispatches.
+        const flipped = await db
           .update(schema.matches)
           .set({ status: "disputed" })
           .where(
@@ -5367,7 +5560,15 @@ export const Actions = {
               eq(schema.matches.id, m.id),
               eq(schema.matches.status, "result_pending"),
             ),
-          );
+          )
+          .returning({ id: schema.matches.id });
+        if (flipped.length === 1) {
+          // Best-effort: a Telegram failure must never affect the
+          // dispute flow or this response.
+          try {
+            await notifyTelegramDispute(ctx, db, fresh);
+          } catch { /* dispatch is best-effort */ }
+        }
         for (const pid of [m.playerAId, m.playerBId]) {
           await notify(db, {
             playerId: pid,
@@ -5386,6 +5587,7 @@ export const Actions = {
   }),
 
   cancelMatch: defineAction({
+    description: "Cancel a match before it starts and refund all locked stakes.",
     request: z.object({
       match_id: z.number(),
       player_id: z.number(),
@@ -5455,6 +5657,7 @@ export const Actions = {
   // like (1). No punishment or ban state is ever written, and every
   // guard rejects with zero state change.
   kickParticipant: defineAction({
+    description: "Remove a participant from a team match room before it starts (not available in 1v1).",
     request: z.object({
       match_id: z.number(),
       // The player to remove (the brief's { match_id, player_id }). The
@@ -5722,6 +5925,7 @@ export const Actions = {
   // (match, friend) per 5 minutes via the shared DB rate limiter — a
   // throttled retry writes no notification.
   inviteToMatch: defineAction({
+    description: "Invite a friend into an open slot of the signed-in player's match room.",
     request: z.object({
       match_id: z.number().int().default(0),
       challenge_id: z.number().int().default(0),
@@ -5838,6 +6042,7 @@ export const Actions = {
   // uses; a failed lock changes nothing. Referral pending rows mirror
   // acceptChallenge exactly, and both leaders are notified.
   joinMatchSlot: defineAction({
+    description: "Join an open slot in a match room the player was invited to.",
     request: z.object({
       match_id: z.number(),
       player_id: z.number(),
@@ -5981,6 +6186,7 @@ export const Actions = {
   // from the winning leader's row, so a swapped leader wins for the
   // side they ended on.
   swapTeamSlot: defineAction({
+    description: "Swap a participant between teams during ready check.",
     request: z.object({
       match_id: z.number(),
       player_id: z.number(),
@@ -6038,6 +6244,7 @@ export const Actions = {
   }),
 
   resolveDispute: defineAction({
+    description: "Admin action: settle a disputed match by declaring a winner or refunding both sides.",
     request: z.object({
       match_id: z.number(),
       winner_id: z.number(), // 0 = refund both
@@ -6059,28 +6266,17 @@ export const Actions = {
         return { ok: false, error: "Dispute ဆုံးဖြတ်ရန် security confirmation လိုပါတယ်" };
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
       if (err2fa) return { ok: false, error: err2fa };
-      const rows = await db
-        .select()
-        .from(schema.matches)
-        .where(eq(schema.matches.id, args.match_id))
-        .limit(1);
-      const m = rows[0];
-      if (!m || m.status !== "disputed")
-        return { ok: false, error: "Dispute match မဟုတ်ပါ" };
-      if (args.winner_id === 0) {
-        await refundMatch(db, m, "Dispute — admin refund");
-      } else {
-        if (args.winner_id !== m.playerAId && args.winner_id !== m.playerBId)
-          return { ok: false, error: "Winner က match ထဲက player ဖြစ်ရပါမယ်" };
-        await settleMatch(ctx, db, m, args.winner_id);
-      }
-      await logAct(db, auth.actor.name, `Dispute ${m.code} resolved (winner: ${args.winner_id || "refund"})`);
+      // Post-gate logic lives in resolveDisputeInternal (Batch 21) —
+      // shared verbatim with the Telegram dsp callback.
+      const r = await resolveDisputeInternal(ctx, db, args.match_id, args.winner_id, auth.actor.name);
+      if (!r.ok) return { ok: false, error: r.error };
       ctx.invalidateQueries();
       return { ok: true, error: "" };
     },
   }),
 
   listDisputes: defineAction({
+    description: "List matches currently in dispute for staff review.",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -6101,7 +6297,51 @@ export const Actions = {
     },
   }),
 
+  // Batch 21 (C): search-first admin player lookup. The Admin Players
+  // section no longer receives the full player list (getAdmin is slimmed
+  // in the same batch); staff search by player ID / username / MLBB ID
+  // and act on the result rows through the EXISTING adminPlayerAction
+  // verbs and gates. Fail-closed like listDisputes: non-staff, plain
+  // players and forged sessions get an empty list and nothing else.
+  adminSearchPlayers: defineAction({
+    description: "Staff search for players by ID, username, MLBB ID, or game name; returns at most 20 matches.",
+    request: z.object({
+      query: z.string().default(""),
+      actor_player_id: z.number().default(0),
+      session_token: z.string().default(""),
+    }),
+    response: z.object({ players: z.array(playerShape) }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const auth = await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin", "moderator"]);
+      if (auth.error) return { players: [] };
+      const q = args.query.trim();
+      if (!q) return { players: [] };
+      const allDigits = /^\d+$/.test(q);
+      if (!allDigits && q.length < 2) return { players: [] };
+      const ql = q.toLowerCase();
+      const all = await db.select().from(schema.players);
+      const matched = all
+        .filter((p) =>
+          allDigits
+            ? p.id === Number(q) ||
+              p.mlbbId.toLowerCase().includes(ql) ||
+              p.name.toLowerCase().includes(ql) ||
+              p.gameName.toLowerCase().includes(ql)
+            : p.name.toLowerCase().includes(ql) ||
+              p.gameName.toLowerCase().includes(ql) ||
+              p.mlbbId.toLowerCase().includes(ql),
+        )
+        .sort((a, b) => a.id - b.id)
+        .slice(0, 20);
+      const out = [];
+      for (const p of matched) out.push({ ...(await playerOutAsync(ctx, p)), role: effectiveRole(p) });
+      return { players: out };
+    },
+  }),
+
   getWallet: defineAction({
+    description: "Load the signed-in player's coin wallet: balance, locked coins, and recent transactions.",
     request: z.object({ player_id: z.number(), session_token: z.string().default("") }),
     response: z.object({
       player: playerShape.nullable(),
@@ -6162,6 +6402,7 @@ export const Actions = {
   }),
 
   buyCoins: defineAction({
+    description: "Create a coin top-up purchase request with the chosen package and sender name.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -6279,6 +6520,7 @@ export const Actions = {
   }),
 
   listPurchaseRequests: defineAction({
+    description: "List coin purchase requests (the player's own, or all pending for staff).",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -6300,6 +6542,7 @@ export const Actions = {
   }),
 
   decidePurchase: defineAction({
+    description: "Staff action: approve or reject a pending coin purchase request.",
     request: z.object({
       actor_player_id: z.number().default(0),
       actor: z.string().default("admin"),
@@ -6330,6 +6573,7 @@ export const Actions = {
   }),
 
   uploadPurchaseProof: defineAction({
+    description: "Upload the payment screenshot proof for a coin purchase request.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -6371,6 +6615,7 @@ export const Actions = {
   }),
 
   requestWithdraw: defineAction({
+    description: "Create a coin withdrawal request to KPay or Wave with payout details.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -6524,6 +6769,7 @@ export const Actions = {
   }),
 
   listWithdrawRequests: defineAction({
+    description: "List withdrawal requests (the player's own, or all pending for staff).",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -6544,6 +6790,7 @@ export const Actions = {
   }),
 
   decideWithdraw: defineAction({
+    description: "Staff action: mark a withdrawal paid or reject it.",
     request: z.object({
       actor_player_id: z.number().default(0),
       actor: z.string().default("admin"),
@@ -6569,6 +6816,7 @@ export const Actions = {
   }),
 
   buyDiamonds: defineAction({
+    description: "Order an MLBB diamond package paid with coins.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -6680,6 +6928,7 @@ export const Actions = {
   }),
 
   listDiamondOrders: defineAction({
+    description: "List diamond orders (the player's own, or all pending for staff).",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -6721,6 +6970,7 @@ export const Actions = {
   }),
 
   decideDiamondOrder: defineAction({
+    description: "Staff action: fulfil or reject a pending diamond order.",
     request: z.object({
       actor_player_id: z.number().default(0),
       actor: z.string().default("admin"),
@@ -6746,6 +6996,7 @@ export const Actions = {
   }),
 
   saveDiamondPackage: defineAction({
+    description: "Staff action: create or update a diamond shop package.",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -6799,6 +7050,7 @@ export const Actions = {
   }),
 
   deleteDiamondPackage: defineAction({
+    description: "Staff action: delete a diamond shop package.",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -6824,6 +7076,7 @@ export const Actions = {
   }),
 
   uploadPaymentQr: defineAction({
+    description: "Staff action: upload a KPay or Wave payment QR image shown to players.",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -6867,6 +7120,7 @@ export const Actions = {
   }),
 
   deletePaymentQr: defineAction({
+    description: "Staff action: remove a payment QR image.",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -6898,6 +7152,7 @@ export const Actions = {
   }),
 
   uploadSlideImage: defineAction({
+    description: "Staff action: upload a home slideshow image into an admin-managed slot.",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -6941,6 +7196,7 @@ export const Actions = {
   }),
 
   deleteSlideImage: defineAction({
+    description: "Staff action: remove an admin-uploaded slideshow image, restoring the default art.",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -6978,6 +7234,7 @@ export const Actions = {
    * (so the URL changes on every replacement = cache-busting). Empty
    * setting = the baked bundle crop is shown as the default. */
   uploadWizardArt: defineAction({
+    description: "Staff action: upload replacement art for a challenge-wizard slot.",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -7029,6 +7286,7 @@ export const Actions = {
   }),
 
   deleteWizardArt: defineAction({
+    description: "Staff action: remove uploaded wizard art, restoring the default art.",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -7068,6 +7326,7 @@ export const Actions = {
   }),
 
   telegramCallback: defineAction({
+    description: "Handle signed Telegram bot button callbacks (top-up, withdrawal, and dispute decisions).",
     request: z.object({
       update: z.record(z.string(), z.unknown()),
     }),
@@ -7109,10 +7368,14 @@ export const Actions = {
       if (fromChat === undefined || String(fromChat) !== chatId)
         return { ok: false, error: "Telegram chat မကိုက်ပါ — ဆုံးဖြတ်ခွင့် မရှိပါ", handled: false };
       const data = typeof cq.data === "string" ? cq.data : "";
+      // Disputes use their own prefix (Batch 21): "dsp:<matchId>:<winnerId>"
+      // — winnerId 0 means refund both. Same host-secret + chat-id gates
+      // above protect this branch exactly like the money branches.
+      const dsp = data.match(/^dsp:(\d+):(\d+)$/);
       // Diamond orders use their own prefix: "dd:<orderId>:<approve|reject>".
-      const dd = data.match(/^dd:(\d+):(approve|reject)$/);
-      const m = dd ? null : data.match(/^(pur|wd):(\d+):(approve|reject|paid)$/);
-      if (!dd && !m) return ignore;
+      const dd = dsp ? null : data.match(/^dd:(\d+):(approve|reject)$/);
+      const m = dd || dsp ? null : data.match(/^(pur|wd):(\d+):(approve|reject|paid)$/);
+      if (!dd && !m && !dsp) return ignore;
       const kind = m?.[1] ?? "";
       const reqId = Number(m?.[2] ?? 0);
       const rawDecision = m?.[3] ?? "";
@@ -7126,7 +7389,19 @@ export const Actions = {
       const decidedBy = `Telegram (${fromName})`;
       let outcome: string;
       let already = false;
-      if (dd) {
+      if (dsp) {
+        const winnerId = Number(dsp[2]);
+        const r = await resolveDisputeInternal(ctx, db, Number(dsp[1]), winnerId, decidedBy);
+        outcome = r.ok
+          ? winnerId > 0
+            ? "⚖️ Dispute ဖြေရှင်းပြီး — winner သတ်မှတ် settle လုပ်ပြီးပါပြီ"
+            : "↩️ Dispute ဖြေရှင်းပြီး — နှစ်ဖက်စလုံး ပြန်အမ်းပြီးပါပြီ"
+          : r.error;
+        // A second tap lands here: the match is no longer disputed, the
+        // internal returns !ok with zero money movement — present it
+        // like the money branches' already-decided case.
+        already = !r.ok && r.error.includes("Dispute match မဟုတ်ပါ");
+      } else if (dd) {
         const r = await decideDiamondOrderInternal(
           ctx, db, Number(dd[1]), dd[2] === "approve" ? "fulfill" : "reject", decidedBy, "",
         );
@@ -7182,6 +7457,7 @@ export const Actions = {
   }),
 
   sweepTimeouts: defineAction({
+    description: "Run the server maintenance sweep: ready/result timeouts, expiring money requests, and the 7-day retention cleanup.",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -7198,6 +7474,7 @@ export const Actions = {
   }),
 
   feePreview: defineAction({
+    description: "Preview the platform fee and winner payout for a given stake and mode.",
     request: z.object({
       arena: z.enum(["1v1", "classic", "brawl"]),
       stake: z.number().int().min(0),
@@ -7237,6 +7514,7 @@ export const Actions = {
   }),
 
   listTournaments: defineAction({
+    description: "List tournaments with their entries and brackets.",
     request: z.object({}),
     response: z.object({
       tournaments: z.array(
@@ -7313,6 +7591,7 @@ export const Actions = {
   }),
 
   createTournament: defineAction({
+    description: "Staff action: create a new tournament.",
     request: z.object({
       actor: z.string().default("admin"),
       actor_player_id: z.number().default(0),
@@ -7355,6 +7634,7 @@ export const Actions = {
   }),
 
   registerTournament: defineAction({
+    description: "Register the signed-in player (or their team) for a tournament.",
     request: z.object({
       tournament_id: z.number(),
       player_id: z.number().nullable().default(null),
@@ -7390,6 +7670,7 @@ export const Actions = {
   }),
 
   generateBracket: defineAction({
+    description: "Staff action: generate a tournament bracket from its entries.",
     request: z.object({
       tournament_id: z.number(),
       actor: z.string().default("admin"),
@@ -7429,6 +7710,7 @@ export const Actions = {
   }),
 
   setBracketWinner: defineAction({
+    description: "Staff action: record the winner of a bracket match.",
     request: z.object({
       bracket_id: z.number(),
       winner: z.string().min(1).max(60),
@@ -7493,6 +7775,7 @@ export const Actions = {
   }),
 
   leaderboard: defineAction({
+    description: "Load the public leaderboard ranked by wins with rank-ladder tiers.",
     request: z.object({
       category: z.enum(["top_player", "most_wins", "win_streak", "top_team", "champion"]),
       period: z.enum(["daily", "weekly", "monthly", "all_time"]),
@@ -7668,6 +7951,7 @@ export const Actions = {
   }),
 
   matchHistory: defineAction({
+    description: "Load a player's completed match history.",
     request: z.object({ player_id: z.number(), session_token: z.string().default("") }),
     response: z.object({ matches: z.array(matchShape) }),
     async handler(ctx, args) {
@@ -7691,6 +7975,7 @@ export const Actions = {
   }),
 
   listTeams: defineAction({
+    description: "List teams and their members.",
     request: z.object({}),
     response: z.object({
       teams: z.array(
@@ -7743,6 +8028,7 @@ export const Actions = {
   }),
 
   createTeam: defineAction({
+    description: "Create a new team led by the signed-in player.",
     request: z.object({
       leader_id: z.number(),
       session_token: z.string().default(""),
@@ -7774,6 +8060,7 @@ export const Actions = {
   }),
 
   teamMemberAction: defineAction({
+    description: "Manage team membership: invite, accept, leave, kick, and ready flags.",
     request: z.object({
       action: z.enum(["add", "remove", "ready", "disband"]),
       team_id: z.number(),
@@ -7917,6 +8204,7 @@ export const Actions = {
   }),
 
   friendsAction: defineAction({
+    description: "Manage the friend list: add, remove, and list friends.",
     request: z.object({
       action: z.enum(["list", "add", "remove"]),
       player_id: z.number(),
@@ -7979,6 +8267,7 @@ export const Actions = {
    * leaderboard's for the same player. The Owner (admin-only) is never
    * a summary target and cannot view summaries. */
   getPlayerSummary: defineAction({
+    description: "Load a public player profile summary: rank, record, and stats.",
     request: z.object({
       player_id: z.number(),
       target_id: z.number(),
@@ -8048,6 +8337,7 @@ export const Actions = {
    * can be read or written (IDOR-proof by construction). The Owner is
    * blocked like every other player action (ownerPlayerBlock). */
   listConversations: defineAction({
+    description: "List the signed-in player's friend DM conversations with unread counts.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -8122,6 +8412,7 @@ export const Actions = {
   }),
 
   getDmThread: defineAction({
+    description: "Load the DM message history with one friend.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -8178,6 +8469,7 @@ export const Actions = {
   }),
 
   sendDm: defineAction({
+    description: "Send a direct message to a friend.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -8229,6 +8521,7 @@ export const Actions = {
   }),
 
   markDmRead: defineAction({
+    description: "Mark a DM conversation as read.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -8281,6 +8574,7 @@ export const Actions = {
   }),
 
   getReferral: defineAction({
+    description: "Load the signed-in player's referral code, referrals, and earned commissions.",
     request: z.object({ player_id: z.number(), session_token: z.string().default("") }),
     response: z.object({
       code: z.string(),
@@ -8355,6 +8649,7 @@ export const Actions = {
   }),
 
   listNotifications: defineAction({
+    description: "List the signed-in player's notifications.",
     request: z.object({ player_id: z.number(), session_token: z.string().default("") }),
     response: z.object({
       notifications: z.array(
@@ -8487,6 +8782,7 @@ export const Actions = {
   }),
 
   markNotificationsRead: defineAction({
+    description: "Mark notifications as read.",
     request: z.object({ player_id: z.number(), session_token: z.string().default("") }),
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
@@ -8519,6 +8815,7 @@ export const Actions = {
   }),
 
   createReport: defineAction({
+    description: "File a report against a player or match for staff review.",
     request: z.object({
       reporter_id: z.number().nullable().default(null),
       session_token: z.string().default(""),
@@ -8557,6 +8854,7 @@ export const Actions = {
   }),
 
   listReports: defineAction({
+    description: "Staff action: list player reports.",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -8602,6 +8900,7 @@ export const Actions = {
   }),
 
   resolveReport: defineAction({
+    description: "Staff action: resolve a report with an outcome such as a warning or ban.",
     request: z.object({
       report_id: z.number(),
       action: z.enum(["none", "warning", "temp_ban", "perm_ban"]),
@@ -8693,6 +8992,7 @@ export const Actions = {
   }),
 
   ticketsAction: defineAction({
+    description: "Create and manage support tickets for players and staff replies.",
     request: z.object({
       action: z.enum(["list", "create", "reply"]),
       player_id: z.number().nullable().default(null),
@@ -8784,6 +9084,7 @@ export const Actions = {
   }),
 
   staffGrantAction: defineAction({
+    description: "Owner-only: grant or revoke a staff role (Admin, Moderator, Support) for a Gmail address.",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -8882,6 +9183,7 @@ export const Actions = {
   }),
 
   getAdmin: defineAction({
+    description: "Load the admin panel data: settings, pending queues, duplicate-pair report, and platform health.",
     request: z.object({
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -8911,7 +9213,8 @@ export const Actions = {
       activity: z.array(
         z.object({ id: z.number(), actor: z.string(), action: z.string(), created_at: z.string() }),
       ),
-      players: z.array(playerShape),
+      // Batch 21 (C): no full player list here any more — the Admin
+      // Players section searches via adminSearchPlayers instead.
       // Batch 14 fix: legacy duplicate (mlbb_id, server_id) pairs, listed
       // READ-ONLY for the Owner to review manually (pair uniqueness is
       // enforced at the application level; no DB unique index exists).
@@ -8969,7 +9272,7 @@ export const Actions = {
           settings: { ...settingsOut({}), telegram_chat_id: "" },
           health: { total_players: 0, online_players: 0, active_matches: 0, pending_disputes: 0, pending_reports: 0, open_tickets: 0, total_transactions: 0, total_fees: 0, db_status: "FORBIDDEN" },
           money: { topups_today_count: 0, topups_today_coins: 0, withdrawals_today_count: 0, withdrawals_today_kyat: 0, fees_today_coins: 0, pending_topups: 0, pending_withdrawals: 0 },
-          activity: [], players: [], duplicate_pairs: [], suspicious_players: [], terms_history: [], backups: [], staff_grants: [],
+          activity: [], duplicate_pairs: [], suspicious_players: [], terms_history: [], backups: [], staff_grants: [],
         };
       }
       const s = await getSettingsMap(db);
@@ -9048,7 +9351,6 @@ export const Actions = {
           action: a.action,
           created_at: iso(a.createdAt) ?? "",
         })),
-        players: await (async () => { const arr = []; for (const pl of all) arr.push({ ...(await playerOutAsync(ctx, pl)), role: effectiveRole(pl) }); return arr; })(),
         duplicate_pairs: (() => {
           // Group the already-loaded players by their trimmed filled pair
           // (same semantics as pairOwner) and keep only groups of 2+.
@@ -9089,6 +9391,7 @@ export const Actions = {
   }),
 
   updateSettings: defineAction({
+    description: "Staff action: update platform settings (content and pricing keys for Admin; payment and credential keys Owner-only).",
     request: z.object({
       actor: z.string().default("admin"),
       actor_player_id: z.number().default(0),
@@ -9267,6 +9570,7 @@ export const Actions = {
   }),
 
   adminPlayerAction: defineAction({
+    description: "Staff action on a player: adjust coins, set role, warn, ban, or unban, per the role permission matrix.",
     request: z.object({
       actor: z.string().default("admin"),
       actor_player_id: z.number().default(0),
@@ -9358,6 +9662,7 @@ export const Actions = {
   }),
 
   telegramPost: defineAction({
+    description: "Staff action: post an announcement to the configured Telegram channel or chat.",
     request: z.object({
       actor: z.string().default("admin"),
       actor_player_id: z.number().default(0),
@@ -9399,6 +9704,7 @@ export const Actions = {
   }),
 
   telegramTest: defineAction({
+    description: "Staff action: send a test message to verify the Telegram bot configuration.",
     request: z.object({
       actor: z.string().default("admin"),
       actor_player_id: z.number().default(0),
@@ -9437,6 +9743,7 @@ export const Actions = {
   }),
 
   googleLogin: defineAction({
+    description: "Sign in with a verified Google identity token, or park it pending profile completion for a new identity.",
     request: z.object({
       id_token: z.string().min(10).max(4000),
       // Batch 14 (M3): LINK MODE — a signed-in player attaching this
@@ -9712,6 +10019,7 @@ export const Actions = {
    *  (no Google) → link only with that account's live session as proof;
    *  pair free → create the player (with M5 name adoption). */
   completeGoogleProfile: defineAction({
+    description: "Finish a Google sign-up by submitting MLBB ID and server ID, or link Google to an existing account.",
     request: z.object({
       pending_token: z.string().min(1).max(200),
       name: z.string().min(1).max(60),
@@ -9893,6 +10201,7 @@ export const Actions = {
   }),
 
   totpAction: defineAction({
+    description: "Set up, enable, disable, or verify two-factor authentication (TOTP) for staff accounts.",
     request: z.object({
       action: z.enum(["setup", "enable", "disable"]),
       player_id: z.number(),
@@ -9952,6 +10261,7 @@ export const Actions = {
   }),
 
   voiceSignalSend: defineAction({
+    description: "Send a WebRTC voice signalling message to another player in a match room.",
     request: z.object({
       match_id: z.number(),
       from_player_id: z.number(),
@@ -9985,6 +10295,7 @@ export const Actions = {
   }),
 
   voiceSignalPoll: defineAction({
+    description: "Poll for pending WebRTC voice signalling messages in a match room.",
     request: z.object({
       match_id: z.number(),
       player_id: z.number(),
@@ -10030,6 +10341,7 @@ export const Actions = {
   }),
 
   backupAction: defineAction({
+    description: "Owner-only: create, list, or restore full platform backup snapshots.",
     request: z.object({
       action: z.enum(["export", "snapshot", "restore"]),
       actor: z.string().default("admin"),
@@ -10208,6 +10520,7 @@ export const Actions = {
   }),
 
   uploadAvatar: defineAction({
+    description: "Upload a profile avatar image for the signed-in player.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -10238,6 +10551,7 @@ export const Actions = {
   }),
 
   deleteAvatar: defineAction({
+    description: "Remove the signed-in player's uploaded avatar.",
     request: z.object({ player_id: z.number(), session_token: z.string().default("") }),
     response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
@@ -10256,6 +10570,7 @@ export const Actions = {
   }),
 
   uploadTeamLogo: defineAction({
+    description: "Upload a logo image for a team the player leads.",
     request: z.object({
       team_id: z.number(),
       actor_player_id: z.number().default(0),
@@ -10289,6 +10604,7 @@ export const Actions = {
   }),
 
   deleteTeamLogo: defineAction({
+    description: "Remove a team's uploaded logo.",
     request: z.object({
       team_id: z.number(),
       actor_player_id: z.number().default(0),
@@ -10326,6 +10642,7 @@ export const Actions = {
    * registration or profile saving. Rate-limited per player (or a
    * shared anonymous bucket) so it cannot be abused as a free proxy. */
   lookupMlbbName: defineAction({
+    description: "Look up the in-game name for an MLBB ID and server ID pair.",
     request: z.object({
       mlbb_id: z.string().max(30).default(""),
       server_id: z.string().max(30).default(""),
@@ -10355,6 +10672,7 @@ export const Actions = {
    *  FIELD in the spectator shapes above: no results, no evidence, no
    *  chat, no private player fields anywhere. No session required. */
   getLiveMatches: defineAction({
+    description: "List matches currently live for the public spectator view.",
     request: z.object({}),
     response: z.object({
       matches: z.array(spectatorMatchShape),
@@ -10425,6 +10743,7 @@ export const Actions = {
    *  browser endpoint's latest signed-in player owns it). No action
    *  ever returns subscription rows. */
   pushSubscribe: defineAction({
+    description: "Subscribe this browser for Web Push notifications for the signed-in player.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
@@ -10504,6 +10823,7 @@ export const Actions = {
    *  disable). Only rows owned by the session player are ever deleted;
    *  idempotent — ok whether or not a row existed. */
   pushUnsubscribe: defineAction({
+    description: "Remove a Web Push subscription for this browser.",
     request: z.object({
       player_id: z.number(),
       session_token: z.string().default(""),
