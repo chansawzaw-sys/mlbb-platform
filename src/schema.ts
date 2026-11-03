@@ -30,6 +30,12 @@ export const players = sqliteTable("players", {
     .default("active"),
   balance: integer("balance").notNull().default(0),
   lockedCoins: integer("locked_coins").notNull().default(0),
+  /** Batch 28: coins frozen out of the spendable balance while a
+   *  match-linked report case against this player is under review.
+   *  Moved balance -> held by placeReportHold; leaves only through
+   *  resolvePairHold (release back to balance, or transfer to the
+   *  first upheld case's reporter). Held coins are never spendable. */
+  heldCoins: integer("held_coins").notNull().default(0),
   wins: integer("wins").notNull().default(0),
   losses: integer("losses").notNull().default(0),
   winStreak: integer("win_streak").notNull().default(0),
@@ -306,6 +312,10 @@ export const reports = sqliteTable("reports", {
    *  retention sweep keeps a completed match while any of its cases is
    *  still open/reviewing. */
   matchId: integer("match_id"),
+  /** Batch 28: the reported player's id for match-linked cases,
+   *  derived server-side at createReport (opposing side's leader).
+   *  NULL for ordinary reports, which only carry a target NAME. */
+  targetId: integer("target_id"),
   reporterId: integer("reporter_id"),
   reporterName: text("reporter_name").notNull().default(""),
   targetName: text("target_name").notNull(),
@@ -316,6 +326,32 @@ export const reports = sqliteTable("reports", {
     .default("open"),
   actionTaken: text("action_taken").notNull().default(""),
   createdAt: ts("created_at"),
+});
+
+/** Batch 28: ONE hold per (match, reported player) pair. Created by the
+ *  first match-linked report on that pair (INSERT OR IGNORE on the
+ *  unique (match_id, player_id) index); later reports on the same pair
+ *  reuse it and never move money again. receivedAmount is what the
+ *  player won from the match (settlement payout); heldAmount is what
+ *  was actually frozen out of their spendable balance (<= received,
+ *  capped by the balance at hold time). The hold resolves exactly once
+ *  when the pair's last open/reviewing case closes: transferred to the
+ *  FIRST upheld case's reporter (first_upheld_*) or released back. */
+export const reportHolds = sqliteTable("report_holds", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  matchId: integer("match_id").notNull(),
+  playerId: integer("player_id").notNull(),
+  receivedAmount: integer("received_amount").notNull().default(0),
+  heldAmount: integer("held_amount").notNull().default(0),
+  status: text("status", { enum: ["active", "resolved"] })
+    .notNull()
+    .default("active"),
+  resolution: text("resolution").notNull().default(""),
+  resolvedToId: integer("resolved_to_id"),
+  firstUpheldCaseId: integer("first_upheld_case_id"),
+  firstUpheldReporterId: integer("first_upheld_reporter_id"),
+  createdAt: ts("created_at"),
+  resolvedAt: integer("resolved_at", { mode: "timestamp_ms" }),
 });
 
 export const tickets = sqliteTable("tickets", {

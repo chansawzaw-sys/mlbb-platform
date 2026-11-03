@@ -627,6 +627,299 @@ async function participantsFor(db: Db, matchId: number): Promise<ParticipantRow[
     .orderBy(schema.matchParticipants.id);
 }
 
+type ReportHoldRow = typeof schema.reportHolds.$inferSelect;
+
+/** Batch 28: what a player actually RECEIVED from a match — the sum of
+ *  their settlement "payout" ledger rows for the match. Falls back to
+ *  the frozen participant snapshot (state "paid") when no payout ledger
+ *  rows exist. Never negative. */
+async function receivedFromMatch(db: Db, matchId: number, playerId: number): Promise<number> {
+  const txns = await db
+    .select()
+    .from(schema.transactions)
+    .where(
+      and(
+        eq(schema.transactions.type, "payout"),
+        eq(schema.transactions.matchId, matchId),
+        eq(schema.transactions.playerId, playerId),
+      ),
+    );
+  let total = txns.reduce((s, t) => s + t.amount, 0);
+  if (total === 0) {
+    const parts = await participantsFor(db, matchId);
+    total = parts
+      .filter((pt) => pt.playerId === playerId && pt.state === "paid")
+      .reduce((s, pt) => s + pt.payoutAmount, 0);
+  }
+  return Math.max(0, total);
+}
+
+async function holdForPair(db: Db, matchId: number, playerId: number): Promise<ReportHoldRow | null> {
+  const rows = await db
+    .select()
+    .from(schema.reportHolds)
+    .where(
+      and(
+        eq(schema.reportHolds.matchId, matchId),
+        eq(schema.reportHolds.playerId, playerId),
+      ),
+    )
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/** Batch 28: freeze the reported player's winnings from a completed
+ *  match while cases about it are under review. ONE hold per
+ *  (match, player) pair — the INSERT OR IGNORE on the unique index
+ *  makes repeat reports on the same pair a pure re-read: no money ever
+ *  moves twice. The move itself is the house lockSide pattern: a
+ *  guarded atomic update (balance −= H, held += H, only while the
+ *  CURRENT balance still covers H); on a lost race the player is
+ *  re-read and H recomputed, bounded to 3 attempts, so the final H may
+ *  legitimately be 0 (e.g. the winnings were already spent). */
+async function placeReportHold(
+  db: Db,
+  args: { match: MatchRow; target: PlayerRow; reporter: PlayerRow; caseCode: string },
+): Promise<{ received: number; held: number; state: "held" | "existing" | "zero" }> {
+  const { match, target, reporter, caseCode } = args;
+  const received = await receivedFromMatch(db, match.id, target.id);
+  const inserted = await db
+    .insert(schema.reportHolds)
+    .values({ matchId: match.id, playerId: target.id, receivedAmount: received })
+    .onConflictDoNothing()
+    .returning({ id: schema.reportHolds.id });
+  if (inserted.length === 0) {
+    const existing = await holdForPair(db, match.id, target.id);
+    return {
+      received: existing?.receivedAmount ?? received,
+      held: existing?.heldAmount ?? 0,
+      state: "existing",
+    };
+  }
+  let held = 0;
+  let newBalance: number | undefined;
+  for (let attempt = 0; attempt < 3 && received > 0; attempt++) {
+    const fresh = attempt === 0 ? target : await getPlayer(db, target.id);
+    if (!fresh || fresh.balance <= 0) break;
+    const h = Math.min(received, fresh.balance);
+    if (h <= 0) break;
+    const r = await db
+      .update(schema.players)
+      .set({
+        balance: sql`${schema.players.balance} - ${h}`,
+        heldCoins: sql`${schema.players.heldCoins} + ${h}`,
+      })
+      .where(
+        and(
+          eq(schema.players.id, target.id),
+          gte(schema.players.balance, h),
+        ),
+      )
+      .returning({ balance: schema.players.balance });
+    if (r[0]) {
+      held = h;
+      newBalance = r[0].balance;
+      break;
+    }
+  }
+  if (held > 0) {
+    await db
+      .update(schema.reportHolds)
+      .set({ heldAmount: held })
+      .where(
+        and(
+          eq(schema.reportHolds.matchId, match.id),
+          eq(schema.reportHolds.playerId, target.id),
+          eq(schema.reportHolds.status, "active"),
+        ),
+      );
+    await addTxn(db, {
+      playerId: target.id,
+      type: "report_hold",
+      amount: -held,
+      balanceAfter: newBalance ?? null,
+      note: `Report hold — Case ${caseCode} (Match ${match.code})`,
+      matchId: match.id,
+    });
+    await notify(db, {
+      playerId: target.id,
+      type: "report",
+      title: "⏸️ Coin ခေတ္တ ထိန်းထားပါသည်",
+      body: `Match ${match.code} မှ ရရှိထားသော 🪙 ${held} coin ကို report case တစ်ခု စစ်ဆေးနေစဉ် ခေတ္တ ထိန်းထားပါသည်။ (${held} coins from match ${match.code} are temporarily held while a report case is under review.)`,
+      matchId: match.id,
+    });
+  }
+  await notify(db, {
+    playerId: reporter.id,
+    type: "report",
+    title: "Report လက်ခံရရှိပါပြီ",
+    body:
+      held > 0
+        ? `Case ${caseCode}: သင် report တင်ထားသူထံမှ 🪙 ${held} coin ကို case စစ်ဆေးနေစဉ် ခေတ္တ ထိန်းထားပြီးပါပြီ။ (${held} coins of the reported player are held for your case.)`
+        : `Case ${caseCode}: ထိန်းထားရန် ကျန်ငွေ မရှိပါ။ (No available balance could be held for your case.)`,
+    matchId: match.id,
+  });
+  return { received, held, state: held > 0 ? "held" : "zero" };
+}
+
+/** Batch 28: settle the (match, reported player) hold once a case on
+ *  the pair is decided. Deterministic outcome → hold mapping:
+ *   - "uphold" is the ONLY transfer outcome. An uphold on ANY case of
+ *     the pair is remembered on the hold (first_upheld_*) even while
+ *     other cases remain open; when the pair's LAST open case closes,
+ *     the held coins transfer to the FIRST upheld case's reporter.
+ *   - "none" / "warning" / "temp_ban" / "perm_ban" all RELEASE the
+ *     hold back to the reported player when the last case closes.
+ *  Exactly-once: the hold row is claimed (active → resolved) by a
+ *  conditional update BEFORE any coin moves, so a replayed resolve can
+ *  never move money twice. The held pool is the transfer source, so no
+ *  balance can go negative. */
+async function resolvePairHold(
+  db: Db,
+  args: {
+    matchId: number;
+    targetId: number;
+    caseCode: string;
+    decidedCase: { id: number; reporterId: number | null; action: string };
+  },
+): Promise<void> {
+  const { matchId, targetId, decidedCase } = args;
+  let hold = await holdForPair(db, matchId, targetId);
+  if (!hold || hold.status !== "active") return;
+  if (decidedCase.action === "uphold" && hold.firstUpheldCaseId == null) {
+    await db
+      .update(schema.reportHolds)
+      .set({
+        firstUpheldCaseId: decidedCase.id,
+        firstUpheldReporterId: decidedCase.reporterId,
+      })
+      .where(
+        and(
+          eq(schema.reportHolds.id, hold.id),
+          isNull(schema.reportHolds.firstUpheldCaseId),
+        ),
+      );
+    hold = (await holdForPair(db, matchId, targetId)) ?? hold;
+  }
+  const openCases = await db
+    .select()
+    .from(schema.reports)
+    .where(
+      and(
+        eq(schema.reports.matchId, matchId),
+        eq(schema.reports.targetId, targetId),
+        inArray(schema.reports.status, ["open", "reviewing"]),
+      ),
+    );
+  if (openCases.length > 0) return; // hold persists until the last case closes
+  const claimed = await db
+    .update(schema.reportHolds)
+    .set({ status: "resolved", resolvedAt: new Date() })
+    .where(
+      and(
+        eq(schema.reportHolds.id, hold.id),
+        eq(schema.reportHolds.status, "active"),
+      ),
+    )
+    .returning({ id: schema.reportHolds.id });
+  if (claimed.length === 0) return; // already resolved by another path
+  const held = hold.heldAmount;
+  const beneficiary = hold.firstUpheldReporterId;
+  if (beneficiary != null && held > 0) {
+    // TRANSFER: held pool → the first upheld case's reporter. The
+    // reported player's spendable balance is untouched. The debit is
+    // guarded on the held pool itself; if it cannot land, the hold row
+    // stays claimed/resolved but no coins are minted for the reporter.
+    const debited = await db
+      .update(schema.players)
+      .set({ heldCoins: sql`${schema.players.heldCoins} - ${held}` })
+      .where(
+        and(
+          eq(schema.players.id, targetId),
+          gte(schema.players.heldCoins, held),
+        ),
+      )
+      .returning({ id: schema.players.id });
+    if (debited.length === 0) return;
+    const rep = await getPlayer(db, beneficiary);
+    let repBalance: number | null = null;
+    if (rep) {
+      repBalance = rep.balance + held;
+      await db
+        .update(schema.players)
+        .set({ balance: repBalance })
+        .where(eq(schema.players.id, beneficiary));
+    }
+    await db
+      .update(schema.reportHolds)
+      .set({ resolution: "transferred", resolvedToId: beneficiary })
+      .where(eq(schema.reportHolds.id, hold.id));
+    await addTxn(db, {
+      playerId: targetId,
+      type: "report_hold_transfer",
+      amount: 0,
+      note: `Report hold transferred — Case ${args.caseCode}: 🪙 ${held} held coins moved to the upheld case's reporter`,
+      matchId,
+    });
+    await addTxn(db, {
+      playerId: beneficiary,
+      type: "report_compensation",
+      amount: held,
+      balanceAfter: repBalance,
+      note: `Report compensation — Case ${args.caseCode}: upheld report, 🪙 ${held} held coins transferred to you`,
+      matchId,
+    });
+    await notify(db, {
+      playerId: targetId,
+      type: "report",
+      title: "Report ဆုံးဖြတ်ချက် — ထိန်းထားငွေ လွှဲပေးပြီး",
+      body: `Case ${args.caseCode} မှန်ကန်ကြောင်း ဆုံးဖြတ်ခဲ့သောကြောင့် ထိန်းထားသော 🪙 ${held} coin ကို report တင်သူထံ လွှဲပေးလိုက်ပါပြီ။ (Your held ${held} coins were transferred to the reporter — the case was upheld.)`,
+      matchId,
+    });
+    await notify(db, {
+      playerId: beneficiary,
+      type: "report",
+      title: "🎉 Report မှန်ကန် — လျော်ကြေး ရရှိပါပြီ",
+      body: `Case ${args.caseCode} မှန်ကန်ကြောင်း ဆုံးဖြတ်ခဲ့သောကြောင့် ထိန်းထားသော 🪙 ${held} coin ကို သင့်ထံ လွှဲပေးလိုက်ပါပြီ။ (Compensation received: ${held} held coins were transferred to you.)`,
+      matchId,
+    });
+  } else {
+    // RELEASE: held pool → back to the reported player's balance.
+    if (held > 0) {
+      const tp = await getPlayer(db, targetId);
+      if (tp) {
+        const nb = tp.balance + held;
+        await db
+          .update(schema.players)
+          .set({
+            balance: nb,
+            heldCoins: Math.max(0, tp.heldCoins - held),
+          })
+          .where(eq(schema.players.id, targetId));
+        await addTxn(db, {
+          playerId: targetId,
+          type: "report_hold_release",
+          amount: held,
+          balanceAfter: nb,
+          note: `Report hold released — Case ${args.caseCode}`,
+          matchId,
+        });
+        await notify(db, {
+          playerId: targetId,
+          type: "report",
+          title: "✅ ထိန်းထားငွေ ပြန်လွှတ်ပေးပြီး",
+          body: `Case ${args.caseCode} ပြီးဆုံးသွားသောကြောင့် ထိန်းထားသော 🪙 ${held} coin ကို သင့် balance သို့ ပြန်ထည့်ပေးလိုက်ပါပြီ။ (Your held ${held} coins were released back to your balance.)`,
+          matchId,
+        });
+      }
+    }
+    await db
+      .update(schema.reportHolds)
+      .set({ resolution: "released" })
+      .where(eq(schema.reportHolds.id, hold.id));
+  }
+}
+
 const OWN_LOBBY_JOIN_ERR = "ကိုယ့် lobby ဖွင့်ထားပါတယ် — သူများ ပွဲဝင်ချင်ရင် ကိုယ့် lobby အရင် ဖျက်ပါ (You have an open lobby — delete your own lobby first to join someone else's match)";
 
 /** Batch 13: the player's own OPEN challenge (creatorId = playerId), or
@@ -789,6 +1082,7 @@ function playerOut(p: PlayerRow, avatarUrl = "") {
     status: p.status,
     balance: p.balance,
     locked_coins: p.lockedCoins,
+    held_coins: p.heldCoins,
     wins: p.wins,
     losses: p.losses,
     total_matches: total,
@@ -819,6 +1113,7 @@ function playerPublicOut(p: PlayerRow, viewerId: number | null, avatarUrl = "") 
     ...full,
     balance: 0,
     locked_coins: 0,
+    held_coins: 0,
     email: "",
     // Internal moderation/security fields never leak to other players:
     // the suspicious reason and the 2FA flag are self-view / staff-only.
@@ -855,6 +1150,7 @@ const playerShape = z.object({
   status: z.string(),
   balance: z.number(),
   locked_coins: z.number(),
+  held_coins: z.number(),
   wins: z.number(),
   losses: z.number(),
   total_matches: z.number(),
@@ -3105,6 +3401,7 @@ async function matchOut(
     status: "active",
     balance: 0,
     lockedCoins: 0,
+    heldCoins: 0,
     wins: 0,
     losses: 0,
     winStreak: 0,
@@ -9065,17 +9362,28 @@ export const Actions = {
       // money logic — resolution stays with the existing admin tools).
       match_id: z.number().default(0),
     }),
-    response: z.object({ ok: z.boolean(), case_code: z.string(), error: z.string() }),
+    response: z.object({
+      ok: z.boolean(),
+      case_code: z.string(),
+      error: z.string(),
+      // Batch 28: the auto-hold outcome for match-linked reports
+      // (hold_state "" for ordinary reports; "held" / "existing" /
+      // "zero" for match-linked ones).
+      hold_amount: z.number(),
+      hold_received: z.number(),
+      hold_state: z.string(),
+    }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      const noHold = { hold_amount: 0, hold_received: 0, hold_state: "" };
       let reporterName = "";
       let reporterId: number | null = null;
       let meReporter: PlayerRow | null = null;
       if (args.reporter_id) {
         const meR = await playerBySession(db, args.reporter_id, args.session_token);
-        if (!meR) return { ok: false, case_code: "", error: AUTH_ERR };
+        if (!meR) return { ok: false, case_code: "", error: AUTH_ERR, ...noHold };
         const obRep = ownerPlayerBlock(meR);
-        if (obRep) return { ok: false, case_code: "", error: obRep };
+        if (obRep) return { ok: false, case_code: "", error: obRep, ...noHold };
         reporterName = meR.name;
         reporterId = meR.id;
         meReporter = meR;
@@ -9085,16 +9393,18 @@ export const Actions = {
       // its 7-day reportable window); the target is the opposing side's
       // leader, derived here, never trusted from the client.
       let linkMatchId: number | null = null;
+      let linkMatch: MatchRow | null = null;
+      let linkTarget: PlayerRow | null = null;
       let targetName = args.target_name;
       let detail = args.detail;
       if (args.match_id > 0) {
-        if (!meReporter) return { ok: false, case_code: "", error: AUTH_ERR };
+        if (!meReporter) return { ok: false, case_code: "", error: AUTH_ERR, ...noHold };
         const mRows = await db.select().from(schema.matches).where(eq(schema.matches.id, args.match_id)).limit(1);
         const mm = mRows[0];
         if (!mm || mm.status !== "completed")
-          return { ok: false, case_code: "", error: "ပြီးဆုံးပြီး match ကိုပဲ report လုပ်နိုင်ပါတယ်" };
+          return { ok: false, case_code: "", error: "ပြီးဆုံးပြီး match ကိုပဲ report လုပ်နိုင်ပါတယ်", ...noHold };
         if (mm.completedAt && mm.completedAt.getTime() < Date.now() - 7 * 24 * 3600 * 1000)
-          return { ok: false, case_code: "", error: "၇ ရက် ကျော်သွားတဲ့ match ကို report လုပ်လို့ မရတော့ပါ" };
+          return { ok: false, case_code: "", error: "၇ ရက် ကျော်သွားတဲ့ match ကို report လုပ်လို့ မရတော့ပါ", ...noHold };
         const parts = await participantsFor(db, mm.id);
         const myRow = parts.find((pt) => pt.playerId === meReporter.id);
         const mySide: "A" | "B" | null = myRow
@@ -9104,7 +9414,7 @@ export const Actions = {
             : mm.playerBId === meReporter.id
               ? "B"
               : null;
-        if (!mySide) return { ok: false, case_code: "", error: "ဒီ match မှာ မပါဝင်ခဲ့ပါ" };
+        if (!mySide) return { ok: false, case_code: "", error: "ဒီ match မှာ မပါဝင်ခဲ့ပါ", ...noHold };
         const oppLeaderId = mySide === "A" ? mm.playerBId : mm.playerAId;
         const oppLeader = await getPlayer(db, oppLeaderId);
         // Team edge: if the reporter was a snapshot member whose leader
@@ -9118,19 +9428,37 @@ export const Actions = {
         targetName = finalOpp?.name ?? targetName;
         detail = `[Match ${mm.code}] ${args.detail}`.trim().slice(0, 1000);
         linkMatchId = mm.id;
+        linkMatch = mm;
+        linkTarget = finalOpp;
       }
       const rl = await rateLimit(db, `report:${reporterId ?? "anon"}`, 10, 60 * 60 * 1000);
-      if (rl) return { ok: false, case_code: "", error: rl };
+      if (rl) return { ok: false, case_code: "", error: rl, ...noHold };
       const caseCode = uid("CASE");
       await db.insert(schema.reports).values({
         caseCode,
         matchId: linkMatchId,
+        // Batch 28: the reported player's id, derived server-side above
+        // for match-linked cases (NULL for ordinary name-only reports).
+        targetId: linkTarget?.id ?? null,
         reporterId,
         reporterName,
         targetName,
         reason: args.reason,
         detail,
       });
+      // Batch 28: auto-hold the reported player's winnings from this
+      // match while the case is under review (one hold per pair —
+      // repeat reports on the same match never move money twice).
+      let holdOut = noHold;
+      if (linkMatchId && linkMatch && linkTarget && meReporter) {
+        const h = await placeReportHold(db, {
+          match: linkMatch,
+          target: linkTarget,
+          reporter: meReporter,
+          caseCode,
+        });
+        holdOut = { hold_amount: h.held, hold_received: h.received, hold_state: h.state };
+      }
       if (linkMatchId) {
         // Best-effort plain-text Telegram alert (the dispute keyboard path
         // settles matches and is deliberately NOT reused for reports).
@@ -9140,7 +9468,7 @@ export const Actions = {
         } catch { /* alert is best-effort */ }
       }
       ctx.invalidateQueries();
-      return { ok: true, case_code: caseCode, error: "" };
+      return { ok: true, case_code: caseCode, error: "", ...holdOut };
     },
   }),
 
@@ -9164,6 +9492,11 @@ export const Actions = {
           created_at: z.string(),
           match_id: z.number().nullable(),
           match_code: z.string(),
+          // Batch 28: the pair's report-hold figures for match-linked
+          // cases ("" / 0 when no hold row exists for the pair).
+          hold_amount: z.number(),
+          hold_received: z.number(),
+          hold_status: z.string(),
         }),
       ),
     }),
@@ -9181,20 +9514,37 @@ export const Actions = {
         const mr = (await db.select().from(schema.matches).where(eq(schema.matches.id, mid)).limit(1))[0];
         if (mr) matchCodeOf.set(mid, mr.code);
       }
+      const holdOf = new Map<string, ReportHoldRow>();
+      for (const r of rows) {
+        if (r.matchId == null || r.targetId == null) continue;
+        const key = `${r.matchId}:${r.targetId}`;
+        if (holdOf.has(key)) continue;
+        const h = await holdForPair(db, r.matchId, r.targetId);
+        if (h) holdOf.set(key, h);
+      }
       return {
-        reports: rows.map((r) => ({
-          id: r.id,
-          case_code: r.caseCode,
-          reporter_name: r.reporterName,
-          target_name: r.targetName,
-          reason: r.reason,
-          detail: r.detail,
-          status: r.status,
-          action_taken: r.actionTaken,
-          created_at: iso(r.createdAt) ?? "",
-          match_id: r.matchId ?? null,
-          match_code: r.matchId != null ? (matchCodeOf.get(r.matchId) ?? "") : "",
-        })),
+        reports: rows.map((r) => {
+          const h =
+            r.matchId != null && r.targetId != null
+              ? holdOf.get(`${r.matchId}:${r.targetId}`)
+              : undefined;
+          return {
+            id: r.id,
+            case_code: r.caseCode,
+            reporter_name: r.reporterName,
+            target_name: r.targetName,
+            reason: r.reason,
+            detail: r.detail,
+            status: r.status,
+            action_taken: r.actionTaken,
+            created_at: iso(r.createdAt) ?? "",
+            match_id: r.matchId ?? null,
+            match_code: r.matchId != null ? (matchCodeOf.get(r.matchId) ?? "") : "",
+            hold_amount: h?.heldAmount ?? 0,
+            hold_received: h?.receivedAmount ?? 0,
+            hold_status: h?.status ?? "",
+          };
+        }),
       };
     },
   }),
@@ -9203,7 +9553,7 @@ export const Actions = {
     description: "Staff action: resolve a report with an outcome such as a warning or ban.",
     request: z.object({
       report_id: z.number(),
-      action: z.enum(["none", "warning", "temp_ban", "perm_ban"]),
+      action: z.enum(["none", "warning", "temp_ban", "perm_ban", "uphold"]),
       actor: z.string().default("admin"),
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
@@ -9220,7 +9570,9 @@ export const Actions = {
       // fixed-Gmail Owner or a granted Admin) + security confirmation +
       // TOTP. Moderators keep the lesser report outcomes
       // (warning / temp_ban) without it.
-      if (args.action === "perm_ban") {
+      // Batch 28: "uphold" is a MONEY outcome (it decides who receives
+      // the held coins), so it carries exactly the same gate.
+      if (args.action === "perm_ban" || args.action === "uphold") {
         const ownerAuth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
         if (ownerAuth.error || !ownerAuth.actor) return { ok: false };
         if (!args.confirmed) return { ok: false };
@@ -9251,12 +9603,17 @@ export const Actions = {
             ? "Temporary ban"
             : args.action === "perm_ban"
               ? "Permanent ban"
-              : "လုပ်ဆောင်ချက် မရှိ";
+              : args.action === "uphold"
+                ? "Report မှန်ကန် — Upheld"
+                : "လုပ်ဆောင်ချက် မရှိ";
       await db
         .update(schema.reports)
         .set({ status: "resolved", actionTaken: label })
         .where(eq(schema.reports.id, args.report_id));
-      if (args.action !== "none") {
+      // Batch 28: "uphold" applies NO player status change and NO
+      // reputation change by itself — the held-coin transfer below is
+      // the remedy — so it stays out of the sanction block.
+      if (args.action !== "none" && args.action !== "uphold") {
         const all = await db.select().from(schema.players);
         const target = all.find(
           (p) => p.name.toLowerCase() === r.targetName.toLowerCase(),
@@ -9282,6 +9639,29 @@ export const Actions = {
             type: "report",
             title: "Admin ဆုံးဖြတ်ချက်",
             body: `Case ${r.caseCode}: ${label}`,
+          });
+        }
+      }
+      // Batch 28: settle this match's report hold now that a case on
+      // the (match, reported player) pair has been decided. The
+      // deterministic outcome → hold mapping lives on resolvePairHold:
+      // "uphold" is the ONLY transfer outcome; every other outcome
+      // releases the hold when the pair's last open case closes.
+      if (r.matchId != null) {
+        let pairTargetId = r.targetId ?? null;
+        if (pairTargetId == null) {
+          const allP2 = await db.select().from(schema.players);
+          const byName = allP2.find(
+            (p) => p.name.toLowerCase() === r.targetName.toLowerCase(),
+          );
+          pairTargetId = byName?.id ?? null;
+        }
+        if (pairTargetId != null) {
+          await resolvePairHold(db, {
+            matchId: r.matchId,
+            targetId: pairTargetId,
+            caseCode: r.caseCode,
+            decidedCase: { id: r.id, reporterId: r.reporterId, action: args.action },
           });
         }
       }
