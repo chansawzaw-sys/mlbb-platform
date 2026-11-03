@@ -136,6 +136,13 @@ export const matches = sqliteTable("matches", {
   readyWarned: integer("ready_warned").notNull().default(0),
   aEvidence: text("a_evidence").notNull().default(""),
   bEvidence: text("b_evidence").notNull().default(""),
+  /** Batch 27 (Job 6): stamped the first time ANY participant becomes
+   *  ready in a ready_check match; starts the forfeit countdown
+   *  (first_ready_at + ready_timeout_min). Never cleared by unready. */
+  firstReadyAt: integer("first_ready_at", { mode: "timestamp_ms" }),
+  /** Batch 27 (Job 6): "" for ordinary finishes; "forfeit_ready" when the
+   *  ready-countdown sweep settled the match for the ready side. */
+  finishReason: text("finish_reason").notNull().default(""),
   winnerId: integer("winner_id"),
   createdAt: ts("created_at"),
   completedAt: integer("completed_at", { mode: "timestamp_ms" }),
@@ -294,6 +301,11 @@ export const referralCommissions = sqliteTable("referral_commissions", {
 export const reports = sqliteTable("reports", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   caseCode: text("case_code").notNull(),
+  /** Batch 27 (Job 7): the completed match this case is about, when filed
+   *  from a match-history detail. NULL for ordinary player reports. The
+   *  retention sweep keeps a completed match while any of its cases is
+   *  still open/reviewing. */
+  matchId: integer("match_id"),
   reporterId: integer("reporter_id"),
   reporterName: text("reporter_name").notNull().default(""),
   targetName: text("target_name").notNull(),

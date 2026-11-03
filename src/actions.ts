@@ -1,5 +1,5 @@
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
-import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import * as schema from "./schema";
 
 function getDb(ctx: Ctx) {
@@ -178,6 +178,11 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   // button. Default EMPTY — the Owner enters it later; the button only
   // renders when a valid https URL is stored. Validated in updateSettings.
   telegram_channel_url: "",
+  // Batch 27 (Job 1): MLBB Account Recovery page control — Admin-toggleable
+  // from Admin → Integrations. The username is the SINGLE config point for
+  // the page's https://t.me/<username> contact button.
+  recovery_enabled: "1",
+  recovery_telegram_username: "Truelovesjejek",
   turn_url: "",
   turn_username: "",
   turn_credential: "",
@@ -313,6 +318,8 @@ const SETTINGS_KEYS_CONTENT: string[] = [
   "terms_text",
   "terms_version",
   "telegram_channel_url",
+  "recovery_enabled",
+  "recovery_telegram_username",
   "ready_timeout_min",
 ];
 const SETTINGS_KEYS_PRICING: string[] = [
@@ -566,6 +573,39 @@ function feeFor(
  *  the indivisible remainder goes to the platform (added to the recorded
  *  fee take) so winners×share + fee + remainder = pot exactly.
  *  For team_size 1: share = pot − fee and remainder = 0 — the old model. */
+/** Batch 27 (Job 7 clarification): PERSISTENT all-time completed-match
+ *  counter. Home's stats.completed_matches used to count match rows, so
+ *  the 7-day retention sweep would have shrunk it. The counter lives in
+ *  the settings table under a key that is NOT part of DEFAULT_SETTINGS
+ *  (so it never enters the 99-key classification and cannot be edited
+ *  through updateSettings). It is seeded from the live completed-row
+ *  count the first time it is read or a match completes, and incremented
+ *  exactly once per completion inside settleMatch — whose atomic claim
+ *  guarantees the increment runs at most once per match. */
+const STAT_COMPLETED_KEY = "stat_completed_matches_total";
+async function completedMatchesTotal(db: Db): Promise<number> {
+  const rows = await db.select().from(schema.settings).where(eq(schema.settings.key, STAT_COMPLETED_KEY)).limit(1);
+  const raw = rows[0]?.value;
+  if (raw !== undefined && raw !== "" && Number.isFinite(Number(raw))) return Number(raw);
+  const done = (await db.select().from(schema.matches)).filter((m) => m.status === "completed").length;
+  await setSetting(db, STAT_COMPLETED_KEY, String(done));
+  return done;
+}
+async function bumpCompletedMatchesTotal(db: Db): Promise<void> {
+  const cur = await completedMatchesTotal(db);
+  await setSetting(db, STAT_COMPLETED_KEY, String(cur + 1));
+}
+
+/** Batch 27 (Job 6): stamp first_ready_at the first time any participant
+ *  becomes ready in a ready_check match. Conditional update — an existing
+ *  stamp is never overwritten and unready never clears it. */
+async function stampFirstReady(db: Db, matchId: number): Promise<void> {
+  await db
+    .update(schema.matches)
+    .set({ firstReadyAt: new Date() })
+    .where(and(eq(schema.matches.id, matchId), isNull(schema.matches.firstReadyAt)));
+}
+
 function payoutCalc(stake: number, teamSize: number, fee: number) {
   const size = Math.max(1, Math.floor(teamSize) || 1);
   const pot = stake * 2 * size;
@@ -1496,6 +1536,14 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 
 /** Public display mask for payout names: first word, first 3 chars + "***"
  *  (single initial + "***" for very short names). Never a full name. */
+/** Batch 27 (Job 1): a Telegram username is 5–32 chars of [A-Za-z0-9_].
+ *  One validator shared by updateSettings and getBootstrap so the Recovery
+ *  page renders exactly when the stored username is dialable. */
+const RECOVERY_USERNAME_RE = /^[A-Za-z0-9_]{5,32}$/;
+function validRecoveryUsername(u: string): boolean {
+  return RECOVERY_USERNAME_RE.test((u ?? "").trim());
+}
+
 function maskName(name: string): string {
   const first = (name ?? "").trim().split(/\s+/)[0] ?? "";
   if (first.length <= 2) return `${first.slice(0, 1)}***`;
@@ -1846,9 +1894,38 @@ async function sweepRetentionInternal(db: Db, ctx: Ctx | null): Promise<number> 
     await db.delete(schema.withdrawRequests).where(eq(schema.withdrawRequests.id, r.id));
     wCount++;
   }
-  const total = nCount + pCount + wCount;
+  // Batch 27 (Job 7): COMPLETED matches older than 7 days by finished_at
+  // are deleted WITH their evidence blobs, participant snapshots, room
+  // chat and voice signals — EXCEPT a match with an OPEN report case
+  // (status open/reviewing) linked to it; a later sweep deletes it once
+  // the case is decided and it is past 7 days. Ledger rows (transactions),
+  // player W/L counters and the persistent completed counter are NOT
+  // touched, so no displayed aggregate changes when a row is deleted.
+  let mCount = 0;
+  const openCaseMatchIds = new Set(
+    (await db.select().from(schema.reports))
+      .filter((r) => r.matchId != null && (r.status === "open" || r.status === "reviewing"))
+      .map((r) => r.matchId as number),
+  );
+  const oldMatches = (await db.select().from(schema.matches))
+    .filter((m) => m.status === "completed" && m.completedAt != null && m.completedAt < cutoff && !openCaseMatchIds.has(m.id));
+  for (const m of oldMatches) {
+    if (ctx) {
+      for (const key of [m.aEvidence, m.bEvidence]) {
+        if (key && key.startsWith("evidence/")) {
+          try { await ctx.blobs.delete(key); } catch { /* best-effort */ }
+        }
+      }
+    }
+    await db.delete(schema.matchParticipants).where(eq(schema.matchParticipants.matchId, m.id));
+    await db.delete(schema.chatMessages).where(eq(schema.chatMessages.matchId, m.id));
+    await db.delete(schema.voiceSignals).where(eq(schema.voiceSignals.matchId, m.id));
+    await db.delete(schema.matches).where(eq(schema.matches.id, m.id));
+    mCount++;
+  }
+  const total = nCount + pCount + wCount + mCount;
   if (total > 0) {
-    await logAct(db, "system", `Retention sweep (>7d): notifications ${nCount}, purchases ${pCount}, withdrawals ${wCount} deleted`);
+    await logAct(db, "system", `Retention sweep (>7d): notifications ${nCount}, purchases ${pCount}, withdrawals ${wCount}, matches ${mCount} deleted`);
   }
   return total;
 }
@@ -1862,7 +1939,60 @@ async function sweepTimeoutsInternal(db: Db, ctx: Ctx | null = null): Promise<nu
   const matchTimeoutMs = numSetting(s, "match_timeout_min", 180) * 60 * 1000;
   const rows = await db.select().from(schema.matches);
   for (const m of rows) {
-    if (m.status === "ready_check" && m.readyDeadline.getTime() < now) {
+    // Batch 27 (Job 6): once first_ready_at is stamped, the FORFEIT
+    // countdown owns this match — the legacy readyDeadline branch below
+    // must not also fire. When the countdown (first_ready_at +
+    // ready_timeout_min, read live) expires: exactly one side fully
+    // ready wins by forfeit through the shared settleMatch core; no side
+    // fully ready refunds everyone in full.
+    if (m.status === "ready_check" && m.firstReadyAt) {
+      const readyTimeoutMs = numSetting(s, "ready_timeout_min", 3) * 60 * 1000;
+      if (now >= m.firstReadyAt.getTime() + readyTimeoutMs) {
+        const fresh = (await db.select().from(schema.matches).where(eq(schema.matches.id, m.id)).limit(1))[0];
+        if (fresh && fresh.status === "ready_check" && fresh.firstReadyAt) {
+          const parts = await participantsFor(db, fresh.id);
+          const sideReady = (side: "A" | "B"): boolean => {
+            const leaderReady = side === "A" ? fresh.aReady === 1 : fresh.bReady === 1;
+            if (!leaderReady) return false;
+            if (parts.length === 0) return true;
+            const rowsSide = parts.filter((pt) => pt.side === side);
+            const lockedCount = rowsSide.filter((pt) => pt.state === "locked").length;
+            if (lockedCount !== fresh.teamSize) return false;
+            const leaderId = side === "A" ? fresh.playerAId : fresh.playerBId;
+            return rowsSide
+              .filter((pt) => pt.playerId !== leaderId)
+              .every((pt) => pt.ready === 1);
+          };
+          const aR = sideReady("A");
+          const bR = sideReady("B");
+          if (aR !== bR) {
+            const winnerId = aR ? fresh.playerAId : fresh.playerBId;
+            const loserId = aR ? fresh.playerBId : fresh.playerAId;
+            const settled = await settleMatch(ctx, db, fresh, winnerId, "forfeit_ready");
+            if (settled) {
+              await notify(db, {
+                playerId: winnerId, type: "result",
+                title: "🏆 Ready အချိန်ကိုက် အနိုင်ရပါပြီ",
+                body: `${fresh.code} — သင့်ဘက်က Ready အပြည့် နှိပ်ထားပြီး တစ်ဖက်ဘက်က သတ်မှတ်ချိန်အတွင်း Ready မနှိပ်လို့ သင် အနိုင်ရပါပြီ။`,
+                matchId: fresh.id,
+              });
+              await notify(db, {
+                playerId: loserId, type: "result",
+                title: "⏰ Ready မနှိပ်လို့ အရှုံးသတ်မှတ်ပါပြီ",
+                body: `${fresh.code} — သတ်မှတ်ချိန်အတွင်း Ready မနှိပ်လို့ အရှုံးသတ်မှတ်ပြီး ကြေးငွေ ပြန်မအမ်းပါ။`,
+                matchId: fresh.id,
+              });
+              await logAct(db, "system", `Ready forfeit sweep settled ${fresh.code} (winner ${winnerId}, loser not ready)`);
+              acted++;
+            }
+          } else if (!aR && !bR) {
+            await refundMatch(db, fresh, "Ready countdown expired — no side fully ready");
+            await logAct(db, "system", `Ready countdown sweep refunded ${fresh.code} (no side fully ready)`);
+            acted++;
+          }
+        }
+      }
+    } else if (m.status === "ready_check" && m.readyDeadline.getTime() < now) {
       if (m.readyWarned === 0) {
         await db
           .update(schema.matches)
@@ -2351,6 +2481,7 @@ async function settleMatch(
   db: Db,
   match: typeof schema.matches.$inferSelect,
   winnerId: number,
+  finishReason = "",
 ): Promise<boolean> {
   // CLAIM FIRST (money-core discipline): atomically flip the match to
   // "completed" from any non-terminal state BEFORE any balance moves.
@@ -2358,7 +2489,7 @@ async function settleMatch(
   // pay out once, however many settle paths fire concurrently.
   const claim = await db
     .update(schema.matches)
-    .set({ status: "completed", winnerId, completedAt: new Date() })
+    .set({ status: "completed", winnerId, completedAt: new Date(), finishReason })
     .where(
       and(
         eq(schema.matches.id, match.id),
@@ -2367,6 +2498,9 @@ async function settleMatch(
     )
     .returning({ id: schema.matches.id });
   if (claim.length === 0) return false;
+  // Batch 27: the claim succeeded, so this match completes exactly once —
+  // bump the persistent all-time completed counter (Job 7 clarification).
+  await bumpCompletedMatchesTotal(db);
 
   // TEAM BRANCH (Batch 8): a match with a participant snapshot settles
   // per-member. winnerId is one of the two leaders; their SIDE wins.
@@ -2893,6 +3027,11 @@ const matchShape = z.object({
   a_ready: z.boolean(),
   b_ready: z.boolean(),
   ready_deadline: z.string(),
+  // Batch 27 (Job 6): forfeit countdown basis. first_ready_at is null
+  // before anyone readies; finish_reason is "" except "forfeit_ready".
+  first_ready_at: z.string().nullable(),
+  finish_reason: z.string(),
+  completed_at: z.string().nullable(),
   started_at: z.string().nullable(),
   a_result: z.string(),
   b_result: z.string(),
@@ -2914,6 +3053,7 @@ const matchShape = z.object({
       stake: z.number(),
       ready: z.boolean(),
       state: z.string(),
+      payout_amount: z.number(),
     }),
   ),
   team_a_roster: z.array(z.object({ player: playerShape, ready: z.boolean() })),
@@ -3026,11 +3166,21 @@ async function matchOut(
       stake: pt.stake,
       ready: pt.ready === 1,
       state: pt.state,
+      payout_amount: pt.payoutAmount,
     })),
     status: m.status,
     a_ready: m.aReady === 1,
     b_ready: m.bReady === 1,
-    ready_deadline: m.readyDeadline.toISOString(),
+    // Batch 27 (Job 6): once first_ready_at is stamped, ready_deadline is
+    // the FORFEIT countdown deadline (first_ready_at + ready_timeout_min,
+    // read live from settings); before that it stays the legacy
+    // ready-check deadline, so every existing consumer is unchanged.
+    ready_deadline: m.firstReadyAt
+      ? new Date(m.firstReadyAt.getTime() + numSetting(await getSettingsMap(db), "ready_timeout_min", 3) * 60 * 1000).toISOString()
+      : m.readyDeadline.toISOString(),
+    first_ready_at: iso(m.firstReadyAt),
+    finish_reason: m.finishReason ?? "",
+    completed_at: iso(m.completedAt),
     started_at: iso(m.startedAt),
     a_result: m.aResult,
     b_result: m.bResult,
@@ -3130,6 +3280,8 @@ const settingsShape = z.object({
   turn_configured: z.boolean(),
   telegram_chat_id: z.string(),
   telegram_channel_url: z.string(),
+  recovery_enabled: z.boolean(),
+  recovery_telegram_username: z.string(),
   google_client_id: z.string(),
   google_enabled: z.boolean(),
   google_setup_state: z.string(),
@@ -3241,6 +3393,10 @@ function settingsOut(s: Record<string, string>, adminView = false) {
     // Batch 12: the channel link is PUBLIC by design — it is the target
     // of the header "Channel Join" button, so it ships in every view.
     telegram_channel_url: s["telegram_channel_url"] ?? "",
+    // Batch 27 (Job 1): Recovery control ships like the channel URL — the
+    // username is public by design (it is the contact target).
+    recovery_enabled: s["recovery_enabled"] !== "0",
+    recovery_telegram_username: s["recovery_telegram_username"] ?? "",
     google_client_id: s["google_client_id"] ?? "",
     google_enabled:
       s["google_enabled"] === "1" && (s["google_client_id"] ?? "").trim() !== "",
@@ -3934,11 +4090,18 @@ export const Actions = {
         .nullable(),
       live_matches: z.array(matchShape),
       top_players: z.array(playerShape),
+      // Batch 27 (Job 1): public-safe Recovery contact config — the page
+      // renders only when enabled is true AND the username is valid.
+      recovery: z.object({ enabled: z.boolean(), username: z.string() }),
+      // Batch 27 (Job 3): full display name + avatar for the tap-through
+      // list of the last 30; the Home preview masks the name client-side.
+      // PUBLIC-SAFE: never a payout phone or account name.
       recent_payouts: z.array(
         z.object({
-          masked_name: z.string(),
-          net_kyat: z.number(),
+          name: z.string(),
+          avatar: z.string(),
           method: z.string(),
+          amount_kyat: z.number(),
           decided_at: z.string(),
         }),
       ),
@@ -3951,6 +4114,14 @@ export const Actions = {
           // Batch 13 Add.2: winner player ids, parallel to winner_names,
           // so a winner's name on Home can open the player-summary popup.
           winner_ids: z.array(z.number()),
+          // Batch 27 (Job 5): detail fields for the tap-through list —
+          // avatars parallel to winner_ids, the opposing side, stake.
+          match_id: z.number(),
+          winner_avatars: z.array(z.string()),
+          opponent_names: z.array(z.string()),
+          opponent_ids: z.array(z.number()),
+          opponent_avatars: z.array(z.string()),
+          stake: z.number(),
           amount: z.number(),
           team_size: z.number(),
           arena: z.string(),
@@ -4028,8 +4199,9 @@ export const Actions = {
           total_players: allPlayers.length,
           active_matches: active.length,
           live_matches: liveMatchRows(allMatches).length,
-          completed_matches: allMatches.filter((m) => m.status === "completed")
-            .length,
+          // Batch 27 (Job 7 clarification): PERSISTENT counter, not a
+          // match-row count — the 7-day sweep must never shrink it.
+          completed_matches: await completedMatchesTotal(db),
           open_challenges: openCh.length,
         },
         next_tournament: next
@@ -4044,24 +4216,29 @@ export const Actions = {
         live_matches: liveOut,
         top_players: await playersPublicOutAsync(ctx, allPlayers.filter((p) => effectiveRole(p) !== "owner").slice(0, 5), viewerId),
         recent_payouts: await (async () => {
-          // Public trust feed: PAID withdrawals only, names masked, and
-          // NEVER a phone number or full name.
+          // Batch 27 (Job 3): last 30 PAID withdrawals with FULL display
+          // name + avatar (the Home preview masks client-side; the
+          // tap-through list shows full names). Payment method is public
+          // (KPay / Wave) — the payout PHONE / account name is NEVER in
+          // this payload.
           const paid = await db
             .select()
             .from(schema.withdrawRequests)
             .where(eq(schema.withdrawRequests.status, "paid"))
             .orderBy(desc(schema.withdrawRequests.decidedAt))
-            .limit(10);
-          return paid.map((w) => ({
-            masked_name: maskName(
-              allPlayers.find((x) => x.id === w.playerId)?.name ?? "Player",
-            ),
-            net_kyat: w.netKyat,
-            // Payment method is public (KPay / Wave) — the payout PHONE
-            // number is never exposed here, only the method.
-            method: w.method,
-            decided_at: iso(w.decidedAt) ?? iso(w.createdAt) ?? "",
-          }));
+            .limit(30);
+          const out = [];
+          for (const w of paid) {
+            const p = allPlayers.find((x) => x.id === w.playerId);
+            out.push({
+              name: p?.name ?? "Player",
+              avatar: p ? await blobUrlSafe(ctx, p.avatarBlobKey ?? "") : "",
+              method: w.method,
+              amount_kyat: w.netKyat,
+              decided_at: iso(w.decidedAt) ?? iso(w.createdAt) ?? "",
+            });
+          }
+          return out;
         })(),
         total_paid_kyat: await (async () => {
           const paidAll = await db
@@ -4071,24 +4248,36 @@ export const Actions = {
           return paidAll.reduce((a, w) => a + w.netKyat, 0);
         })(),
         recent_winners: await (async () => {
-          // Latest 10 completed matches WITH a winner, newest first.
-          // Snapshot (team) matches: the winning side is the winning
-          // LEADER's participant-row side (post-swap correct, same rule
-          // as settleMatch); winner_names are that side's PAID rows —
-          // falling back to the side's rows when none are marked paid —
-          // and amount is the per-winner payout share. Non-snapshot
-          // matches: the single winner and pot − fee.
+          // Batch 27 (Job 5): latest 30 completed matches WITH a winner,
+          // newest first (scan up to 120 rows). Snapshot (team) matches:
+          // the winning side is the winning LEADER's participant-row side
+          // (post-swap correct, same rule as settleMatch); winner_names
+          // are that side's PAID rows — falling back to the side's rows
+          // when none are marked paid — and amount is the per-winner
+          // payout share. Opponents are the OTHER side's participant
+          // rows. Non-snapshot matches: the single winner, the other
+          // leader as opponent, and pot − fee. Public-safe fields only.
           const done = await db
             .select()
             .from(schema.matches)
             .where(eq(schema.matches.status, "completed"))
             .orderBy(desc(schema.matches.completedAt))
-            .limit(40);
+            .limit(120);
           const nameOf = (id: number) =>
             allPlayers.find((x) => x.id === id)?.name ?? "Player";
+          const avatarOf = async (id: number) => {
+            const p = allPlayers.find((x) => x.id === id);
+            return p ? await blobUrlSafe(ctx, p.avatarBlobKey ?? "") : "";
+          };
           const out: {
             winner_names: string[];
             winner_ids: number[];
+            match_id: number;
+            winner_avatars: string[];
+            opponent_names: string[];
+            opponent_ids: number[];
+            opponent_avatars: string[];
+            stake: number;
             amount: number;
             team_size: number;
             arena: string;
@@ -4096,7 +4285,7 @@ export const Actions = {
             completed_at: string;
           }[] = [];
           for (const cm of done) {
-            if (out.length >= 10) break;
+            if (out.length >= 30) break;
             if (cm.winnerId == null) continue;
             const parts = await participantsFor(db, cm.id);
             if (parts.length > 0) {
@@ -4110,9 +4299,16 @@ export const Actions = {
               const paidRows = sideRows.filter((pt) => pt.state === "paid");
               const winRows = paidRows.length > 0 ? paidRows : sideRows;
               if (winRows.length === 0) continue;
+              const oppRows = parts.filter((pt) => pt.side !== winSide);
               out.push({
                 winner_names: winRows.map((pt) => nameOf(pt.playerId)),
                 winner_ids: winRows.map((pt) => pt.playerId),
+                match_id: cm.id,
+                winner_avatars: await Promise.all(winRows.map((pt) => avatarOf(pt.playerId))),
+                opponent_names: oppRows.map((pt) => nameOf(pt.playerId)),
+                opponent_ids: oppRows.map((pt) => pt.playerId),
+                opponent_avatars: await Promise.all(oppRows.map((pt) => avatarOf(pt.playerId))),
+                stake: cm.stake,
                 amount: winRows[0]!.payoutAmount,
                 team_size: cm.teamSize,
                 arena: cm.arena,
@@ -4120,9 +4316,16 @@ export const Actions = {
                 completed_at: iso(cm.completedAt) ?? iso(cm.createdAt) ?? "",
               });
             } else {
+              const oppId = cm.winnerId === cm.playerAId ? cm.playerBId : cm.playerAId;
               out.push({
                 winner_names: [nameOf(cm.winnerId)],
                 winner_ids: [cm.winnerId],
+                match_id: cm.id,
+                winner_avatars: [await avatarOf(cm.winnerId)],
+                opponent_names: [nameOf(oppId)],
+                opponent_ids: [oppId],
+                opponent_avatars: [await avatarOf(oppId)],
+                stake: cm.stake,
                 amount: cm.stake * 2 - cm.feeAmount,
                 team_size: cm.teamSize,
                 arena: cm.arena,
@@ -4133,6 +4336,12 @@ export const Actions = {
           }
           return out;
         })(),
+        recovery: {
+          enabled:
+            (s["recovery_enabled"] ?? "1") === "1" &&
+            validRecoveryUsername(s["recovery_telegram_username"] ?? ""),
+          username: (s["recovery_telegram_username"] ?? "").trim(),
+        },
         // Diamond shop: enabled packages (sorted) for everyone; the
         // viewer's own orders only (empty when logged out).
         diamond_packages: await (async () => {
@@ -5216,6 +5425,11 @@ export const Actions = {
         !!viewer &&
         ["owner", "admin", "moderator", "support"].includes(effectiveRole(viewer));
       const priv = isParticipant || isStaff;
+      // Batch 27 (Job 7): a COMPLETED match's detail is participant-scoped
+      // — a non-participant (including a logged-out caller) gets no match
+      // payload at all, so finished rooms can't be enumerated by id.
+      if (m.status === "completed" && !priv)
+        return { match: null, chat: [], result_unlocked: false, unlock_at: null, viewer_join_side: null, friend_states: {}, heroes: heroesFor(m.bannedHeroes), ice_servers: iceServersFor(s, false) };
       const chat = priv
         ? await db
             .select()
@@ -5335,6 +5549,9 @@ export const Actions = {
       const isA = m.playerAId === args.player_id;
       const isB = m.playerBId === args.player_id;
       if (!isA && !isB) return { ok: false, error: "ဒီ match မှာ မပါဝင်ပါ", started: false };
+      // Batch 27 (Job 6): a leader pressing Ready starts the forfeit
+      // countdown — stamp first_ready_at before any gate can return.
+      await stampFirstReady(db, m.id);
       const aReady = isA ? 1 : m.aReady;
       const bReady = isB ? 1 : m.bReady;
       // TEAM READY GATE: in 2v2-5v5 every team member must be ready (Team
@@ -7958,16 +8175,33 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const meHist = await playerBySession(db, args.player_id, args.session_token);
       if (!meHist) return { matches: [] };
+      // Batch 27 (Job 7): participant-scoped (snapshot members included,
+      // not just the two leaders) and windowed to the last 7 days so the
+      // list matches the retention sweep between runs: completed and
+      // cancelled age out by finish/create time; disputed matches stay
+      // visible while their admin decision is pending (coins locked).
+      const cutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000);
+      const myPartMatchIds = new Set(
+        (await db.select().from(schema.matchParticipants))
+          .filter((pt) => pt.playerId === args.player_id)
+          .map((pt) => pt.matchId),
+      );
       const rows = await db
         .select()
         .from(schema.matches)
         .orderBy(desc(schema.matches.id))
-        .limit(200);
-      const mine = rows.filter(
-        (m) =>
-          (m.playerAId === args.player_id || m.playerBId === args.player_id) &&
-          ["completed", "cancelled", "disputed"].includes(m.status),
-      );
+        .limit(500);
+      const mine = rows.filter((m) => {
+        const involved =
+          m.playerAId === args.player_id ||
+          m.playerBId === args.player_id ||
+          myPartMatchIds.has(m.id);
+        if (!involved) return false;
+        if (m.status === "disputed") return true;
+        if (m.status === "completed") return (m.completedAt ?? m.createdAt) >= cutoff;
+        if (m.status === "cancelled") return m.createdAt >= cutoff;
+        return false;
+      });
       const out = [];
       for (const m of mine) out.push(await matchOut(ctx, db, m, args.player_id, true));
       return { matches: out };
@@ -8195,6 +8429,9 @@ export const Actions = {
               .update(schema.matchParticipants)
               .set({ ready: args.ready ? 1 : 0 })
               .where(eq(schema.matchParticipants.id, pt.id));
+            // Batch 27 (Job 6): a member becoming ready via the Team
+            // section also starts the match's forfeit countdown.
+            if (args.ready) await stampFirstReady(db, mm.id);
           }
         }
       }
@@ -8823,12 +9060,17 @@ export const Actions = {
       target_name: z.string().min(1).max(60),
       reason: z.string().min(1).max(60),
       detail: z.string().max(1000).default(""),
+      // Batch 27 (Job 7): when filed from a completed match's detail, the
+      // match id links the case to that match (same reports queue; no new
+      // money logic — resolution stays with the existing admin tools).
+      match_id: z.number().default(0),
     }),
     response: z.object({ ok: z.boolean(), case_code: z.string(), error: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       let reporterName = "";
       let reporterId: number | null = null;
+      let meReporter: PlayerRow | null = null;
       if (args.reporter_id) {
         const meR = await playerBySession(db, args.reporter_id, args.session_token);
         if (!meR) return { ok: false, case_code: "", error: AUTH_ERR };
@@ -8836,18 +9078,67 @@ export const Actions = {
         if (obRep) return { ok: false, case_code: "", error: obRep };
         reporterName = meR.name;
         reporterId = meR.id;
+        meReporter = meR;
+      }
+      // Batch 27 (Job 7): a match-linked report is validated server-side —
+      // the reporter must be a participant of a COMPLETED match (inside
+      // its 7-day reportable window); the target is the opposing side's
+      // leader, derived here, never trusted from the client.
+      let linkMatchId: number | null = null;
+      let targetName = args.target_name;
+      let detail = args.detail;
+      if (args.match_id > 0) {
+        if (!meReporter) return { ok: false, case_code: "", error: AUTH_ERR };
+        const mRows = await db.select().from(schema.matches).where(eq(schema.matches.id, args.match_id)).limit(1);
+        const mm = mRows[0];
+        if (!mm || mm.status !== "completed")
+          return { ok: false, case_code: "", error: "ပြီးဆုံးပြီး match ကိုပဲ report လုပ်နိုင်ပါတယ်" };
+        if (mm.completedAt && mm.completedAt.getTime() < Date.now() - 7 * 24 * 3600 * 1000)
+          return { ok: false, case_code: "", error: "၇ ရက် ကျော်သွားတဲ့ match ကို report လုပ်လို့ မရတော့ပါ" };
+        const parts = await participantsFor(db, mm.id);
+        const myRow = parts.find((pt) => pt.playerId === meReporter.id);
+        const mySide: "A" | "B" | null = myRow
+          ? myRow.side
+          : mm.playerAId === meReporter.id
+            ? "A"
+            : mm.playerBId === meReporter.id
+              ? "B"
+              : null;
+        if (!mySide) return { ok: false, case_code: "", error: "ဒီ match မှာ မပါဝင်ခဲ့ပါ" };
+        const oppLeaderId = mySide === "A" ? mm.playerBId : mm.playerAId;
+        const oppLeader = await getPlayer(db, oppLeaderId);
+        // Team edge: if the reporter was a snapshot member whose leader
+        // columns sit on their own side, the opposing leader is still the
+        // other column — unless they swapped onto the winning side rows;
+        // participant rows decide in that case.
+        const oppRowLeader = parts.find(
+          (pt) => pt.side !== mySide && (pt.playerId === mm.playerAId || pt.playerId === mm.playerBId),
+        );
+        const finalOpp = oppRowLeader ? await getPlayer(db, oppRowLeader.playerId) : oppLeader;
+        targetName = finalOpp?.name ?? targetName;
+        detail = `[Match ${mm.code}] ${args.detail}`.trim().slice(0, 1000);
+        linkMatchId = mm.id;
       }
       const rl = await rateLimit(db, `report:${reporterId ?? "anon"}`, 10, 60 * 60 * 1000);
       if (rl) return { ok: false, case_code: "", error: rl };
       const caseCode = uid("CASE");
       await db.insert(schema.reports).values({
         caseCode,
+        matchId: linkMatchId,
         reporterId,
         reporterName,
-        targetName: args.target_name,
+        targetName,
         reason: args.reason,
-        detail: args.detail,
+        detail,
       });
+      if (linkMatchId) {
+        // Best-effort plain-text Telegram alert (the dispute keyboard path
+        // settles matches and is deliberately NOT reused for reports).
+        try {
+          const sRep = await getSettingsMap(db);
+          await telegramSend(sRep, `🚨 Report ${caseCode}\nMatch-linked case from ${reporterName} → ${targetName}\nReason: ${args.reason}`);
+        } catch { /* alert is best-effort */ }
+      }
       ctx.invalidateQueries();
       return { ok: true, case_code: caseCode, error: "" };
     },
@@ -8871,6 +9162,8 @@ export const Actions = {
           status: z.string(),
           action_taken: z.string(),
           created_at: z.string(),
+          match_id: z.number().nullable(),
+          match_code: z.string(),
         }),
       ),
     }),
@@ -8883,6 +9176,11 @@ export const Actions = {
         .from(schema.reports)
         .orderBy(desc(schema.reports.id))
         .limit(100);
+      const matchCodeOf = new Map<number, string>();
+      for (const mid of new Set(rows.map((r) => r.matchId).filter((x): x is number => x != null))) {
+        const mr = (await db.select().from(schema.matches).where(eq(schema.matches.id, mid)).limit(1))[0];
+        if (mr) matchCodeOf.set(mid, mr.code);
+      }
       return {
         reports: rows.map((r) => ({
           id: r.id,
@@ -8894,6 +9192,8 @@ export const Actions = {
           status: r.status,
           action_taken: r.actionTaken,
           created_at: iso(r.createdAt) ?? "",
+          match_id: r.matchId ?? null,
+          match_code: r.matchId != null ? (matchCodeOf.get(r.matchId) ?? "") : "",
         })),
       };
     },
@@ -9201,6 +9501,11 @@ export const Actions = {
         total_fees: z.number(),
         db_status: z.string(),
       }),
+      // Batch 27 (Job 4): all-time PAID totals split by payout method.
+      payout_split: z.object({
+        kpay: z.object({ total_kyat: z.number(), count: z.number() }),
+        wave: z.object({ total_kyat: z.number(), count: z.number() }),
+      }),
       money: z.object({
         topups_today_count: z.number(),
         topups_today_coins: z.number(),
@@ -9271,6 +9576,7 @@ export const Actions = {
           // payload must not leak even the pre-confirmation public fields.
           settings: { ...settingsOut({}), telegram_chat_id: "" },
           health: { total_players: 0, online_players: 0, active_matches: 0, pending_disputes: 0, pending_reports: 0, open_tickets: 0, total_transactions: 0, total_fees: 0, db_status: "FORBIDDEN" },
+          payout_split: { kpay: { total_kyat: 0, count: 0 }, wave: { total_kyat: 0, count: 0 } },
           money: { topups_today_count: 0, topups_today_coins: 0, withdrawals_today_count: 0, withdrawals_today_kyat: 0, fees_today_coins: 0, pending_topups: 0, pending_withdrawals: 0 },
           activity: [], duplicate_pairs: [], suspicious_players: [], terms_history: [], backups: [], staff_grants: [],
         };
@@ -9319,6 +9625,15 @@ export const Actions = {
             .reduce((a, t) => a + t.amount, 0),
           db_status: "OK",
         },
+        payout_split: await (async () => {
+          const paidW = (await db.select().from(schema.withdrawRequests))
+            .filter((w) => w.status === "paid");
+          const agg = (method: string) => {
+            const rowsM = paidW.filter((w) => w.method === method);
+            return { total_kyat: rowsM.reduce((a, w) => a + w.netKyat, 0), count: rowsM.length };
+          };
+          return { kpay: agg("kpay"), wave: agg("wave") };
+        })(),
         money: await (async () => {
           // Today's money summary (UTC day). Top-ups are coin-denominated
           // (kyat actually received is off-platform); fees come from the
@@ -9503,6 +9818,19 @@ export const Actions = {
           if (!parsed || parsed.protocol !== "https:" || url.length > 500)
             return { ok: false, error: "Channel link မမှန်ပါ — https:// နဲ့ စတဲ့ link အပြည့် ထည့်ပါ (ဥပမာ https://t.me/…)" };
         }
+      }
+      // Batch 27 (Job 1): the Recovery Telegram username must be a valid
+      // Telegram username (5–32 chars, [A-Za-z0-9_]). A bad value rejects
+      // the WHOLE save before anything is written, like the channel URL.
+      if (args.values["recovery_telegram_username"] !== undefined) {
+        const un = args.values["recovery_telegram_username"].trim();
+        if (!validRecoveryUsername(un))
+          return { ok: false, error: "Telegram username မမှန်ပါ — အက္ခရာ/ဂဏန်း/underscore ၅–၃၂ လုံး ဖြစ်ရပါမယ် (@ မပါဘဲ)" };
+      }
+      if (args.values["recovery_enabled"] !== undefined) {
+        const en = args.values["recovery_enabled"].trim();
+        if (en !== "0" && en !== "1")
+          return { ok: false, error: "Recovery on/off တန်ဖိုး မမှန်ပါ" };
       }
       for (const [k, v] of Object.entries(args.values)) {
         if (!(k in DEFAULT_SETTINGS) && k !== "announcement_my" && k !== "announcement_en")
