@@ -121,6 +121,18 @@ if (existsSync(ASSETS_DIR)) {
     }
   }
 }
+// Root-level bundled binaries restore the same way (Batch 26: the
+// favicon ships as client/dist/favicon.ico.b64 so /favicon.ico can be
+// served as a real file instead of the SPA fallback).
+if (existsSync(CLIENT_DIR)) {
+  for (const name of readdirSync(CLIENT_DIR)) {
+    if (!name.endsWith(".b64")) continue;
+    const target = join(CLIENT_DIR, name.slice(0, -4));
+    if (!existsSync(target)) {
+      writeFileSync(target, Buffer.from(readFileSync(join(CLIENT_DIR, name), "utf8"), "base64"));
+    }
+  }
+}
 
 // --- action dispatch table ----------------------------------------------
 // The runtime worker also accepts the slugified name as a fallback.
