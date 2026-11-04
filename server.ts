@@ -506,6 +506,8 @@ const MIME: Record<string, string> = {
   ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".json": "application/json",
+  ".txt": "text/plain; charset=utf-8",
+  ".xml": "application/xml; charset=utf-8",
   ".webp": "image/webp",
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -514,8 +516,22 @@ const MIME: Record<string, string> = {
   ".woff2": "font/woff2",
 };
 
+// Batch 29: clean reviewer/crawler paths map to the REAL static files in
+// client/dist (authored in the artifact's client/public/). Exact-path
+// matches only, resolved BEFORE the SPA fallback; "/" and every other
+// path keep the existing file-or-SPA behavior byte-for-byte.
+const STATIC_PAGES: Record<string, string> = {
+  "/about": "about.html",
+  "/terms": "terms.html",
+  "/privacy": "privacy.html",
+  "/contact": "contact.html",
+};
+
 async function serveStatic(pathname: string): Promise<Response> {
-  const rel = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
+  const rel =
+    pathname === "/"
+      ? "index.html"
+      : STATIC_PAGES[pathname] ?? pathname.replace(/^\/+/, "");
   const filePath = resolve(join(CLIENT_DIR, rel));
   if (filePath.startsWith(CLIENT_DIR + sep) && existsSync(filePath)) {
     const file = Bun.file(filePath);

@@ -6,7 +6,7 @@
 //    HTML/bundle); the cached shell is only an offline fallback.
 //  - Same-origin static assets are CACHE-FIRST (they are content-hashed).
 //  - Non-GET requests and everything else are left completely untouched.
-const CACHE_NAME = "mlbb-shell-v10";
+const CACHE_NAME = "mlbb-shell-v11";
 
 const SHELL_URLS = [
   "./",
@@ -72,11 +72,16 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(
       fetch(request)
         .then((response) => {
-          const copy = response.clone();
-          caches
-            .open(CACHE_NAME)
-            .then((cache) => cache.put("./index.html", copy))
-            .catch(() => {});
+          // Batch 29: only the app root navigation may refresh the cached
+          // shell — static info pages (/about, /terms, /privacy, /contact)
+          // must never be cached AS index.html.
+          if (url.pathname === "/") {
+            const copy = response.clone();
+            caches
+              .open(CACHE_NAME)
+              .then((cache) => cache.put("./index.html", copy))
+              .catch(() => {});
+          }
           return response;
         })
         .catch(async () => {
