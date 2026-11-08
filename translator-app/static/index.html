@@ -212,7 +212,7 @@ const ICON = {pending:"⏳", running:"🔄", done:"✅", error:"❌"};
 let timer = null;
 
 /* ---------------- state ---------------- */
-let previewId = null, previewDur = 0;
+let previewId = null, previewDur = 0, previewUrl = null;
 let logoId = null;
 let logoPos = {x: 1, y: 0};          // 0..1 across travel range (W-logoW, H-logoH)
 let blur = null;                      // {x,y,w,h} normalized
@@ -235,7 +235,7 @@ $("previewBtn").onclick = async () => {
       headers: {"Content-Type": "application/json"}, body: JSON.stringify({url})});
     const pv = await res.json();
     if (!res.ok) throw new Error(pv.error || "preview မရပါ");
-    previewId = pv.preview_id; previewDur = pv.duration;
+    previewId = pv.preview_id; previewDur = pv.duration; previewUrl = url;
     const t0 = Math.min(2, Math.max(pv.duration - 0.2, 0));
     $("scrub").max = Math.max(pv.duration - 0.15, 0); $("scrub").value = t0;
     loadFrame(t0);
@@ -373,11 +373,42 @@ stage.addEventListener("pointermove", onMove);
 stage.addEventListener("pointerup", onUp);
 stage.addEventListener("pointercancel", onUp);
 
+/* ---------- fresh start when a new link is put in ----------
+   The previous video's preview, blur box, logo placement and job
+   display belong to the old link only — a different link wipes them
+   all and starts from zero. */
+function resetForNewLink() {
+  previewId = null; previewUrl = null; previewDur = 0;
+  blur = null; logoId = null; logoPos = {x: 1, y: 0};
+  currentJobId = null; reviewJobId = null; reviewShownFor = null;
+  clearInterval(timer);
+  $("frameImg").removeAttribute("src");
+  $("logoFile").value = "";
+  $("logoEl").style.display = "none";
+  layoutBlur(); layoutSubs();
+  $("reviewCard").classList.remove("show");
+  $("card").style.display = "none";
+  $("steps").innerHTML = ""; $("err").textContent = "";
+  $("preview").style.display = "none"; $("preview").removeAttribute("src");
+  $("dl").style.display = "none"; $("jobDl").style.display = "none";
+  $("cleanupNote").style.display = "none"; $("doneBtns").style.display = "none";
+  $("go").disabled = false;
+}
+$("url").addEventListener("input", () => {
+  const u = $("url").value.trim();
+  if ((previewUrl && u !== previewUrl) || (!previewUrl && currentJobId)) {
+    resetForNewLink();
+  }
+});
+
 /* ---------------- job ---------------- */
 let currentJobId = null;
 $("go").onclick = async () => {
   const url = $("url").value.trim();
   if (!url) { alert("လင့်ခ် အရင်ထည့်ပါ"); return; }
+  if (previewId && url !== previewUrl) {
+    previewId = null; blur = null; logoId = null;  // stale editor state
+  }
   $("go").disabled = true; $("err").textContent = "";
   $("reviewCard").classList.remove("show"); reviewShownFor = null;
   $("dl").style.display = "none"; $("preview").style.display = "none";

@@ -389,6 +389,14 @@ def create_job():
     source_path = None
     preview_id = data.get("preview_id")
     if preview_id:
+        # A preview may be reused ONLY for the very link it was taken
+        # from (its id is a hash of that link). A stale id left over
+        # from a previous video must never substitute the old video
+        # for the new link's job.
+        expected_pid, _ = _preview_dir(url)
+        if str(preview_id) != expected_pid:
+            preview_id = None
+    if preview_id:
         cand = PREVIEWS_DIR / str(preview_id) / "source.mp4"
         if cand.exists():
             source_path = str(cand)
