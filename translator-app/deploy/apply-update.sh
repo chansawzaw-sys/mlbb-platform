@@ -81,5 +81,5 @@ if [ "$AUTO" -eq 0 ]; then
   fi
 fi
 
-bash "$APP/deploy/translator-bootstrap.sh"
+timeout --kill-after=10 600 bash "$APP/deploy/translator-bootstrap.sh" || { echo "BOOTSTRAP FAILED OR TIMED OUT"; exit 1; }
 echo "APPLY_UPDATE_DONE"
