@@ -588,7 +588,7 @@ def _on_tg_callback(cq):
             return
         if flow.get("file_id"):
             job["url"] = "📁 Telegram file"
-        if acct:
+        if acct and not tg.is_admin(chat_id):
             job["user_id"] = acct["id"]
         job["source_path"] = flow.get("src")
         fx = {}
