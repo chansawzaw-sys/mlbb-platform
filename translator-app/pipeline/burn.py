@@ -252,12 +252,12 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
                 cmd += ["-i", str(logo_path)]
             cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]",
                     "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
-                    "-crf", "20", "-c:a", "copy", str(output_mp4)]
+                    "-crf", "24", "-c:a", "copy", str(output_mp4)]
             run(cmd)
             return output_mp4
     vf = f"ass='{ass}':fontsdir='{fontsdir}'"
     run(["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4), "-vf", vf,
-         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
          "-c:a", "copy", str(output_mp4)])
     return output_mp4
 

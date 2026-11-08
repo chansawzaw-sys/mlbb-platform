@@ -86,7 +86,7 @@ def apply_effects(input_mp4, output_mp4, fx):
     if logo_path:
         cmd += ["-i", str(logo_path)]
     cmd += ["-filter_complex", ";".join(filters), "-map", cur, "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
             "-c:a", "copy", str(output_mp4)]
     run(cmd)
     return output_mp4

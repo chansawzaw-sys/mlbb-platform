@@ -78,7 +78,7 @@ def _video_single_pass(src, chunks, out):
     filters.append("".join(labels) + f"concat=n={len(chunks)}:v=1:a=0[outv]")
     run(["ffmpeg", "-y", "-v", "error", "-i", str(src),
          "-filter_complex", ";".join(filters), "-map", "[outv]",
-         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", str(out)])
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", str(out)])
 
 
 def _video_chunked(src, chunks, cdir, out):
@@ -90,7 +90,7 @@ def _video_chunked(src, chunks, cdir, out):
         vout = cdir / f"v{n:03d}.mp4"
         run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['start']:.3f}",
              "-i", str(src), "-vf", _piece_vf(c, dur), "-an",
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
              str(vout)])
         vlist.append(vout)
     lst = cdir / "vlist_fb.txt"
@@ -161,7 +161,7 @@ def retime(workdir):
                       for c in chunks)
     if passthrough:
         run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-i", str(dub_wav),
-             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac",
+             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
              "-shortest", str(workdir / "retimed.mp4")])
     else:
         retimed_video = workdir / "retimed_video.mp4"
@@ -173,7 +173,7 @@ def retime(workdir):
         else:
             _video_chunked(src, chunks, cdir, retimed_video)
         run(["ffmpeg", "-y", "-v", "error", "-i", str(retimed_video), "-i", str(dub_wav),
-             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest",
+             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k", "-shortest",
              str(workdir / "retimed.mp4")])
         # Intermediates are dead weight once the mux exists (the chunked
         # fallback's pieces are a second full copy of the video) — drop
