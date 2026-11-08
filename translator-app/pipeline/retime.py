@@ -65,8 +65,11 @@ def _piece_vf(c, dur):
 
 def _video_single_pass(src, chunks, out):
     """All chunks in ONE ffmpeg decode+encode (a trim/concat filter
-    graph) instead of one process per chunk — identical filters and
-    output, minus the per-chunk process + file overhead."""
+    graph). ONLY safe for a FEW chunks: with many trim branches on one
+    input, ffmpeg buffers frames for the latest branch while earlier
+    ones process, which balloons memory and time (a ~40-chunk graph
+    stalled a production job in this step for 19+ minutes). The
+    chunked path below is linear and is the default for real jobs."""
     filters, labels = [], []
     for n, c in enumerate(chunks):
         f = (f"[0:v]trim=start={c['start']:.3f}:end={c['end']:.3f},"
@@ -78,7 +81,8 @@ def _video_single_pass(src, chunks, out):
     filters.append("".join(labels) + f"concat=n={len(chunks)}:v=1:a=0[outv]")
     run(["ffmpeg", "-y", "-v", "error", "-i", str(src),
          "-filter_complex", ";".join(filters), "-map", "[outv]",
-         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", str(out)])
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", str(out)],
+        timeout=1800)
 
 
 def _video_chunked(src, chunks, cdir, out):
@@ -91,13 +95,13 @@ def _video_chunked(src, chunks, cdir, out):
         run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['start']:.3f}",
              "-i", str(src), "-vf", _piece_vf(c, dur), "-an",
              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-             str(vout)])
+             str(vout)], timeout=1200)
         vlist.append(vout)
     lst = cdir / "vlist_fb.txt"
     lst.write_text("".join(f"file '{f.resolve()}'\n" for f in vlist),
                    encoding="utf-8")
     run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
-         "-i", str(lst), "-c:v", "copy", str(out)])
+         "-i", str(lst), "-c:v", "copy", str(out)], timeout=1200)
 
 
 def retime(workdir, max_speed=MAX_SPEED):
@@ -128,7 +132,7 @@ def retime(workdir, max_speed=MAX_SPEED):
             tts_file = seg["tts_file"]
             af = f"atempo={c['speed']:.4f},apad,atrim=0:{c['new_dur']:.3f}"
             run(["ffmpeg", "-y", "-v", "error", "-i", tts_file, "-af", af,
-                 "-ac", "2", "-ar", "44100", str(aout)])
+                 "-ac", "2", "-ar", "44100", str(aout)], timeout=300)
             new_segs.append({**seg,
                              "start_new": round(t_cursor, 3),
                              "end_new": round(t_cursor + c["new_dur"], 3),
@@ -138,7 +142,7 @@ def retime(workdir, max_speed=MAX_SPEED):
             run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['start']:.3f}", "-i", str(src),
                  "-t", f"{dur:.3f}", "-vn", "-af",
                  f"volume={GAP_VOL},aresample=44100,apad,atrim=0:{c['new_dur']:.3f}",
-                 "-ac", "2", "-ar", "44100", str(aout)])
+                 "-ac", "2", "-ar", "44100", str(aout)], timeout=300)
         alist.append(aout)
         t_cursor += c["new_dur"]
 
@@ -148,7 +152,7 @@ def retime(workdir, max_speed=MAX_SPEED):
         cmd = ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(lst)]
         cmd += ["-c:v", "copy"] if is_video else ["-c:a", "pcm_s16le"]
         cmd += [str(out)]
-        run(cmd)
+        run(cmd, timeout=1200)
 
     dub_wav = workdir / "dub.wav"
     _concat(alist, dub_wav, False)
@@ -163,10 +167,13 @@ def retime(workdir, max_speed=MAX_SPEED):
     if passthrough:
         run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-i", str(dub_wav),
              "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
-             "-shortest", str(workdir / "retimed.mp4")])
+             "-shortest", str(workdir / "retimed.mp4")], timeout=1200)
     else:
         retimed_video = workdir / "retimed_video.mp4"
-        if len(chunks) <= 80:
+        # Single-pass only for a handful of chunks (see its docstring:
+        # many-branch trim graphs stall); the chunked path is linear
+        # in the chunk count and bounded in memory.
+        if len(chunks) <= 12:
             try:
                 _video_single_pass(src, chunks, retimed_video)
             except Exception:
@@ -175,7 +182,7 @@ def retime(workdir, max_speed=MAX_SPEED):
             _video_chunked(src, chunks, cdir, retimed_video)
         run(["ffmpeg", "-y", "-v", "error", "-i", str(retimed_video), "-i", str(dub_wav),
              "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k", "-shortest",
-             str(workdir / "retimed.mp4")])
+             str(workdir / "retimed.mp4")], timeout=1200)
         # Intermediates are dead weight once the mux exists (the chunked
         # fallback's pieces are a second full copy of the video) — drop
         # them now instead of letting them sit until job cleanup.
