@@ -25,7 +25,7 @@
 #      no serialization; two concurrent whisper+ffmpeg jobs can OOM a
 #      2 GB box). TRANSLATOR_GATE=off in the unit disables the gate.
 #   6. Puts Caddy in front on public port 8611 with HTTP basic auth
-#      (user "king"; password generated once, stored root-only in
+#      (user "htetheather"; password generated once, stored root-only in
 #      /root/translator-auth.txt, printed once at the end).
 #   7. Opens ONLY port 8611 in ufw (the app port 8613 stays private;
 #      8080/80/443 remain MLBB's business).
@@ -45,7 +45,7 @@ APP_USER='translator'                    # dedicated system user
 DEPLOY_DIR='/opt/translator-deploy'      # launcher + deploy artifacts
 INTERNAL_PORT='8613'                     # Flask app, 127.0.0.1 only
 PUBLIC_PORT='8611'                       # Caddy, public, basic-auth
-AUTH_USER='king'
+AUTH_USER='htetheather'
 AUTH_FILE='/root/translator-auth.txt'
 LOG_FILE='/root/translator-deploy.log'
 SERVICE_NAME='translator'
@@ -287,6 +287,14 @@ PYEOF
 .venv/bin/python -m py_compile "$DEPLOY_DIR/serve.py"
 echo "Launcher installed at $DEPLOY_DIR/serve.py"
 
+# --- 8b. decode any base64-packed binary assets (e.g. PWA icons) ---------------
+# Binary files travel through the git snapshot flow as <name>.b64 text.
+for b64 in "$APP_DIR"/static/*.b64; do
+  [ -e "$b64" ] || continue
+  base64 -d "$b64" > "${b64%.b64}"
+  echo "Decoded asset: ${b64%.b64}"
+done
+
 # --- 9. ownership ----------------------------------------------------------------------
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 chown -R root:root "$DEPLOY_DIR"
@@ -352,7 +360,7 @@ cat > /etc/caddy/translator.caddy <<EOF
 #
 # FUTURE DOMAIN / HTTPS: add a new site block in the main Caddyfile, e.g.
 #   translator.example.com {
-#       basic_auth { king <same bcrypt hash as below> }
+#       basic_auth { htetheather <same bcrypt hash as below> }
 #       reverse_proxy 127.0.0.1:${INTERNAL_PORT}
 #   }
 # Caddy will provision HTTPS automatically once DNS points at this server;
@@ -381,6 +389,29 @@ ufw allow 22/tcp
 ufw allow "${PUBLIC_PORT}/tcp"
 ufw --force enable
 ufw status || true
+
+# --- 13b. port 80 -> Caddy redirect (some networks block non-standard ports) --
+# Idempotent now, and re-applied at boot by a tiny oneshot unit (iptables
+# rules do not survive reboots on their own).
+if ! iptables -t nat -C PREROUTING -p tcp --dport 80 -j REDIRECT --to-port "${PUBLIC_PORT}" 2>/dev/null; then
+  iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port "${PUBLIC_PORT}"
+fi
+cat > /etc/systemd/system/translator-port80.service <<EOF2
+[Unit]
+Description=Re-apply port 80 redirect to the translator Caddy port
+After=network.target docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -t nat -C PREROUTING -p tcp --dport 80 -j REDIRECT --to-port ${PUBLIC_PORT} 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port ${PUBLIC_PORT}'
+
+[Install]
+WantedBy=multi-user.target
+EOF2
+systemctl daemon-reload
+systemctl enable translator-port80.service >/dev/null 2>&1 || true
+echo "Port 80 redirect to :${PUBLIC_PORT} active (and boot-persistent)."
 
 # --- 14. start + health checks ----------------------------------------------------------------
 systemctl restart "$SERVICE_NAME"
