@@ -328,7 +328,7 @@ RestartSec=3
 # Sane caps for a 1 vCPU / 2 GB box shared with the MLBB container:
 # whisper-small (int8) + one ffmpeg pass fit comfortably under 1.5 GB;
 # 90% CPU leaves the MLBB app responsive while a job runs.
-MemoryMax=1500M
+MemoryMax=2600M
 CPUQuota=90%
 OOMPolicy=continue
 NoNewPrivileges=true

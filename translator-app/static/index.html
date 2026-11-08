@@ -152,6 +152,11 @@
     <div class="row">
       <button class="ghost" id="qrDel" style="display:none">QR ဖျက်မယ်</button>
     </div>
+    <h4>🤖 Bot ဆိုင် အဖွင့်/အပိတ်</h4>
+    <p class="hint">ဖွင့်ရင် account ချိတ်ထားတဲ့ customer တွေ bot မှာ job ထုတ်လို့ရမယ် (credit မလောက်ရင် မရ, တစ်ရက် အများဆုံး ၃၀ ခု)</p>
+    <div class="row">
+      <button class="ghost" id="botOpenBtn">…</button>
+    </div>
   </div>
 
   <label>ဗီဒီယိုလင့်ခ်</label>
@@ -886,7 +891,7 @@ async function loadMe() {
     $("authOut").style.display = ME ? "none" : "";
     $("authIn").style.display = ME ? "" : "none";
     $("adminCard").classList.toggle("show", !!(ME && ME.role === "admin"));
-    if (ME && ME.role === "admin") loadTopups();
+    if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); }
     if (ME) loadPayQr();
     if (ME) {
       $("authInfo").textContent = "👤 " + ME.username +
@@ -986,6 +991,19 @@ async function topupDecide(tid, decision) {
     body: JSON.stringify({decision})});
   loadTopups();
 }
+async function loadBotOpen() {
+  const r = await (await fetch("/api/settings/telegram")).json();
+  $("botOpenBtn").textContent = r.bot_open
+    ? "🤖 ဆိုင် ဖွင့်ထား — ပိတ်ရန် နှိပ်" : "🤖 ဆိုင် ပိတ်ထား — ဖွင့်ရန် နှိပ်";
+  $("botOpenBtn").dataset.open = r.bot_open ? "1" : "";
+}
+$("botOpenBtn").addEventListener("click", async () => {
+  const open = !$("botOpenBtn").dataset.open;
+  await fetch("/api/settings/botopen", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({open})});
+  loadBotOpen();
+});
 $("qrFile").addEventListener("change", async () => {
   const f = $("qrFile").files[0];
   if (!f) return;
@@ -1053,6 +1071,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 93</p>
+<p class="hint" id="buildTag" style="text-align:center">build 94</p>
 </body>
 </html>

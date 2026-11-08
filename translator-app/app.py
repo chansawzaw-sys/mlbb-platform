@@ -101,13 +101,20 @@ CLEANUP_DELAY = 900
 CLEANUP_TIMERS = {}
 
 
+def _job_retention(job):
+    """Bot-submitted jobs stay 24h — customers come back for their
+    video; web jobs keep the 15-minute hygiene rule."""
+    return 24 * 3600 if job.get("tg_chat_id") else CLEANUP_DELAY
+
+
 def _schedule_cleanup(job):
     jid = job["id"]
     old = CLEANUP_TIMERS.pop(jid, None)
     if old:
         old.cancel()
-    job["cleanup_at"] = time.time() + CLEANUP_DELAY
-    t = threading.Timer(CLEANUP_DELAY, _cleanup_job, args=(jid,))
+    delay = _job_retention(job)
+    job["cleanup_at"] = time.time() + delay
+    t = threading.Timer(delay, _cleanup_job, args=(jid,))
     t.daemon = True
     t.start()
     CLEANUP_TIMERS[jid] = t
@@ -246,9 +253,8 @@ def _on_tg_message(msg):
     if _tg_menu_step(msg, chat_id, text):
         return
     if vid:
-        if not tg.is_admin(chat_id):
-            tg.send_message(chat_id,
-                            "🔒 အခုတော့ admin အတွက်ပဲ ဖွင့်ထားပါတယ်")
+        if not _may_submit(chat_id):
+            _deny_submit(chat_id)
             return
         mine = [j for j in JOBS.values()
                 if j.get("tg_chat_id") == chat_id
@@ -284,10 +290,10 @@ def _on_tg_message(msg):
         return
     if not text:
         return
-    if not tg.is_admin(chat_id):
-        # Closed to everyone but the fixed admin for now (owner's
-        # order); registration above still records future customers.
-        tg.send_message(chat_id, "🔒 အခုတော့ admin အတွက်ပဲ ဖွင့်ထားပါတယ်")
+    if not _may_submit(chat_id):
+        # Job submission: the fixed admin always; customers only
+        # once the owner opens the bot AND their chat is linked.
+        _deny_submit(chat_id)
         return
     m = re.search(r"https?://\S+", text)
     if not m:
@@ -338,6 +344,35 @@ def _pay_info():
             if ln.startswith("PAY_INFO="):
                 return ln.split("=", 1)[1].strip()
     return ""
+
+
+def _bot_open():
+    """Owner switch: when BOT_OPEN=1 in .env, customers whose
+    Telegram chat is linked to a web account may submit bot jobs
+    (credit pre-checks + the daily cap apply). Read live on every
+    call, so the admin toggle takes effect immediately."""
+    p = ROOT / ".env"
+    if p.exists():
+        for ln in p.read_text(encoding="utf-8").splitlines():
+            if ln.startswith("BOT_OPEN="):
+                return ln.split("=", 1)[1].strip() == "1"
+    return False
+
+
+def _may_submit(chat_id):
+    from pipeline import telegram_send as tg
+    if tg.is_admin(chat_id):
+        return True
+    return _bot_open() and bool(accounts.user_for_tg(chat_id))
+
+
+def _deny_submit(chat_id):
+    from pipeline import telegram_send as tg
+    if _bot_open():
+        tg.send_message(chat_id, "အရင် 👤 Username ချိတ် (Menu ထဲက) ပါ"
+                        + _LINK_HINT)
+    else:
+        tg.send_message(chat_id, "🔒 အခုတော့ admin အတွက်ပဲ ဖွင့်ထားပါတယ်")
 
 
 def _tg_menu_step(msg, chat_id, text):
@@ -1020,7 +1055,8 @@ def telegram_status():
     from pipeline import telegram_send as tg
     info = {"configured": bool(tg.token()), "bot": None,
             "recipients": len(tg.recipients()),
-            "poller": tg.poller_status(), "payinfo": _pay_info()}
+            "poller": tg.poller_status(), "payinfo": _pay_info(),
+            "bot_open": _bot_open()}
     if info["configured"]:
         try:
             info["bot"] = (tg.get_me() or {}).get("username")
@@ -1242,6 +1278,13 @@ def payinfo_save():
     data = request.get_json(force=True, silent=True) or {}
     _env_write("PAY_INFO", (data.get("text") or "").strip()[:300])
     return jsonify({"ok": True})
+
+
+@app.post("/api/settings/botopen")
+def botopen_save():
+    data = request.get_json(force=True, silent=True) or {}
+    _env_write("BOT_OPEN", "1" if data.get("open") else "0")
+    return jsonify({"ok": True, "bot_open": _bot_open()})
 
 
 @app.post("/api/settings/payqr")
