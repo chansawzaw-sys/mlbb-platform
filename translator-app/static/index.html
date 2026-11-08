@@ -746,6 +746,13 @@ async function loadTgState() {
     $("tgState").textContent = d.configured
       ? `✅ ချိတ်ပြီး (@${d.bot || "?"}) — Start နှိပ်ထားသူ ${d.recipients} ယောက်`
       : "❌ မချိတ်ရသေး";
+    if (d.configured && d.poller) {
+      $("tgState").textContent += d.poller.alive
+        ? ` · စစ်ပြီး: ${d.poller.last_poll_ago ?? "?"}s က`
+        : " · ⚠️ စစ်သူ ရပ်နေတယ်";
+      if (d.poller.last_error)
+        $("tgState").textContent += " · ⚠️ " + d.poller.last_error;
+    }
     // Once a token is saved the card tucks itself away (the 🤖
     // button in the header reopens it), like the Gemini key card.
     $("tgToggle").textContent = d.configured ? "🤖 ✅" : "🤖";

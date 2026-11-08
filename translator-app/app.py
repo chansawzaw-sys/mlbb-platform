@@ -233,8 +233,47 @@ def _on_tg_message(msg):
     if chat.get("type") != "private":
         return
     chat_id = chat.get("id")
+    # A video FILE is a submission too — it may carry no text at all,
+    # so it must be handled before the text checks below.
+    vid = msg.get("video")
+    if not vid:
+        doc = msg.get("document") or {}
+        if (doc.get("mime_type") or "").startswith("video/"):
+            vid = doc
     text = (msg.get("text") or msg.get("caption") or "").strip()
-    if not text or text.startswith("/"):
+    if vid:
+        if not tg.is_admin(chat_id):
+            tg.send_message(chat_id,
+                            "🔒 အခုတော့ admin အတွက်ပဲ ဖွင့်ထားပါတယ်")
+            return
+        mine = [j for j in JOBS.values()
+                if j.get("tg_chat_id") == chat_id
+                and j.get("status") in ("queued", "running")]
+        if mine:
+            tg.send_message(chat_id, "⏳ သင့် အရင် video မပြီးသေးပါ — "
+                                     "ပြီးရင် နောက် တစ်ခု ပို့ပါ")
+            return
+        if (vid.get("file_size") or 0) > 20 * 1000 * 1000:
+            tg.send_message(chat_id, "⚠️ ဒီ file က 20MB ထက် ကြီးနေပါတယ် "
+                                     "— link ပို့ပေးပါ")
+            return
+        frm = msg.get("from") or {}
+        _TG_FLOW[chat_id] = {
+            "file_id": vid["file_id"], "step": "prepare",
+            "from": frm.get("username") or frm.get("first_name"),
+            "ts": time.time()}
+        tg.send_message(chat_id, "⏳ file ယူနေတယ် — ဝါးမယ့် နေရာ "
+                                 "ရွေးဖို့ ပုံ ပို့ပေးမယ်")
+        threading.Thread(target=_tg_flow_prepare, args=(chat_id,),
+                         daemon=True).start()
+        return
+    if text.startswith("/"):
+        # /start always earns the welcome (it is also the registration
+        # moment); other commands stay silent.
+        if text.startswith("/start"):
+            tg.send_message(chat_id, tg.WELCOME)
+        return
+    if not text:
         return
     if not tg.is_admin(chat_id):
         # Closed to everyone but the fixed admin for now (owner's
@@ -280,11 +319,18 @@ def _tg_flow_prepare(chat_id):
     if not flow:
         return
     try:
-        pid, pdir = _preview_dir(flow["url"])
-        pdir.mkdir(parents=True, exist_ok=True)
-        src = pdir / "source.mp4"
-        if not src.exists():
-            dl_mod.download(flow["url"], pdir)
+        if flow.get("file_id"):
+            pid, pdir = _preview_dir("tg-file:" + flow["file_id"])
+            pdir.mkdir(parents=True, exist_ok=True)
+            src = pdir / "source.mp4"
+            if not src.exists():
+                tg.download_file(flow["file_id"], src)
+        else:
+            pid, pdir = _preview_dir(flow["url"])
+            pdir.mkdir(parents=True, exist_ok=True)
+            src = pdir / "source.mp4"
+            if not src.exists():
+                dl_mod.download(flow["url"], pdir)
         dur = probe_duration(src)
         frame = pdir / "tg_frame.jpg"
         sh(["ffmpeg", "-y", "-v", "error", "-ss",
@@ -356,10 +402,14 @@ def _on_tg_callback(cq):
                                      "— မနက်ဖြန် ပြန်လာပါ")
             return
         _TG_FLOW.pop(chat_id, None)
-        job, err = _new_job({"url": flow["url"], "mode": mode})
+        job, err = _new_job({"url": flow.get("url")
+                             or "https://telegram.org/file",
+                             "mode": mode})
         if err:
             tg.send_message(chat_id, "❌ " + err)
             return
+        if flow.get("file_id"):
+            job["url"] = "📁 Telegram file"
         job["source_path"] = flow.get("src")
         if flow.get("blur"):
             job["fx"] = {"blur": {**flow["blur"], "strength": 25}}
@@ -730,7 +780,8 @@ def _env_remove(key):
 def telegram_status():
     from pipeline import telegram_send as tg
     info = {"configured": bool(tg.token()), "bot": None,
-            "recipients": len(tg.recipients())}
+            "recipients": len(tg.recipients()),
+            "poller": tg.poller_status()}
     if info["configured"]:
         try:
             info["bot"] = (tg.get_me() or {}).get("username")
@@ -1418,10 +1469,16 @@ try:
     _tg.MESSAGE_HANDLER = _on_tg_message
     _tg.CALLBACK_HANDLER = _on_tg_callback
     _tg.start_poller()
-    threading.Thread(target=_backup_loop, daemon=True).start()
-    threading.Thread(target=_tg_dispatcher, daemon=True).start()
 except Exception:
     pass
+
+# Each background loop gets its own guard: one failure must never
+# silently take the others down with it.
+for _target in (_backup_loop, _tg_dispatcher):
+    try:
+        threading.Thread(target=_target, daemon=True).start()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

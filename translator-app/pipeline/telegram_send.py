@@ -31,6 +31,21 @@ WELCOME = ("✅ မှတ်ပုံတင်ပြီးပါပြီ!\n"
            "ဒီမှာ ပို့လိုက်ပါ — ပြီးသွားရင် ဗီဒီယို ဒီ chat ထဲ "
            "ပြန်ပို့ပေးပါမယ်။")
 
+# Diagnostics for the settings card: when the poller last completed
+# a poll and what it last choked on (if anything).
+LAST_POLL = {"at": 0.0, "error": ""}
+
+
+_POLLER_THREAD = None
+
+
+def poller_status():
+    return {"alive": bool(_POLLER_THREAD and _POLLER_THREAD.is_alive()),
+            "last_poll_ago": (round(time.time() - LAST_POLL["at"])
+                              if LAST_POLL["at"] else None),
+            "last_error": LAST_POLL["error"][:120]}
+
+
 # Set by the app: called with every incoming message dict (after
 # registration), so the app can treat links as new jobs.
 MESSAGE_HANDLER = None
@@ -154,6 +169,8 @@ def poll_once():
     if not data.get("ok"):
         raise RuntimeError(
             f"telegram getUpdates: {data.get('description')}")
+    LAST_POLL["at"] = time.time()
+    LAST_POLL["error"] = ""
     updates = data.get("result") or []
     new_users = []
     for u in updates:
@@ -256,22 +273,44 @@ def answer_callback(callback_query_id):
 
 def start_poller():
     """Background thread keeping the recipient list current. Runs for
-    the life of the process; idles quietly while no token is set."""
-    global _POLLER_STARTED
-    if _POLLER_STARTED:
+    the life of the process; idles quietly while no token is set.
+    Safe to call again (e.g. right after a token is saved): a dead
+    thread is restarted, a live one is left alone."""
+    global _POLLER_THREAD
+    if _POLLER_THREAD and _POLLER_THREAD.is_alive():
         return
-    _POLLER_STARTED = True
 
     def loop():
         while True:
             try:
                 if token():
                     poll_once()
-            except Exception:
-                pass
+            except Exception as e:
+                LAST_POLL["error"] = f"{type(e).__name__}: {e}"[:200]
             time.sleep(5)
 
-    threading.Thread(target=loop, daemon=True).start()
+    _POLLER_THREAD = threading.Thread(target=loop, daemon=True)
+    _POLLER_THREAD.start()
+
+
+def download_file(file_id, dest_path):
+    """Bot file download (getFile). Telegram refuses bot downloads
+    over 20 MB — the caller checks the size before calling."""
+    tok = token()
+    if not tok:
+        raise RuntimeError("telegram bot token မရှိပါ")
+    info = _call(tok, "getFile", file_id=str(file_id))
+    path = info.get("file_path")
+    if not path:
+        raise RuntimeError("telegram file မရပါ")
+    import requests
+    url = f"https://api.telegram.org/file/bot{tok}/{path}"
+    with requests.get(url, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        with open(dest_path, "wb") as fh:
+            for chunk in r.iter_content(chunk_size=1 << 18):
+                fh.write(chunk)
+    return dest_path
 
 
 # ---------------- sending ----------------
