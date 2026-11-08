@@ -62,38 +62,46 @@ def download(url: str, workdir: Path) -> Path:
         "quiet": True,
         "no_warnings": True,
     }
-    # Attempt ladder: plain first, then browser impersonation. TikTok and
-    # other social sites fingerprint plain datacenter clients and answer
-    # with an error page ("Unexpected response from webpage request");
-    # impersonating a real browser's TLS/headers usually gets through.
     info = None
     first_err = None
-    for target in (None, "chrome", "safari"):
-        attempt_opts = dict(opts)
-        if target is not None:
-            try:
-                from yt_dlp.networking.impersonation import ImpersonateTarget
-                attempt_opts["impersonate"] = ImpersonateTarget(target)
-            except Exception:
-                continue
+    if "tiktok" in urlparse(url).netloc:
+        # TikTok blocks this server's IP at the page level, so every
+        # yt-dlp attempt below just burns minutes before failing. The
+        # public resolver sees the video from a different vantage point
+        # and is fast — try it FIRST; the ladder stays as the backup.
         try:
-            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-            break
+            info = _tiktok_fallback(url, workdir)
         except Exception as e:
-            if first_err is None:
-                first_err = e
+            first_err = e
     if info is None:
-        if "tiktok" in urlparse(url).netloc:
+        # Attempt ladder: plain first, then browser impersonation. Social
+        # sites fingerprint plain datacenter clients and answer with an
+        # error page ("Unexpected response from webpage request");
+        # impersonating a real browser's TLS/headers usually gets through.
+        for target in (None, "chrome", "safari"):
+            attempt_opts = dict(opts)
+            if target is not None:
+                try:
+                    from yt_dlp.networking.impersonation import ImpersonateTarget
+                    attempt_opts["impersonate"] = ImpersonateTarget(target)
+                except Exception:
+                    continue
             try:
-                info = _tiktok_fallback(url, workdir)
-            except Exception:
-                raise first_err
-        else:
-            raise first_err
+                with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                break
+            except Exception as e:
+                if first_err is None:
+                    first_err = e
+    if info is None:
+        raise first_err
     # Caption fast-path is BEST-EFFORT only: a subtitle 429/failure must
     # never kill the video download (observed on rate-limited IPs).
+    # Skipped for TikTok: from this server's IP the caption request just
+    # fails slowly — whisper transcribes the audio anyway.
     try:
+        if "tiktok" in urlparse(url).netloc:
+            raise RuntimeError("skip caption fetch for TikTok")
         sub_opts = {
             "skip_download": True, "writesubtitles": True, "writeautomaticsub": True,
             "subtitleslangs": ["en.*"], "subtitlesformat": "vtt",
