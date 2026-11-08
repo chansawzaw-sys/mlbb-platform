@@ -172,6 +172,15 @@ def _backup_loop():
                           if p.is_dir())
             for old in days[:-14]:
                 shutil.rmtree(ROOT / "backups" / old, ignore_errors=True)
+            # Dormant-account sweep (owner rule): accounts with no
+            # login for 60 days, zero credits and no jobs ever are
+            # deleted (archived in deleted_users). Admin accounts,
+            # credit holders and anyone who ever ran a job are
+            # untouchable here.
+            active = {j.get("user_id") for j in _all_jobs()
+                      if j.get("user_id")}
+            for u in accounts.dormant_users(60, active):
+                accounts.delete_user(u["id"], why="dormant60")
         except Exception:
             pass
         time.sleep(24 * 3600)
@@ -326,6 +335,7 @@ _BLUR_PRESETS = {
 _MENU_ROWS = [["🎬 Video ထုတ်မယ်", "💰 Credit ဖြည့်"],
               ["💳 လက်ကျန်", "👤 Username ချိတ်"]]
 _LINK_CODES = {}   # code -> (user_id, expires) — web-issued, bot-redeemed
+_LINK_FAILS = {}   # chat_id -> (fail_count, locked_until) — code guessing
 
 # Whenever the bot sends a user off to the web app (to register or
 # link), the message carries the app link AND the install reminder.
@@ -417,9 +427,19 @@ def _tg_menu_step(msg, chat_id, text):
     is_menu = text in ("🎬 Video ထုတ်မယ်", "💰 Credit ဖြည့်",
                        "💳 လက်ကျန်", "👤 Username ချိတ်")
     if flow and flow.get("step") == "link" and not is_menu:
+        fails = _LINK_FAILS.get(chat_id)
+        if fails and fails[1] > time.time():
+            tg.send_message(chat_id, "🔒 code အမှား များလို့ ခဏ ပိတ်ထား "
+                                     "တယ် — ၃၀ မိနစ် စောင့်ပါ")
+            return True
         entry = _LINK_CODES.pop(text.strip(), None)
         _TG_FLOW.pop(chat_id, None)
+        if not (entry and entry[1] > time.time()):
+            count = (fails[0] + 1) if fails else 1
+            until = time.time() + 1800 if count >= 5 else 0
+            _LINK_FAILS[chat_id] = (count, until)
         if entry and entry[1] > time.time():
+            _LINK_FAILS.pop(chat_id, None)
             accounts.link_tg(entry[0], chat_id)
             user = accounts.get_user(entry[0])
             tg.send_message(
@@ -1142,8 +1162,26 @@ def _set_session(resp, token):
     return resp
 
 
+_REG_ATTEMPTS = {}
+
+
+def _reg_throttled(ip):
+    """At most 10 registrations per hour per source — account
+    farming is the cheapest abuse there is."""
+    now = time.time()
+    hits = [t for t in _REG_ATTEMPTS.get(ip, []) if now - t < 3600]
+    hits.append(now)
+    _REG_ATTEMPTS[ip] = hits
+    return len(hits) > 10
+
+
 @app.post("/api/auth/register")
 def auth_register():
+    ip = (request.headers.get("X-Forwarded-For") or
+          request.remote_addr or "")
+    if _reg_throttled(ip):
+        return jsonify({"error": "ခဏ ခဏ ဖွင့်နေတယ် — နာရီ အနည်းငယ် "
+                                 "စောင့်ပြီး ပြန် ကြိုးစားပါ"}), 429
     data = request.get_json(force=True, silent=True) or {}
     user, err = accounts.create_user(data.get("username"),
                                      data.get("password"))
@@ -1335,6 +1373,18 @@ def admin_users():
         return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     return jsonify({"users": accounts.search_users(
         request.args.get("q", ""))})
+
+
+@app.delete("/api/admin/users/<int:uid>")
+def admin_user_delete(uid):
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    me = _current_user()
+    if me and me["id"] == uid:
+        return jsonify({"error": "ကိုယ့် account ကိုယ် ဖျက်မရပါ"}), 400
+    if not accounts.delete_user(uid):
+        return jsonify({"error": "ဖျက်မရပါ (admin account ဖြစ် နေ)"}), 400
+    return jsonify({"ok": True})
 
 
 @app.get("/api/admin/users/<int:uid>")

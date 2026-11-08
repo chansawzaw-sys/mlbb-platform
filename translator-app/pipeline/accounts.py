@@ -64,6 +64,13 @@ CREATE TABLE IF NOT EXISTS topups (
   created_at REAL NOT NULL,
   decided_at REAL
 );
+CREATE TABLE IF NOT EXISTS deleted_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT,
+  created_at REAL,
+  deleted_at REAL,
+  why TEXT
+);
 """
 
 
@@ -71,6 +78,9 @@ def _db():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(users)")]
+    if "last_login" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN last_login REAL")
     return conn
 
 
@@ -150,6 +160,9 @@ def authenticate(username, password, ip=""):
     if row["disabled"]:
         return None, "ဒီ account ပိတ်ထားပါတယ် — admin ကို ဆက်သွယ်ပါ"
     _clear_fails(username, ip)
+    with _LOCK, _db() as conn:
+        conn.execute("UPDATE users SET last_login = ? WHERE id = ?",
+                     (time.time(), row["id"]))
     return _public(row), None
 
 
@@ -337,6 +350,39 @@ def pending_topups():
             "JOIN users u ON u.id = t.user_id "
             "WHERE t.status = 'pending' ORDER BY t.id").fetchall()
     return [dict(r) for r in rows]
+
+
+def delete_user(user_id, why="manual"):
+    """Hard-delete an account (sessions die with it) and leave an
+    archive row. Admin accounts can never be deleted this way.
+    The credit ledger is kept — it is the money audit trail."""
+    with _LOCK, _db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?",
+                           (int(user_id),)).fetchone()
+        if row is None or row["role"] == "admin":
+            return False
+        conn.execute(
+            "INSERT INTO deleted_users (username, created_at, "
+            "deleted_at, why) VALUES (?, ?, ?, ?)",
+            (row["username"], row["created_at"], time.time(), why))
+        conn.execute("DELETE FROM sessions WHERE user_id = ?",
+                     (int(user_id),))
+        conn.execute("DELETE FROM users WHERE id = ?", (int(user_id),))
+    return True
+
+
+def dormant_users(days=60, exclude_ids=()):
+    """Dead signups: no admin role, zero credits, and no login (or
+    registration, when never logged in) for `days` days. Callers
+    additionally exclude accounts that ever ran a job."""
+    cutoff = time.time() - days * 86400
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM users WHERE role != 'admin' AND credits = 0 "
+            "AND COALESCE(last_login, created_at) < ?",
+            (cutoff,)).fetchall()
+    return [_public(r) for r in rows
+            if r["id"] not in set(exclude_ids or ())]
 
 
 def decide_topup(topup_id, ok):

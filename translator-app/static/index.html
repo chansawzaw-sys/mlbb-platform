@@ -926,8 +926,10 @@ async function adminDetail(uid, rowEl) {
   const r = await (await fetch("/api/admin/users/" + uid)).json();
   d = document.createElement("div");
   d.className = "udetail";
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+    (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
   const jobs = (r.jobs || []).map(j =>
-    "• " + j.status + " · " + (j.url || "").slice(0, 42) +
+    "• " + esc(j.status) + " · " + esc((j.url || "").slice(0, 42)) +
     (j.charged_minutes ? " · " + j.charged_minutes + " cr" : "")).join("<br>");
   const led = (r.ledger || []).map(l =>
     "• " + (l.delta > 0 ? "+" : "") + l.delta + " (" + l.reason + ")").join("<br>");
@@ -951,6 +953,13 @@ async function adminDetail(uid, rowEl) {
   const tgi = mk("Telegram chat id");
   d.append(tgi, btn("📲 TG ချိတ်မယ်", () =>
     postUser(uid, {tg_chat_id: tgi.value})));
+  d.append(btn("🗑 အကောင့် ဖျက်မယ်", async () => {
+    if (!confirm("ဒီ အကောင့် ကို တကယ် ဖျက်မှာလား? ပြန် မရပါ")) return;
+    const r = await (await fetch("/api/admin/users/" + uid,
+      {method: "DELETE"})).json();
+    if (r.error) { alert(r.error); return; }
+    loadAdminUsers();
+  }));
   rowEl.appendChild(d);
 }
 async function postUser(uid, body) {
@@ -1071,6 +1080,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 95</p>
+<p class="hint" id="buildTag" style="text-align:center">build 96</p>
 </body>
 </html>
