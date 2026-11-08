@@ -50,6 +50,21 @@ AUTH_USER='htetheather'
 AUTH_FILE='/root/translator-auth.txt'
 LOG_FILE='/root/translator-deploy.log'
 SERVICE_NAME='translator'
+
+# --- wall flip (owner-controlled) ---------------------------------------------------
+# VT_FLIP=1 in the app .env (armed from the app's Admin card) means:
+# serve WITHOUT the Caddy basic-auth wall and enforce web accounts
+# (VT_ACCOUNTS=1 in the unit env). Absent/0 = the wall stands and
+# accounts stay in shadow mode. The auth file is kept either way, so
+# disarming the flag brings the identical wall back on the next run.
+FLIP=0
+if grep -q '^VT_FLIP=1' "$APP_DIR/.env" 2>/dev/null; then
+  FLIP=1
+fi
+VT_ENV_LINE=""
+if [ "$FLIP" -eq 1 ]; then
+  VT_ENV_LINE="Environment=VT_ACCOUNTS=1"
+fi
 # Optional: if the app source is ever published to a git repo, put its clone
 # URL here (or export TRANSLATOR_REPO_URL before running) and the script
 # will clone it when $APP_DIR is empty. Default: source is placed by hand.
@@ -322,6 +337,7 @@ Environment=PORT=$INTERNAL_PORT
 Environment=TRANSLATOR_APP_DIR=$APP_DIR
 Environment=TRANSLATOR_GATE=on
 Environment=PYTHONUNBUFFERED=1
+$VT_ENV_LINE
 ExecStart=$APP_DIR/.venv/bin/python $DEPLOY_DIR/serve.py
 Restart=on-failure
 RestartSec=3
@@ -364,22 +380,19 @@ mkdir -p /etc/caddy
 if [ -f /etc/caddy/translator.caddy ]; then
   cp /etc/caddy/translator.caddy /etc/caddy/translator.caddy.bak
 fi
+AUTH_BLOCK=""
+if [ "$FLIP" -eq 0 ]; then
+  AUTH_BLOCK="	basic_auth {
+		${AUTH_USER} ${AUTH_HASH}
+	}"
+fi
 cat > /etc/caddy/translator.caddy <<EOF
 # === video-translator (managed by translator-bootstrap.sh) ===
-# Trial setup: plain HTTP on the public port, basic auth, app on localhost.
-#
-# FUTURE DOMAIN / HTTPS: add a new site block in the main Caddyfile, e.g.
-#   translator.example.com {
-#       basic_auth { htetheather <same bcrypt hash as below> }
-#       reverse_proxy 127.0.0.1:${INTERNAL_PORT}
-#   }
-# Caddy will provision HTTPS automatically once DNS points at this server;
-# then this :${PUBLIC_PORT} block can be removed. Do NOT reuse ports
-# 8080/80/443 here — those belong to the MLBB app.
+# Public port -> app on localhost. Basic-auth wall stands unless the
+# owner armed the flip (VT_FLIP=1 in the app .env), in which case the
+# app's own account system is the only gate.
 :${PUBLIC_PORT} {
-	basic_auth {
-		$AUTH_USER $AUTH_HASH
-	}
+$AUTH_BLOCK
 	reverse_proxy 127.0.0.1:${INTERNAL_PORT}
 	encode gzip
 }
@@ -389,11 +402,9 @@ if [ -n "$TLS_NAME" ]; then
   cat >> /etc/caddy/translator.caddy <<EOF
 
 # HTTPS site — Caddy provisions a Let's Encrypt certificate automatically.
-# A secure context is what makes the PWA fully installable. Same auth + app.
+# A secure context is what makes the PWA fully installable. Same gate + app.
 ${TLS_NAME} {
-	basic_auth {
-		$AUTH_USER $AUTH_HASH
-	}
+$AUTH_BLOCK
 	reverse_proxy 127.0.0.1:${INTERNAL_PORT}
 	encode gzip
 }
@@ -417,7 +428,11 @@ if ! systemctl is-active --quiet caddy; then
     sleep 2
   fi
 fi
-echo "Caddy serving :${PUBLIC_PORT} -> 127.0.0.1:${INTERNAL_PORT} (basic auth on)."
+if [ "$FLIP" -eq 1 ]; then
+  echo "Caddy serving :${PUBLIC_PORT} -> 127.0.0.1:${INTERNAL_PORT} (WALL DOWN — accounts enforced)."
+else
+  echo "Caddy serving :${PUBLIC_PORT} -> 127.0.0.1:${INTERNAL_PORT} (basic auth on)."
+fi
 
 # --- 13. firewall: only the Caddy port is public for this app ------------------------------
 ufw allow 22/tcp
@@ -497,16 +512,24 @@ fi
 echo "App OK on 127.0.0.1:${INTERNAL_PORT}."
 
 code_noauth="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PUBLIC_PORT}/")"
-if [ "$code_noauth" != "401" ]; then
-  echo "ERROR: Caddy without auth returned HTTP $code_noauth (expected 401)."
-  exit 1
+if [ "$FLIP" -eq 1 ]; then
+  if [ "$code_noauth" != "200" ]; then
+    echo "ERROR: flipped site without auth returned HTTP $code_noauth (expected 200)."
+    exit 1
+  fi
+  echo "Caddy OK: wall down, site public on :${PUBLIC_PORT} (accounts enforced)."
+else
+  if [ "$code_noauth" != "401" ]; then
+    echo "ERROR: Caddy without auth returned HTTP $code_noauth (expected 401)."
+    exit 1
+  fi
+  code_auth="$(curl -s -o /dev/null -w '%{http_code}' -u "${AUTH_USER}:${AUTH_PW}" "http://127.0.0.1:${PUBLIC_PORT}/")"
+  if [ "$code_auth" != "200" ]; then
+    echo "ERROR: Caddy with auth returned HTTP $code_auth (expected 200)."
+    exit 1
+  fi
+  echo "Caddy OK: no-auth -> 401, with-auth -> 200 on :${PUBLIC_PORT}."
 fi
-code_auth="$(curl -s -o /dev/null -w '%{http_code}' -u "${AUTH_USER}:${AUTH_PW}" "http://127.0.0.1:${PUBLIC_PORT}/")"
-if [ "$code_auth" != "200" ]; then
-  echo "ERROR: Caddy with auth returned HTTP $code_auth (expected 200)."
-  exit 1
-fi
-echo "Caddy OK: no-auth -> 401, with-auth -> 200 on :${PUBLIC_PORT}."
 
 trap - ERR
 echo "TRANSLATOR_DEPLOY_DONE"

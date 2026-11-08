@@ -1074,7 +1074,7 @@ def telegram_status():
     info = {"configured": bool(tg.token()), "bot": None,
             "recipients": len(tg.recipients()),
             "poller": tg.poller_status(), "payinfo": _pay_info(),
-            "bot_open": _bot_open()}
+            "bot_open": _bot_open(), "wall_flip": _wall_flip()}
     if info["configured"]:
         try:
             info["bot"] = (tg.get_me() or {}).get("username")
@@ -1177,11 +1177,6 @@ def _reg_throttled(ip):
 
 @app.post("/api/auth/register")
 def auth_register():
-    ip = (request.headers.get("X-Forwarded-For") or
-          request.remote_addr or "")
-    if _reg_throttled(ip):
-        return jsonify({"error": "ခဏ ခဏ ဖွင့်နေတယ် — နာရီ အနည်းငယ် "
-                                 "စောင့်ပြီး ပြန် ကြိုးစားပါ"}), 429
     data = request.get_json(force=True, silent=True) or {}
     user, err = accounts.create_user(data.get("username"),
                                      data.get("password"))
@@ -1314,6 +1309,27 @@ def payinfo_save():
     data = request.get_json(force=True, silent=True) or {}
     _env_write("PAY_INFO", (data.get("text") or "").strip()[:300])
     return jsonify({"ok": True})
+
+
+def _wall_flip():
+    p = ROOT / ".env"
+    if p.exists():
+        for ln in p.read_text(encoding="utf-8").splitlines():
+            if ln.startswith("VT_FLIP="):
+                return ln.split("=", 1)[1].strip() == "1"
+    return False
+
+
+@app.post("/api/settings/wallflip")
+def wallflip_save():
+    """Arm/disarm the wall flip. The flag is read by the deploy
+    bootstrap: on the next deploy run the Caddy basic-auth wall
+    comes down (and accounts enforcement switches on), or the wall
+    is restored. Nothing changes until that run — by design, so the
+    operator chooses the moment."""
+    data = request.get_json(force=True, silent=True) or {}
+    _env_write("VT_FLIP", "1" if data.get("flip") else "0")
+    return jsonify({"ok": True, "wall_flip": _wall_flip()})
 
 
 @app.post("/api/settings/botopen")

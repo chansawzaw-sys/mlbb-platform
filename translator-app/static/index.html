@@ -152,6 +152,11 @@
     <div class="row">
       <button class="ghost" id="qrDel" style="display:none">QR ဖျက်မယ်</button>
     </div>
+    <h4>🧱 Password တံတိုင်း (Wall)</h4>
+    <p class="hint">တံတိုင်း ဖြုတ်ရင် လူတိုင်း app ကို ဖွင့်လို့ရပြီး ကိုယ့် account နဲ့ ကိုယ် ဝင်ရမယ် (user အချင်းချင်း မမြင်ရတဲ့ စနစ် အပြည့် အသက်ဝင်မယ်)။ ခလုတ် နှိပ်ရုံနဲ့ တန်း မပြောင်းဘူး — နောက် deploy run (console: bash apply-update.sh) မှာ ပြောင်းမယ်။ ပြန် တင်ချင်လည်း ဒီကပဲ ပြန် နှိပ်ပြီး deploy run ရုံပဲ။</p>
+    <div class="row">
+      <button class="ghost" id="wallBtn">…</button>
+    </div>
     <h4>🤖 Bot ဆိုင် အဖွင့်/အပိတ်</h4>
     <p class="hint">ဖွင့်ရင် account ချိတ်ထားတဲ့ customer တွေ bot မှာ job ထုတ်လို့ရမယ် (credit မလောက်ရင် မရ, တစ်ရက် အများဆုံး ၃၀ ခု)</p>
     <div class="row">
@@ -891,7 +896,14 @@ async function loadMe() {
     $("authOut").style.display = ME ? "none" : "";
     $("authIn").style.display = ME ? "" : "none";
     $("adminCard").classList.toggle("show", !!(ME && ME.role === "admin"));
-    if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); }
+    if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); loadWall(); }
+    if (ME && ME.role !== "admin") {
+      // Customers never see the owner's key / bot settings cards.
+      $("keyCard").classList.remove("show");
+      $("tgCard").classList.remove("show");
+      $("keyToggle").style.display = "none";
+      $("tgToggle").style.display = "none";
+    }
     if (ME) loadPayQr();
     if (ME) {
       $("authInfo").textContent = "👤 " + ME.username +
@@ -1000,6 +1012,21 @@ async function topupDecide(tid, decision) {
     body: JSON.stringify({decision})});
   loadTopups();
 }
+async function loadWall() {
+  const r = await (await fetch("/api/settings/telegram")).json();
+  $("wallBtn").textContent = r.wall_flip
+    ? "🧱 တံတိုင်း ဖြုတ်ရန် အဆင်သင့် (deploy run ရင် ပြောင်းမယ်) — ပြန် တင်ရန် နှိပ်"
+    : "🧱 တံတိုင်း ရှိနေတယ် — ဖြုတ်ရန် နှိပ်";
+  $("wallBtn").dataset.flip = r.wall_flip ? "1" : "";
+}
+$("wallBtn").addEventListener("click", async () => {
+  const flip = !$("wallBtn").dataset.flip;
+  if (flip && !confirm("တံတိုင်း ဖြုတ်ဖို့ အဆင်သင့် လုပ်မှာလား? နောက် deploy run မှာ password မမေးတော့ဘဲ account login ပဲ ဖြစ်သွားမယ်")) return;
+  await fetch("/api/settings/wallflip", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({flip})});
+  loadWall();
+});
 async function loadBotOpen() {
   const r = await (await fetch("/api/settings/telegram")).json();
   $("botOpenBtn").textContent = r.bot_open
@@ -1080,6 +1107,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 96</p>
+<p class="hint" id="buildTag" style="text-align:center">build 97</p>
 </body>
 </html>
