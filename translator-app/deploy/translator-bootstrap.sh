@@ -106,7 +106,7 @@ if ! command -v caddy >/dev/null 2>&1; then
   apt-get install -y caddy
 fi
 caddy version
-ffmpeg -version | head -1
+ffmpeg -version | head -1 || true
 python3 --version
 
 # --- 3. dedicated user ----------------------------------------------------------
@@ -329,10 +329,10 @@ echo "systemd unit ${SERVICE_NAME}.service installed."
 
 # --- 11. basic-auth password (generated once, then reused) --------------------------------
 if [ -f "$AUTH_FILE" ] && grep -q '^password:' "$AUTH_FILE"; then
-  AUTH_PW="$(sed -n 's/^password:[[:space:]]*//p' "$AUTH_FILE" | head -1)"
+  AUTH_PW="$(sed -n 's/^password:[[:space:]]*//p' "$AUTH_FILE" | head -1 || true)"
   echo "Reusing the existing basic-auth password from $AUTH_FILE."
 else
-  AUTH_PW="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)"
+  AUTH_PW="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16 || true)"
   {
     echo "# Video Translator basic auth — keep private (root only)."
     echo "username: $AUTH_USER"
