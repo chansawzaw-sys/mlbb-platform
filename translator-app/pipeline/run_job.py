@@ -43,7 +43,10 @@ def run_phase1(workdir, url, source_path=None, progress=None):
     mark("download", "done")
 
     mark("transcribe", "running")
-    transcribe.transcribe(src, workdir)
+    # Captions first when download.py fetched them (YouTube): parsing a
+    # .vtt takes a second, whisper on this CPU takes minutes. Falls back
+    # to whisper automatically when no usable captions exist.
+    transcribe.transcribe(src, workdir, use_captions=True)
     mark("transcribe", "done")
 
     mark("translate", "running")

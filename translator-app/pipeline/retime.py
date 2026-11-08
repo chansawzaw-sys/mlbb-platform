@@ -83,7 +83,7 @@ def retime(workdir):
             vf += f",tpad=stop_mode=clone:stop_duration={c['excess']:.3f}"
         run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['start']:.3f}", "-i", str(src),
              "-vf", vf, "-an",
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", str(vout)])
+             "-c:v", "libx264", "-preset", "superfast", "-crf", "20", str(vout)])
         vlist.append(vout)
 
         aout = cdir / f"a{n:03d}.wav"

@@ -180,7 +180,7 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None):
     fontsdir = str(FONTS_DIR).replace("\\", "/").replace(":", "\\:")
     vf = f"ass='{ass}':fontsdir='{fontsdir}'"
     run(["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4), "-vf", vf,
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+         "-c:v", "libx264", "-preset", "superfast", "-crf", "20",
          "-c:a", "copy", str(output_mp4)])
     return output_mp4
 

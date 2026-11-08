@@ -117,6 +117,28 @@ def _gtts_synth(text, out_path):
     raise RuntimeError(f"gTTS failed after retries: {last_err}")
 
 
+async def _edge_all(jobs, voice, rate, pitch):
+    """Synthesize all segments with edge-tts, up to 4 at a time.
+
+    The old loop ran one websocket session per segment back-to-back —
+    with 20-30 segments that alone took a minute or more. Returns the
+    set of segment indices that produced a non-empty file."""
+    sem = asyncio.Semaphore(4)
+    ok = set()
+
+    async def one(idx, text, out):
+        async with sem:
+            try:
+                await _edge_synth(text, voice, out, rate, pitch)
+                if out.exists() and out.stat().st_size > 0:
+                    ok.add(idx)
+            except Exception:
+                pass
+
+    await asyncio.gather(*(one(i, t, o) for i, t, o in jobs))
+    return ok
+
+
 def synthesize(workdir, voice=DEFAULT_VOICE, rate=0, pitch=0):
     """rate: speech-speed adjustment in percent (-50..+100, 0 = default).
     pitch: pitch adjustment in Hz (-50..+50, 0 = default). Both reach
@@ -128,20 +150,20 @@ def synthesize(workdir, voice=DEFAULT_VOICE, rate=0, pitch=0):
     segs = load_segments(workdir / "segments_my.json")
     tts_dir = workdir / "tts"
     tts_dir.mkdir(exist_ok=True)
-    edge_down = False
-    for i, seg in enumerate(segs):
-        out = tts_dir / f"seg_{i:03d}.mp3"
-        text = (seg.get("text_my") or "").strip()
-        if not text:
-            continue
+    jobs = [(i, (seg.get("text_my") or "").strip(), tts_dir / f"seg_{i:03d}.mp3")
+            for i, seg in enumerate(segs)]
+    jobs = [(i, t, o) for i, t, o in jobs if t]
+    edge_ok = set()
+    if jobs:
+        try:
+            edge_ok = asyncio.run(_edge_all(jobs, voice, rate, pitch))
+        except Exception:
+            edge_ok = set()
+    for i, text, out in jobs:
+        seg = segs[i]
         provider = None
-        if not edge_down:
-            try:
-                asyncio.run(_edge_synth(text, voice, out, rate, pitch))
-                if out.exists() and out.stat().st_size > 0:
-                    provider = f"edge-tts:{voice}"
-            except Exception:
-                edge_down = True  # don't pay the failure cost per segment
+        if i in edge_ok:
+            provider = f"edge-tts:{voice}"
         if provider is None:
             try:
                 _classic_synth(text, out)
