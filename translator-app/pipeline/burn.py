@@ -96,33 +96,67 @@ _FIT_MAX_LINES = 2
 _FIT_MIN_FRAC = 0.5
 
 
-def _fit_font_size(text, family, base_fs, avail_w):
-    """Largest size <= base_fs whose text fits _FIT_MAX_LINES lines of
-    avail_w px; base_fs when it already fits or measuring is impossible."""
+def _est_lines(text, family, fs, avail_w):
+    """Estimated wrapped line count of text at font size fs within
+    avail_w px, measured with the real font (PIL); None if unmeasurable."""
     try:
         from PIL import ImageFont
         fname = _FONT_FILES.get(family)
         if not fname or avail_w <= 0:
-            return base_fs
+            return None
         path = FONTS_DIR / fname
         plain = text.replace("\\N", " ").strip()
         if not path.exists() or not plain:
+            return None
+        font = ImageFont.truetype(str(path), max(8, int(round(fs))))
+        w = font.getlength(plain)
+        return int(w // max(1.0, avail_w * 0.94)) + 1
+    except Exception:
+        return None
+
+
+def _fit_font_size(text, family, base_fs, avail_w):
+    """Largest size <= base_fs whose text fits _FIT_MAX_LINES lines of
+    avail_w px; base_fs when it already fits or measuring is impossible."""
+    if _est_lines(text, family, base_fs, avail_w) is None:
+        return base_fs
+    fs = float(base_fs)
+    floor = base_fs * _FIT_MIN_FRAC
+    while fs > floor:
+        lines = _est_lines(text, family, fs, avail_w)
+        if lines is not None and lines <= _FIT_MAX_LINES:
+            return fs
+        fs *= 0.9
+    return floor
+
+
+def _fit_box(text, family, base_fs, rect_w, rect_h):
+    """Font size that fits text INSIDE a rect (the user's blur box).
+
+    Hard rule: the block's HEIGHT must fit rect_h (it is centered in
+    the box, so overflow would spill both ways). Preferred: also at
+    most _FIT_MAX_LINES lines. Returns the largest size satisfying
+    both when one exists, else the largest height-fitting size (a
+    3-line small text inside the box beats a 2-line text spilling
+    out of it). base_fs if unmeasurable."""
+    if _est_lines(text, family, base_fs, rect_w) is None:
+        return base_fs
+    fs = float(base_fs)
+    best = None  # largest fs whose height fits (any line count)
+    while fs >= 10:
+        lines = _est_lines(text, family, fs, rect_w)
+        if lines is None:
             return base_fs
-        fs = float(base_fs)
-        floor = base_fs * _FIT_MIN_FRAC
-        while fs > floor:
-            font = ImageFont.truetype(str(path), max(8, int(round(fs))))
-            w = font.getlength(plain)
-            lines = int(w // max(1.0, avail_w * 0.94)) + 1
+        if lines * fs * 1.35 <= rect_h * 0.96:
+            if best is None:
+                best = fs
             if lines <= _FIT_MAX_LINES:
                 return fs
-            fs *= 0.9
-        return floor
-    except Exception:
-        return base_fs
+        fs *= 0.9
+    return best if best is not None else 10.0
 
 
-def srt_to_ass(srt_path, ass_path, width, height, family, subs):
+def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None):
     """Write an ASS script with PlayRes = the real video resolution."""
     cfg = normalize_subs(subs)
     font_size = _BASE_FS_FRAC * height * cfg["size_pct"] / 100.0
@@ -154,12 +188,37 @@ def srt_to_ass(srt_path, ass_path, width, height, family, subs):
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
+    # Blur-box placement: when the user drew a blur rect (fractions of
+    # the frame) to hide the original subtitles, the Myanmar text goes
+    # INSIDE that box — centered, with its size fitted to the box.
+    box = None
+    if blur_box:
+        try:
+            bx = min(max(float(blur_box["x"]), 0.0), 0.99)
+            by = min(max(float(blur_box["y"]), 0.0), 0.99)
+            bw = min(max(float(blur_box["w"]), 0.0), 1.0 - bx)
+            bh = min(max(float(blur_box["h"]), 0.0), 1.0 - by)
+            if bw >= 0.05 and bh >= 0.03:
+                box = (bx * width, by * height, bw * width, bh * height)
+        except Exception:
+            box = None
     avail_w = width - 2 * margin_lr
     for start, end, body in _parse_srt(srt_path):
-        fs = _fit_font_size(body, family, font_size, avail_w)
-        if fs < font_size - 0.6:
-            body = f"{{\\fs{fs:.0f}}}" + body
-        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{body}")
+        ev_ml, ev_mr = 0, 0
+        if box:
+            rx, ry, rw, rh = box
+            cand = min(font_size, rh * 0.55)
+            fs = _fit_box(body, family, cand, rw, rh)
+            body = (f"{{\\an5\\pos({rx + rw / 2:.0f},{ry + rh / 2:.0f})"
+                    f"\\fs{fs:.0f}}}") + body
+            # Per-event margins make libass wrap INSIDE the box width
+            # (a \pos event otherwise wraps at the full-frame margins).
+            ev_ml, ev_mr = int(rx), int(width - (rx + rw))
+        else:
+            fs = _fit_font_size(body, family, font_size, avail_w)
+            if fs < font_size - 0.6:
+                body = f"{{\\fs{fs:.0f}}}" + body
+        lines.append(f"Dialogue: 0,{start},{end},Default,,{ev_ml},{ev_mr},0,,{body}")
     Path(ass_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return ass_path
 
@@ -171,11 +230,13 @@ def video_size(input_mp4):
     raise RuntimeError(f"no video stream in {input_mp4}")
 
 
-def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None):
+def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
+         blur_box=None):
     family = FONT_CHOICES.get(font, FONT_CHOICES[DEFAULT_FONT])
     width, height = video_size(input_mp4)
     ass_path = Path(srt_path).with_name(Path(srt_path).stem + ".layout.ass")
-    srt_to_ass(srt_path, ass_path, width, height, family, subs)
+    srt_to_ass(srt_path, ass_path, width, height, family, subs,
+               blur_box=blur_box)
     ass = str(ass_path.resolve()).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
     fontsdir = str(FONTS_DIR).replace("\\", "/").replace(":", "\\:")
     vf = f"ass='{ass}':fontsdir='{fontsdir}'"
@@ -187,5 +248,7 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None):
 
 if __name__ == "__main__":
     _subs = json.loads(sys.argv[5]) if len(sys.argv) > 5 else None
+    _box = json.loads(sys.argv[6]) if len(sys.argv) > 6 else None
     print(burn(sys.argv[1], sys.argv[2], sys.argv[3],
-               sys.argv[4] if len(sys.argv) > 4 else DEFAULT_FONT, _subs))
+               sys.argv[4] if len(sys.argv) > 4 else DEFAULT_FONT, _subs,
+               blur_box=_box))

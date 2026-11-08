@@ -299,6 +299,49 @@ def fonts():
                     for k in burn_mod.FONT_CHOICES])
 
 
+# ---------- Gemini key (server-side only) ----------
+# The user pastes the key into THIS page (behind the app's login) — it
+# must never travel through chat. It is stored in the project .env
+# (chmod 600, survives app updates, never in git) and no endpoint ever
+# returns the value, only whether one is configured.
+
+@app.get("/api/settings/gemini-key")
+def gemini_key_status():
+    from pipeline import gemini_translate
+    return jsonify({"configured": gemini_translate.key_configured()})
+
+
+@app.post("/api/settings/gemini-key")
+def gemini_key_save():
+    data = request.get_json(force=True) or {}
+    key = (data.get("key") or "").strip()
+    if not (key.startswith("AIza") and 20 <= len(key) <= 80):
+        return jsonify({"error": "key မမှန်ပါ — AIza နဲ့ စတဲ့ Gemini key ဖြစ်ရပါမယ်"}), 400
+    env_path = ROOT / ".env"
+    lines = []
+    if env_path.exists():
+        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
+                 if not ln.startswith("GEMINI_API_KEY=")]
+    lines.append(f"GEMINI_API_KEY={key}")
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        os.chmod(env_path, 0o600)
+    except Exception:
+        pass
+    return jsonify({"ok": True, "configured": True})
+
+
+@app.delete("/api/settings/gemini-key")
+def gemini_key_delete():
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
+                 if not ln.startswith("GEMINI_API_KEY=")]
+        env_path.write_text("\n".join(lines) + ("\n" if lines else ""),
+                            encoding="utf-8")
+    return jsonify({"ok": True, "configured": False})
+
+
 def _clamp_num(v, lo, hi, default):
     try:
         v = float(v)

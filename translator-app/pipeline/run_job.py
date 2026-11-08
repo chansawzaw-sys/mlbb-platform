@@ -72,7 +72,8 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
         if fx_mod.has_fx(fx):
             base = workdir / "fx.mp4"
             fx_mod.apply_effects(src, base, fx)
-        burn.burn(base, workdir / "subs_my.srt", final, font=font, subs=subs)
+        burn.burn(base, workdir / "subs_my.srt", final, font=font, subs=subs,
+                  blur_box=(fx or {}).get("blur"))
         mark("finalize", "done")
         return final
 
@@ -91,7 +92,8 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
         fx_mod.apply_effects(base, fxed, fx)
         base = fxed
     if mode == "both":
-        burn.burn(base, workdir / "subs_retimed.srt", final, font=font, subs=subs)
+        burn.burn(base, workdir / "subs_retimed.srt", final, font=font,
+                  subs=subs, blur_box=(fx or {}).get("blur"))
     else:  # dub only
         shutil.copyfile(base, final)
     mark("finalize", "done")

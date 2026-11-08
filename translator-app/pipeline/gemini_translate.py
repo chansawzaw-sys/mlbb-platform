@@ -2,8 +2,9 @@
 
 Key handling (security): the key is read ONLY from the server-side env var
 GEMINI_API_KEY or from the git-ignored `.env` file in the project root.
-It is never accepted from the client, never returned in any API payload,
-and never written to logs or segment files.
+The user saves it via the app's own settings endpoint (behind the app
+login; see app.py) — it never travels through chat, is never returned in
+any API payload, and is never written to logs or segment files.
 
 One request translates ALL segments (JSON in/out, ids preserved) with a
 prompt that asks for natural spoken Burmese (ပြောစကား), keeping names and

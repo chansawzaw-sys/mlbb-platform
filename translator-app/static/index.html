@@ -123,6 +123,7 @@
     <div class="row">
       <button class="ghost" id="blurClear">အကွက် ဖျက်မယ်</button>
     </div>
+    <p class="hint">💡 ဝါး အကွက် ဆွဲထားရင် မြန်မာ စာတန်းကို အဲဒီ အကွက် <b>အတွင်းမှာပဲ</b> စာလုံး အရွယ်ပါ ချိန်ပြီး ထိုးပေးမယ် (အကွက် မရှိရင် ပုံမှန် နေရာ)။</p>
 
     <h3>🔤 စာတန်း ပုံစံ</h3>
     <label>စာအရွယ်အစား <span class="val" id="subSizeVal"></span></label>
@@ -193,6 +194,16 @@
     <p class="hint">⬆️ စာသားပဲ သီးသန့် လိုချင်ရင် ဗီဒီယို ဆက်မလုပ်ဘဲ ဒီကပဲ ဒေါင်းနိုင်တယ်။</p>
     <button id="revGo">✏️ ပြင်ပြီး ပြန်လုပ်မယ်</button>
     <button class="ghost" id="revSkip">ပိတ်မယ်</button>
+  </div>
+
+  <div class="card" id="keyCard">
+    <h3 style="margin-top:0">🔑 Gemini key (ဘာသာပြန် အတွက်)</h3>
+    <p class="hint">Key ရှိရင် ဘာသာပြန် <b>မြန်ပြီး အရည်အသွေး ကောင်း</b>တယ်။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="keyState">…</span></p>
+    <input type="password" id="keyInput" placeholder="AIza… နဲ့ စတဲ့ key ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+    <div class="row">
+      <button class="ghost" id="keySave">သိမ်းမယ်</button>
+      <button class="ghost" id="keyDel">ဖျက်မယ်</button>
+    </div>
   </div>
 </div>
 <script>
@@ -498,6 +509,29 @@ async function poll(id) {
     $("cleanupNote").style.display = "none"; $("doneBtns").style.display = "none";
   }
 }
+/* ---------------- Gemini key settings ---------------- */
+async function loadKeyState() {
+  try {
+    const d = await (await fetch("/api/settings/gemini-key")).json();
+    $("keyState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
+  } catch (e) { $("keyState").textContent = "?"; }
+}
+$("keySave").onclick = async () => {
+  const key = $("keyInput").value.trim();
+  if (!key) { alert("key အရင် ထည့်ပါ"); return; }
+  const res = await fetch("/api/settings/gemini-key", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({key})});
+  const d = await res.json();
+  if (!res.ok) { alert(d.error || "သိမ်းလို့ မရပါ"); return; }
+  $("keyInput").value = "";
+  loadKeyState();
+  alert("သိမ်းပြီးပြီ — နောက် job တွေမှာ Gemini နဲ့ ပြန်ပေးမယ်");
+};
+$("keyDel").onclick = async () => {
+  await fetch("/api/settings/gemini-key", {method: "DELETE"});
+  loadKeyState();
+};
+loadKeyState();
 </script>
 <script>
 if ("serviceWorker" in navigator) {
