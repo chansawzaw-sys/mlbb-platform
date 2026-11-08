@@ -118,6 +118,12 @@ def index():
     return send_from_directory(ROOT / "static", "index.html")
 
 
+@app.get("/static/<path:filename>")
+def static_files(filename):
+    # static_folder is disabled above; serve the PWA manifest/icons explicitly.
+    return send_from_directory(ROOT / "static", filename)
+
+
 @app.get("/api/voices")
 def voices():
     try:
