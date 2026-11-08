@@ -51,7 +51,66 @@ def _bing(text):
                              from_language="en", to_language="my")
 
 
-_PROVIDERS = [("google", _google), ("bing", _bing)]
+def _google_gtx(text):
+    """Raw translate_a/single (client=gtx) call — a different request
+    shape, and in practice a different rate-limit bucket, than
+    deep-translator's path (the same reason the tw-ob TTS endpoint
+    answered while the batchexecute endpoint was 429ing)."""
+    import requests
+    params = {"client": "gtx", "sl": "auto", "tl": "my", "dt": "t",
+              "q": text}
+    url = "https://translate.googleapis.com/translate_a/single"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if len(text) < 1500:
+        r = requests.get(url, params=params, headers=headers, timeout=30)
+    else:
+        r = requests.post(url, data=params, headers=headers, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    out = "".join(part[0] for part in (data[0] or []) if part and part[0])
+    if not out.strip():
+        raise RuntimeError("gtx returned empty")
+    return out
+
+
+def _mymemory(text):
+    """MyMemory free tier — a small per-IP daily quota, so it sits late
+    in the chain as a rescue for individual segments, never batches."""
+    import requests
+    r = requests.get("https://api.mymemory.translated.net/get",
+                     params={"q": text, "langpair": "en|my"},
+                     headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    out = ((data.get("responseData") or {}).get("translatedText") or "").strip()
+    if not out or "YOU USED ALL AVAILABLE" in out.upper() \
+            or str(data.get("responseStatus")) not in ("200", "None"):
+        raise RuntimeError(f"mymemory: {data.get('responseStatus')}")
+    return out
+
+
+_PROVIDERS = [("google", _google), ("gtx", _google_gtx),
+              ("bing", _bing), ("mymemory", _mymemory)]
+
+# The provider that worked is remembered ACROSS jobs (a tiny file in
+# the app dir), so every new job starts with the known-good one first
+# instead of re-discovering the failures each time.
+_GOOD_FILE = Path(__file__).resolve().parent.parent / ".translate_good"
+
+
+def _load_good():
+    try:
+        name = _GOOD_FILE.read_text(encoding="utf-8").strip()
+        return name if any(name == n for n, _ in _PROVIDERS) else None
+    except Exception:
+        return None
+
+
+def _save_good(name):
+    try:
+        _GOOD_FILE.write_text(name, encoding="utf-8")
+    except Exception:
+        pass
 
 # --- Why this step used to crawl -------------------------------------------
 # The old loop called translate_one() per segment, and translate_one
@@ -73,19 +132,30 @@ def _batch_google(texts):
     so a mangled reply can never misalign translations."""
     joined = "\n".join(f"[[{i}]] {t}" for i, t in enumerate(texts))
     out = _with_timeout(_google, joined, timeout=60) or ""
+    return _split_marked(out, len(texts))
+
+
+def _split_marked(out, count):
     parts = {}
     cur = None
-    for line in out.splitlines():
+    for line in (out or "").splitlines():
         m = re.match(r"\[\[\s*(\d+)\s*\]\]\s*(.*)", line)
         if m:
             cur = int(m.group(1))
             parts[cur] = m.group(2)
         elif cur is not None and line.strip():
             parts[cur] = (parts[cur] + " " + line.strip()).strip()
-    if len(parts) != len(texts) or any(not parts.get(i, "").strip()
-                                       for i in range(len(texts))):
+    if len(parts) != count or any(not parts.get(i, "").strip()
+                                  for i in range(count)):
         raise RuntimeError("batch reply misaligned")
-    return [parts[i].strip() for i in range(len(texts))]
+    return [parts[i].strip() for i in range(count)]
+
+
+def _batch_gtx(texts):
+    """The batch trick through the gtx endpoint (see _google_gtx)."""
+    joined = "\n".join(f"[[{i}]] {t}" for i, t in enumerate(texts))
+    out = _with_timeout(_google_gtx, joined, timeout=60) or ""
+    return _split_marked(out, len(texts))
 
 
 def _chunks(texts, limit=4000):
@@ -110,7 +180,7 @@ class _Chain:
     the job; once a good provider is known there are no retry sleeps."""
 
     def __init__(self):
-        self.good = None
+        self.good = _load_good()
         self.fails = {}
 
     def one(self, text):
@@ -125,6 +195,7 @@ class _Chain:
                     out = (_with_timeout(fn, text) or "").strip()
                     if out:
                         self.good = name
+                        _save_good(name)
                         return out, name
                 except Exception as e:
                     last_err = e
@@ -158,18 +229,24 @@ def translate_segments(workdir):
             pass  # any Gemini failure -> free chain below, as designed
     texts = [(seg.get("text") or "").strip() for seg in segs]
     results = [None] * len(segs)
-    # 1. Batched Google — one request per chunk.
+    # 1. Batched free endpoints — one request per chunk, Google first,
+    # then the gtx endpoint (a different bucket) for whatever is left.
     for group in _chunks(texts):
         if all(not texts[i] for i in group):
             for i in group:
                 results[i] = ("", "empty")
             continue
+        got, prov = None, None
         try:
-            got = _batch_google([texts[i] for i in group])
-            for i, t in zip(group, got):
-                results[i] = (t, "google-batch")
+            got, prov = _batch_google([texts[i] for i in group]), "google-batch"
         except Exception:
-            pass  # the chain below handles this chunk segment by segment
+            try:
+                got, prov = _batch_gtx([texts[i] for i in group]), "gtx-batch"
+            except Exception:
+                got = None  # the chain below handles it segment by segment
+        if got:
+            for i, t in zip(group, got):
+                results[i] = (t, prov)
     # 2. Per-segment chain (with memory) for whatever is left.
     chain = _Chain()
     for i, seg in enumerate(segs):
