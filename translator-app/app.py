@@ -25,6 +25,7 @@ from pipeline.common import ensure_system_ca
 
 ensure_system_ca()
 
+from pipeline import accounts
 from pipeline import download as dl_mod
 from pipeline import fx as fx_mod
 from pipeline import run_job, tts
@@ -114,6 +115,57 @@ def _schedule_cleanup(job):
 
 _TG_PENDING = []  # job ids created from Telegram, waiting for a free slot
 _TG_FLOW = {}     # chat_id -> bot choice flow state (blur spot, mode)
+_TG_DAILY_CAP = int(os.environ.get("VT_TG_DAILY_CAP", "30"))
+_TG_DAILY_FILE = ROOT / ".tg_daily.json"
+
+
+def _tg_daily_count(chat_id, add=False):
+    """Per-chat bot jobs per day (protects the shared quotas)."""
+    today = time.strftime("%Y-%m-%d")
+    try:
+        store = json.loads(_TG_DAILY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        store = {}
+    entry = store.get(str(chat_id)) or [today, 0]
+    if entry[0] != today:
+        entry = [today, 0]
+    if add:
+        entry[1] += 1
+        store[str(chat_id)] = entry
+        try:
+            _TG_DAILY_FILE.write_text(json.dumps(store),
+                                       encoding="utf-8")
+        except Exception:
+            pass
+    return entry[1]
+
+
+def _backup_loop():
+    """Daily snapshot of the money/identity data (users.db, keys,
+    recipients) — 14 days kept, private perms. Same-host protection
+    against corruption; off-host copies come with the launch setup."""
+    time.sleep(90)
+    names = ["users.db", ".env", ".tg_recipients.json",
+             ".translate_good", ".tg_daily.json"]
+    while True:
+        try:
+            dest = ROOT / "backups" / time.strftime("%Y-%m-%d")
+            dest.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(ROOT / "backups", 0o700)
+            except Exception:
+                pass
+            for n in names:
+                src = ROOT / n
+                if src.exists():
+                    shutil.copy2(src, dest / n)
+            days = sorted(p.name for p in (ROOT / "backups").iterdir()
+                          if p.is_dir())
+            for old in days[:-14]:
+                shutil.rmtree(ROOT / "backups" / old, ignore_errors=True)
+        except Exception:
+            pass
+        time.sleep(24 * 3600)
 
 
 def _any_active_worker():
@@ -297,6 +349,12 @@ def _on_tg_callback(cq):
         mode = data[2:]
         if mode not in ("both", "subs", "dub"):
             return
+        if (not tg.is_admin(chat_id)
+                and _tg_daily_count(chat_id) >= _TG_DAILY_CAP):
+            _TG_FLOW.pop(chat_id, None)
+            tg.send_message(chat_id, "🚫 ဒီနေ့ အတွက် job ကန့်သတ် ပြည့်ပြီ "
+                                     "— မနက်ဖြန် ပြန်လာပါ")
+            return
         _TG_FLOW.pop(chat_id, None)
         job, err = _new_job({"url": flow["url"], "mode": mode})
         if err:
@@ -309,6 +367,7 @@ def _on_tg_callback(cq):
         job["tg_from"] = flow.get("from")
         JOBS[job["id"]] = job
         _save(job)
+        _tg_daily_count(chat_id, add=True)
         _TG_PENDING.append(job["id"])
         if _any_active_worker() or len(_TG_PENDING) > 1:
             tg.send_message(chat_id,
@@ -708,6 +767,174 @@ def telegram_recipients():
     return jsonify({"recipients": tg.recipients()})
 
 
+# ------------------------------------------------------------------
+# Web accounts (commercial stage). SHADOW MODE by default: accounts
+# can be created and used, but nothing is gated on them yet — the
+# login wall still guards the site while the owner registers and
+# claims the admin account. Setting VT_ACCOUNTS=1 (at the wall-flip
+# deploy) turns enforcement on: /api then needs a session, users see
+# only their own jobs, settings need the admin role. Loopback calls
+# without a forwarded-for header (the serve.py job gate) stay exempt.
+ACCOUNTS_ENFORCED = os.environ.get("VT_ACCOUNTS") == "1"
+_SESSION_COOKIE = "vt_session"
+
+
+def _current_user():
+    return accounts.user_for_token(request.cookies.get(_SESSION_COOKIE))
+
+
+def _is_loopback_internal():
+    return (request.remote_addr in ("127.0.0.1", "::1")
+            and not request.headers.get("X-Forwarded-For"))
+
+
+@app.before_request
+def _accounts_guard():
+    if not ACCOUNTS_ENFORCED or _is_loopback_internal():
+        return None
+    path = request.path
+    if not path.startswith("/api/") or path.startswith("/api/auth/"):
+        return None
+    user = _current_user()
+    if path.startswith("/api/settings/") or path.startswith("/api/admin/"):
+        if not user or user["role"] != "admin":
+            return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+        return None
+    if user is None:
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    return None
+
+
+def _owns(user, job):
+    if not ACCOUNTS_ENFORCED or user is None:
+        return True
+    return user["role"] == "admin" or job.get("user_id") == user["id"]
+
+
+def _set_session(resp, token):
+    resp.set_cookie(_SESSION_COOKIE, token, max_age=30 * 86400,
+                    httponly=True, samesite="Lax",
+                    secure=request.is_secure)
+    return resp
+
+
+@app.post("/api/auth/register")
+def auth_register():
+    data = request.get_json(force=True, silent=True) or {}
+    user, err = accounts.create_user(data.get("username"),
+                                     data.get("password"))
+    if err:
+        return jsonify({"error": err}), 400
+    return _set_session(jsonify({"user": user}),
+                        accounts.new_session(user["id"]))
+
+
+@app.post("/api/auth/login")
+def auth_login():
+    data = request.get_json(force=True, silent=True) or {}
+    ip = (request.headers.get("X-Forwarded-For") or
+          request.remote_addr or "")
+    user, err = accounts.authenticate(data.get("username"),
+                                      data.get("password"), ip)
+    if err:
+        return jsonify({"error": err}), 401
+    return _set_session(jsonify({"user": user}),
+                        accounts.new_session(user["id"]))
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    accounts.revoke(request.cookies.get(_SESSION_COOKIE))
+    resp = jsonify({"ok": True})
+    resp.delete_cookie(_SESSION_COOKIE)
+    return resp
+
+
+@app.get("/api/auth/me")
+def auth_me():
+    import sqlite3
+    claim_open = False
+    try:
+        with accounts._db() as conn:
+            claim_open = not conn.execute(
+                "SELECT 1 FROM users WHERE role = 'admin'").fetchone()
+    except sqlite3.Error:
+        claim_open = True
+    return jsonify({"user": _current_user(),
+                    "admin_claim_open": claim_open,
+                    "enforced": ACCOUNTS_ENFORCED})
+
+
+@app.post("/api/auth/change-password")
+def auth_change_password():
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    ok = accounts.set_password(user["id"], data.get("password"))
+    if not ok:
+        return jsonify({"error": "password အနည်းဆုံး ၆ လုံး ထားပါ"}), 400
+    return jsonify({"ok": True})
+
+
+@app.post("/api/admin/claim")
+def admin_claim():
+    """One-shot bootstrap: the signed-in account becomes admin, but
+    only while no admin exists yet (behind the owner's wall)."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    if not accounts.claim_admin(user["username"]):
+        return jsonify({"error": "admin ရှိပြီးသား ဖြစ်နေပါတယ်"}), 409
+    return jsonify({"user": _current_user()})
+
+
+def _require_admin():
+    user = _current_user()
+    if not user or user["role"] != "admin":
+        return None
+    return user
+
+
+@app.get("/api/admin/users")
+def admin_users():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    return jsonify({"users": accounts.search_users(
+        request.args.get("q", ""))})
+
+
+@app.get("/api/admin/users/<int:uid>")
+def admin_user_detail(uid):
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    user = accounts.get_user(uid)
+    if not user:
+        return jsonify({"error": "user မတွေ့ပါ"}), 404
+    jobs = [j for j in _all_jobs() if j.get("user_id") == uid]
+    return jsonify({"user": user, "job_count": len(jobs)})
+
+
+@app.post("/api/admin/users/<int:uid>")
+def admin_user_update(uid):
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    user = accounts.get_user(uid)
+    if not user:
+        return jsonify({"error": "user မတွေ့ပါ"}), 404
+    if "disabled" in data:
+        accounts.set_disabled(uid, bool(data["disabled"]))
+    if data.get("credits_delta"):
+        accounts.adjust_credits(uid, int(data["credits_delta"]))
+    if data.get("new_password"):
+        if not accounts.set_password(uid, data["new_password"]):
+            return jsonify({"error": "password အနည်းဆုံး ၆ လုံး ထားပါ"}), 400
+    if data.get("tg_chat_id"):
+        accounts.link_tg(uid, int(data["tg_chat_id"]))
+    return jsonify({"user": accounts.get_user(uid)})
+
+
 def _tg_worker(job, chat_id, out_path):
     from pipeline import telegram_send as tg
     try:
@@ -821,6 +1048,9 @@ def create_job():
     job, err = _new_job(data)
     if err:
         return jsonify({"error": err}), 400
+    me = _current_user()
+    if me:
+        job["user_id"] = me["id"]
     preview_id = data.get("preview_id")
     if preview_id:
         # A preview may be reused ONLY for the very link it was taken
@@ -878,12 +1108,17 @@ def _all_jobs():
 
 @app.get("/api/jobs")
 def list_jobs():
-    return jsonify({"jobs": [_job_view(j) for j in _all_jobs()[:10]]})
+    user = _current_user()
+    mine = [j for j in _all_jobs() if _owns(user, j)]
+    return jsonify({"jobs": [_job_view(j) for j in mine[:10]]})
 
 
 @app.get("/api/jobs/latest")
 def latest_job():
+    user = _current_user()
     for j in _all_jobs():
+        if not _owns(user, j):
+            continue
         if j.get("status") in ("queued", "running", "waiting_review"):
             return jsonify({"job": _job_view(j)})
         age = time.time() - (j.get("finished_at") or j.get("created_at") or 0)
@@ -896,7 +1131,7 @@ def latest_job():
 @app.get("/api/jobs/<jid>")
 def get_job(jid):
     job = _load_job(jid)
-    if not job:
+    if not job or not _owns(_current_user(), job):
         return jsonify({"error": "job မတွေ့ပါ"}), 404
     return jsonify(job)
 
@@ -1183,6 +1418,7 @@ try:
     _tg.MESSAGE_HANDLER = _on_tg_message
     _tg.CALLBACK_HANDLER = _on_tg_callback
     _tg.start_poller()
+    threading.Thread(target=_backup_loop, daemon=True).start()
     threading.Thread(target=_tg_dispatcher, daemon=True).start()
 except Exception:
     pass

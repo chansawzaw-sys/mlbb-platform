@@ -105,6 +105,33 @@
     </div>
   </div>
 
+  <div class="card show" id="accountCard">
+    <h3 style="margin-top:0">👤 အကောင့်</h3>
+    <div id="authOut">
+      <input id="authUser" placeholder="username" autocomplete="username" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-bottom:8px">
+      <input type="password" id="authPass" placeholder="password" autocomplete="current-password" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+      <div class="row">
+        <button class="ghost" id="loginBtn">ဝင်မယ်</button>
+        <button class="ghost" id="registerBtn">အကောင့် အသစ် ဖွင့်မယ်</button>
+      </div>
+      <p class="err" id="authErr"></p>
+    </div>
+    <div id="authIn" style="display:none">
+      <p class="hint" id="authInfo" style="margin:4px 0"></p>
+      <div class="row">
+        <button class="ghost" id="claimBtn" style="display:none">👑 Admin အဖြစ် သတ်မှတ်မယ်</button>
+        <button class="ghost" id="logoutBtn">ထွက်မယ်</button>
+      </div>
+      <p class="err" id="authErr2"></p>
+    </div>
+  </div>
+
+  <div class="card" id="adminCard">
+    <h3 style="margin-top:0">🛠 Admin — လူ ရှာရန်</h3>
+    <input id="adminQ" placeholder="username ရိုက်ရှာပါ (အနည်းဆုံး ၂ လုံး)" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+    <div id="adminResults" style="margin-top:8px"></div>
+  </div>
+
   <label>ဗီဒီယိုလင့်ခ်</label>
   <input type="url" id="url" placeholder="https://www.youtube.com/watch?v=...">
 
@@ -731,12 +758,98 @@ $("tgSave").onclick = async () => {
   $("tgInput").value = "";
   alert("🤖 @" + (d.bot || "") + " ချိတ်ပြီးပြီ — ပို့ချင်တဲ့သူ bot ကို Start နှိပ်ခိုင်းပါ");
   loadTgState();
+
 };
+$("loginBtn").addEventListener("click", () => authPost("/api/auth/login"));
+$("registerBtn").addEventListener("click", () => authPost("/api/auth/register"));
+$("logoutBtn").addEventListener("click", async () => {
+  await fetch("/api/auth/logout", {method: "POST"}); loadMe();
+});
+$("claimBtn").addEventListener("click", async () => {
+  const res = await fetch("/api/admin/claim", {method: "POST"});
+  const d = await res.json();
+  if (!res.ok) { $("authErr2").textContent = d.error || "အမှား"; return; }
+  loadMe();
+});
+let adminTimer = null;
+$("adminQ").addEventListener("input", () => {
+  clearTimeout(adminTimer);
+  adminTimer = setTimeout(loadAdminUsers, 350);
+});
+async function loadAdminUsers() {
+  const q = $("adminQ").value.trim();
+  const box = $("adminResults");
+  if (q.length < 2) { box.innerHTML = ""; return; }
+  const r = await (await fetch("/api/admin/users?q=" +
+    encodeURIComponent(q))).json();
+  box.innerHTML = "";
+  (r.users || []).forEach(u => {
+    const div = document.createElement("div");
+    div.className = "jobrow";
+    const info = document.createElement("span");
+    info.textContent = "👤 " + u.username + " · 💳 " + u.credits +
+      (u.disabled ? " · 🚫 ပိတ်ထား" : "") +
+      (u.tg_chat_id ? " · TG ✓" : "");
+    const plus = document.createElement("button");
+    plus.className = "ghost"; plus.textContent = "+10";
+    plus.title = "credit ၁၀ ထည့်မယ်";
+    plus.addEventListener("click", () => adminAdjust(u.id, 10));
+    const ban = document.createElement("button");
+    ban.className = "ghost";
+    ban.textContent = u.disabled ? "ပြန်ဖွင့်" : "ပိတ်";
+    ban.addEventListener("click", () => adminBan(u.id, !u.disabled));
+    div.append(info, plus, ban);
+    box.appendChild(div);
+  });
+  if (!(r.users || []).length)
+    box.innerHTML = '<p class="hint">မတွေ့ပါ</p>';
+}
+async function adminAdjust(uid, delta) {
+  await fetch("/api/admin/users/" + uid, {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({credits_delta: delta})});
+  loadAdminUsers();
+}
+async function adminBan(uid, disabled) {
+  await fetch("/api/admin/users/" + uid, {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({disabled})});
+  loadAdminUsers();
+}
+loadMe();
 $("tgDel").onclick = async () => {
   await fetch("/api/settings/telegram", {method: "DELETE"});
   loadTgState();
 };
 loadTgState();
+
+// ---------- accounts ----------
+let ME = null;
+async function loadMe() {
+  try {
+    const r = await (await fetch("/api/auth/me")).json();
+    ME = r.user;
+    $("authOut").style.display = ME ? "none" : "";
+    $("authIn").style.display = ME ? "" : "none";
+    $("adminCard").classList.toggle("show", !!(ME && ME.role === "admin"));
+    if (ME) {
+      $("authInfo").textContent = "👤 " + ME.username +
+        (ME.role === "admin" ? " (admin)" : "") +
+        " · 💳 " + ME.credits + " credits";
+      $("claimBtn").style.display = r.admin_claim_open ? "" : "none";
+    }
+  } catch (e) {}
+}
+async function authPost(path) {
+  const res = await fetch(path, {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({username: $("authUser").value,
+                          password: $("authPass").value})});
+  const d = await res.json();
+  if (!res.ok) { $("authErr").textContent = d.error || "အမှား"; return; }
+  $("authErr").textContent = "";
+  loadMe();
+}
 window.tgPick = async function (id) {
   const box = $("tgpick-" + id);
   if (box.style.display !== "none") { box.style.display = "none"; return; }
