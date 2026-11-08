@@ -315,8 +315,13 @@ def gemini_key_status():
 def gemini_key_save():
     data = request.get_json(force=True) or {}
     key = (data.get("key") or "").strip()
-    if not (key.startswith("AIza") and 20 <= len(key) <= 80):
-        return jsonify({"error": "key မမှန်ပါ — AIza နဲ့ စတဲ့ Gemini key ဖြစ်ရပါမယ်"}), 400
+    # Both Gemini key formats are valid: legacy "AIza…" keys and the
+    # "AQ.…" auth keys AI Studio has issued since May 2026 (~53 chars).
+    ok_format = (key.startswith("AIza") or key.startswith("AQ.")) \
+        and 20 <= len(key) <= 80 \
+        and all(ch.isalnum() or ch in "._-" for ch in key)
+    if not ok_format:
+        return jsonify({"error": "key မမှန်ပါ — Gemini key (AQ. သို့ AIza နဲ့ စတာ) ဖြစ်ရပါမယ်"}), 400
     env_path = ROOT / ".env"
     lines = []
     if env_path.exists():
