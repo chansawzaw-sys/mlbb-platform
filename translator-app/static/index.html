@@ -82,7 +82,7 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>🎬 ဗီဒီယို မြန်မာဘာသာပြန် <button class="ghost" id="keyToggle" title="Gemini key" style="float:right">🔑</button></h1>
+  <h1>🎬 ဗီဒီယို မြန်မာဘာသာပြန် <button class="ghost" id="keyToggle" title="Gemini key" style="float:right">🔑</button> <button class="ghost" id="tgToggle" title="Telegram bot setting" style="float:right">🤖</button></h1>
   <p class="sub">ဗီဒီယိုလင့်ခ် ထည့်ရုံနဲ့ — စာသားထုတ် → မြန်မာပြန် → စာတန်းထိုး (ရုပ်ရှင်ပုံစံ) / အသံထွက် အစအဆုံးလုပ်ပေးမယ်။ အသံကို အချိန်ကိုက်အောင် အမြန်ညှိ၊ မလုံလောက်ရင် ဖရိမ်ရပ်ပြီး ဆက်ပြောပေးမယ်။</p>
 
   <div class="card show" id="keyCard">
@@ -746,8 +746,13 @@ async function loadTgState() {
     $("tgState").textContent = d.configured
       ? `✅ ချိတ်ပြီး (@${d.bot || "?"}) — Start နှိပ်ထားသူ ${d.recipients} ယောက်`
       : "❌ မချိတ်ရသေး";
+    // Once a token is saved the card tucks itself away (the 🤖
+    // button in the header reopens it), like the Gemini key card.
+    $("tgToggle").textContent = d.configured ? "🤖 ✅" : "🤖";
+    $("tgCard").classList.toggle("show", !d.configured);
   } catch (e) { $("tgState").textContent = "?"; }
 }
+$("tgToggle").onclick = () => $("tgCard").classList.toggle("show");
 $("tgSave").onclick = async () => {
   const tok = $("tgInput").value.trim();
   if (!tok) { alert("token အရင် ထည့်ပါ"); return; }
