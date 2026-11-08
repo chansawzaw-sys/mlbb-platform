@@ -124,6 +124,12 @@ def static_files(filename):
     return send_from_directory(ROOT / "static", filename)
 
 
+@app.get("/sw.js")
+def service_worker():
+    # Served from the root so its scope covers the whole app.
+    return send_from_directory(ROOT / "static", "sw.js")
+
+
 @app.get("/api/voices")
 def voices():
     try:

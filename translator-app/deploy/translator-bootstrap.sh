@@ -45,6 +45,7 @@ APP_USER='translator'                    # dedicated system user
 DEPLOY_DIR='/opt/translator-deploy'      # launcher + deploy artifacts
 INTERNAL_PORT='8613'                     # Flask app, 127.0.0.1 only
 PUBLIC_PORT='8611'                       # Caddy, public, basic-auth
+TLS_NAME='85-155-149-58.sslip.io'        # free sslip.io name -> this server's IP; Caddy gets a real Let's Encrypt cert for it (HTTPS = full PWA install). Empty = HTTP only.
 AUTH_USER='htetheather'
 AUTH_FILE='/root/translator-auth.txt'
 LOG_FILE='/root/translator-deploy.log'
@@ -354,6 +355,10 @@ AUTH_HASH="$(caddy hash-password --plaintext "$AUTH_PW")"
 
 # --- 12. Caddy site block (own file, imported — coexists with future MLBB blocks) ---------
 mkdir -p /etc/caddy
+# Keep the previous (working) config so a bad new config can be rolled back.
+if [ -f /etc/caddy/translator.caddy ]; then
+  cp /etc/caddy/translator.caddy /etc/caddy/translator.caddy.bak
+fi
 cat > /etc/caddy/translator.caddy <<EOF
 # === video-translator (managed by translator-bootstrap.sh) ===
 # Trial setup: plain HTTP on the public port, basic auth, app on localhost.
@@ -375,6 +380,22 @@ cat > /etc/caddy/translator.caddy <<EOF
 }
 # === end video-translator ===
 EOF
+if [ -n "$TLS_NAME" ]; then
+  cat >> /etc/caddy/translator.caddy <<EOF
+
+# HTTPS site — Caddy provisions a Let's Encrypt certificate automatically.
+# A secure context is what makes the PWA fully installable. Same auth + app.
+${TLS_NAME} {
+	basic_auth {
+		$AUTH_USER $AUTH_HASH
+	}
+	reverse_proxy 127.0.0.1:${INTERNAL_PORT}
+	encode gzip
+}
+EOF
+  ufw allow 443/tcp
+  echo "HTTPS site block added for ${TLS_NAME}."
+fi
 touch /etc/caddy/Caddyfile
 if ! grep -q 'translator\.caddy' /etc/caddy/Caddyfile; then
   echo 'import /etc/caddy/translator.caddy' >> /etc/caddy/Caddyfile
@@ -382,6 +403,15 @@ fi
 caddy validate --config /etc/caddy/Caddyfile
 systemctl enable caddy
 systemctl restart caddy
+sleep 2
+if ! systemctl is-active --quiet caddy; then
+  echo "WARN: Caddy failed to start with the new config; restoring the previous one."
+  if [ -f /etc/caddy/translator.caddy.bak ]; then
+    cp /etc/caddy/translator.caddy.bak /etc/caddy/translator.caddy
+    systemctl restart caddy
+    sleep 2
+  fi
+fi
 echo "Caddy serving :${PUBLIC_PORT} -> 127.0.0.1:${INTERNAL_PORT} (basic auth on)."
 
 # --- 13. firewall: only the Caddy port is public for this app ------------------------------
