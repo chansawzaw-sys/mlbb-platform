@@ -27,10 +27,16 @@ def video_size(path):
     raise RuntimeError("no video stream found")
 
 
+ASPECT_DIMS = {"9:16": (720, 1280), "16:9": (1280, 720),
+               "1:1": (960, 960), "4:5": (864, 1080)}
+ASPECT_STYLES = ("blur", "black", "crop")
+
+
 def has_fx(fx):
     if not fx:
         return False
-    return bool(fx.get("blur")) or bool(fx.get("logo", {}).get("path"))
+    return (bool(fx.get("blur")) or bool(fx.get("logo", {}).get("path"))
+            or (fx.get("aspect") or {}).get("ratio") in ASPECT_DIMS)
 
 
 def filter_chain(fx, vw, vh):
@@ -71,8 +77,35 @@ def filter_chain(fx, vw, vh):
             f"format=rgba,colorchannelmixer=aa={opacity:.3f}[fxlogo]")
         filters.append(
             f"{cur}[fxlogo]overlay=x='(main_w-overlay_w)*{pos_x:.4f}'"
-            f":y='(main_h-overlay_h)*{pos_y:.4f}'[vfx]")
-        cur = "[vfx]"
+            f":y='(main_h-overlay_h)*{pos_y:.4f}'[vfxl]")
+        cur = "[vfxl]"
+    # Reframe to a target aspect (9:16 / 16:9 / 1:1 / 4:5) as the LAST
+    # stage, so blur/logo coordinates stay in the source's own frame.
+    aspect = fx.get("aspect") or {}
+    dims = ASPECT_DIMS.get(aspect.get("ratio"))
+    if dims:
+        tw, th = dims
+        style = aspect.get("style")
+        if style not in ASPECT_STYLES:
+            style = "blur"
+        if style == "crop":
+            filters.append(
+                f"{cur}scale={tw}:{th}:force_original_aspect_ratio=increase,"
+                f"crop={tw}:{th}[vasp]")
+        elif style == "black":
+            filters.append(
+                f"{cur}scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+                f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:black[vasp]")
+        else:  # blurred-fill: full frame visible over its own blurred copy
+            filters.append(f"{cur}split=2[aspbg][aspfg]")
+            filters.append(
+                f"[aspbg]scale={tw}:{th}:force_original_aspect_ratio=increase,"
+                f"crop={tw}:{th},gblur=sigma=24[aspb]")
+            filters.append(
+                f"[aspfg]scale={tw}:{th}:force_original_aspect_ratio=decrease"
+                f"[aspf]")
+            filters.append(f"[aspb][aspf]overlay=(W-w)/2:(H-h)/2[vasp]")
+        cur = "[vasp]"
     return filters, cur, logo_path
 
 

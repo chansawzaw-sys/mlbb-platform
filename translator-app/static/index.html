@@ -82,7 +82,7 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>🎬 ဗီဒီယို မြန်မာဘာသာပြန် <button class="ghost" id="keyToggle" title="Gemini key" style="float:right">🔑</button> <button class="ghost" id="tgToggle" title="Telegram bot setting" style="float:right">🤖</button></h1>
+  <h1>🎬 ဗီဒီယို မြန်မာဘာသာပြန် <span style="float:right"><button class="ghost" id="keyToggle" title="Gemini key" style="width:auto;padding:4px 12px">🔑</button> <button class="ghost" id="tgToggle" title="Telegram bot setting" style="width:auto;padding:4px 12px">🤖</button></span></h1>
   <p class="sub">ဗီဒီယိုလင့်ခ် ထည့်ရုံနဲ့ — စာသားထုတ် → မြန်မာပြန် → စာတန်းထိုး (ရုပ်ရှင်ပုံစံ) / အသံထွက် အစအဆုံးလုပ်ပေးမယ်။ အသံကို အချိန်ကိုက်အောင် အမြန်ညှိ၊ မလုံလောက်ရင် ဖရိမ်ရပ်ပြီး ဆက်ပြောပေးမယ်။</p>
 
   <div class="card show" id="keyCard">
@@ -206,6 +206,20 @@
     <option value="2.0">2.0×</option>
     <option value="3.0">3.0×</option>
     <option value="4.0">4.0× — အမြန်ဆုံး (ရပ်ချိန် မရှိသလောက်)</option>
+  </select>
+
+  <label>Frame (ဗီဒီယို အချိုး ပြောင်းရန်)</label>
+  <select id="aspect">
+    <option value="">မူရင်း (မပြောင်း)</option>
+    <option value="9:16">9:16 — TikTok / Reels</option>
+    <option value="16:9">16:9 — YouTube</option>
+    <option value="1:1">1:1 — လေးထောင့်</option>
+    <option value="4:5">4:5 — Facebook ပို့စ်</option>
+  </select>
+  <select id="aspectStyle">
+    <option value="blur">ဘေး ဝါး (အပြည့် မြင်ရမယ်)</option>
+    <option value="black">ဘေး အနက်</option>
+    <option value="crop">ဖြည့် ဖြတ် (ဘေး ပျောက်မယ်)</option>
   </select>
 
   <label>စာတန်း Font (အားလုံး Myanmar Unicode)</label>
@@ -470,6 +484,8 @@ $("go").onclick = async () => {
   $("cleanupNote").style.display = "none"; $("doneBtns").style.display = "none";
   $("card").style.display = "block"; $("steps").innerHTML = "စတင်နေပြီ…";
   const fx = {};
+  if ($("aspect").value) fx.aspect = {ratio: $("aspect").value,
+                                      style: $("aspectStyle").value};
   if (blur) fx.blur = {...blur, strength: Number($("blurStrength").value)};
   if (logoId) fx.logo = {logo_id: logoId, pos_x: logoPos.x, pos_y: logoPos.y,
     size_pct: Number($("logoSize").value), opacity: Number($("logoOpacity").value),

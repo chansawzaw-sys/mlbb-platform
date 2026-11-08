@@ -234,6 +234,15 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
          blur_box=None, fx=None):
     family = FONT_CHOICES.get(font, FONT_CHOICES[DEFAULT_FONT])
     width, height = video_size(input_mp4)
+    if fx and (fx.get("aspect") or {}).get("ratio"):
+        # The fx graph reframes the canvas: lay subtitles out on the
+        # FINAL size, and drop in-box placement (the blur box belongs
+        # to the pre-reframe frame; the blur itself still applies).
+        from . import fx as _fxm
+        dims = _fxm.ASPECT_DIMS.get(fx["aspect"]["ratio"])
+        if dims:
+            width, height = dims
+            blur_box = None
     ass_path = Path(srt_path).with_name(Path(srt_path).stem + ".layout.ass")
     srt_to_ass(srt_path, ass_path, width, height, family, subs,
                blur_box=blur_box)

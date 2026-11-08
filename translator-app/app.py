@@ -395,6 +395,17 @@ def _on_tg_callback(cq):
         mode = data[2:]
         if mode not in ("both", "subs", "dub"):
             return
+        flow["mode"] = mode
+        flow["step"] = "frame"
+        tg.send_message(chat_id, "Frame (ဗီဒီယို အချိုး) ရွေးပါ",
+                        buttons=[[("မူရင်း", "f:orig"), ("9:16", "f:9:16"),
+                                  ("16:9", "f:16:9")],
+                                 [("1:1", "f:1:1"), ("4:5", "f:4:5")]])
+        return
+    if data.startswith("f:") and flow.get("step") == "frame":
+        ratio = data[2:]
+        if ratio != "orig" and ratio not in fx_mod.ASPECT_DIMS:
+            return
         if (not tg.is_admin(chat_id)
                 and _tg_daily_count(chat_id) >= _TG_DAILY_CAP):
             _TG_FLOW.pop(chat_id, None)
@@ -404,15 +415,20 @@ def _on_tg_callback(cq):
         _TG_FLOW.pop(chat_id, None)
         job, err = _new_job({"url": flow.get("url")
                              or "https://telegram.org/file",
-                             "mode": mode})
+                             "mode": flow.get("mode") or "both"})
         if err:
             tg.send_message(chat_id, "❌ " + err)
             return
         if flow.get("file_id"):
             job["url"] = "📁 Telegram file"
         job["source_path"] = flow.get("src")
+        fx = {}
         if flow.get("blur"):
-            job["fx"] = {"blur": {**flow["blur"], "strength": 25}}
+            fx["blur"] = {**flow["blur"], "strength": 25}
+        if ratio != "orig":
+            fx["aspect"] = {"ratio": ratio, "style": "blur"}
+        if fx:
+            job["fx"] = fx
         job["tg_chat_id"] = chat_id
         job["tg_from"] = flow.get("from")
         JOBS[job["id"]] = job
@@ -681,6 +697,12 @@ def _build_fx(data):
                           "size_pct": float(logo_in.get("size_pct", 18)),
                           "opacity": float(logo_in.get("opacity", 70)),
                           "saturation": float(logo_in.get("saturation", 100))}
+    asp_in = fx_in.get("aspect") or {}
+    if asp_in.get("ratio") in fx_mod.ASPECT_DIMS:
+        style = asp_in.get("style")
+        fx["aspect"] = {"ratio": asp_in["ratio"],
+                        "style": style if style in fx_mod.ASPECT_STYLES
+                        else "blur"}
     return fx
 
 
