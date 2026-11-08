@@ -54,6 +54,52 @@ def _plan(segs, total_dur):
     return chunks
 
 
+def _piece_vf(c, dur):
+    # NOTE: trim INSIDE the filter chain, not output -t: an output -t
+    # would also cut the tpad freeze frames we are trying to add.
+    vf = f"trim=duration={dur:.3f},setpts=PTS-STARTPTS,fps=30,format=yuv420p"
+    if c["kind"] == "seg" and c["excess"] > 0.01:
+        vf += f",tpad=stop_mode=clone:stop_duration={c['excess']:.3f}"
+    return vf
+
+
+def _video_single_pass(src, chunks, out):
+    """All chunks in ONE ffmpeg decode+encode (a trim/concat filter
+    graph) instead of one process per chunk — identical filters and
+    output, minus the per-chunk process + file overhead."""
+    filters, labels = [], []
+    for n, c in enumerate(chunks):
+        f = (f"[0:v]trim=start={c['start']:.3f}:end={c['end']:.3f},"
+             "setpts=PTS-STARTPTS,fps=30,format=yuv420p")
+        if c["kind"] == "seg" and c["excess"] > 0.01:
+            f += f",tpad=stop_mode=clone:stop_duration={c['excess']:.3f}"
+        filters.append(f + f"[v{n}]")
+        labels.append(f"[v{n}]")
+    filters.append("".join(labels) + f"concat=n={len(chunks)}:v=1:a=0[outv]")
+    run(["ffmpeg", "-y", "-v", "error", "-i", str(src),
+         "-filter_complex", ";".join(filters), "-map", "[outv]",
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", str(out)])
+
+
+def _video_chunked(src, chunks, cdir, out):
+    """Original path: one encode per chunk + concat-copy. Kept as the
+    fallback for very many chunks, or if the single pass ever fails."""
+    vlist = []
+    for n, c in enumerate(chunks):
+        dur = c["end"] - c["start"]
+        vout = cdir / f"v{n:03d}.mp4"
+        run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['start']:.3f}",
+             "-i", str(src), "-vf", _piece_vf(c, dur), "-an",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+             str(vout)])
+        vlist.append(vout)
+    lst = cdir / "vlist_fb.txt"
+    lst.write_text("".join(f"file '{f.resolve()}'\n" for f in vlist),
+                   encoding="utf-8")
+    run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+         "-i", str(lst), "-c:v", "copy", str(out)])
+
+
 def retime(workdir):
     workdir = Path(workdir)
     src = workdir / "source.mp4"
@@ -69,23 +115,12 @@ def retime(workdir):
 
     cdir = workdir / "chunks"
     cdir.mkdir(exist_ok=True)
-    vlist, alist = [], []
+    alist = []
     new_segs = []
     t_cursor = 0.0
 
     for n, c in enumerate(chunks):
         dur = c["end"] - c["start"]
-        vout = cdir / f"v{n:03d}.mp4"
-        # NOTE: trim INSIDE the filter chain, not output -t: an output -t would
-        # also cut the tpad freeze frames we are trying to add.
-        vf = f"trim=duration={dur:.3f},setpts=PTS-STARTPTS,fps=30,format=yuv420p"
-        if c["kind"] == "seg" and c["excess"] > 0.01:
-            vf += f",tpad=stop_mode=clone:stop_duration={c['excess']:.3f}"
-        run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['start']:.3f}", "-i", str(src),
-             "-vf", vf, "-an",
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", str(vout)])
-        vlist.append(vout)
-
         aout = cdir / f"a{n:03d}.wav"
         if c["kind"] == "seg":
             seg = segs[c["seg_idx"]]
@@ -114,10 +149,17 @@ def retime(workdir):
         cmd += [str(out)]
         run(cmd)
 
-    retimed_video = workdir / "retimed_video.mp4"
     dub_wav = workdir / "dub.wav"
-    _concat(vlist, retimed_video, True)
     _concat(alist, dub_wav, False)
+
+    retimed_video = workdir / "retimed_video.mp4"
+    if len(chunks) <= 80:
+        try:
+            _video_single_pass(src, chunks, retimed_video)
+        except Exception:
+            _video_chunked(src, chunks, cdir, retimed_video)
+    else:
+        _video_chunked(src, chunks, cdir, retimed_video)
 
     run(["ffmpeg", "-y", "-v", "error", "-i", str(retimed_video), "-i", str(dub_wav),
          "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest",

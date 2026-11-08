@@ -82,7 +82,7 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>🎬 ဗီဒီယို မြန်မာဘာသာပြန်</h1>
+  <h1>🎬 ဗီဒီယို မြန်မာဘာသာပြန် <button class="ghost" id="keyToggle" title="Gemini key" style="float:right">🔑</button></h1>
   <p class="sub">ဗီဒီယိုလင့်ခ် ထည့်ရုံနဲ့ — စာသားထုတ် → မြန်မာပြန် → စာတန်းထိုး (ရုပ်ရှင်ပုံစံ) / အသံထွက် အစအဆုံးလုပ်ပေးမယ်။ အသံကို အချိန်ကိုက်အောင် အမြန်ညှိ၊ မလုံလောက်ရင် ဖရိမ်ရပ်ပြီး ဆက်ပြောပေးမယ်။</p>
 
   <div class="card show" id="keyCard">
@@ -658,8 +658,13 @@ async function loadKeyState() {
   try {
     const d = await (await fetch("/api/settings/gemini-key")).json();
     $("keyState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
+    $("keyToggle").textContent = d.configured ? "🔑 ✅" : "🔑";
+    // Once a key is saved the card tucks itself away; the small 🔑
+    // button by the title reopens it whenever the key needs changing.
+    $("keyCard").classList.toggle("show", !d.configured);
   } catch (e) { $("keyState").textContent = "?"; }
 }
+$("keyToggle").onclick = () => $("keyCard").classList.toggle("show");
 $("keySave").onclick = async () => {
   const key = $("keyInput").value.trim();
   if (!key) { alert("key အရင် ထည့်ပါ"); return; }

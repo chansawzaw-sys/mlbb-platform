@@ -68,12 +68,10 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
     final = workdir / "output.mp4"
     if mode == "subs":
         mark("finalize", "running")
-        base = src
-        if fx_mod.has_fx(fx):
-            base = workdir / "fx.mp4"
-            fx_mod.apply_effects(src, base, fx)
-        burn.burn(base, workdir / "subs_my.srt", final, font=font, subs=subs,
-                  blur_box=(fx or {}).get("blur"))
+        # fx (if any) rides INSIDE the burn encode — no separate fx pass.
+        burn.burn(src, workdir / "subs_my.srt", final, font=font, subs=subs,
+                  blur_box=(fx or {}).get("blur"),
+                  fx=fx if fx_mod.has_fx(fx) else None)
         mark("finalize", "done")
         return final
 
@@ -87,14 +85,16 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
 
     mark("finalize", "running")
     base = workdir / "retimed.mp4"
-    if fx_mod.has_fx(fx):
-        fxed = workdir / "fx.mp4"
-        fx_mod.apply_effects(base, fxed, fx)
-        base = fxed
     if mode == "both":
+        # fx (if any) rides INSIDE the burn encode — no separate fx pass.
         burn.burn(base, workdir / "subs_retimed.srt", final, font=font,
-                  subs=subs, blur_box=(fx or {}).get("blur"))
-    else:  # dub only
+                  subs=subs, blur_box=(fx or {}).get("blur"),
+                  fx=fx if fx_mod.has_fx(fx) else None)
+    else:  # dub only — no burn, so fx gets its own (single) pass
+        if fx_mod.has_fx(fx):
+            fxed = workdir / "fx.mp4"
+            fx_mod.apply_effects(base, fxed, fx)
+            base = fxed
         shutil.copyfile(base, final)
     mark("finalize", "done")
     return final

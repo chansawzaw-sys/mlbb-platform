@@ -231,7 +231,7 @@ def video_size(input_mp4):
 
 
 def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
-         blur_box=None):
+         blur_box=None, fx=None):
     family = FONT_CHOICES.get(font, FONT_CHOICES[DEFAULT_FONT])
     width, height = video_size(input_mp4)
     ass_path = Path(srt_path).with_name(Path(srt_path).stem + ".layout.ass")
@@ -239,6 +239,22 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
                blur_box=blur_box)
     ass = str(ass_path.resolve()).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
     fontsdir = str(FONTS_DIR).replace("\\", "/").replace(":", "\\:")
+    if fx:
+        from . import fx as fx_mod
+        if fx_mod.has_fx(fx):
+            # Blur/logo + subtitles in ONE encode: the fx filter graph
+            # runs first, the ass filter is appended to its output.
+            # (Was: a full fx encode followed by a full burn encode.)
+            filters, cur, logo_path = fx_mod.filter_chain(fx, width, height)
+            filters.append(f"{cur}ass='{ass}':fontsdir='{fontsdir}'[vout]")
+            cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4)]
+            if logo_path:
+                cmd += ["-i", str(logo_path)]
+            cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]",
+                    "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-crf", "20", "-c:a", "copy", str(output_mp4)]
+            run(cmd)
+            return output_mp4
     vf = f"ass='{ass}':fontsdir='{fontsdir}'"
     run(["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4), "-vf", vf,
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",

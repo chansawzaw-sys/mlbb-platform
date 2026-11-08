@@ -33,17 +33,15 @@ def has_fx(fx):
     return bool(fx.get("blur")) or bool(fx.get("logo", {}).get("path"))
 
 
-def apply_effects(input_mp4, output_mp4, fx):
-    """Apply blur (first) and logo (on top) in ONE ffmpeg pass. Returns output."""
-    if not has_fx(fx):
-        raise ValueError("apply_effects called with empty fx")
-    vw, vh = video_size(input_mp4)
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4)]
+def filter_chain(fx, vw, vh):
+    """Build the -filter_complex pieces for blur + logo.
+
+    Returns (filters, out_label, logo_path). The input video is [0:v];
+    a logo, if any, must be supplied as input 1. Shared by
+    apply_effects() and by burn.py, which appends the subtitle filter
+    to the same graph so blur/logo + subtitles cost ONE encode."""
     logo = fx.get("logo") or {}
     logo_path = logo.get("path")
-    if logo_path:
-        cmd += ["-i", str(logo_path)]
-
     filters = []
     cur = "[0:v]"
     blur = fx.get("blur")
@@ -75,7 +73,18 @@ def apply_effects(input_mp4, output_mp4, fx):
             f"{cur}[fxlogo]overlay=x='(main_w-overlay_w)*{pos_x:.4f}'"
             f":y='(main_h-overlay_h)*{pos_y:.4f}'[vfx]")
         cur = "[vfx]"
+    return filters, cur, logo_path
 
+
+def apply_effects(input_mp4, output_mp4, fx):
+    """Apply blur (first) and logo (on top) in ONE ffmpeg pass. Returns output."""
+    if not has_fx(fx):
+        raise ValueError("apply_effects called with empty fx")
+    vw, vh = video_size(input_mp4)
+    filters, cur, logo_path = filter_chain(fx, vw, vh)
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4)]
+    if logo_path:
+        cmd += ["-i", str(logo_path)]
     cmd += ["-filter_complex", ";".join(filters), "-map", cur, "-map", "0:a?",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
             "-c:a", "copy", str(output_mp4)]

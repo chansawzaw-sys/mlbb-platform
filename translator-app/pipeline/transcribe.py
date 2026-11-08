@@ -47,6 +47,23 @@ def _parse_vtt(vtt_path: Path):
     return out
 
 
+_MODEL_CACHE = {}
+
+
+def _get_model(model_ref):
+    """Load the whisper model ONCE per process and reuse it across jobs.
+
+    Loading took seconds (plus a hub metadata round-trip) on every job;
+    the app is a long-lived process and jobs are serialized by the gate,
+    so a cached model is safe and removes that fixed cost entirely."""
+    m = _MODEL_CACHE.get(model_ref)
+    if m is None:
+        from faster_whisper import WhisperModel
+        m = WhisperModel(model_ref, device="cpu", compute_type="int8")
+        _MODEL_CACHE[model_ref] = m
+    return m
+
+
 def transcribe(video_path, workdir, use_captions=False):
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -65,7 +82,6 @@ def transcribe(video_path, workdir, use_captions=False):
     run(["ffmpeg", "-y", "-v", "error", "-i", str(video_path),
          "-vn", "-ac", "1", "-ar", "16000", str(wav)])
 
-    from faster_whisper import WhisperModel
     # Prefer the project-local model (models/faster-whisper-small) when present
     # so the app is self-contained and never re-downloads; else use the
     # WHISPER_MODEL name (default "small") from the HF hub.
@@ -75,7 +91,7 @@ def transcribe(video_path, workdir, use_captions=False):
         model_ref = str(local)
     else:
         model_ref = os.environ.get("WHISPER_MODEL", "small")
-    model = WhisperModel(model_ref, device="cpu", compute_type="int8")
+    model = _get_model(model_ref)
     segments, _info = model.transcribe(str(wav), beam_size=1, vad_filter=True)
     segs = []
     for s in segments:
