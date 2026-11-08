@@ -850,7 +850,12 @@ def _worker2(job):
 
 @app.get("/")
 def index():
-    return send_from_directory(ROOT / "static", "index.html")
+    resp = send_from_directory(ROOT / "static", "index.html")
+    # The shell must never come from a browser cache — a stale copy
+    # looks exactly like "the update didn't land" (build tag and
+    # all), which has burned several debugging rounds.
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.get("/static/<path:filename>")
