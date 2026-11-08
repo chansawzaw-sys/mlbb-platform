@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -68,6 +69,42 @@ def _progress_fn(job):
     return progress
 
 
+# ---------- auto-cleanup: no job data stays on the server ----------
+# 15 minutes after a job finishes (done or error), its whole folder —
+# source, intermediates and output — plus the cached preview copy of
+# the same URL is deleted, so nothing accumulates on the disk.
+CLEANUP_DELAY = 900
+CLEANUP_TIMERS = {}
+
+
+def _schedule_cleanup(job):
+    jid = job["id"]
+    old = CLEANUP_TIMERS.pop(jid, None)
+    if old:
+        old.cancel()
+    job["cleanup_at"] = time.time() + CLEANUP_DELAY
+    t = threading.Timer(CLEANUP_DELAY, _cleanup_job, args=(jid,))
+    t.daemon = True
+    t.start()
+    CLEANUP_TIMERS[jid] = t
+
+
+def _cleanup_job(jid):
+    CLEANUP_TIMERS.pop(jid, None)
+    job = JOBS.pop(jid, None)
+    url = (job or {}).get("url")
+    if not url:
+        try:
+            meta = json.loads((JOBS_DIR / jid / "job.json").read_text(encoding="utf-8"))
+            url = meta.get("url")
+        except Exception:
+            url = None
+    shutil.rmtree(JOBS_DIR / jid, ignore_errors=True)
+    if url:
+        _, pdir = _preview_dir(url)
+        shutil.rmtree(pdir, ignore_errors=True)
+
+
 def _fail(job, e):
     job["status"] = "error"
     job["error"] = str(e)[-1500:]
@@ -75,40 +112,53 @@ def _fail(job, e):
         if s["key"] == job.get("current") and s["state"] == "running":
             s["state"] = "error"
     job["finished_at"] = time.time()
+    _schedule_cleanup(job)
+    _save(job)
+
+
+def _run_phase2(job):
+    workdir = JOBS_DIR / job["id"]
+    run_job.run_phase2(workdir, mode=job["mode"], voice=job["voice"],
+                       progress=_progress_fn(job), fx=job.get("fx"),
+                       font=job.get("font") or "noto",
+                       voice_rate=job.get("voice_rate", 0),
+                       voice_pitch=job.get("voice_pitch", 0),
+                       subs=job.get("subs"))
+
+
+def _finish(job):
+    job["status"] = "done"
+    job["current"] = None
+    job["finished_at"] = time.time()
+    _schedule_cleanup(job)
     _save(job)
 
 
 def _worker(job):
-    """Phase 1 only: download -> transcribe -> translate, then wait for
-    the user's review/edit of the Myanmar segments."""
+    """Full run: download -> transcribe -> translate -> TTS/retime/burn.
+
+    No mandatory review stop: the auto-translated Myanmar text is used
+    as-is and the video renders straight through. The user can still
+    edit the text afterwards and re-render (see job_review)."""
     workdir = JOBS_DIR / job["id"]
     try:
         job["status"] = "running"
         _save(job)
         run_job.run_phase1(workdir, job["url"], source_path=job.get("source_path"),
                            progress=_progress_fn(job))
-        job["status"] = "waiting_review"
-        job["current"] = None
-        _save(job)
+        _run_phase2(job)
+        _finish(job)
     except Exception as e:  # surface the real error to the UI
         _fail(job, e)
 
 
 def _worker2(job):
-    """Phase 2: TTS/retime/fx/burn from the final edited segments."""
-    workdir = JOBS_DIR / job["id"]
+    """Re-render phase 2 from the current (possibly edited) segments."""
     try:
         job["status"] = "running"
         _save(job)
-        run_job.run_phase2(workdir, mode=job["mode"], voice=job["voice"],
-                           progress=_progress_fn(job), fx=job.get("fx"),
-                           font=job.get("font") or "noto",
-                           voice_rate=job.get("voice_rate", 0),
-                           voice_pitch=job.get("voice_pitch", 0),
-                           subs=job.get("subs"))
-        job["status"] = "done"
-        job["finished_at"] = time.time()
-        _save(job)
+        _run_phase2(job)
+        _finish(job)
     except Exception as e:
         _fail(job, e)
 
@@ -355,15 +405,17 @@ def job_segments(jid):
 
 @app.post("/api/jobs/<jid>/review")
 def job_review(jid):
-    """Submit edits (or none) and continue to phase 2.
+    """Submit edits (or none) and (re-)run phase 2.
 
     Body: {"edits": [{"idx": 0, "text_my": "..."}, ...]} — segments not
-    listed keep their translated text. Empty edits = continue unchanged.
+    listed keep their translated text. Allowed on a finished job (the
+    normal flow renders straight through; this is the optional
+    edit-and-rerun path) and on a legacy waiting_review job.
     """
     job = _load_job(jid)
     if not job:
         return jsonify({"error": "job မတွေ့ပါ"}), 404
-    if job["status"] != "waiting_review":
+    if job["status"] not in ("waiting_review", "done"):
         return jsonify({"error": "ဒီ job က ပြင်ဆင်ရန် အဆင့် မဟုတ်ပါ"}), 409
     data = request.get_json(force=True) or {}
     edits = {int(e["idx"]): str(e["text_my"]) for e in data.get("edits", [])
@@ -381,6 +433,11 @@ def job_review(jid):
     save_segments(segs, seg_path)
     write_srt(segs, JOBS_DIR / jid / "subs_my.srt")  # keep subs-mode SRT in sync
     job["edited_count"] = changed
+    # A re-render supersedes the pending auto-cleanup of the old result.
+    old_timer = CLEANUP_TIMERS.pop(jid, None)
+    if old_timer:
+        old_timer.cancel()
+    job.pop("cleanup_at", None)
     _save(job)
     threading.Thread(target=_worker2, args=(job,), daemon=True).start()
     return jsonify({"ok": True, "edited_count": changed})
@@ -392,6 +449,32 @@ def download_job(jid):
     if not out.exists():
         return jsonify({"error": "မပြီးသေးပါ"}), 404
     return send_file(out, as_attachment=True, download_name=f"myanmar-{jid}.mp4")
+
+
+@app.get("/api/jobs/<jid>/stream")
+def stream_job(jid):
+    """Inline playback for the result preview (the download route's
+    attachment header prevents some phone browsers from playing it)."""
+    out = JOBS_DIR / jid / "output.mp4"
+    if not out.exists():
+        return jsonify({"error": "မပြီးသေးပါ"}), 404
+    return send_file(out, as_attachment=False)
+
+
+@app.delete("/api/jobs/<jid>")
+def delete_job(jid):
+    """Delete a job and all its files right now (the user asked for no
+    leftovers; otherwise the 15-minute auto-cleanup does it)."""
+    job = _load_job(jid)
+    if not job:
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    if job["status"] in ("queued", "running"):
+        return jsonify({"error": "လုပ်နေဆဲ job ကို မဖျက်နိုင်ပါ"}), 409
+    old_timer = CLEANUP_TIMERS.pop(jid, None)
+    if old_timer:
+        old_timer.cancel()
+    _cleanup_job(jid)
+    return jsonify({"ok": True})
 
 
 # ---------- text-only export + bulk text input ----------
@@ -493,7 +576,7 @@ def job_review_bulk(jid):
     job = _load_job(jid)
     if not job:
         return jsonify({"error": "job မတွေ့ပါ"}), 404
-    if job["status"] != "waiting_review":
+    if job["status"] not in ("waiting_review", "done"):
         return jsonify({"error": "ဒီ job က ပြင်ဆင်ရန် အဆင့် မဟုတ်ပါ"}), 409
     data = request.get_json(force=True) or {}
     text = (data.get("text") or "").strip()
@@ -525,6 +608,39 @@ def job_review_bulk(jid):
     write_srt(segs, JOBS_DIR / jid / "subs_my.srt")  # keep SRT in sync
     return jsonify({"ok": True, "changed": changed, "segments": [
         {"idx": i, "text_my": s.get("text_my")} for i, s in enumerate(segs)]})
+
+
+def _startup_sweep():
+    """Remove leftovers from before a restart: job folders and preview
+    caches older than an hour are deleted (nothing is kept long-term)."""
+    now = time.time()
+    for d in list(JOBS_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        ref, url = None, None
+        try:
+            meta = json.loads((d / "job.json").read_text(encoding="utf-8"))
+            ref = meta.get("finished_at") or meta.get("created_at")
+            url = meta.get("url")
+        except Exception:
+            pass
+        if ref and now - float(ref) > 3600:
+            shutil.rmtree(d, ignore_errors=True)
+            if url:
+                _, pdir = _preview_dir(url)
+                shutil.rmtree(pdir, ignore_errors=True)
+    for d in list(PREVIEWS_DIR.iterdir()):
+        try:
+            if d.is_dir() and now - d.stat().st_mtime > 3600:
+                shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+
+
+try:
+    _startup_sweep()
+except Exception:
+    pass
 
 
 if __name__ == "__main__":

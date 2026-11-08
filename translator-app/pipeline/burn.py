@@ -84,6 +84,44 @@ def _parse_srt(srt_path):
     return cues
 
 
+# --- Per-cue fit: shrink long cues so the text fits its box ---------------
+# libass wraps at the margins, but a long cue still stacks 3-4 lines and
+# covers the frame (worst on vertical video). Measure each cue with the
+# REAL font (PIL) and, when it would need more than _FIT_MAX_LINES lines,
+# shrink that cue's font (ASS \fs override) until it fits.
+_FONT_FILES = {"Noto Sans Myanmar": "NotoSansMyanmar-Bold.ttf",
+               "Pyidaungsu": "Pyidaungsu-2.3_Bold.ttf",
+               "Padauk": "Padauk-Bold.ttf"}
+_FIT_MAX_LINES = 2
+_FIT_MIN_FRAC = 0.5
+
+
+def _fit_font_size(text, family, base_fs, avail_w):
+    """Largest size <= base_fs whose text fits _FIT_MAX_LINES lines of
+    avail_w px; base_fs when it already fits or measuring is impossible."""
+    try:
+        from PIL import ImageFont
+        fname = _FONT_FILES.get(family)
+        if not fname or avail_w <= 0:
+            return base_fs
+        path = FONTS_DIR / fname
+        plain = text.replace("\\N", " ").strip()
+        if not path.exists() or not plain:
+            return base_fs
+        fs = float(base_fs)
+        floor = base_fs * _FIT_MIN_FRAC
+        while fs > floor:
+            font = ImageFont.truetype(str(path), max(8, int(round(fs))))
+            w = font.getlength(plain)
+            lines = int(w // max(1.0, avail_w * 0.94)) + 1
+            if lines <= _FIT_MAX_LINES:
+                return fs
+            fs *= 0.9
+        return floor
+    except Exception:
+        return base_fs
+
+
 def srt_to_ass(srt_path, ass_path, width, height, family, subs):
     """Write an ASS script with PlayRes = the real video resolution."""
     cfg = normalize_subs(subs)
@@ -116,7 +154,11 @@ def srt_to_ass(srt_path, ass_path, width, height, family, subs):
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
+    avail_w = width - 2 * margin_lr
     for start, end, body in _parse_srt(srt_path):
+        fs = _fit_font_size(body, family, font_size, avail_w)
+        if fs < font_size - 0.6:
+            body = f"{{\\fs{fs:.0f}}}" + body
         lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{body}")
     Path(ass_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return ass_path

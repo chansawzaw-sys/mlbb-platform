@@ -169,11 +169,16 @@
       <a class="dlbtn" id="jobDlSrcTxt" download>📄 မူရင်း စာသား (TXT)</a>
       <a class="dlbtn" id="jobDlSrcSrt" download>📄 မူရင်း SRT</a>
     </div>
+    <p class="hint" id="cleanupNote" style="display:none">⏰ ၁၅ မိနစ် အတွင်း ဒေါင်းပါ / ပြင်ပါ — ကုန်သွားရင် server ပေါ်က ဖိုင် အကုန် အလိုလို ဖျက်ပါမယ် (memory မကျန်အောင်)။</p>
+    <div class="row" id="doneBtns" style="display:none">
+      <button class="ghost" id="editBtn">✏️ မြန်မာစာ ပြင်ပြီး ပြန်လုပ်မယ်</button>
+      <button class="ghost" id="delBtn">🗑 ခုပဲ ဖျက်မယ်</button>
+    </div>
   </div>
 
   <div class="card" id="reviewCard">
     <h3 style="margin-top:0">📝 မြန်မာ ဘာသာပြန်ကို စစ်ပြီး ပြင်ရန်</h3>
-    <p class="hint">အင်္ဂလိပ် မူရင်းကို ကြည့်ပြီး မြန်မာစာကို လိုသလို ပြင်နိုင်တယ်။ ပြင်ပြီးမှ အသံထွက် + စာတန်းထိုး ဆက်လုပ်ပေးမယ်။</p>
+    <p class="hint">အင်္ဂလိပ် မူရင်းကို ကြည့်ပြီး မြန်မာစာကို လိုသလို ပြင်နိုင်တယ်။ ပြင်ပြီး "ပြန်လုပ်မယ်" နှိပ်ရင် အသံ + စာတန်း ပြန်လုပ်ပေးမယ်။</p>
     <h3>📝 မြန်မာ စာသား အပြည့်အစုံ ထည့်ရန်</h3>
     <p class="hint">ကိုယ်တိုင် (သို့) အပြင်မှာ ပြန်ထားတဲ့ မြန်မာ စာသား အပြည့်ကို ဒီမှာ ကူးထည့်လိုက်ရင် အပိုင်းတွေထဲ အလိုလို ခွဲထည့်ပေးမယ် — တစ်ကြောင်းချင်း ရေးထားရင် ကြောင်းအလိုက်၊ မဟုတ်ရင် ဝါကျ (။ / .) အလိုက် ခွဲမယ်။ ပိုနေရင် နောက်ဆုံး အပိုင်းထဲ ပေါင်းထည့်ပြီး၊ လိုနေရင် ကျန် အပိုင်းတွေ ဒီအတိုင်း ထားမယ်။ ခွဲထည့်ပြီးရင် အောက်က အပိုင်းတွေမှာ ပြန်စစ်/ပြင်နိုင်တယ်။</p>
     <textarea class="revMy" id="bulkText" rows="5" placeholder="ဘာသာပြန်ပြီးသား မြန်မာ စာသားကို ဒီမှာ ကူးထည့်ပါ"></textarea>
@@ -186,8 +191,8 @@
       <a class="dlbtn" id="revDlSrcSrt" download>📄 မူရင်း SRT</a>
     </div>
     <p class="hint">⬆️ စာသားပဲ သီးသန့် လိုချင်ရင် ဗီဒီယို ဆက်မလုပ်ဘဲ ဒီကပဲ ဒေါင်းနိုင်တယ်။</p>
-    <button id="revGo">✏️ ပြင်ပြီးဆက်မယ်</button>
-    <button class="ghost" id="revSkip">➡️ ဒီအတိုင်းဆက်မယ်</button>
+    <button id="revGo">✏️ ပြင်ပြီး ပြန်လုပ်မယ်</button>
+    <button class="ghost" id="revSkip">ပိတ်မယ်</button>
   </div>
 </div>
 <script>
@@ -358,6 +363,7 @@ stage.addEventListener("pointerup", onUp);
 stage.addEventListener("pointercancel", onUp);
 
 /* ---------------- job ---------------- */
+let currentJobId = null;
 $("go").onclick = async () => {
   const url = $("url").value.trim();
   if (!url) { alert("လင့်ခ် အရင်ထည့်ပါ"); return; }
@@ -365,6 +371,7 @@ $("go").onclick = async () => {
   $("reviewCard").classList.remove("show"); reviewShownFor = null;
   $("dl").style.display = "none"; $("preview").style.display = "none";
   $("jobDl").style.display = "none";
+  $("cleanupNote").style.display = "none"; $("doneBtns").style.display = "none";
   $("card").style.display = "block"; $("steps").innerHTML = "စတင်နေပြီ…";
   const fx = {};
   if (blur) fx.blur = {...blur, strength: Number($("blurStrength").value)};
@@ -381,6 +388,7 @@ $("go").onclick = async () => {
                           preview_id: previewId, fx})});
   const job = await res.json();
   if (!res.ok) { $("err").textContent = job.error || "အမှားတစ်ခု ဖြစ်သွားပြီ"; $("go").disabled = false; return; }
+  currentJobId = job.id;
   clearInterval(timer);
   timer = setInterval(() => poll(job.id), 2000);
   poll(job.id);
@@ -426,7 +434,23 @@ async function submitReview(edits) {
 $("revGo").onclick = () => submitReview(
   [...document.querySelectorAll(".revMy[data-idx]")].map(t =>
     ({idx: Number(t.dataset.idx), text_my: t.value})));
-$("revSkip").onclick = () => submitReview([]);
+$("revSkip").onclick = () => {
+  $("reviewCard").classList.remove("show"); reviewShownFor = null;
+};
+$("editBtn").onclick = () => { if (currentJobId) loadReview(currentJobId); };
+$("delBtn").onclick = async () => {
+  if (!currentJobId) return;
+  if (!confirm("ဒီ job ရဲ့ ဖိုင် အကုန် ခုပဲ ဖျက်မှာ သေချာလား?")) return;
+  const res = await fetch("/api/jobs/" + currentJobId, {method: "DELETE"});
+  if (res.ok) {
+    clearInterval(timer); currentJobId = null;
+    $("card").style.display = "none"; $("go").disabled = false;
+    alert("ဖျက်ပြီးပြီ — server မှာ ဘာမှ မကျန်ပါ");
+  } else {
+    const d = await res.json().catch(() => ({}));
+    alert(d.error || "ဖျက်လို့ မရပါ");
+  }
+};
 
 /* -------- text-only downloads + bulk text input -------- */
 function fillDl(prefix, id) {
@@ -456,17 +480,22 @@ $("bulkGo").onclick = async () => {
 
 async function poll(id) {
   const job = await (await fetch("/api/jobs/" + id)).json();
+  if (job.error && job.status === "deleted") return;
   $("steps").innerHTML = job.steps.map(s =>
     `<div class="step ${s.state}">${ICON[s.state] || "⏳"} ${s.label}</div>`).join("");
   if (job.status === "waiting_review" && reviewShownFor !== id) loadReview(id);
   if (job.status === "done") {
     clearInterval(timer); $("go").disabled = false;
+    currentJobId = id;
     $("dl").href = "/api/jobs/" + id + "/download"; $("dl").style.display = "block";
     fillDl("jobDl", id); $("jobDl").style.display = "flex";
-    $("preview").src = "/api/jobs/" + id + "/download"; $("preview").style.display = "block";
+    $("preview").src = "/api/jobs/" + id + "/stream"; $("preview").style.display = "block";
+    $("cleanupNote").style.display = "block"; $("doneBtns").style.display = "flex";
   } else if (job.status === "error") {
     clearInterval(timer); $("go").disabled = false;
     $("err").textContent = job.error || "";
+  } else {
+    $("cleanupNote").style.display = "none"; $("doneBtns").style.display = "none";
   }
 }
 </script>
