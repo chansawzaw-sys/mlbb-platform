@@ -27,8 +27,25 @@ _ME_CACHE = {}
 _POLLER_STARTED = False
 
 WELCOME = ("✅ မှတ်ပုံတင်ပြီးပါပြီ!\n"
-           "ဒီ bot ကနေ ဘာသာပြန်ပြီးသား ဗီဒီယိုတွေ သင့်ဆီ "
-           "တိုက်ရိုက် ပို့ပေးပါမယ်။")
+           "🎬 ဘာသာပြန်ချင်တဲ့ video link (YouTube / TikTok) ကို "
+           "ဒီမှာ ပို့လိုက်ပါ — ပြီးသွားရင် ဗီဒီယို ဒီ chat ထဲ "
+           "ပြန်ပို့ပေးပါမယ်။")
+
+# Set by the app: called with every incoming message dict (after
+# registration), so the app can treat links as new jobs.
+MESSAGE_HANDLER = None
+
+# The owner's own Telegram chat id, fixed in code at their order
+# (2026-11-08: "ငါ့ tg ကို admin ပုံသေ") — the same pattern as the
+# MLBB app's fixed admin Gmail. Only this chat may submit jobs for
+# now; everyone else may register (future customers) and receive.
+# A chat id never changes; if the owner ever changes Telegram
+# accounts, this one constant is the edit.
+FIXED_ADMIN_CHAT_ID = 6526641203
+
+
+def is_admin(chat_id):
+    return str(chat_id) == str(FIXED_ADMIN_CHAT_ID)
 
 
 def _root():
@@ -159,7 +176,22 @@ def poll_once():
             _call(tok, "sendMessage", chat_id=cid, text=WELCOME)
         except Exception:
             pass  # registration stands even if the greeting fails
+    if MESSAGE_HANDLER:
+        for u in updates:
+            msg = u.get("message")
+            if msg:
+                try:
+                    MESSAGE_HANDLER(msg)
+                except Exception:
+                    pass
     return len(updates)
+
+
+def send_message(chat_id, text):
+    tok = token()
+    if not tok:
+        raise RuntimeError("telegram bot token မရှိပါ")
+    return _call(tok, "sendMessage", chat_id=str(chat_id), text=text)
 
 
 def start_poller():

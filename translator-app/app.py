@@ -110,6 +110,132 @@ def _schedule_cleanup(job):
     CLEANUP_TIMERS[jid] = t
 
 
+# ---------- Telegram round-trip: bot-submitted jobs ----------
+
+_TG_PENDING = []  # job ids created from Telegram, waiting for a free slot
+
+
+def _any_active_worker():
+    return any(j.get("worker_started")
+               and j.get("status") in ("queued", "running")
+               for j in list(JOBS.values()))
+
+
+def _tg_deliver_async(job):
+    """A bot-submitted job finished: send the video back to its chat."""
+    chat_id = job.get("tg_chat_id")
+    if not chat_id:
+        return
+
+    def go():
+        from pipeline import telegram_send as tg
+        out = JOBS_DIR / job["id"] / "output.mp4"
+        try:
+            if not out.exists():
+                return
+            if out.stat().st_size > tg.MAX_BYTES:
+                tg.send_message(
+                    chat_id,
+                    f"✅ ပြီးပါပြီ — ဒါပေမဲ့ ဖိုင် {out.stat().st_size / 1e6:.0f}MB "
+                    "ဖြစ်နေလို့ Telegram ကနေ ပို့လို့ မရပါ (50MB အများဆုံး)")
+                job["tg"] = {"state": "failed", "to": job.get("tg_from"),
+                             "error": "file > 50MB"}
+            else:
+                job["tg"] = {"state": "sending", "to": job.get("tg_from")}
+                _save(job)
+                tg.send_video(chat_id, out,
+                              caption="🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို\n"
+                                      + (job.get("url") or ""))
+                job["tg"] = {"state": "sent", "to": job.get("tg_from")}
+        except Exception as e:
+            job["tg"] = {"state": "failed", "to": job.get("tg_from"),
+                         "error": str(e)[:200]}
+        _save(job)
+
+    threading.Thread(target=go, daemon=True).start()
+
+
+def _tg_error_async(job):
+    chat_id = job.get("tg_chat_id")
+    if not chat_id:
+        return
+
+    def go():
+        try:
+            from pipeline import telegram_send as tg
+            tg.send_message(chat_id, "❌ မလုပ်နိုင်ပါ: "
+                            + str(job.get("error") or "")[:300])
+        except Exception:
+            pass
+
+    threading.Thread(target=go, daemon=True).start()
+
+
+def _on_tg_message(msg):
+    """A Telegram user sent something to the bot: a video link becomes
+    a job (queued behind whatever is running); anything else gets a
+    one-line hint. Private chats only."""
+    from pipeline import telegram_send as tg
+    chat = msg.get("chat") or {}
+    if chat.get("type") != "private":
+        return
+    chat_id = chat.get("id")
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    if not text or text.startswith("/"):
+        return
+    if not tg.is_admin(chat_id):
+        # Closed to everyone but the fixed admin for now (owner's
+        # order); registration above still records future customers.
+        tg.send_message(chat_id, "🔒 အခုတော့ admin အတွက်ပဲ ဖွင့်ထားပါတယ်")
+        return
+    m = re.search(r"https?://\S+", text)
+    if not m:
+        tg.send_message(chat_id,
+                        "🎬 ဘာသာပြန်ချင်တဲ့ video link ကို ပို့ပါ (YouTube / TikTok)")
+        return
+    mine = [j for j in JOBS.values()
+            if j.get("tg_chat_id") == chat_id
+            and j.get("status") in ("queued", "running")]
+    if mine:
+        tg.send_message(chat_id,
+                        "⏳ သင့် အရင် video မပြီးသေးပါ — ပြီးရင် နောက် link ပို့ပါ")
+        return
+    job, err = _new_job({"url": m.group(0), "mode": "both"})
+    if err:
+        tg.send_message(chat_id, "❌ " + err)
+        return
+    frm = msg.get("from") or {}
+    job["tg_chat_id"] = chat_id
+    job["tg_from"] = frm.get("username") or frm.get("first_name")
+    JOBS[job["id"]] = job
+    _save(job)
+    _TG_PENDING.append(job["id"])
+    if _any_active_worker() or len(_TG_PENDING) > 1:
+        tg.send_message(chat_id,
+                        f"✅ လက်ခံရပြီ — တန်းစီ {len(_TG_PENDING)} ခုမြောက်, "
+                        "အရင် job တွေ ပြီးရင် စပါမယ်")
+    else:
+        tg.send_message(chat_id,
+                        "✅ လက်ခံရပြီ — စလုပ်နေပါပြီ, ပြီးရင် ဒီမှာပဲ ပို့ပေးပါမယ်")
+
+
+def _tg_dispatcher():
+    """Start queued bot jobs one at a time (the server runs a single
+    heavy job safely; the web form is gated the same way)."""
+    while True:
+        try:
+            if _TG_PENDING and not _any_active_worker():
+                jid = _TG_PENDING.pop(0)
+                job = JOBS.get(jid)
+                if job and job.get("status") == "queued":
+                    job["worker_started"] = True
+                    threading.Thread(target=_worker, args=(job,),
+                                     daemon=True).start()
+        except Exception:
+            pass
+        time.sleep(4)
+
+
 def _cleanup_job(jid):
     CLEANUP_TIMERS.pop(jid, None)
     job = JOBS.pop(jid, None)
@@ -135,6 +261,7 @@ def _fail(job, e):
     job["finished_at"] = time.time()
     _schedule_cleanup(job)
     _save(job)
+    _tg_error_async(job)
 
 
 def _run_phase2(job):
@@ -153,6 +280,7 @@ def _finish(job):
     job["finished_at"] = time.time()
     _schedule_cleanup(job)
     _save(job)
+    _tg_deliver_async(job)
 
 
 def _cancelled(job):
@@ -514,9 +642,11 @@ def _build_subs(data):
     }
 
 
-@app.post("/api/jobs")
-def create_job():
-    data = request.get_json(force=True)
+def _new_job(data):
+    """Build a job record from request-style data, or (None, error).
+    Shared by the web form and the Telegram bot, so a job is a job
+    however it arrives. The caller registers it in JOBS and decides
+    when its worker starts."""
     url = (data.get("url") or "").strip()
     mode = data.get("mode") or "both"
     voice = data.get("voice") or tts.DEFAULT_VOICE
@@ -533,39 +663,47 @@ def create_job():
     except (TypeError, ValueError):
         voice_pitch = 0
     if font not in FONT_LABELS:
-        return jsonify({"error": "font မမှန်ပါ"}), 400
+        return None, "font မမှန်ပါ"
     if not url.startswith(("http://", "https://")):
-        return jsonify({"error": "လင့်ခ် မမှန်ပါ"}), 400
+        return None, "လင့်ခ် မမှန်ပါ"
     if mode not in ("subs", "dub", "both"):
-        return jsonify({"error": "mode မမှန်ပါ"}), 400
-    source_path = None
-    preview_id = data.get("preview_id")
-    if preview_id:
-        # A preview may be reused ONLY for the very link it was taken
-        # from (its id is a hash of that link). A stale id left over
-        # from a previous video must never substitute the old video
-        # for the new link's job.
-        expected_pid, _ = _preview_dir(url)
-        if str(preview_id) != expected_pid:
-            preview_id = None
-    if preview_id:
-        cand = PREVIEWS_DIR / str(preview_id) / "source.mp4"
-        if cand.exists():
-            source_path = str(cand)
-    jid = uuid.uuid4().hex[:12]
+        return None, "mode မမှန်ပါ"
     job = {
-        "id": jid, "url": url, "mode": mode, "voice": voice, "font": font,
-        "subs": subs,
+        "id": uuid.uuid4().hex[:12], "url": url, "mode": mode,
+        "voice": voice, "font": font, "subs": subs,
         "voice_rate": voice_rate, "voice_pitch": voice_pitch,
-        "fx": _build_fx(data), "source_path": source_path,
+        "fx": _build_fx(data), "source_path": None,
         "status": "queued", "current": None, "error": None,
         "created_at": time.time(), "updated_at": time.time(),
         "finished_at": None,
         "steps": [{"key": k, "label": STEP_LABELS[k], "state": "pending"}
                   for k in run_job.steps_for_mode(mode)],
     }
-    JOBS[jid] = job
+    return job, None
+
+
+@app.post("/api/jobs")
+def create_job():
+    data = request.get_json(force=True)
+    job, err = _new_job(data)
+    if err:
+        return jsonify({"error": err}), 400
+    preview_id = data.get("preview_id")
+    if preview_id:
+        # A preview may be reused ONLY for the very link it was taken
+        # from (its id is a hash of that link). A stale id left over
+        # from a previous video must never substitute the old video
+        # for the new link's job.
+        expected_pid, _ = _preview_dir(job["url"])
+        if str(preview_id) != expected_pid:
+            preview_id = None
+    if preview_id:
+        cand = PREVIEWS_DIR / str(preview_id) / "source.mp4"
+        if cand.exists():
+            job["source_path"] = str(cand)
+    JOBS[job["id"]] = job
     _save(job)
+    job["worker_started"] = True
     threading.Thread(target=_worker, args=(job,), daemon=True).start()
     return jsonify(job)
 
@@ -695,6 +833,7 @@ def job_review(jid):
         old_timer.cancel()
     job.pop("cleanup_at", None)
     _save(job)
+    job["worker_started"] = True
     threading.Thread(target=_worker2, args=(job,), daemon=True).start()
     return jsonify({"ok": True, "edited_count": changed})
 
@@ -908,7 +1047,9 @@ except Exception:
 
 try:
     from pipeline import telegram_send as _tg
+    _tg.MESSAGE_HANDLER = _on_tg_message
     _tg.start_poller()
+    threading.Thread(target=_tg_dispatcher, daemon=True).start()
 except Exception:
     pass
 
