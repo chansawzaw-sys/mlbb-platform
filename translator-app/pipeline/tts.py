@@ -127,7 +127,7 @@ async def _edge_all(jobs, voice, rate, pitch):
     The old loop ran one websocket session per segment back-to-back —
     with 20-30 segments that alone took a minute or more. Returns the
     set of segment indices that produced a non-empty file."""
-    sem = asyncio.Semaphore(4)
+    sem = asyncio.Semaphore(6)
     ok = set()
 
     async def one(idx, text, out):

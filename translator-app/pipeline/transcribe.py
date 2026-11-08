@@ -96,7 +96,10 @@ def transcribe(video_path, workdir, use_captions=False):
     if (local / "model.bin").exists() and not os.environ.get("WHISPER_MODEL"):
         model_ref = str(local)
     else:
-        model_ref = os.environ.get("WHISPER_MODEL", "small")
+        # Default "base" (user, 2026-11-08: everything fast) — roughly
+        # 2x faster decode than "small" at a small accuracy cost;
+        # WHISPER_MODEL=small restores the old behaviour.
+        model_ref = os.environ.get("WHISPER_MODEL", "base")
     model = _get_model(model_ref)
     # condition_on_previous_text=False: decoding no longer waits on the
     # previous window's text — measurably faster on CPU, and it also

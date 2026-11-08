@@ -65,6 +65,9 @@ def download(url: str, workdir: Path) -> Path:
         # stretch each ladder attempt to minutes of silent waiting.
         "socket_timeout": 15,
         "retries": 3,
+        # Segmented downloads (YouTube DASH etc.) fetch fragments one by
+        # one by default; 4 at a time is a large, safe win on this link.
+        "concurrent_fragment_downloads": 4,
     }
     info = None
     first_err = None
