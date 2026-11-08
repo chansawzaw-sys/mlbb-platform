@@ -166,9 +166,9 @@ def poll_once():
         store = _load_store()
     r = requests.get(_API.format(token=tok, method="getUpdates"),
                      params={"offset": store.get("offset", 0),
-                             "timeout": 0,
+                             "timeout": 30,
                              "allowed_updates": '["message", "callback_query"]'},
-                     timeout=20)
+                     timeout=40)
     data = r.json()
     if not data.get("ok"):
         raise RuntimeError(
@@ -177,7 +177,13 @@ def poll_once():
     LAST_POLL["error"] = ""
     updates = data.get("result") or []
     new_users = []
+    start_chats = set()
     for u in updates:
+        _t = (u.get("message") or {}).get("text") or ""
+        if _t.startswith("/start"):
+            _c = (u.get("message") or {}).get("chat") or {}
+            if _c.get("id"):
+                start_chats.add(str(_c["id"]))
         store["offset"] = max(store.get("offset", 0), u["update_id"] + 1)
         msg = u.get("message") or {}
         if not msg and u.get("callback_query"):
@@ -203,6 +209,8 @@ def poll_once():
         with _LOCK:
             _save_store(store)
     for cid in new_users:
+        if MESSAGE_HANDLER and cid in start_chats:
+            continue  # the handler answers /start itself (with menu)
         try:
             _call(tok, "sendMessage", chat_id=cid, text=WELCOME)
         except Exception:
@@ -226,13 +234,17 @@ def poll_once():
     return len(updates)
 
 
-def send_message(chat_id, text, buttons=None):
+def send_message(chat_id, text, buttons=None, keyboard=None):
     tok = token()
     if not tok:
         raise RuntimeError("telegram bot token မရှိပါ")
     params = {"chat_id": str(chat_id), "text": text}
     if buttons:
         params["reply_markup"] = _markup(buttons)
+    elif keyboard:
+        params["reply_markup"] = json.dumps({
+            "keyboard": [[{"text": t} for t in row] for row in keyboard],
+            "resize_keyboard": True})
     return _call(tok, "sendMessage", **params)
 
 
@@ -302,9 +314,12 @@ def start_poller():
             try:
                 if token():
                     poll_once()
+                # Long polling already waited server-side; re-poll
+                # almost immediately so queued updates drain fast.
+                time.sleep(0.2)
             except Exception as e:
                 LAST_POLL["error"] = f"{type(e).__name__}: {e}"[:200]
-            time.sleep(5)
+                time.sleep(3)
 
     _POLLER_THREAD = threading.Thread(target=loop, daemon=True)
     _POLLER_THREAD.start()

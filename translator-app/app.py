@@ -282,11 +282,9 @@ def _on_tg_message(msg):
         # moment) and the persistent menu keyboard; other commands
         # stay silent.
         if text.startswith("/start"):
-            tg.send_message(chat_id, tg.WELCOME)
-            try:
-                tg.send_keyboard(chat_id, "👇 Menu", _MENU_ROWS)
-            except Exception:
-                pass
+            # Welcome + menu keyboard in ONE call (two calls made
+            # the menu visibly trail the greeting).
+            tg.send_message(chat_id, tg.WELCOME, keyboard=_MENU_ROWS)
         return
     if not text:
         return
