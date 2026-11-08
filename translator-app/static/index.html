@@ -135,6 +135,7 @@
   <div class="card" id="adminCard">
     <h3 style="margin-top:0">🛠 Admin — လူ ရှာရန်</h3>
     <input id="adminQ" placeholder="username ရိုက်ရှာပါ (အနည်းဆုံး ၂ လုံး)" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+    <p class="hint">username ရိုက်ရှာရင် အဲဒီ လူ အတွက် လုပ်လို့ရတာတွေ ပေါ်လာမယ် — credit ပေး/နှုတ် · ပိတ်/ဖွင့် · password ပြင် · TG ချိတ် · job + credit မှတ်တမ်း</p>
     <div id="adminResults" style="margin-top:8px"></div>
     <h4>💰 Credit ဖြည့် တောင်းဆိုချက်များ</h4>
     <div id="topupList"><p class="hint">…</p></div>
@@ -911,10 +912,34 @@ async function adminDetail(uid, rowEl) {
     (j.charged_minutes ? " · " + j.charged_minutes + " cr" : "")).join("<br>");
   const led = (r.ledger || []).map(l =>
     "• " + (l.delta > 0 ? "+" : "") + l.delta + " (" + l.reason + ")").join("<br>");
-  d.innerHTML = "<p class='hint'>Job " + r.job_count + " ခု" +
+  d.innerHTML = "<p class='hint'>Job " + r.job_count + " ခု · 💳 " +
+    r.user.credits + " credits" +
     (jobs ? "<br>" + jobs : "") +
     (led ? "<br>💳 မှတ်တမ်း:<br>" + led : "") + "</p>";
+  const mk = (ph) => { const i = document.createElement("input");
+    i.placeholder = ph;
+    i.style.cssText = "width:100%;padding:8px;border-radius:8px;box-sizing:border-box;margin-top:6px";
+    return i; };
+  const btn = (label, fn) => { const b = document.createElement("button");
+    b.className = "ghost"; b.textContent = label;
+    b.addEventListener("click", fn); return b; };
+  const amt = mk("credit ပမာဏ (ဥပမာ 50 သို့ -20)");
+  d.append(amt, btn("💳 Credit ပြင်မယ်", () =>
+    postUser(uid, {credits_delta: parseInt(amt.value) || 0})));
+  const pw = mk("password အသစ်");
+  d.append(pw, btn("🔑 Password ပြင်မယ်", () =>
+    postUser(uid, {new_password: pw.value})));
+  const tgi = mk("Telegram chat id");
+  d.append(tgi, btn("📲 TG ချိတ်မယ်", () =>
+    postUser(uid, {tg_chat_id: tgi.value})));
   rowEl.appendChild(d);
+}
+async function postUser(uid, body) {
+  const r = await (await fetch("/api/admin/users/" + uid, {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body)})).json();
+  if (r.error) { alert(r.error); return; }
+  loadAdminUsers();
 }
 async function loadTopups() {
   if (!(ME && ME.role === "admin")) return;
@@ -987,6 +1012,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 89</p>
+<p class="hint" id="buildTag" style="text-align:center">build 90</p>
 </body>
 </html>
