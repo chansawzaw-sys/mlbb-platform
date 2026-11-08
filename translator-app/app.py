@@ -113,6 +113,7 @@ def _schedule_cleanup(job):
 # ---------- Telegram round-trip: bot-submitted jobs ----------
 
 _TG_PENDING = []  # job ids created from Telegram, waiting for a free slot
+_TG_FLOW = {}     # chat_id -> bot choice flow state (blur spot, mode)
 
 
 def _any_active_worker():
@@ -200,23 +201,144 @@ def _on_tg_message(msg):
         tg.send_message(chat_id,
                         "⏳ သင့် အရင် video မပြီးသေးပါ — ပြီးရင် နောက် link ပို့ပါ")
         return
-    job, err = _new_job({"url": m.group(0), "mode": "both"})
-    if err:
-        tg.send_message(chat_id, "❌ " + err)
-        return
     frm = msg.get("from") or {}
-    job["tg_chat_id"] = chat_id
-    job["tg_from"] = frm.get("username") or frm.get("first_name")
-    JOBS[job["id"]] = job
-    _save(job)
-    _TG_PENDING.append(job["id"])
-    if _any_active_worker() or len(_TG_PENDING) > 1:
-        tg.send_message(chat_id,
-                        f"✅ လက်ခံရပြီ — တန်းစီ {len(_TG_PENDING)} ခုမြောက်, "
-                        "အရင် job တွေ ပြီးရင် စပါမယ်")
-    else:
-        tg.send_message(chat_id,
-                        "✅ လက်ခံရပြီ — စလုပ်နေပါပြီ, ပြီးရင် ဒီမှာပဲ ပို့ပေးပါမယ်")
+    _TG_FLOW[chat_id] = {
+        "url": m.group(0), "step": "prepare",
+        "from": frm.get("username") or frm.get("first_name"),
+        "ts": time.time()}
+    tg.send_message(chat_id,
+                    "⏳ video ယူနေတယ် — ဝါးမယ့် နေရာ ရွေးဖို့ ပုံ ပို့ပေးမယ်")
+    threading.Thread(target=_tg_flow_prepare, args=(chat_id,),
+                     daemon=True).start()
+
+
+_BLUR_PRESETS = {
+    "top": {"x": 0.04, "y": 0.03, "w": 0.92, "h": 0.18},
+    "mid": {"x": 0.04, "y": 0.41, "w": 0.92, "h": 0.18},
+    "bot": {"x": 0.04, "y": 0.79, "w": 0.92, "h": 0.18},
+}
+
+
+def _tg_flow_prepare(chat_id):
+    """Bot flow step 1: fetch the video (the preview cache doubles as
+    the job's source, so nothing downloads twice), auto-detect the
+    caption band, and ask the user to confirm it on a frame photo."""
+    from pipeline import telegram_send as tg
+    flow = _TG_FLOW.get(chat_id)
+    if not flow:
+        return
+    try:
+        pid, pdir = _preview_dir(flow["url"])
+        pdir.mkdir(parents=True, exist_ok=True)
+        src = pdir / "source.mp4"
+        if not src.exists():
+            dl_mod.download(flow["url"], pdir)
+        dur = probe_duration(src)
+        frame = pdir / "tg_frame.jpg"
+        sh(["ffmpeg", "-y", "-v", "error", "-ss",
+            f"{max(1.0, dur * 0.3):.1f}", "-i", str(src),
+            "-frames:v", "1", str(frame)])
+        from pipeline import detect_text
+        box = detect_text.detect_text_box(src)
+        flow.update({"pid": pid, "src": str(src), "box": box,
+                     "step": "blur"})
+        rows = []
+        if box:
+            shown = pdir / "tg_frame_box.jpg"
+            detect_text.draw_box(frame, box, shown)
+            rows.append([("✅ ဒီနေရာ ဝါး", "b:ok"), ("မဝါးဘူး", "b:no")])
+            caption = ("🔍 စာတန်း နေရာ တွေ့တယ် — အနီ အကွက် ကို ဝါးပြီး "
+                       "မြန်မာ စာတန်း အဲဒီ အထဲ ထည့်ပေးမယ်။ မှန်လား?")
+        else:
+            shown = frame
+            rows.append([("မဝါးဘူး", "b:no")])
+            caption = ("စာတန်း နေရာ auto မတွေ့ဘူး — ဝါးချင်တဲ့ အပိုင်း "
+                       "ရွေးပါ (မဝါးချင် 'မဝါးဘူး')")
+        rows.append([("အပေါ်", "b:top"), ("အလယ်", "b:mid"),
+                     ("အောက်", "b:bot")])
+        tg.send_photo(chat_id, shown, caption=caption, buttons=rows)
+    except Exception as e:
+        _TG_FLOW.pop(chat_id, None)
+        try:
+            tg.send_message(chat_id, "❌ video ယူလို့ မရပါ: " + str(e)[:200])
+        except Exception:
+            pass
+
+
+def _on_tg_callback(cq):
+    """Inline-button taps for the bot flow: blur spot, then mode."""
+    from pipeline import telegram_send as tg
+    tg.answer_callback(cq.get("id"))
+    chat = (cq.get("message") or {}).get("chat") or {}
+    chat_id = chat.get("id") or (cq.get("from") or {}).get("id")
+    data = cq.get("data") or ""
+    flow = _TG_FLOW.get(chat_id)
+    if not flow:
+        return
+    if time.time() - flow.get("ts", 0) > 30 * 60:
+        _TG_FLOW.pop(chat_id, None)
+        tg.send_message(chat_id, "⏰ အချိန် ကုန်သွားပြီ — link ပြန်ပို့ပါ")
+        return
+    if data.startswith("b:") and flow.get("step") == "blur":
+        choice = data[2:]
+        if choice == "ok":
+            flow["blur"] = flow.get("box")
+        elif choice == "no":
+            flow["blur"] = None
+        else:
+            flow["blur"] = _BLUR_PRESETS.get(choice)
+        flow["step"] = "mode"
+        tg.send_message(chat_id, "ဘယ် ပုံစံ ထုတ်မလဲ?",
+                        buttons=[[("နှစ်မျိုးလုံး", "m:both")],
+                                 [("စာတန်း ပဲ", "m:subs"),
+                                  ("အသံ ပဲ", "m:dub")]])
+        return
+    if data.startswith("m:") and flow.get("step") == "mode":
+        mode = data[2:]
+        if mode not in ("both", "subs", "dub"):
+            return
+        _TG_FLOW.pop(chat_id, None)
+        job, err = _new_job({"url": flow["url"], "mode": mode})
+        if err:
+            tg.send_message(chat_id, "❌ " + err)
+            return
+        job["source_path"] = flow.get("src")
+        if flow.get("blur"):
+            job["fx"] = {"blur": {**flow["blur"], "strength": 25}}
+        job["tg_chat_id"] = chat_id
+        job["tg_from"] = flow.get("from")
+        JOBS[job["id"]] = job
+        _save(job)
+        _TG_PENDING.append(job["id"])
+        if _any_active_worker() or len(_TG_PENDING) > 1:
+            tg.send_message(chat_id,
+                            f"✅ လက်ခံရပြီ — တန်းစီ {len(_TG_PENDING)} ခုမြောက်, "
+                            "အရင် job တွေ ပြီးရင် စပါမယ်")
+        else:
+            tg.send_message(chat_id,
+                            "✅ လက်ခံရပြီ — စလုပ်နေပါပြီ, ပြီးရင် ဒီမှာပဲ ပို့ပေးပါမယ်")
+
+
+def _tg_progress(job):
+    """Tell the chat which step a bot job is on (changes only)."""
+    from pipeline import telegram_send as tg
+    chat_id = job.get("tg_chat_id")
+    if not chat_id:
+        return
+    last = None
+    while job.get("status") in ("queued", "running"):
+        cur = None
+        for s in job.get("steps") or []:
+            if s.get("state") == "running":
+                cur = s.get("label")
+                break
+        if cur and cur != last:
+            last = cur
+            try:
+                tg.send_message(chat_id, f"⏳ {cur}…")
+            except Exception:
+                pass
+        time.sleep(5)
 
 
 def _tg_dispatcher():
@@ -230,6 +352,8 @@ def _tg_dispatcher():
                 if job and job.get("status") == "queued":
                     job["worker_started"] = True
                     threading.Thread(target=_worker, args=(job,),
+                                     daemon=True).start()
+                    threading.Thread(target=_tg_progress, args=(job,),
                                      daemon=True).start()
         except Exception:
             pass
@@ -1057,6 +1181,7 @@ except Exception:
 try:
     from pipeline import telegram_send as _tg
     _tg.MESSAGE_HANDLER = _on_tg_message
+    _tg.CALLBACK_HANDLER = _on_tg_callback
     _tg.start_poller()
     threading.Thread(target=_tg_dispatcher, daemon=True).start()
 except Exception:

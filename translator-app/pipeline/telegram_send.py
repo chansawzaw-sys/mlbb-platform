@@ -35,6 +35,10 @@ WELCOME = ("✅ မှတ်ပုံတင်ပြီးပါပြီ!\n"
 # registration), so the app can treat links as new jobs.
 MESSAGE_HANDLER = None
 
+# Set by the app: called with every callback_query dict (inline
+# button taps), so the app can run choice flows (blur spot, mode).
+CALLBACK_HANDLER = None
+
 # The owner's own Telegram chat id, fixed in code at their order
 # (2026-11-08: "ငါ့ tg ကို admin ပုံသေ") — the same pattern as the
 # MLBB app's fixed admin Gmail. Only this chat may submit jobs for
@@ -144,7 +148,7 @@ def poll_once():
     r = requests.get(_API.format(token=tok, method="getUpdates"),
                      params={"offset": store.get("offset", 0),
                              "timeout": 0,
-                             "allowed_updates": '["message"]'},
+                             "allowed_updates": '["message", "callback_query"]'},
                      timeout=20)
     data = r.json()
     if not data.get("ok"):
@@ -155,6 +159,12 @@ def poll_once():
     for u in updates:
         store["offset"] = max(store.get("offset", 0), u["update_id"] + 1)
         msg = u.get("message") or {}
+        if not msg and u.get("callback_query"):
+            # a button tap also counts as contact: register the tapper
+            cq = u["callback_query"]
+            frm = cq.get("from") or {}
+            chat = (cq.get("message") or {}).get("chat") or {}
+            msg = {"from": frm, "chat": chat}
         frm, chat = msg.get("from") or {}, msg.get("chat") or {}
         if frm.get("is_bot") or not chat.get("id"):
             continue
@@ -184,14 +194,64 @@ def poll_once():
                     MESSAGE_HANDLER(msg)
                 except Exception:
                     pass
+    if CALLBACK_HANDLER:
+        for u in updates:
+            cq = u.get("callback_query")
+            if cq:
+                try:
+                    CALLBACK_HANDLER(cq)
+                except Exception:
+                    pass
     return len(updates)
 
 
-def send_message(chat_id, text):
+def send_message(chat_id, text, buttons=None):
     tok = token()
     if not tok:
         raise RuntimeError("telegram bot token မရှိပါ")
-    return _call(tok, "sendMessage", chat_id=str(chat_id), text=text)
+    params = {"chat_id": str(chat_id), "text": text}
+    if buttons:
+        params["reply_markup"] = _markup(buttons)
+    return _call(tok, "sendMessage", **params)
+
+
+def _markup(buttons):
+    """buttons: rows of (label, callback_data) -> inline keyboard JSON."""
+    return json.dumps({"inline_keyboard": [
+        [{"text": label, "callback_data": data} for label, data in row]
+        for row in buttons]})
+
+
+def send_photo(chat_id, photo_path, caption="", buttons=None):
+    tok = token()
+    if not tok:
+        raise RuntimeError("telegram bot token မရှိပါ")
+    import requests
+    data = {"chat_id": str(chat_id), "caption": caption[:1024]}
+    if buttons:
+        data["reply_markup"] = _markup(buttons)
+    with open(photo_path, "rb") as fh:
+        r = requests.post(_API.format(token=tok, method="sendPhoto"),
+                          data=data,
+                          files={"photo": (Path(photo_path).name, fh,
+                                           "image/jpeg")},
+                          timeout=120)
+    payload = r.json()
+    if not payload.get("ok"):
+        raise RuntimeError(
+            f"telegram sendPhoto: {payload.get('description')}")
+    return payload["result"]
+
+
+def answer_callback(callback_query_id):
+    tok = token()
+    if not tok:
+        return
+    try:
+        _call(tok, "answerCallbackQuery",
+              callback_query_id=str(callback_query_id), timeout=10)
+    except Exception:
+        pass
 
 
 def start_poller():
