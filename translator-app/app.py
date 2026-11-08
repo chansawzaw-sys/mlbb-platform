@@ -271,7 +271,8 @@ def _run_phase2(job):
                        font=job.get("font") or "noto",
                        voice_rate=job.get("voice_rate", 0),
                        voice_pitch=job.get("voice_pitch", 0),
-                       subs=job.get("subs"))
+                       subs=job.get("subs"),
+                       max_speed=job.get("speed_cap") or 1.3)
 
 
 def _finish(job):
@@ -662,6 +663,13 @@ def _new_job(data):
         voice_pitch = max(-50, min(50, int(data.get("voice_pitch") or 0)))
     except (TypeError, ValueError):
         voice_pitch = 0
+    # Dub speed cap: how far the retime step may speed speech up to
+    # fit its window before it must freeze the frame instead
+    # (owner's control, 1.0 = never speed up, up to 4.0).
+    try:
+        speed_cap = max(1.0, min(4.0, float(data.get("speed_cap") or 1.3)))
+    except (TypeError, ValueError):
+        speed_cap = 1.3
     if font not in FONT_LABELS:
         return None, "font မမှန်ပါ"
     if not url.startswith(("http://", "https://")):
@@ -672,6 +680,7 @@ def _new_job(data):
         "id": uuid.uuid4().hex[:12], "url": url, "mode": mode,
         "voice": voice, "font": font, "subs": subs,
         "voice_rate": voice_rate, "voice_pitch": voice_pitch,
+        "speed_cap": speed_cap,
         "fx": _build_fx(data), "source_path": None,
         "status": "queued", "current": None, "error": None,
         "created_at": time.time(), "updated_at": time.time(),

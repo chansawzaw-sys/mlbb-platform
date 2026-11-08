@@ -57,7 +57,7 @@ def run_phase1(workdir, url, source_path=None, progress=None):
 
 def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
                fx=None, font=burn.DEFAULT_FONT, voice_rate=0, voice_pitch=0,
-               subs=None):
+               subs=None, max_speed=None):
     """Phase 2: from the FINAL (possibly user-edited) segments_my.json —
     TTS -> retime -> logo/blur -> subtitle burn -> output.mp4.
     `subs` is the subtitle-layout dict (size_pct/width_pct/bottom_pct/align);
@@ -80,7 +80,7 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
     mark("tts", "done")
 
     mark("retime", "running")
-    retime.retime(workdir)
+    retime.retime(workdir, max_speed=max_speed or retime.MAX_SPEED)
     mark("retime", "done")
 
     mark("finalize", "running")

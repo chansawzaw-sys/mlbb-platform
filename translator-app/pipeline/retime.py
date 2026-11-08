@@ -27,7 +27,7 @@ MAX_SPEED = 1.30
 GAP_VOL = 0.25
 
 
-def _plan(segs, total_dur):
+def _plan(segs, total_dur, max_speed=MAX_SPEED):
     """Build chunk list covering [0, total_dur]: gaps and speech segments."""
     chunks = []
     cursor = 0.0
@@ -40,7 +40,7 @@ def _plan(segs, total_dur):
         if tts_dur <= orig or tts_dur == 0:
             speed, excess = 1.0, 0.0
         else:
-            speed = min(MAX_SPEED, tts_dur / orig)
+            speed = min(max_speed, tts_dur / orig)
             excess = max(0.0, tts_dur / speed - orig)
         chunks.append({"kind": "seg", "start": start, "end": end, "seg_idx": idx,
                        "speed": round(speed, 4), "excess": round(excess, 3),
@@ -100,7 +100,7 @@ def _video_chunked(src, chunks, cdir, out):
          "-i", str(lst), "-c:v", "copy", str(out)])
 
 
-def retime(workdir):
+def retime(workdir, max_speed=MAX_SPEED):
     workdir = Path(workdir)
     src = workdir / "source.mp4"
     segs = load_segments(workdir / "segments_my.json")
@@ -111,7 +111,8 @@ def retime(workdir):
         if s.get("codec_type") == "video" and s.get("duration"):
             total = min(total, float(s["duration"]))
             break
-    chunks = _plan(segs, total)
+    max_speed = max(1.0, min(4.0, float(max_speed or MAX_SPEED)))
+    chunks = _plan(segs, total, max_speed)
 
     cdir = workdir / "chunks"
     cdir.mkdir(exist_ok=True)
@@ -152,12 +153,12 @@ def retime(workdir):
     dub_wav = workdir / "dub.wav"
     _concat(alist, dub_wav, False)
 
-    # Fast path: if NO segment needed speeding up or a freeze frame,
-    # the retimed timeline IS the original timeline — the video track
-    # passes through untouched (stream copy in the mux below) and the
-    # most expensive encode of the whole job simply does not happen.
-    passthrough = all(c["kind"] == "gap" or
-                      (c["speed"] == 1.0 and c["excess"] <= 0.01)
+    # Fast path: if NO segment needed a freeze frame, the retimed
+    # timeline IS the original timeline (speeding the AUDIO up to fit
+    # its window never changes the video track) — the video passes
+    # through untouched (stream copy in the mux below) and the most
+    # expensive encode of the whole job simply does not happen.
+    passthrough = all(c["kind"] == "gap" or c["excess"] <= 0.01
                       for c in chunks)
     if passthrough:
         run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-i", str(dub_wav),
@@ -189,7 +190,7 @@ def retime(workdir):
     write_srt(new_segs, workdir / "subs_retimed.srt", start_key="start_new", end_key="end_new")
     plan = {"chunks": chunks, "source_duration": round(total, 3),
             "retimed_duration": round(t_cursor, 3),
-            "video_passthrough": passthrough}
+            "video_passthrough": passthrough, "max_speed": max_speed}
     (workdir / "retime_plan.json").write_text(
         __import__("json").dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     return plan
