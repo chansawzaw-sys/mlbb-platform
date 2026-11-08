@@ -59,7 +59,13 @@ def _get_model(model_ref):
     m = _MODEL_CACHE.get(model_ref)
     if m is None:
         from faster_whisper import WhisperModel
-        m = WhisperModel(model_ref, device="cpu", compute_type="int8")
+        try:
+            # Cache-only first: zero network, no hub metadata round-trip.
+            m = WhisperModel(model_ref, device="cpu", compute_type="int8",
+                             local_files_only=True)
+        except Exception:
+            # Fresh server: download once, later loads hit the branch above.
+            m = WhisperModel(model_ref, device="cpu", compute_type="int8")
         _MODEL_CACHE[model_ref] = m
     return m
 
@@ -92,7 +98,11 @@ def transcribe(video_path, workdir, use_captions=False):
     else:
         model_ref = os.environ.get("WHISPER_MODEL", "small")
     model = _get_model(model_ref)
-    segments, _info = model.transcribe(str(wav), beam_size=1, vad_filter=True)
+    # condition_on_previous_text=False: decoding no longer waits on the
+    # previous window's text — measurably faster on CPU, and it also
+    # stops the repeat-loop hallucinations the conditioning can cause.
+    segments, _info = model.transcribe(str(wav), beam_size=1, vad_filter=True,
+                                       condition_on_previous_text=False)
     segs = []
     for s in segments:
         t = (s.text or "").strip()
