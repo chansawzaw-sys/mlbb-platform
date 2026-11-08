@@ -26,6 +26,32 @@ if [ "${1:-}" = "--auto" ]; then
   flock -n 9 || exit 0
 fi
 
+if [ "$AUTO" -eq 1 ]; then
+  # Never restart the app out from under a running job: skip this tick
+  # entirely (the pull is retried next tick, so nothing is lost).
+  if python3 - "$APP" <<'PYEOF'
+import json
+import sys
+import time
+from pathlib import Path
+
+app = Path(sys.argv[1])
+for p in app.glob("jobs/*/job.json"):
+    try:
+        j = json.loads(p.read_text())
+    except Exception:
+        continue
+    if j.get("status") in ("queued", "running") \
+            and time.time() - p.stat().st_mtime < 25 * 60:
+        sys.exit(0)  # an active job exists
+sys.exit(1)
+PYEOF
+  then
+    echo "A job is running; deferring the update to the next tick."
+    exit 0
+  fi
+fi
+
 cd "$REPO"
 BEFORE="$(git rev-parse HEAD)"
 git pull

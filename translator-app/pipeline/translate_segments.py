@@ -24,6 +24,22 @@ from pathlib import Path
 from .common import ensure_system_ca, load_segments, save_segments, write_srt
 
 
+def _with_timeout(fn, text, timeout=45):
+    """Run a provider call under a hard ceiling.
+
+    deep-translator and the translators library issue their HTTP requests
+    with NO timeout, so one hung connection used to stall the whole job
+    forever (the job sat at 'running' and blocked every new job behind
+    the one-job gate). The worker thread is abandoned as a daemon and
+    the call simply counts as a provider failure."""
+    from concurrent.futures import ThreadPoolExecutor
+    ex = ThreadPoolExecutor(max_workers=1)
+    try:
+        return ex.submit(fn, text).result(timeout=timeout)
+    finally:
+        ex.shutdown(wait=False)
+
+
 def _google(text):
     from deep_translator import GoogleTranslator
     return GoogleTranslator(source="auto", target="my").translate(text)
@@ -56,7 +72,7 @@ def _batch_google(texts):
     split back on those markers. Raises unless every marker survives,
     so a mangled reply can never misalign translations."""
     joined = "\n".join(f"[[{i}]] {t}" for i, t in enumerate(texts))
-    out = _google(joined) or ""
+    out = _with_timeout(_google, joined, timeout=60) or ""
     parts = {}
     cur = None
     for line in out.splitlines():
@@ -106,7 +122,7 @@ class _Chain:
             attempts = 1 if self.good else 2
             for attempt in range(attempts):
                 try:
-                    out = (fn(text) or "").strip()
+                    out = (_with_timeout(fn, text) or "").strip()
                     if out:
                         self.good = name
                         return out, name

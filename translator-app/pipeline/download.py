@@ -61,6 +61,10 @@ def download(url: str, workdir: Path) -> Path:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        # Bound every attempt: without these, a hostile/slow site can
+        # stretch each ladder attempt to minutes of silent waiting.
+        "socket_timeout": 15,
+        "retries": 3,
     }
     info = None
     first_err = None
@@ -107,6 +111,7 @@ def download(url: str, workdir: Path) -> Path:
             "subtitleslangs": ["en.*"], "subtitlesformat": "vtt",
             "outtmpl": str(workdir / "source.%(ext)s"),
             "noplaylist": True, "quiet": True, "no_warnings": True,
+            "socket_timeout": 15, "retries": 2,
         }
         with yt_dlp.YoutubeDL(sub_opts) as ydl:
             ydl.extract_info(url, download=True)

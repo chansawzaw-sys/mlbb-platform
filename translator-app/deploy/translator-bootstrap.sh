@@ -244,7 +244,7 @@ import app as appmod  # noqa: E402  (the user's app, unmodified)
 from flask import jsonify, request  # noqa: E402
 
 ACTIVE_STATUSES = {"queued", "running"}
-STALE_AFTER = 6 * 3600  # seconds
+STALE_AFTER = 25 * 60  # seconds since the job's last heartbeat
 
 
 def _busy_job(exclude_jid=None):
@@ -254,8 +254,13 @@ def _busy_job(exclude_jid=None):
             continue
         if job.get("status") not in ACTIVE_STATUSES:
             continue
-        created = job.get("created_at") or now
-        if now - float(created) < STALE_AFTER:
+        if job.get("cancel_requested"):
+            continue  # stopping anyway — never block on it
+        # A live worker heartbeats updated_at every ~45 s. Judging by
+        # created_at instead (the old rule, 6 h) meant one wedged job
+        # could block every new job for hours.
+        updated = job.get("updated_at") or job.get("created_at") or now
+        if now - float(updated) < STALE_AFTER:
             return job
     return None
 

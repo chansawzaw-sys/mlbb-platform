@@ -1,6 +1,6 @@
 // Minimal service worker — enables PWA install. Network-first so the app
 // is never stale; the cache is only an offline fallback for the shell.
-const CACHE = "vt-shell-v1";
+const CACHE = "vt-shell-v2";
 const SHELL = ["/", "/static/manifest.webmanifest", "/static/icon-192.png", "/static/icon-512.png"];
 
 self.addEventListener("install", (e) => {
@@ -16,6 +16,18 @@ self.addEventListener("activate", (e) => {
     caches.keys()
       .then((ks) => Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  e.waitUntil(
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then((cs) => {
+      for (const c of cs) {
+        if ("focus" in c) return c.focus();
+      }
+      return clients.openWindow("/");
+    })
   );
 });
 

@@ -57,8 +57,15 @@ def _save(job):
     p.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+class JobCancelled(Exception):
+    """Raised inside a worker when the user asked to stop the job."""
+
+
 def _progress_fn(job):
     def progress(step, state, note=""):
+        if job.get("cancel_requested"):
+            raise JobCancelled()
+        job["updated_at"] = time.time()
         for s in job["steps"]:
             if s["key"] == step:
                 s["state"] = state
@@ -67,6 +74,20 @@ def _progress_fn(job):
         job["current"] = step
         _save(job)
     return progress
+
+
+def _heartbeat(job):
+    """Keep updated_at (and the on-disk copy) fresh while a worker is
+    alive, so stale-job detection — here and in the launcher gate — can
+    tell a genuinely running job from a wedged one."""
+    while job.get("status") in ("queued", "running") \
+            and not job.get("cancel_requested"):
+        job["updated_at"] = time.time()
+        try:
+            _save(job)
+        except Exception:
+            pass
+        time.sleep(45)
 
 
 # ---------- auto-cleanup: no job data stays on the server ----------
@@ -134,6 +155,16 @@ def _finish(job):
     _save(job)
 
 
+def _cancelled(job):
+    job["status"] = "cancelled"
+    job["error"] = "ရပ်လိုက်ပြီ — ဖျက်ရန် တောင်းဆိုထားသည်"
+    job["finished_at"] = time.time()
+    _save(job)
+    t = threading.Timer(20, _cleanup_job, args=(job["id"],))
+    t.daemon = True
+    t.start()
+
+
 def _worker(job):
     """Full run: download -> transcribe -> translate -> TTS/retime/burn.
 
@@ -141,6 +172,7 @@ def _worker(job):
     as-is and the video renders straight through. The user can still
     edit the text afterwards and re-render (see job_review)."""
     workdir = JOBS_DIR / job["id"]
+    threading.Thread(target=_heartbeat, args=(job,), daemon=True).start()
     try:
         job["status"] = "running"
         _save(job)
@@ -148,17 +180,22 @@ def _worker(job):
                            progress=_progress_fn(job))
         _run_phase2(job)
         _finish(job)
+    except JobCancelled:
+        _cancelled(job)
     except Exception as e:  # surface the real error to the UI
         _fail(job, e)
 
 
 def _worker2(job):
     """Re-render phase 2 from the current (possibly edited) segments."""
+    threading.Thread(target=_heartbeat, args=(job,), daemon=True).start()
     try:
         job["status"] = "running"
         _save(job)
         _run_phase2(job)
         _finish(job)
+    except JobCancelled:
+        _cancelled(job)
     except Exception as e:
         _fail(job, e)
 
@@ -412,7 +449,8 @@ def create_job():
         "voice_rate": voice_rate, "voice_pitch": voice_pitch,
         "fx": _build_fx(data), "source_path": source_path,
         "status": "queued", "current": None, "error": None,
-        "created_at": time.time(), "finished_at": None,
+        "created_at": time.time(), "updated_at": time.time(),
+        "finished_at": None,
         "steps": [{"key": k, "label": STEP_LABELS[k], "state": "pending"}
                   for k in run_job.steps_for_mode(mode)],
     }
@@ -420,6 +458,58 @@ def create_job():
     _save(job)
     threading.Thread(target=_worker, args=(job,), daemon=True).start()
     return jsonify(job)
+
+
+def _job_view(job):
+    return {k: job.get(k) for k in
+            ("id", "url", "mode", "status", "current", "error",
+             "created_at", "updated_at", "finished_at", "cleanup_at")}
+
+
+def _all_jobs():
+    """In-memory jobs merged with any persisted on disk. A job that
+    exists only on disk cannot be running (the process that ran it is
+    gone), so a disk-only 'active' status is healed to error rather
+    than lying to the UI — and blocking the gate — forever."""
+    out = {}
+    for p in JOBS_DIR.glob("*/job.json"):
+        try:
+            j = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if j.get("id"):
+            out[j["id"]] = j
+    for jid, j in JOBS.items():
+        out[jid] = j
+    res = []
+    for jid, j in out.items():
+        if jid not in JOBS and j.get("status") in ("queued", "running"):
+            j["status"] = "error"
+            j["error"] = "server ပြန်စ၍ ရပ်သွား"
+            j["finished_at"] = j.get("finished_at") or time.time()
+            JOBS[jid] = j
+            _save(j)
+            _schedule_cleanup(j)
+        res.append(j)
+    res.sort(key=lambda j: j.get("created_at") or 0, reverse=True)
+    return res
+
+
+@app.get("/api/jobs")
+def list_jobs():
+    return jsonify({"jobs": [_job_view(j) for j in _all_jobs()[:10]]})
+
+
+@app.get("/api/jobs/latest")
+def latest_job():
+    for j in _all_jobs():
+        if j.get("status") in ("queued", "running", "waiting_review"):
+            return jsonify({"job": _job_view(j)})
+        age = time.time() - (j.get("finished_at") or j.get("created_at") or 0)
+        if age < 20 * 60:
+            return jsonify({"job": _job_view(j)})
+        break
+    return jsonify({"job": None})
 
 
 @app.get("/api/jobs/<jid>")
@@ -525,7 +615,15 @@ def delete_job(jid):
     if not job:
         return jsonify({"error": "job မတွေ့ပါ"}), 404
     if job["status"] in ("queued", "running"):
-        return jsonify({"error": "လုပ်နေဆဲ job ကို မဖျက်နိုင်ပါ"}), 409
+        # Stop it instead of refusing: the worker checks cancel_requested
+        # at every step boundary and unwinds; a failsafe timer removes
+        # the files even if a step never returns.
+        job["cancel_requested"] = True
+        _save(job)
+        t = threading.Timer(300, _cleanup_job, args=(jid,))
+        t.daemon = True
+        t.start()
+        return jsonify({"ok": True, "cancelling": True})
     old_timer = CLEANUP_TIMERS.pop(jid, None)
     if old_timer:
         old_timer.cancel()

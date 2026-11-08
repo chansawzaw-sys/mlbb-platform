@@ -105,7 +105,11 @@ def _gtts_synth(text, out_path):
     from gtts import gTTS
 
     last_err = None
-    for attempt in range(10):
+    # Was 10 attempts with sleeps up to 30 s (~4 min of pure sleeping per
+    # segment in the worst case) — this is the LAST fallback, so a long
+    # tail here multiplies across every remaining segment. 4 attempts
+    # with a short backoff rides out a 429 burst without the crawl.
+    for attempt in range(4):
         tld = _GTTS_TLDS[attempt % len(_GTTS_TLDS)]
         try:
             gTTS(text, lang="my", tld=tld).save(str(out_path))
@@ -113,7 +117,7 @@ def _gtts_synth(text, out_path):
                 return
         except Exception as e:  # 429 etc — back off and try another host
             last_err = e
-        time.sleep(min(6 * (attempt + 1), 30))
+        time.sleep(min(4 * (attempt + 1), 12))
     raise RuntimeError(f"gTTS failed after retries: {last_err}")
 
 
@@ -129,7 +133,10 @@ async def _edge_all(jobs, voice, rate, pitch):
     async def one(idx, text, out):
         async with sem:
             try:
-                await _edge_synth(text, voice, out, rate, pitch)
+                # A hung websocket must not stall the whole step: cap each
+                # segment at 60 s, then let the fallback chain take it.
+                await asyncio.wait_for(
+                    _edge_synth(text, voice, out, rate, pitch), timeout=60)
                 if out.exists() and out.stat().st_size > 0:
                     ok.add(idx)
             except Exception:

@@ -36,6 +36,7 @@
     border-radius: 12px; padding: 14px; display: none; }
   .card.show { display: block; }
   .step { display: flex; gap: 8px; align-items: center; padding: 7px 0; font-size: 14px; color: #99a; }
+  .jobrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid #ffffff14; font-size: 14px; }
   .step.running { color: #fff; }
   .step.done { color: #7dd87d; }
   .step.error { color: #ff8080; }
@@ -185,6 +186,11 @@
       <button class="ghost" id="editBtn">✏️ မြန်မာစာ ပြင်ပြီး ပြန်လုပ်မယ်</button>
       <button class="ghost" id="delBtn">🗑 ခုပဲ ဖျက်မယ်</button>
     </div>
+  </div>
+
+  <div class="card show" id="jobsCard">
+    <h3 style="margin-top:0">📋 အလုပ်များ <button class="ghost" id="notifyBtn" style="float:right">🔔 ပြီးရင် အသိပေး</button></h3>
+    <div id="jobsList"><p class="hint">…</p></div>
   </div>
 
   <div class="card" id="reviewCard">
@@ -432,6 +438,8 @@ $("go").onclick = async () => {
   const job = await res.json();
   if (!res.ok) { $("err").textContent = job.error || "အမှားတစ်ခု ဖြစ်သွားပြီ"; $("go").disabled = false; return; }
   currentJobId = job.id;
+  try { localStorage.setItem("vt_job", job.id); } catch (e) {}
+  loadJobs();
   clearInterval(timer);
   timer = setInterval(() => poll(job.id), 2000);
   poll(job.id);
@@ -523,7 +531,17 @@ $("bulkGo").onclick = async () => {
 
 async function poll(id) {
   const job = await (await fetch("/api/jobs/" + id)).json();
-  if (job.error && job.status === "deleted") return;
+  if (!job.steps) {  // deleted/unknown — forget it and stop
+    try { localStorage.removeItem("vt_job"); } catch (e) {}
+    clearInterval(timer);
+    return;
+  }
+  const prev = lastStatus[id]; lastStatus[id] = job.status;
+  if (prev && ACTIVE_ST.includes(prev)
+      && ["done", "error", "cancelled"].includes(job.status)) {
+    notifyUser(job);
+    loadJobs();
+  }
   $("steps").innerHTML = job.steps.map(s =>
     `<div class="step ${s.state}">${ICON[s.state] || "⏳"} ${s.label}</div>`).join("");
   if (job.status === "waiting_review" && reviewShownFor !== id) loadReview(id);
@@ -534,13 +552,107 @@ async function poll(id) {
     fillDl("jobDl", id); $("jobDl").style.display = "flex";
     $("preview").src = "/api/jobs/" + id + "/stream"; $("preview").style.display = "block";
     $("cleanupNote").style.display = "block"; $("doneBtns").style.display = "flex";
-  } else if (job.status === "error") {
+  } else if (job.status === "error" || job.status === "cancelled") {
     clearInterval(timer); $("go").disabled = false;
     $("err").textContent = job.error || "";
   } else {
     $("cleanupNote").style.display = "none"; $("doneBtns").style.display = "none";
   }
 }
+/* ---------------- jobs list / restore / notify ---------------- */
+const ACTIVE_ST = ["queued", "running", "waiting_review"];
+const ST_ICON = {queued: "⏳", running: "🔄", waiting_review: "✏️",
+                 done: "✅", error: "❌", cancelled: "⏹"};
+let lastStatus = {};
+function shortUrl(u) {
+  try { return new URL(u).hostname.replace("www.", "") + " …" + (u || "").slice(-6); }
+  catch (e) { return (u || "").slice(0, 40); }
+}
+function mmss(sec) {
+  sec = Math.max(0, Math.round(sec));
+  return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
+}
+async function loadJobs() {
+  try {
+    const d = await (await fetch("/api/jobs")).json();
+    const el = $("jobsList");
+    if (!d.jobs || !d.jobs.length) {
+      el.innerHTML = '<p class="hint">အလုပ် မရှိသေးပါ</p>';
+      return;
+    }
+    el.innerHTML = d.jobs.map(j => {
+      let extra = "";
+      if ((j.status === "running" || j.status === "queued") && j.current)
+        extra = " — " + j.current;
+      if (j.status === "done" && j.cleanup_at)
+        extra = " — ဖျက်ရန် " + mmss(j.cleanup_at - Date.now() / 1000) + " ကျန်";
+      return `<div class="jobrow"><span>${ST_ICON[j.status] || "•"} ${shortUrl(j.url)}${extra}</span>` +
+        `<span><button class="ghost" onclick="attachJob('${j.id}')">ကြည့်</button> ` +
+        `<button class="ghost" onclick="delJob('${j.id}','${j.status}')">ဖျက်</button></span></div>`;
+    }).join("");
+  } catch (e) {}
+}
+window.attachJob = function (id) {
+  currentJobId = id; reviewJobId = id;
+  try { localStorage.setItem("vt_job", id); } catch (e) {}
+  $("card").style.display = "block"; $("err").textContent = "";
+  clearInterval(timer);
+  timer = setInterval(() => poll(id), 2000);
+  poll(id);
+};
+window.delJob = async function (id, status) {
+  const active = ACTIVE_ST.includes(status);
+  if (!confirm(active ? "လုပ်နေဆဲ job — ရပ်ပြီး ဖျက်မှာ သေချာလား?"
+                      : "ဒီ job ရဲ့ ဖိုင် အကုန် ဖျက်မှာ သေချာလား?")) return;
+  const res = await fetch("/api/jobs/" + id, {method: "DELETE"});
+  if (!res.ok) {
+    const d = await res.json().catch(() => ({}));
+    alert(d.error || "ဖျက်လို့ မရပါ");
+    return;
+  }
+  if (id === currentJobId) {
+    clearInterval(timer); currentJobId = null;
+    $("card").style.display = "none";
+    try { localStorage.removeItem("vt_job"); } catch (e) {}
+  }
+  loadJobs();
+};
+function notifyUser(job) {
+  try { if (localStorage.getItem("vt_notify") !== "1") return; } catch (e) { return; }
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  const body = job.status === "done" ? "ဗီဒီယို ရပြီ — download လုပ်နိုင်ပြီ"
+                                     : (job.error || "job ရပ်သွား");
+  if (navigator.serviceWorker && navigator.serviceWorker.ready) {
+    navigator.serviceWorker.ready
+      .then(r => r.showNotification("🎬 Video Translator",
+        {body, icon: "/static/icon-192.png"}))
+      .catch(() => {});
+  } else {
+    new Notification("🎬 Video Translator", {body});
+  }
+}
+$("notifyBtn").onclick = async () => {
+  if (!("Notification" in window)) { alert("ဒီ browser က notification မရပါ"); return; }
+  const p = await Notification.requestPermission();
+  if (p === "granted") {
+    try { localStorage.setItem("vt_notify", "1"); } catch (e) {}
+    alert("🔔 ဖွင့်ပြီးပြီ — job ပြီးရင် အသိပေးမယ်");
+  } else {
+    alert("🔕 ခွင့်ပြုချက် မရပါ — browser settings မှာ ဖွင့်ပေးပါ");
+  }
+};
+setInterval(loadJobs, 15000);
+(async function restoreJob() {
+  loadJobs();
+  let id = null;
+  try { id = localStorage.getItem("vt_job"); } catch (e) {}
+  if (id) { attachJob(id); return; }
+  try {
+    const d = await (await fetch("/api/jobs/latest")).json();
+    if (d.job) attachJob(d.job.id);
+  } catch (e) {}
+})();
+
 /* ---------------- Gemini key settings ---------------- */
 async function loadKeyState() {
   try {
