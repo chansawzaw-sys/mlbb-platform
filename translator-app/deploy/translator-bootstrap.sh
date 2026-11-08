@@ -443,6 +443,37 @@ systemctl daemon-reload
 systemctl enable translator-port80.service >/dev/null 2>&1 || true
 echo "Port 80 redirect to :${PUBLIC_PORT} active (and boot-persistent)."
 
+# --- 13c. auto-update timer ------------------------------------------------------
+# Every 15 min the server pulls the repo itself and, only when something
+# changed, applies the update (syntax-gated, locked). This ends the manual
+# console trips: shipping an update = pushing to GitHub.
+cat > /etc/systemd/system/translator-autoupdate.service <<EOF3
+[Unit]
+Description=Auto-update the video translator from GitHub
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'cp ${APP_DIR}/deploy/apply-update.sh /tmp/apply-update-run.sh && bash /tmp/apply-update-run.sh --auto'
+StandardOutput=append:/root/translator-autoupdate.log
+StandardError=append:/root/translator-autoupdate.log
+EOF3
+cat > /etc/systemd/system/translator-autoupdate.timer <<EOF3
+[Unit]
+Description=Run translator auto-update every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+EOF3
+systemctl daemon-reload
+systemctl enable --now translator-autoupdate.timer >/dev/null 2>&1 || true
+echo "Auto-update timer installed (checks GitHub every 15 min)."
+
 # --- 14. start + health checks ----------------------------------------------------------------
 systemctl restart "$SERVICE_NAME"
 echo "Waiting for the app on http://127.0.0.1:${INTERNAL_PORT}/ ..."

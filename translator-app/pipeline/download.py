@@ -26,20 +26,29 @@ def download(url: str, workdir: Path) -> Path:
         "quiet": True,
         "no_warnings": True,
     }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except Exception as first_err:
-        # Retry once with browser impersonation: TikTok and other social
-        # sites fingerprint plain datacenter clients and answer with an
-        # error page ("Unexpected response from webpage request").
+    # Attempt ladder: plain first, then browser impersonation. TikTok and
+    # other social sites fingerprint plain datacenter clients and answer
+    # with an error page ("Unexpected response from webpage request");
+    # impersonating a real browser's TLS/headers usually gets through.
+    info = None
+    first_err = None
+    for target in (None, "chrome", "safari"):
+        attempt_opts = dict(opts)
+        if target is not None:
+            try:
+                from yt_dlp.networking.impersonation import ImpersonateTarget
+                attempt_opts["impersonate"] = ImpersonateTarget(target)
+            except Exception:
+                continue
         try:
-            from yt_dlp.networking.impersonation import ImpersonateTarget
-            imp_opts = dict(opts, impersonate=ImpersonateTarget("chrome"))
-            with yt_dlp.YoutubeDL(imp_opts) as ydl:
+            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-        except Exception:
-            raise first_err
+            break
+        except Exception as e:
+            if first_err is None:
+                first_err = e
+    if info is None:
+        raise first_err
     # Caption fast-path is BEST-EFFORT only: a subtitle 429/failure must
     # never kill the video download (observed on rate-limited IPs).
     try:
