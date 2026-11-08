@@ -152,23 +152,44 @@ def retime(workdir):
     dub_wav = workdir / "dub.wav"
     _concat(alist, dub_wav, False)
 
-    retimed_video = workdir / "retimed_video.mp4"
-    if len(chunks) <= 80:
-        try:
-            _video_single_pass(src, chunks, retimed_video)
-        except Exception:
-            _video_chunked(src, chunks, cdir, retimed_video)
+    # Fast path: if NO segment needed speeding up or a freeze frame,
+    # the retimed timeline IS the original timeline — the video track
+    # passes through untouched (stream copy in the mux below) and the
+    # most expensive encode of the whole job simply does not happen.
+    passthrough = all(c["kind"] == "gap" or
+                      (c["speed"] == 1.0 and c["excess"] <= 0.01)
+                      for c in chunks)
+    if passthrough:
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-i", str(dub_wav),
+             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac",
+             "-shortest", str(workdir / "retimed.mp4")])
     else:
-        _video_chunked(src, chunks, cdir, retimed_video)
-
-    run(["ffmpeg", "-y", "-v", "error", "-i", str(retimed_video), "-i", str(dub_wav),
-         "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest",
-         str(workdir / "retimed.mp4")])
+        retimed_video = workdir / "retimed_video.mp4"
+        if len(chunks) <= 80:
+            try:
+                _video_single_pass(src, chunks, retimed_video)
+            except Exception:
+                _video_chunked(src, chunks, cdir, retimed_video)
+        else:
+            _video_chunked(src, chunks, cdir, retimed_video)
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(retimed_video), "-i", str(dub_wav),
+             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest",
+             str(workdir / "retimed.mp4")])
+        # Intermediates are dead weight once the mux exists (the chunked
+        # fallback's pieces are a second full copy of the video) — drop
+        # them now instead of letting them sit until job cleanup.
+        try:
+            retimed_video.unlink(missing_ok=True)
+            for piece in cdir.glob("v*.mp4"):
+                piece.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     save_segments(new_segs, workdir / "segments_retimed.json")
     write_srt(new_segs, workdir / "subs_retimed.srt", start_key="start_new", end_key="end_new")
     plan = {"chunks": chunks, "source_duration": round(total, 3),
-            "retimed_duration": round(t_cursor, 3)}
+            "retimed_duration": round(t_cursor, 3),
+            "video_passthrough": passthrough}
     (workdir / "retime_plan.json").write_text(
         __import__("json").dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     return plan

@@ -1,7 +1,10 @@
 """Shared ffmpeg/ffprobe helpers."""
 import json
+import shutil
 import subprocess
 from pathlib import Path
+
+_HAS_NICE = shutil.which("nice") is not None
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FONTS_DIR = PROJECT_ROOT / "assets" / "fonts"
@@ -32,7 +35,13 @@ def ensure_system_ca():
 
 
 def run(cmd, **kw):
-    """Run a command, raise RuntimeError with stderr tail on failure."""
+    """Run a command, raise RuntimeError with stderr tail on failure.
+
+    ffmpeg runs under `nice` so a long encode can never starve the
+    rest of this small shared server (the MLBB app lives on it too);
+    the encode still gets every idle cycle, it just yields politely."""
+    if cmd and cmd[0] == "ffmpeg" and _HAS_NICE:
+        cmd = ["nice", "-n", "8"] + [str(c) for c in cmd]
     p = subprocess.run(cmd, capture_output=True, text=True, **kw)
     if p.returncode != 0:
         tail = (p.stderr or p.stdout or "")[-2000:]
