@@ -323,6 +323,13 @@ _MENU_ROWS = [["🎬 Video ထုတ်မယ်", "💰 Credit ဖြည့်"
               ["💳 လက်ကျန်", "👤 Username ချိတ်"]]
 _LINK_CODES = {}   # code -> (user_id, expires) — web-issued, bot-redeemed
 
+# Whenever the bot sends a user off to the web app (to register or
+# link), the message carries the app link AND the install reminder.
+APP_LINK = os.environ.get("VT_APP_URL", "https://85-155-149-58.sslip.io")
+_LINK_HINT = ("\n🔗 App: " + APP_LINK +
+              "\n📲 တစ်ခါတည်း ဒေါင်းထားပါ: link ကို browser မှာ ဖွင့်ပြီး "
+              "menu (⋮) → «Add to Home screen»")
+
 
 def _pay_info():
     p = ROOT / ".env"
@@ -410,7 +417,7 @@ def _tg_menu_step(msg, chat_id, text):
                                      f"လက်ကျန် {acct['credits']} credits")
         else:
             tg.send_message(chat_id, "အရင် 👤 Username ချိတ်ပါ — web "
-                                     "account card မှာ code ထုတ်ရမယ်")
+                                     "account card မှာ code ထုတ်ရမယ်" + _LINK_HINT)
         return True
     if text == "👤 Username ချိတ်":
         if acct:
@@ -420,12 +427,12 @@ def _tg_menu_step(msg, chat_id, text):
             _TG_FLOW[chat_id] = {"step": "link", "ts": time.time()}
             tg.send_message(chat_id, "🔑 web app ရဲ့ 👤 account card မှာ "
                                      "'TG ချိတ်ရန် code' ထုတ်ပြီး အဲဒီ "
-                                     "code ကို ဒီမှာ ပို့ပါ")
+                                     "code ကို ဒီမှာ ပို့ပါ" + _LINK_HINT)
         return True
     if text == "💰 Credit ဖြည့်":
         if not acct:
             tg.send_message(chat_id, "အရင် 👤 Username ချိတ်ပါ — "
-                                     "ပြီးမှ credit ဖြည့်လို့ရမယ်")
+                                     "ပြီးမှ credit ဖြည့်လို့ရမယ်" + _LINK_HINT)
             return True
         _TG_FLOW[chat_id] = {"step": "topup_amount", "ts": time.time()}
         info = _pay_info()
@@ -569,7 +576,7 @@ def _on_tg_callback(cq):
                 _TG_FLOW.pop(chat_id, None)
                 tg.send_message(chat_id, "အရင် 👤 Username ချိတ် "
                                          "(Menu ထဲက) ပါ — account "
-                                         "ရှိမှ job ထုတ်လို့ရမယ်")
+                                         "ရှိမှ job ထုတ်လို့ရမယ်" + _LINK_HINT)
                 return
             need = flow.get("minutes") or 1
             if (acct["credits"] or 0) < need:
