@@ -85,7 +85,7 @@ def download(url: str, workdir: Path) -> Path:
         "retries": 3,
         # Segmented downloads (YouTube DASH etc.) fetch fragments one by
         # one by default; 4 at a time is a large, safe win on this link.
-        "concurrent_fragment_downloads": 4,
+        "concurrent_fragment_downloads": 8,
     }
     info = None
     first_err = None

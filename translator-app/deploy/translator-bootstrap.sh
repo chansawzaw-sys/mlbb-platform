@@ -342,10 +342,11 @@ ExecStart=$APP_DIR/.venv/bin/python $DEPLOY_DIR/serve.py
 Restart=on-failure
 RestartSec=3
 # Sane caps for a 1 vCPU / 2 GB box shared with the MLBB container:
-# whisper-small (int8) + one ffmpeg pass fit comfortably under 1.5 GB;
-# 90% CPU leaves the MLBB app responsive while a job runs.
+# whisper base (int8) + one ffmpeg pass; the box has 2 cores:
+# 170% lets a job use nearly the whole machine while MLBB (light,
+# mostly idle) keeps its headroom — this quota was the main speed brake.
 MemoryMax=2600M
-CPUQuota=90%
+CPUQuota=170%
 OOMPolicy=continue
 NoNewPrivileges=true
 PrivateTmp=true
