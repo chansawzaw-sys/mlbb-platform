@@ -25,9 +25,21 @@ def _tiktok_fallback(url: str, workdir: Path) -> dict:
     import requests
 
     headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"}
-    r = requests.get("https://www.tikwm.com/api/", params={"url": url},
-                     headers=headers, timeout=30)
-    r.raise_for_status()
+    # One retry: a transient resolver failure silently drops the job
+    # to the yt-dlp ladder, whose TikTok rendition can be 4x larger.
+    r = None
+    for attempt in range(2):
+        try:
+            r = requests.get("https://www.tikwm.com/api/",
+                             params={"url": url}, headers=headers,
+                             timeout=30)
+            r.raise_for_status()
+            break
+        except Exception:
+            if attempt == 1:
+                raise
+            import time as _t
+            _t.sleep(2)
     payload = r.json()
     data = payload.get("data") or {}
     play = data.get("play") or data.get("hdplay") or data.get("wmplay")
@@ -55,7 +67,13 @@ def download(url: str, workdir: Path) -> Path:
     workdir.mkdir(parents=True, exist_ok=True)
     out = workdir / "source.mp4"
     opts = {
-        "format": "bv*[height<=720]+ba/b[height<=720]/b",
+        # Light renditions first: at the same resolution, platforms
+        # offer several bitrates (TikTok's "download" rendition of a
+        # 63 s clip is 39 MB where the standard one is 9 MB). A bitrate
+        # cap picks the light one; the uncapped selectors remain as
+        # fallbacks so an unusual format list can never fail the job.
+        "format": ("bv*[height<=720][tbr<=1800]+ba/b[height<=720][tbr<=1800]/"
+                   "bv*[height<=720]+ba/b[height<=720]/b"),
         "merge_output_format": "mp4",
         "outtmpl": str(workdir / "source.%(ext)s"),
         "noplaylist": True,
