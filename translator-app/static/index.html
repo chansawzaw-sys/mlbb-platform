@@ -266,7 +266,7 @@
   <div class="card" id="card">
     <div id="steps"></div>
     <p class="err" id="err"></p>
-    <video id="preview" controls playsinline style="display:none"></video>
+    <video id="preview" controls playsinline preload="metadata" style="display:none"></video>
     <a class="dl" id="dl" style="display:none">⬇️ ရလာတဲ့ ဗီဒီယို ဒေါင်းလုပ် (.mp4)</a>
     <div class="row" id="jobDl" style="display:none">
       <a class="dlbtn" id="jobDlTxt" download>📄 မြန်မာ စာသား (TXT)</a>
@@ -647,6 +647,7 @@ async function poll(id) {
     $("dl").href = "/api/jobs/" + id + "/download"; $("dl").style.display = "block";
     fillDl("jobDl", id); $("jobDl").style.display = "flex";
     $("preview").src = "/api/jobs/" + id + "/stream"; $("preview").style.display = "block";
+    try { $("preview").scrollIntoView({behavior: "smooth", block: "center"}); } catch (e) {}
     $("cleanupNote").style.display = "block"; $("doneBtns").style.display = "flex";
   } else if (job.status === "error" || job.status === "cancelled") {
     clearInterval(timer); $("go").disabled = false;
@@ -725,7 +726,7 @@ window.delJob = async function (id, status) {
 function notifyUser(job) {
   try { if (localStorage.getItem("vt_notify") !== "1") return; } catch (e) { return; }
   if (!("Notification" in window) || Notification.permission !== "granted") return;
-  const body = job.status === "done" ? "ဗီဒီယို ရပြီ — download လုပ်နိုင်ပြီ"
+  const body = job.status === "done" ? "ဗီဒီယို ရပြီ — ဒီမှာပဲ တန်း ကြည့်နိုင်ပြီ"
                                      : (job.error || "job ရပ်သွား");
   if (navigator.serviceWorker && navigator.serviceWorker.ready) {
     navigator.serviceWorker.ready
@@ -1107,6 +1108,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 99</p>
+<p class="hint" id="buildTag" style="text-align:center">build 100</p>
 </body>
 </html>

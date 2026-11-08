@@ -557,8 +557,71 @@ def _tg_flow_prepare(chat_id):
             pass
 
 
+def _tg_start_flow_job(chat_id, flow):
+    """Final bot-flow step: credit/cap checks, then create the job
+    from everything the flow collected (blur, mode, frame, speed)."""
+    from pipeline import telegram_send as tg
+    ratio = flow.get("ratio") or "orig"
+    acct = accounts.user_for_tg(chat_id)
+    if not tg.is_admin(chat_id):
+        if not acct:
+            _TG_FLOW.pop(chat_id, None)
+            tg.send_message(chat_id, "အရင် 👤 Username ချိတ် "
+                                     "(Menu ထဲက) ပါ — account "
+                                     "ရှိမှ job ထုတ်လို့ရမယ်" + _LINK_HINT)
+            return
+        need = flow.get("minutes") or 1
+        if (acct["credits"] or 0) < need:
+            _TG_FLOW.pop(chat_id, None)
+            tg.send_message(chat_id,
+                            f"💳 credit မလောက် — ဒီ video က {need} "
+                            f"credits လိုတယ်, လက်ကျန် "
+                            f"{acct['credits']} ပဲ ရှိတယ်")
+            return
+    if (not tg.is_admin(chat_id)
+            and _tg_daily_count(chat_id) >= _TG_DAILY_CAP):
+        _TG_FLOW.pop(chat_id, None)
+        tg.send_message(chat_id, "🚫 ဒီနေ့ အတွက် job ကန့်သတ် ပြည့်ပြီ "
+                                 "— မနက်ဖြန် ပြန်လာပါ")
+        return
+    _TG_FLOW.pop(chat_id, None)
+    job, err = _new_job({"url": flow.get("url")
+                         or "https://telegram.org/file",
+                         "mode": flow.get("mode") or "both",
+                         "speed_cap": flow.get("speed_cap") or 1.3})
+    if err:
+        tg.send_message(chat_id, "❌ " + err)
+        return
+    if flow.get("file_id"):
+        job["url"] = "📁 Telegram file"
+    if acct and not tg.is_admin(chat_id):
+        job["user_id"] = acct["id"]
+    job["source_path"] = flow.get("src")
+    fx = {}
+    if flow.get("blur"):
+        fx["blur"] = {**flow["blur"], "strength": 25}
+    if ratio != "orig":
+        fx["aspect"] = {"ratio": ratio, "style": "blur"}
+    if fx:
+        job["fx"] = fx
+    job["tg_chat_id"] = chat_id
+    job["tg_from"] = flow.get("from")
+    JOBS[job["id"]] = job
+    _save(job)
+    _tg_daily_count(chat_id, add=True)
+    _TG_PENDING.append(job["id"])
+    if _any_active_worker() or len(_TG_PENDING) > 1:
+        tg.send_message(chat_id,
+                        f"✅ လက်ခံရပြီ — တန်းစီ {len(_TG_PENDING)} ခုမြောက်, "
+                        "အရင် job တွေ ပြီးရင် စပါမယ်")
+    else:
+        tg.send_message(chat_id,
+                        "✅ လက်ခံရပြီ — စလုပ်နေပါပြီ, ပြီးရင် ဒီမှာပဲ "
+                        "ဗီဒီယို တန်း ပို့ပေးပါမယ်")
+
+
 def _on_tg_callback(cq):
-    """Inline-button taps for the bot flow: blur spot, then mode."""
+    """Inline-button taps for the bot flow: blur, mode, frame, speed."""
     from pipeline import telegram_send as tg
     tg.answer_callback(cq.get("id"))
     chat = (cq.get("message") or {}).get("chat") or {}
@@ -623,60 +686,28 @@ def _on_tg_callback(cq):
         ratio = data[2:]
         if ratio != "orig" and ratio not in fx_mod.ASPECT_DIMS:
             return
-        acct = accounts.user_for_tg(chat_id)
-        if not tg.is_admin(chat_id):
-            if not acct:
-                _TG_FLOW.pop(chat_id, None)
-                tg.send_message(chat_id, "အရင် 👤 Username ချိတ် "
-                                         "(Menu ထဲက) ပါ — account "
-                                         "ရှိမှ job ထုတ်လို့ရမယ်" + _LINK_HINT)
-                return
-            need = flow.get("minutes") or 1
-            if (acct["credits"] or 0) < need:
-                _TG_FLOW.pop(chat_id, None)
-                tg.send_message(chat_id,
-                                f"💳 credit မလောက် — ဒီ video က {need} "
-                                f"credits လိုတယ်, လက်ကျန် "
-                                f"{acct['credits']} ပဲ ရှိတယ်")
-                return
-        if (not tg.is_admin(chat_id)
-                and _tg_daily_count(chat_id) >= _TG_DAILY_CAP):
-            _TG_FLOW.pop(chat_id, None)
-            tg.send_message(chat_id, "🚫 ဒီနေ့ အတွက် job ကန့်သတ် ပြည့်ပြီ "
-                                     "— မနက်ဖြန် ပြန်လာပါ")
+        flow["ratio"] = ratio
+        if (flow.get("mode") or "both") != "subs":
+            flow["step"] = "speed"
+            tg.send_message(chat_id, "အသံ အရှိန် ရွေးပါ",
+                            buttons=[[("1.0×", "s:1.0"),
+                                      ("1.3× ပုံမှန်", "s:1.3"),
+                                      ("1.5×", "s:1.5")],
+                                     [("2×", "s:2.0"), ("3×", "s:3.0"),
+                                      ("4×", "s:4.0")]])
             return
-        _TG_FLOW.pop(chat_id, None)
-        job, err = _new_job({"url": flow.get("url")
-                             or "https://telegram.org/file",
-                             "mode": flow.get("mode") or "both"})
-        if err:
-            tg.send_message(chat_id, "❌ " + err)
+        _tg_start_flow_job(chat_id, flow)
+        return
+    if data.startswith("s:") and flow.get("step") == "speed":
+        try:
+            speed = float(data[2:])
+        except ValueError:
             return
-        if flow.get("file_id"):
-            job["url"] = "📁 Telegram file"
-        if acct and not tg.is_admin(chat_id):
-            job["user_id"] = acct["id"]
-        job["source_path"] = flow.get("src")
-        fx = {}
-        if flow.get("blur"):
-            fx["blur"] = {**flow["blur"], "strength": 25}
-        if ratio != "orig":
-            fx["aspect"] = {"ratio": ratio, "style": "blur"}
-        if fx:
-            job["fx"] = fx
-        job["tg_chat_id"] = chat_id
-        job["tg_from"] = flow.get("from")
-        JOBS[job["id"]] = job
-        _save(job)
-        _tg_daily_count(chat_id, add=True)
-        _TG_PENDING.append(job["id"])
-        if _any_active_worker() or len(_TG_PENDING) > 1:
-            tg.send_message(chat_id,
-                            f"✅ လက်ခံရပြီ — တန်းစီ {len(_TG_PENDING)} ခုမြောက်, "
-                            "အရင် job တွေ ပြီးရင် စပါမယ်")
-        else:
-            tg.send_message(chat_id,
-                            "✅ လက်ခံရပြီ — စလုပ်နေပါပြီ, ပြီးရင် ဒီမှာပဲ ပို့ပေးပါမယ်")
+        if speed not in (1.0, 1.3, 1.5, 2.0, 3.0, 4.0):
+            return
+        flow["speed_cap"] = speed
+        _tg_start_flow_job(chat_id, flow)
+        return
 
 
 def _tg_progress(job):
