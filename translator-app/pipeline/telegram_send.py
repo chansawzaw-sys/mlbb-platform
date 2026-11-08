@@ -1,0 +1,216 @@
+"""Telegram delivery for finished videos (commercial direction).
+
+How Telegram bots work, and why this module is shaped this way:
+  * A bot can only message a user who has messaged the bot FIRST
+    (there is no API to resolve a @username to a chat id). So the app
+    runs a small getUpdates poller: anyone who opens the bot and taps
+    Start (or sends any message) is registered as a recipient.
+  * The bot token lives in the app .env (TELEGRAM_BOT_TOKEN), set from
+    the app's own settings card — it never travels through chat and no
+    endpoint ever returns it.
+  * api.telegram.org caps bot uploads at 50 MB; the caller enforces
+    that before sending.
+
+Recipients persist in .tg_recipients.json in the app dir (survives
+app updates like .env does; never in git).
+"""
+import json
+import os
+import re
+import threading
+import time
+from pathlib import Path
+
+_API = "https://api.telegram.org/bot{token}/{method}"
+_LOCK = threading.Lock()
+_ME_CACHE = {}
+_POLLER_STARTED = False
+
+WELCOME = ("✅ မှတ်ပုံတင်ပြီးပါပြီ!\n"
+           "ဒီ bot ကနေ ဘာသာပြန်ပြီးသား ဗီဒီယိုတွေ သင့်ဆီ "
+           "တိုက်ရိုက် ပို့ပေးပါမယ်။")
+
+
+def _root():
+    return Path(os.environ.get("VT_APP_ROOT")
+                or Path(__file__).resolve().parent.parent)
+
+
+def _env_path():
+    return _root() / ".env"
+
+
+def token():
+    """Bot token from the environment or the app .env, or None."""
+    t = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    if t:
+        return t
+    p = _env_path()
+    if p.exists():
+        for ln in p.read_text(encoding="utf-8").splitlines():
+            if ln.startswith("TELEGRAM_BOT_TOKEN="):
+                return ln.split("=", 1)[1].strip() or None
+    return None
+
+
+def valid_format(tok):
+    return bool(tok) and bool(
+        re.fullmatch(r"\d{6,12}:[A-Za-z0-9_-]{30,}", tok.strip()))
+
+
+def _call(tok, method, timeout=30, **params):
+    import requests
+    r = requests.post(_API.format(token=tok, method=method),
+                      data=params, timeout=timeout)
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(
+            f"telegram {method}: {data.get('description') or r.status_code}")
+    return data["result"]
+
+
+def get_me(tok=None):
+    """Bot identity (cached per token) — also the token validity check."""
+    tok = tok or token()
+    if not tok:
+        return None
+    if tok not in _ME_CACHE:
+        _ME_CACHE[tok] = _call(tok, "getMe", timeout=15)
+    return _ME_CACHE[tok]
+
+
+# ---------------- recipients ----------------
+
+def _store_path():
+    return _root() / ".tg_recipients.json"
+
+
+def _load_store():
+    try:
+        return json.loads(_store_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {"offset": 0, "users": {}}
+
+
+def _save_store(store):
+    p = _store_path()
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(p)
+
+
+def recipients():
+    with _LOCK:
+        store = _load_store()
+    out = [{"chat_id": int(cid), "username": u.get("username"),
+            "name": u.get("name")}
+           for cid, u in store.get("users", {}).items()]
+    out.sort(key=lambda r: (r["username"] or r["name"] or "").lower())
+    return out
+
+
+def is_recipient(chat_id):
+    with _LOCK:
+        store = _load_store()
+    return str(chat_id) in store.get("users", {})
+
+
+def poll_once():
+    """One getUpdates pass: register anyone who talked to the bot and
+    greet first-timers. Returns how many updates were consumed."""
+    tok = token()
+    if not tok:
+        return 0
+    import requests
+    with _LOCK:
+        store = _load_store()
+    r = requests.get(_API.format(token=tok, method="getUpdates"),
+                     params={"offset": store.get("offset", 0),
+                             "timeout": 0,
+                             "allowed_updates": '["message"]'},
+                     timeout=20)
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(
+            f"telegram getUpdates: {data.get('description')}")
+    updates = data.get("result") or []
+    new_users = []
+    for u in updates:
+        store["offset"] = max(store.get("offset", 0), u["update_id"] + 1)
+        msg = u.get("message") or {}
+        frm, chat = msg.get("from") or {}, msg.get("chat") or {}
+        if frm.get("is_bot") or not chat.get("id"):
+            continue
+        cid = str(chat["id"])
+        if cid not in store["users"]:
+            store["users"][cid] = {
+                "username": frm.get("username"),
+                "name": " ".join(x for x in [frm.get("first_name"),
+                                             frm.get("last_name")] if x),
+                "first_seen": time.time(),
+            }
+            new_users.append(cid)
+        store["users"][cid]["last_seen"] = time.time()
+    if updates:
+        with _LOCK:
+            _save_store(store)
+    for cid in new_users:
+        try:
+            _call(tok, "sendMessage", chat_id=cid, text=WELCOME)
+        except Exception:
+            pass  # registration stands even if the greeting fails
+    return len(updates)
+
+
+def start_poller():
+    """Background thread keeping the recipient list current. Runs for
+    the life of the process; idles quietly while no token is set."""
+    global _POLLER_STARTED
+    if _POLLER_STARTED:
+        return
+    _POLLER_STARTED = True
+
+    def loop():
+        while True:
+            try:
+                if token():
+                    poll_once()
+            except Exception:
+                pass
+            time.sleep(5)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+# ---------------- sending ----------------
+
+MAX_BYTES = 50 * 1000 * 1000  # api.telegram.org bot upload cap
+
+
+def send_video(chat_id, path, caption=""):
+    """Upload the finished mp4 to a registered recipient. sendVideo
+    first (plays inline in Telegram); some files Telegram refuses as
+    video get one retry as a plain document."""
+    tok = token()
+    if not tok:
+        raise RuntimeError("telegram bot token မရှိပါ")
+    import requests
+    path = Path(path)
+    last_err = None
+    for method, field in (("sendVideo", "video"), ("sendDocument", "document")):
+        try:
+            with open(path, "rb") as fh:
+                r = requests.post(
+                    _API.format(token=tok, method=method),
+                    data={"chat_id": str(chat_id), "caption": caption[:1024],
+                          "supports_streaming": "true"},
+                    files={field: (path.name, fh, "video/mp4")},
+                    timeout=600)
+            data = r.json()
+            if data.get("ok"):
+                return data["result"]
+            last_err = RuntimeError(
+                f"telegram {method}: {data.get('description')}")
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(str(last_err))

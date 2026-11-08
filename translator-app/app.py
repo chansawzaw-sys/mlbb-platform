@@ -384,6 +384,116 @@ def gemini_key_delete():
     return jsonify({"ok": True, "configured": False})
 
 
+# ---------- Telegram delivery (commercial direction) ----------
+# Finished videos can be sent straight to Telegram users from the
+# app. Telegram's rule: a bot may only message people who messaged
+# it first, so recipients are people who pressed Start on the bot
+# (pipeline.telegram_send polls for them). The bot token is set
+# here, stored in .env like the Gemini key, never returned.
+
+def _env_write(key, value):
+    env_path = ROOT / ".env"
+    lines = []
+    if env_path.exists():
+        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
+                 if not ln.startswith(key + "=")]
+    lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        os.chmod(env_path, 0o600)
+    except Exception:
+        pass
+
+
+def _env_remove(key):
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
+                 if not ln.startswith(key + "=")]
+        env_path.write_text("\n".join(lines) + ("\n" if lines else ""),
+                            encoding="utf-8")
+
+
+@app.get("/api/settings/telegram")
+def telegram_status():
+    from pipeline import telegram_send as tg
+    info = {"configured": bool(tg.token()), "bot": None,
+            "recipients": len(tg.recipients())}
+    if info["configured"]:
+        try:
+            info["bot"] = (tg.get_me() or {}).get("username")
+        except Exception:
+            info["bot"] = None
+    return jsonify(info)
+
+
+@app.post("/api/settings/telegram")
+def telegram_save():
+    from pipeline import telegram_send as tg
+    data = request.get_json(force=True) or {}
+    tok = (data.get("token") or "").strip()
+    if not tg.valid_format(tok):
+        return jsonify({"error": "token မမှန်ပါ — BotFather က ရတဲ့ token ပုံစံ မဟုတ်ပါ"}), 400
+    try:
+        me = tg.get_me(tok)  # a bad token must not be saved
+    except Exception as e:
+        return jsonify({"error": f"token စစ်လို့ မရပါ: {e}"}), 400
+    _env_write("TELEGRAM_BOT_TOKEN", tok)
+    tg.start_poller()
+    return jsonify({"ok": True, "bot": (me or {}).get("username")})
+
+
+@app.delete("/api/settings/telegram")
+def telegram_delete():
+    _env_remove("TELEGRAM_BOT_TOKEN")
+    return jsonify({"ok": True, "configured": False})
+
+
+@app.get("/api/telegram/recipients")
+def telegram_recipients():
+    from pipeline import telegram_send as tg
+    return jsonify({"recipients": tg.recipients()})
+
+
+def _tg_worker(job, chat_id, out_path):
+    from pipeline import telegram_send as tg
+    try:
+        caption = "🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို\n" + (job.get("url") or "")
+        tg.send_video(chat_id, out_path, caption=caption)
+        job["tg"] = {**(job.get("tg") or {}), "state": "sent"}
+    except Exception as e:
+        job["tg"] = {**(job.get("tg") or {}), "state": "failed",
+                     "error": str(e)[:200]}
+    job["updated_at"] = time.time()
+    _save(job)
+
+
+@app.post("/api/jobs/<jid>/send-telegram")
+def send_telegram(jid):
+    from pipeline import telegram_send as tg
+    job = _load_job(jid)
+    if not job:
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    out = JOBS_DIR / jid / "output.mp4"
+    if not out.exists():
+        return jsonify({"error": "ဗီဒီယို မပြီးသေးပါ"}), 400
+    data = request.get_json(force=True) or {}
+    chat_id = data.get("chat_id")
+    if not chat_id or not tg.is_recipient(chat_id):
+        return jsonify({"error": "လက်ခံသူ မတွေ့ပါ — bot ကို Start နှိပ်ထားသူ ဖြစ်ရပါမယ်"}), 400
+    size = out.stat().st_size
+    if size > tg.MAX_BYTES:
+        return jsonify({"error": f"ဖိုင် {size / 1e6:.0f}MB ရှိနေတယ် — Telegram bot က 50MB အထိပဲ ပို့လို့ရပါတယ်"}), 400
+    user = next((r for r in tg.recipients()
+                 if r["chat_id"] == int(chat_id)), {})
+    job["tg"] = {"state": "sending",
+                 "to": user.get("username") or user.get("name") or str(chat_id)}
+    _save(job)
+    threading.Thread(target=_tg_worker, args=(job, int(chat_id), out),
+                     daemon=True).start()
+    return jsonify({"ok": True, "state": "sending"})
+
+
 def _clamp_num(v, lo, hi, default):
     try:
         v = float(v)
@@ -462,7 +572,7 @@ def create_job():
 
 def _job_view(job):
     return {k: job.get(k) for k in
-            ("id", "url", "mode", "status", "current", "error",
+            ("id", "url", "mode", "status", "current", "error", "tg",
              "created_at", "updated_at", "finished_at", "cleanup_at")}
 
 
@@ -793,6 +903,12 @@ def _startup_sweep():
 
 try:
     _startup_sweep()
+except Exception:
+    pass
+
+try:
+    from pipeline import telegram_send as _tg
+    _tg.start_poller()
 except Exception:
     pass
 

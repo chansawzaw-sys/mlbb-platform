@@ -95,6 +95,16 @@
     </div>
   </div>
 
+  <div class="card show" id="tgCard">
+    <h3 style="margin-top:0">🤖 Telegram bot (ပြီးရင် တန်းပို့ရန်)</h3>
+    <p class="hint">BotFather မှာ bot တစ်ခု လုပ်ပြီး token ကို ဒီမှာ ထည့်ပါ (<b>chat ထဲ မပို့ပါနဲ့</b>)။ ပို့ချင်တဲ့သူက အဲဒီ bot ကို Telegram မှာ <b>Start တစ်ခါ နှိပ်ထား</b>ရမယ် — ပြီးရင် အလုပ်များ စာရင်းကနေ 📨 TG ခလုတ်နဲ့ တန်းပို့နိုင်ပြီ။ အခြေအနေ: <span id="tgState">…</span></p>
+    <input type="password" id="tgInput" placeholder="Bot token (123456789:AA…) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+    <div class="row">
+      <button class="ghost" id="tgSave">သိမ်းမယ်</button>
+      <button class="ghost" id="tgDel">ဖျက်မယ်</button>
+    </div>
+  </div>
+
   <label>ဗီဒီယိုလင့်ခ်</label>
   <input type="url" id="url" placeholder="https://www.youtube.com/watch?v=...">
 
@@ -586,9 +596,18 @@ async function loadJobs() {
         extra = " — " + j.current;
       if (j.status === "done" && j.cleanup_at)
         extra = " — ဖျက်ရန် " + mmss(j.cleanup_at - Date.now() / 1000) + " ကျန်";
-      return `<div class="jobrow"><span>${ST_ICON[j.status] || "•"} ${shortUrl(j.url)}${extra}</span>` +
-        `<span><button class="ghost" onclick="attachJob('${j.id}')">ကြည့်</button> ` +
-        `<button class="ghost" onclick="delJob('${j.id}','${j.status}')">ဖျက်</button></span></div>`;
+      let tg = "";
+      if (j.status === "done" && j.tg) {
+        if (j.tg.state === "sending") tg = " — 📨 ပို့နေဆဲ…";
+        else if (j.tg.state === "sent") tg = " — 📨 " + (j.tg.to ? "@" + j.tg.to : "") + " ဆီ ပို့ပြီး ✓";
+        else if (j.tg.state === "failed") tg = " — 📨 ပို့မရ ❌";
+      }
+      const tgBtn = j.status === "done"
+        ? `<button class="ghost" onclick="tgPick('${j.id}')">📨 TG</button> ` : "";
+      return `<div class="jobrow"><span>${ST_ICON[j.status] || "•"} ${shortUrl(j.url)}${extra}${tg}</span>` +
+        `<span>${tgBtn}<button class="ghost" onclick="attachJob('${j.id}')">ကြည့်</button> ` +
+        `<button class="ghost" onclick="delJob('${j.id}','${j.status}')">ဖျက်</button></span></div>` +
+        `<div class="tgpick" id="tgpick-${j.id}" style="display:none"></div>`;
     }).join("");
   } catch (e) {}
 }
@@ -681,6 +700,60 @@ $("keyDel").onclick = async () => {
   loadKeyState();
 };
 loadKeyState();
+
+/* ---------------- Telegram delivery ---------------- */
+async function loadTgState() {
+  try {
+    const d = await (await fetch("/api/settings/telegram")).json();
+    $("tgState").textContent = d.configured
+      ? `✅ ချိတ်ပြီး (@${d.bot || "?"}) — Start နှိပ်ထားသူ ${d.recipients} ယောက်`
+      : "❌ မချိတ်ရသေး";
+  } catch (e) { $("tgState").textContent = "?"; }
+}
+$("tgSave").onclick = async () => {
+  const tok = $("tgInput").value.trim();
+  if (!tok) { alert("token အရင် ထည့်ပါ"); return; }
+  const res = await fetch("/api/settings/telegram", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({token: tok})});
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok) { alert(d.error || "သိမ်းလို့ မရပါ"); return; }
+  $("tgInput").value = "";
+  alert("🤖 @" + (d.bot || "") + " ချိတ်ပြီးပြီ — ပို့ချင်တဲ့သူ bot ကို Start နှိပ်ခိုင်းပါ");
+  loadTgState();
+};
+$("tgDel").onclick = async () => {
+  await fetch("/api/settings/telegram", {method: "DELETE"});
+  loadTgState();
+};
+loadTgState();
+window.tgPick = async function (id) {
+  const box = $("tgpick-" + id);
+  if (box.style.display !== "none") { box.style.display = "none"; return; }
+  box.style.display = "block";
+  box.innerHTML = '<p class="hint">…</p>';
+  try {
+    const d = await (await fetch("/api/telegram/recipients")).json();
+    const rs = d.recipients || [];
+    if (!rs.length) {
+      box.innerHTML = '<p class="hint">Start နှိပ်ထားသူ မရှိသေးပါ — ပို့ချင်တဲ့သူက bot ကို အရင် Start နှိပ်ရမယ်</p>';
+      return;
+    }
+    box.innerHTML = `<select id="tgsel-${id}">` + rs.map(r =>
+      `<option value="${r.chat_id}">${r.username ? "@" + r.username : (r.name || r.chat_id)}</option>`).join("") +
+      `</select> <button class="ghost" onclick="tgSend('${id}')">ပို့မယ်</button>`;
+  } catch (e) { box.innerHTML = '<p class="err">စာရင်း ယူလို့ မရပါ</p>'; }
+};
+window.tgSend = async function (id) {
+  const sel = $("tgsel-" + id);
+  if (!sel) return;
+  const res = await fetch("/api/jobs/" + id + "/send-telegram", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({chat_id: Number(sel.value)})});
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok) { alert(d.error || "ပို့လို့ မရပါ"); return; }
+  $("tgpick-" + id).style.display = "none";
+  loadJobs();
+};
 </script>
 <script>
 if ("serviceWorker" in navigator) {
