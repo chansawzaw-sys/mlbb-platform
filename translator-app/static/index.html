@@ -103,10 +103,6 @@
       <button class="ghost" id="tgSave">သိမ်းမယ်</button>
       <button class="ghost" id="tgDel">ဖျက်မယ်</button>
     </div>
-    <input id="payInfo" placeholder="ငွေလွှဲ နံပါတ်/အမည် (ဥပမာ KPay 09… နာမည်) — customer မြင်ရမယ်" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-top:8px">
-    <div class="row">
-      <button class="ghost" id="paySave">ငွေလွှဲ အချက်အလက် သိမ်းမယ်</button>
-    </div>
   </div>
 
   <div class="card show" id="accountCard">
@@ -128,6 +124,12 @@
         <button class="ghost" id="logoutBtn">ထွက်မယ်</button>
       </div>
       <p class="hint" id="linkCodeOut" style="display:none"></p>
+      <div id="payBlock" style="margin-top:10px">
+        <h4 style="margin:6px 0">💰 Credit ဖြည့်ရန်</h4>
+        <p class="hint" id="payText"></p>
+        <img id="payQr" alt="" style="display:none;max-width:200px;border-radius:8px">
+        <p class="hint">လွှဲပြီးရင် Telegram bot မှာ 💰 Credit ဖြည့် ကို နှိပ်ပြီး screenshot ပို့ပါ — admin စစ်ပြီး credit ထည့်ပေးမယ်</p>
+      </div>
       <p class="err" id="authErr2"></p>
     </div>
   </div>
@@ -139,6 +141,17 @@
     <div id="adminResults" style="margin-top:8px"></div>
     <h4>💰 Credit ဖြည့် တောင်းဆိုချက်များ</h4>
     <div id="topupList"><p class="hint">…</p></div>
+    <h4>🏦 ငွေဖြည့် လိပ်စာ / QR သတ်မှတ်ရန်</h4>
+    <input id="payInfo" placeholder="ငွေလွှဲ နံပါတ်/အမည် (ဥပမာ KPay 09… နာမည်) — customer မြင်ရမယ်" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+    <div class="row">
+      <button class="ghost" id="paySave">လိပ်စာ သိမ်းမယ်</button>
+    </div>
+    <p class="hint">ငွေလွှဲ QR ပုံ (KPay/Wave app ထဲက QR ကို screenshot ရိုက်ပြီး တင်ပါ):</p>
+    <input type="file" id="qrFile" accept="image/*">
+    <img id="qrPreview" alt="" style="display:none;max-width:200px;border-radius:8px;margin-top:6px">
+    <div class="row">
+      <button class="ghost" id="qrDel" style="display:none">QR ဖျက်မယ်</button>
+    </div>
   </div>
 
   <label>ဗီဒီယိုလင့်ခ်</label>
@@ -778,7 +791,7 @@ async function loadTgState() {
       if (d.poller.last_error)
         $("tgState").textContent += " · ⚠️ " + d.poller.last_error;
     }
-    if (d.payinfo !== undefined) $("payInfo").value = d.payinfo || "";
+    if (d.payinfo !== undefined && $("payInfo")) $("payInfo").value = d.payinfo || "";
     // Once a token is saved the card tucks itself away (the 🤖
     // button in the header reopens it), like the Gemini key card.
     $("tgToggle").textContent = d.configured ? "🤖 ✅" : "🤖";
@@ -874,6 +887,7 @@ async function loadMe() {
     $("authIn").style.display = ME ? "" : "none";
     $("adminCard").classList.toggle("show", !!(ME && ME.role === "admin"));
     if (ME && ME.role === "admin") loadTopups();
+    if (ME) loadPayQr();
     if (ME) {
       $("authInfo").textContent = "👤 " + ME.username +
         (ME.role === "admin" ? " (admin)" : "") +
@@ -972,6 +986,33 @@ async function topupDecide(tid, decision) {
     body: JSON.stringify({decision})});
   loadTopups();
 }
+$("qrFile").addEventListener("change", async () => {
+  const f = $("qrFile").files[0];
+  if (!f) return;
+  const fd = new FormData();
+  fd.append("qr", f);
+  const r = await (await fetch("/api/settings/payqr", {method: "POST", body: fd})).json();
+  if (r.error) { alert(r.error); return; }
+  loadPayQr();
+});
+$("qrDel").addEventListener("click", async () => {
+  await fetch("/api/settings/payqr", {method: "DELETE"});
+  loadPayQr();
+});
+async function loadPayQr() {
+  const r = await (await fetch("/api/pay-info")).json();
+  const show = !!r.qr;
+  if ($("qrPreview")) {
+    $("qrPreview").style.display = show ? "" : "none";
+    if (show) $("qrPreview").src = "/pay-qr.png?t=" + Date.now();
+    $("qrDel").style.display = show ? "" : "none";
+  }
+  if ($("payText")) $("payText").textContent = r.text || "";
+  if ($("payQr")) {
+    $("payQr").style.display = show ? "" : "none";
+    if (show) $("payQr").src = "/pay-qr.png?t=" + Date.now();
+  }
+}
 $("paySave").addEventListener("click", async () => {
   await fetch("/api/settings/payinfo", {method: "POST",
     headers: {"Content-Type": "application/json"},
@@ -1012,6 +1053,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 90</p>
+<p class="hint" id="buildTag" style="text-align:center">build 91</p>
 </body>
 </html>

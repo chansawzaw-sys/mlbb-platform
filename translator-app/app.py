@@ -433,6 +433,12 @@ def _tg_menu_step(msg, chat_id, text):
                         + (info or "admin ဆီ နံပါတ် မေးပါ")
                         + "\n\nဘယ်နှ credits ဖြည့်မလဲ — နံပါတ် ပဲ "
                           "ပို့ပါ (ဥပမာ 100)")
+        qr = ROOT / "payqr.png"
+        if qr.exists():
+            try:
+                tg.send_photo(chat_id, qr, caption="📸 QR scan ပြီး လွှဲပါ")
+            except Exception:
+                pass
         return True
     return False
 
@@ -1229,6 +1235,50 @@ def payinfo_save():
     data = request.get_json(force=True, silent=True) or {}
     _env_write("PAY_INFO", (data.get("text") or "").strip()[:300])
     return jsonify({"ok": True})
+
+
+@app.post("/api/settings/payqr")
+def payqr_save():
+    """Admin uploads the payment QR image customers scan to top
+    up. Stored as payqr.png in the app dir (survives deploys)."""
+    f = request.files.get("qr")
+    if not f or not f.filename:
+        return jsonify({"error": "QR ပုံ မပါပါ"}), 400
+    tmp = ROOT / "payqr.tmp"
+    f.save(tmp)
+    try:
+        from PIL import Image
+        with Image.open(tmp) as im:
+            im.verify()
+        with Image.open(tmp) as im:
+            im.convert("RGB").save(ROOT / "payqr.png")
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        return jsonify({"error": "ပုံ မဟုတ်ပါ"}), 400
+    tmp.unlink(missing_ok=True)
+    return jsonify({"ok": True, "qr": True})
+
+
+@app.delete("/api/settings/payqr")
+def payqr_delete():
+    (ROOT / "payqr.png").unlink(missing_ok=True)
+    return jsonify({"ok": True, "qr": False})
+
+
+@app.get("/pay-qr.png")
+def payqr_file():
+    # A payment QR is meant to be shown — public by design.
+    p = ROOT / "payqr.png"
+    if not p.exists():
+        return jsonify({"error": "QR မရှိပါ"}), 404
+    return send_file(p, mimetype="image/png")
+
+
+@app.get("/api/pay-info")
+def pay_info_public():
+    """What customers see when topping up: the address text + QR."""
+    return jsonify({"text": _pay_info(),
+                    "qr": (ROOT / "payqr.png").exists()})
 
 
 @app.get("/api/admin/users")
