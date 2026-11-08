@@ -7,10 +7,46 @@ Also tries to fetch existing captions (fast path for transcribe.py --captions).
 import json
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yt_dlp
 
 from .common import ensure_system_ca
+
+
+def _tiktok_fallback(url: str, workdir: Path) -> dict:
+    """Last-resort TikTok download via the public tikwm resolver API.
+
+    TikTok increasingly serves datacenter IPs a stripped/blocker page, so
+    even impersonated yt-dlp cannot extract the video. The resolver sees
+    the video from its own (residential-grade) vantage point and returns
+    a direct, watermark-free mp4 URL. No login/cookies involved.
+    """
+    import requests
+
+    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"}
+    r = requests.get("https://www.tikwm.com/api/", params={"url": url},
+                     headers=headers, timeout=30)
+    r.raise_for_status()
+    payload = r.json()
+    data = payload.get("data") or {}
+    play = data.get("play") or data.get("hdplay") or data.get("wmplay")
+    if not play:
+        raise RuntimeError(f"tikwm resolver returned no video URL: {payload!r:.200}")
+    out = workdir / "source.mp4"
+    with requests.get(play, headers=headers, timeout=180, stream=True) as resp:
+        resp.raise_for_status()
+        with open(out, "wb") as f:
+            for chunk in resp.iter_content(1 << 20):
+                if chunk:
+                    f.write(chunk)
+    author = data.get("author") or {}
+    return {
+        "title": data.get("title"),
+        "duration": data.get("duration"),
+        "webpage_url": url,
+        "uploader": author.get("nickname") or author.get("unique_id"),
+    }
 
 
 def download(url: str, workdir: Path) -> Path:
@@ -48,7 +84,13 @@ def download(url: str, workdir: Path) -> Path:
             if first_err is None:
                 first_err = e
     if info is None:
-        raise first_err
+        if "tiktok" in urlparse(url).netloc:
+            try:
+                info = _tiktok_fallback(url, workdir)
+            except Exception:
+                raise first_err
+        else:
+            raise first_err
     # Caption fast-path is BEST-EFFORT only: a subtitle 429/failure must
     # never kill the video download (observed on rate-limited IPs).
     try:
