@@ -103,6 +103,10 @@
       <button class="ghost" id="tgSave">သိမ်းမယ်</button>
       <button class="ghost" id="tgDel">ဖျက်မယ်</button>
     </div>
+    <input id="payInfo" placeholder="ငွေလွှဲ နံပါတ်/အမည် (ဥပမာ KPay 09… နာမည်) — customer မြင်ရမယ်" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-top:8px">
+    <div class="row">
+      <button class="ghost" id="paySave">ငွေလွှဲ အချက်အလက် သိမ်းမယ်</button>
+    </div>
   </div>
 
   <div class="card show" id="accountCard">
@@ -120,8 +124,10 @@
       <p class="hint" id="authInfo" style="margin:4px 0"></p>
       <div class="row">
         <button class="ghost" id="claimBtn" style="display:none">👑 Admin အဖြစ် သတ်မှတ်မယ်</button>
+        <button class="ghost" id="linkCodeBtn">📲 TG ချိတ်ရန် code ထုတ်မယ်</button>
         <button class="ghost" id="logoutBtn">ထွက်မယ်</button>
       </div>
+      <p class="hint" id="linkCodeOut" style="display:none"></p>
       <p class="err" id="authErr2"></p>
     </div>
   </div>
@@ -130,6 +136,8 @@
     <h3 style="margin-top:0">🛠 Admin — လူ ရှာရန်</h3>
     <input id="adminQ" placeholder="username ရိုက်ရှာပါ (အနည်းဆုံး ၂ လုံး)" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <div id="adminResults" style="margin-top:8px"></div>
+    <h4>💰 Credit ဖြည့် တောင်းဆိုချက်များ</h4>
+    <div id="topupList"><p class="hint">…</p></div>
   </div>
 
   <label>ဗီဒီယိုလင့်ခ်</label>
@@ -769,6 +777,7 @@ async function loadTgState() {
       if (d.poller.last_error)
         $("tgState").textContent += " · ⚠️ " + d.poller.last_error;
     }
+    if (d.payinfo !== undefined) $("payInfo").value = d.payinfo || "";
     // Once a token is saved the card tucks itself away (the 🤖
     // button in the header reopens it), like the Gemini key card.
     $("tgToggle").textContent = d.configured ? "🤖 ✅" : "🤖";
@@ -826,7 +835,10 @@ async function loadAdminUsers() {
     ban.className = "ghost";
     ban.textContent = u.disabled ? "ပြန်ဖွင့်" : "ပိတ်";
     ban.addEventListener("click", () => adminBan(u.id, !u.disabled));
-    div.append(info, plus, ban);
+    const det = document.createElement("button");
+    det.className = "ghost"; det.textContent = "အသေးစိတ်";
+    det.addEventListener("click", () => adminDetail(u.id, div));
+    div.append(info, plus, ban, det);
     box.appendChild(div);
   });
   if (!(r.users || []).length)
@@ -860,6 +872,7 @@ async function loadMe() {
     $("authOut").style.display = ME ? "none" : "";
     $("authIn").style.display = ME ? "" : "none";
     $("adminCard").classList.toggle("show", !!(ME && ME.role === "admin"));
+    if (ME && ME.role === "admin") loadTopups();
     if (ME) {
       $("authInfo").textContent = "👤 " + ME.username +
         (ME.role === "admin" ? " (admin)" : "") +
@@ -878,6 +891,68 @@ async function authPost(path) {
   $("authErr").textContent = "";
   loadMe();
 }
+$("linkCodeBtn").addEventListener("click", async () => {
+  const r = await (await fetch("/api/auth/link-code", {method: "POST"})).json();
+  const out = $("linkCodeOut");
+  if (r.code) {
+    out.style.display = "";
+    out.textContent = "📲 Bot မှာ 👤 Username ချိတ် နှိပ်ပြီး ဒီ code ပို့ပါ: " +
+      r.code + " (၁၀ မိနစ် အတွင်း)";
+  }
+});
+async function adminDetail(uid, rowEl) {
+  let d = rowEl.querySelector(".udetail");
+  if (d) { d.remove(); return; }
+  const r = await (await fetch("/api/admin/users/" + uid)).json();
+  d = document.createElement("div");
+  d.className = "udetail";
+  const jobs = (r.jobs || []).map(j =>
+    "• " + j.status + " · " + (j.url || "").slice(0, 42) +
+    (j.charged_minutes ? " · " + j.charged_minutes + " cr" : "")).join("<br>");
+  const led = (r.ledger || []).map(l =>
+    "• " + (l.delta > 0 ? "+" : "") + l.delta + " (" + l.reason + ")").join("<br>");
+  d.innerHTML = "<p class='hint'>Job " + r.job_count + " ခု" +
+    (jobs ? "<br>" + jobs : "") +
+    (led ? "<br>💳 မှတ်တမ်း:<br>" + led : "") + "</p>";
+  rowEl.appendChild(d);
+}
+async function loadTopups() {
+  if (!(ME && ME.role === "admin")) return;
+  const box = $("topupList");
+  const r = await (await fetch("/api/admin/topups")).json();
+  const ts = r.topups || [];
+  if (!ts.length) { box.innerHTML = '<p class="hint">မရှိပါ</p>'; return; }
+  box.innerHTML = "";
+  ts.forEach(t => {
+    const div = document.createElement("div");
+    div.className = "jobrow";
+    const info = document.createElement("span");
+    info.textContent = "👤 " + t.username + " · " + t.credits + " credits";
+    const view = document.createElement("a");
+    view.href = "/api/admin/topups/" + t.id + "/proof";
+    view.target = "_blank"; view.textContent = "ပုံ ကြည့်";
+    const ok = document.createElement("button");
+    ok.className = "ghost"; ok.textContent = "✅ Approve";
+    ok.addEventListener("click", () => topupDecide(t.id, "approved"));
+    const no = document.createElement("button");
+    no.className = "ghost"; no.textContent = "❌ ငြင်း";
+    no.addEventListener("click", () => topupDecide(t.id, "rejected"));
+    div.append(info, view, ok, no);
+    box.appendChild(div);
+  });
+}
+async function topupDecide(tid, decision) {
+  await fetch("/api/admin/topups/" + tid, {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({decision})});
+  loadTopups();
+}
+$("paySave").addEventListener("click", async () => {
+  await fetch("/api/settings/payinfo", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({text: $("payInfo").value})});
+  alert("သိမ်းပြီး");
+});
 window.tgPick = async function (id) {
   const box = $("tgpick-" + id);
   if (box.style.display !== "none") { box.style.display = "none"; return; }

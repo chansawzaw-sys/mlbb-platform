@@ -47,6 +47,23 @@ CREATE TABLE IF NOT EXISTS login_fails (
   count INTEGER NOT NULL,
   locked_until REAL NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  delta INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  ref TEXT,
+  ts REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS topups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  credits INTEGER NOT NULL,
+  proof TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at REAL NOT NULL,
+  decided_at REAL
+);
 """
 
 
@@ -242,3 +259,104 @@ def user_for_tg(chat_id):
         row = conn.execute("SELECT * FROM users WHERE tg_chat_id = ?",
                            (int(chat_id),)).fetchone()
     return _public(row)
+
+
+# ---------------- credits: ledger, charges, top-ups ----------------
+
+def apply_credit(user_id, delta, reason, ref=None):
+    """One ledger-backed balance move. A negative move that would
+    take the balance below zero is refused whole (returns None) —
+    charges are all-or-nothing, never partial. Returns the new
+    balance on success."""
+    with _LOCK, _db() as conn:
+        row = conn.execute("SELECT credits FROM users WHERE id = ?",
+                           (int(user_id),)).fetchone()
+        if row is None:
+            return None
+        new = row["credits"] + int(delta)
+        if new < 0:
+            return None
+        conn.execute("UPDATE users SET credits = ? WHERE id = ?",
+                     (new, int(user_id)))
+        conn.execute(
+            "INSERT INTO ledger (user_id, delta, reason, ref, ts) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (int(user_id), int(delta), reason, ref, time.time()))
+    return new
+
+
+def charge(user_id, amount, ref):
+    """Charge `amount` credits for a job; False when insufficient."""
+    if amount <= 0:
+        return True
+    return apply_credit(user_id, -int(amount), "job", ref) is not None
+
+
+def refund(user_id, amount, ref):
+    if amount > 0:
+        apply_credit(user_id, int(amount), "refund", ref)
+
+
+def ledger_for(user_id, limit=20):
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT delta, reason, ref, ts FROM ledger "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (int(user_id), int(limit))).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_topup(user_id, credits, proof):
+    with _LOCK, _db() as conn:
+        cur = conn.execute(
+            "INSERT INTO topups (user_id, credits, proof, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (int(user_id), int(credits), proof, time.time()))
+        return cur.lastrowid
+
+
+def set_topup_proof(topup_id, proof):
+    with _LOCK, _db() as conn:
+        conn.execute("UPDATE topups SET proof = ? WHERE id = ?",
+                     (proof, int(topup_id)))
+
+
+def get_topup(topup_id):
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT t.*, u.username, u.tg_chat_id FROM topups t "
+            "JOIN users u ON u.id = t.user_id WHERE t.id = ?",
+            (int(topup_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def pending_topups():
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT t.*, u.username FROM topups t "
+            "JOIN users u ON u.id = t.user_id "
+            "WHERE t.status = 'pending' ORDER BY t.id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def decide_topup(topup_id, ok):
+    """Admin decision, exactly-once: the status guard means a second
+    tap (or a second admin surface) can never credit twice. Returns
+    {user_id, credits, tg_chat_id} when this call decided it."""
+    with _LOCK, _db() as conn:
+        cur = conn.execute(
+            "UPDATE topups SET status = ?, decided_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            ("approved" if ok else "rejected", time.time(),
+             int(topup_id)))
+        if cur.rowcount != 1:
+            return None
+        row = conn.execute(
+            "SELECT t.credits, t.user_id, u.tg_chat_id FROM topups t "
+            "JOIN users u ON u.id = t.user_id WHERE t.id = ?",
+            (int(topup_id),)).fetchone()
+    if ok:
+        apply_credit(row["user_id"], row["credits"], "topup",
+                     f"topup:{topup_id}")
+    return {"user_id": row["user_id"], "credits": row["credits"],
+            "tg_chat_id": row["tg_chat_id"]}

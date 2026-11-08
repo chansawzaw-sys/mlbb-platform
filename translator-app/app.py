@@ -9,8 +9,10 @@ API:  POST /api/jobs {url, mode: subs|dub|both, voice}
 """
 import hashlib
 import json
+import math
 import os
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -241,6 +243,8 @@ def _on_tg_message(msg):
         if (doc.get("mime_type") or "").startswith("video/"):
             vid = doc
     text = (msg.get("text") or msg.get("caption") or "").strip()
+    if _tg_menu_step(msg, chat_id, text):
+        return
     if vid:
         if not tg.is_admin(chat_id):
             tg.send_message(chat_id,
@@ -269,9 +273,14 @@ def _on_tg_message(msg):
         return
     if text.startswith("/"):
         # /start always earns the welcome (it is also the registration
-        # moment); other commands stay silent.
+        # moment) and the persistent menu keyboard; other commands
+        # stay silent.
         if text.startswith("/start"):
             tg.send_message(chat_id, tg.WELCOME)
+            try:
+                tg.send_keyboard(chat_id, "👇 Menu", _MENU_ROWS)
+            except Exception:
+                pass
         return
     if not text:
         return
@@ -309,6 +318,124 @@ _BLUR_PRESETS = {
     "bot": {"x": 0.04, "y": 0.79, "w": 0.92, "h": 0.18},
 }
 
+# ---------------- bot account menu: link / balance / top-up --------
+_MENU_ROWS = [["🎬 Video ထုတ်မယ်", "💰 Credit ဖြည့်"],
+              ["💳 လက်ကျန်", "👤 Username ချိတ်"]]
+_LINK_CODES = {}   # code -> (user_id, expires) — web-issued, bot-redeemed
+
+
+def _pay_info():
+    p = ROOT / ".env"
+    if p.exists():
+        for ln in p.read_text(encoding="utf-8").splitlines():
+            if ln.startswith("PAY_INFO="):
+                return ln.split("=", 1)[1].strip()
+    return ""
+
+
+def _tg_menu_step(msg, chat_id, text):
+    """Bot account menu + the link / top-up conversations. Returns
+    True when the message was consumed by one of them. These are
+    ACCOUNT functions (open to anyone who linked an account); job
+    submission stays behind the admin lock in the caller."""
+    from pipeline import telegram_send as tg
+    flow = _TG_FLOW.get(chat_id)
+    acct = accounts.user_for_tg(chat_id)
+    photos = msg.get("photo")
+    if photos and flow and flow.get("step") == "topup_proof" and acct:
+        amount = flow.get("amount") or 0
+        tid = accounts.create_topup(acct["id"], amount, None)
+        tdir = ROOT / "topups"
+        tdir.mkdir(exist_ok=True)
+        proof = tdir / f"{tid}.jpg"
+        ok_file = False
+        try:
+            tg.download_file(photos[-1]["file_id"], proof)
+            accounts.set_topup_proof(tid, proof.name)
+            ok_file = True
+        except Exception:
+            pass
+        _TG_FLOW.pop(chat_id, None)
+        cap = (f"💰 Credit ဖြည့် တောင်းဆိုချက် #{tid}\n"
+               f"👤 {acct['username']} · {amount} credits")
+        buttons = [[("✅ Approve", f"t:{tid}:ok"),
+                    ("❌ ငြင်း", f"t:{tid}:no")]]
+        try:
+            if ok_file:
+                tg.send_photo(tg.FIXED_ADMIN_CHAT_ID, proof,
+                              caption=cap, buttons=buttons)
+            else:
+                tg.send_message(tg.FIXED_ADMIN_CHAT_ID,
+                                cap + "\n(ပုံ ယူမရ)", buttons=buttons)
+        except Exception:
+            pass
+        tg.send_message(chat_id, "✅ တောင်းဆိုချက် admin ဆီ ပို့ပြီ — "
+                                 "စစ်ပြီးရင် credit ဝင်လာမယ်")
+        return True
+    if not text:
+        return False
+    is_menu = text in ("🎬 Video ထုတ်မယ်", "💰 Credit ဖြည့်",
+                       "💳 လက်ကျန်", "👤 Username ချိတ်")
+    if flow and flow.get("step") == "link" and not is_menu:
+        entry = _LINK_CODES.pop(text.strip(), None)
+        _TG_FLOW.pop(chat_id, None)
+        if entry and entry[1] > time.time():
+            accounts.link_tg(entry[0], chat_id)
+            user = accounts.get_user(entry[0])
+            tg.send_message(
+                chat_id, f"✅ ချိတ်ပြီးပြီ — 👤 {user['username']} "
+                         f"(💳 {user['credits']} credits)")
+        else:
+            tg.send_message(chat_id, "❌ code မမှန် (သို့) သက်တမ်း ကုန်ပြီ "
+                                     "— web account card မှာ code အသစ် ထုတ်ပါ")
+        return True
+    if flow and flow.get("step") == "topup_amount" and not is_menu:
+        try:
+            amount = int(text.strip())
+            assert 1 <= amount <= 100000
+        except Exception:
+            tg.send_message(chat_id, "နံပါတ် ပဲ ပို့ပါ (ဥပမာ 100)")
+            return True
+        flow["amount"] = amount
+        flow["step"] = "topup_proof"
+        tg.send_message(chat_id, "📸 အခု လွှဲပြီး screenshot ပို့လိုက်ပါ")
+        return True
+    if text == "🎬 Video ထုတ်မယ်":
+        tg.send_message(chat_id, "🎬 video link (YouTube / TikTok) သို့ "
+                                 "video file ကို ဒီမှာ ပို့လိုက်ပါ")
+        return True
+    if text == "💳 လက်ကျန်":
+        if acct:
+            tg.send_message(chat_id, f"💳 👤 {acct['username']} — "
+                                     f"လက်ကျန် {acct['credits']} credits")
+        else:
+            tg.send_message(chat_id, "အရင် 👤 Username ချိတ်ပါ — web "
+                                     "account card မှာ code ထုတ်ရမယ်")
+        return True
+    if text == "👤 Username ချိတ်":
+        if acct:
+            tg.send_message(chat_id, f"✅ 👤 {acct['username']} နဲ့ "
+                                     "ချိတ်ပြီးသား ဖြစ်ပါတယ်")
+        else:
+            _TG_FLOW[chat_id] = {"step": "link", "ts": time.time()}
+            tg.send_message(chat_id, "🔑 web app ရဲ့ 👤 account card မှာ "
+                                     "'TG ချိတ်ရန် code' ထုတ်ပြီး အဲဒီ "
+                                     "code ကို ဒီမှာ ပို့ပါ")
+        return True
+    if text == "💰 Credit ဖြည့်":
+        if not acct:
+            tg.send_message(chat_id, "အရင် 👤 Username ချိတ်ပါ — "
+                                     "ပြီးမှ credit ဖြည့်လို့ရမယ်")
+            return True
+        _TG_FLOW[chat_id] = {"step": "topup_amount", "ts": time.time()}
+        info = _pay_info()
+        tg.send_message(chat_id, "💰 ငွေ လွှဲရန်:\n"
+                        + (info or "admin ဆီ နံပါတ် မေးပါ")
+                        + "\n\nဘယ်နှ credits ဖြည့်မလဲ — နံပါတ် ပဲ "
+                          "ပို့ပါ (ဥပမာ 100)")
+        return True
+    return False
+
 
 def _tg_flow_prepare(chat_id):
     """Bot flow step 1: fetch the video (the preview cache doubles as
@@ -332,6 +459,7 @@ def _tg_flow_prepare(chat_id):
             if not src.exists():
                 dl_mod.download(flow["url"], pdir)
         dur = probe_duration(src)
+        flow["minutes"] = max(1, math.ceil(dur / 60.0))
         frame = pdir / "tg_frame.jpg"
         sh(["ffmpeg", "-y", "-v", "error", "-ss",
             f"{max(1.0, dur * 0.3):.1f}", "-i", str(src),
@@ -370,6 +498,29 @@ def _on_tg_callback(cq):
     chat = (cq.get("message") or {}).get("chat") or {}
     chat_id = chat.get("id") or (cq.get("from") or {}).get("id")
     data = cq.get("data") or ""
+    if data.startswith("t:"):
+        # Top-up decision — admin chat only, exactly-once in the DB.
+        if not tg.is_admin(chat_id):
+            return
+        res = None
+        act = ""
+        try:
+            _, tid, act = data.split(":")
+            res = accounts.decide_topup(int(tid), act == "ok")
+        except Exception:
+            res = None
+        if res:
+            if res.get("tg_chat_id"):
+                try:
+                    tg.send_message(
+                        res["tg_chat_id"],
+                        f"💳 Credit {res['credits']} ဝင်ပြီ — "
+                        "ကျေးဇူးတင်ပါတယ်!" if act == "ok" else
+                        "❌ Credit ဖြည့် တောင်းဆိုချက် ငြင်းခံရပါတယ်")
+                except Exception:
+                    pass
+            tg.send_message(chat_id, f"ဆုံးဖြတ်ပြီး (#{tid})")
+        return
     flow = _TG_FLOW.get(chat_id)
     if not flow:
         return
@@ -406,6 +557,22 @@ def _on_tg_callback(cq):
         ratio = data[2:]
         if ratio != "orig" and ratio not in fx_mod.ASPECT_DIMS:
             return
+        acct = accounts.user_for_tg(chat_id)
+        if not tg.is_admin(chat_id):
+            if not acct:
+                _TG_FLOW.pop(chat_id, None)
+                tg.send_message(chat_id, "အရင် 👤 Username ချိတ် "
+                                         "(Menu ထဲက) ပါ — account "
+                                         "ရှိမှ job ထုတ်လို့ရမယ်")
+                return
+            need = flow.get("minutes") or 1
+            if (acct["credits"] or 0) < need:
+                _TG_FLOW.pop(chat_id, None)
+                tg.send_message(chat_id,
+                                f"💳 credit မလောက် — ဒီ video က {need} "
+                                f"credits လိုတယ်, လက်ကျန် "
+                                f"{acct['credits']} ပဲ ရှိတယ်")
+                return
         if (not tg.is_admin(chat_id)
                 and _tg_daily_count(chat_id) >= _TG_DAILY_CAP):
             _TG_FLOW.pop(chat_id, None)
@@ -421,6 +588,8 @@ def _on_tg_callback(cq):
             return
         if flow.get("file_id"):
             job["url"] = "📁 Telegram file"
+        if acct:
+            job["user_id"] = acct["id"]
         job["source_path"] = flow.get("src")
         fx = {}
         if flow.get("blur"):
@@ -501,7 +670,40 @@ def _cleanup_job(jid):
         shutil.rmtree(pdir, ignore_errors=True)
 
 
+def _charge_for_job(job):
+    """Credits: a non-admin account pays 1 credit per STARTED minute
+    of the source video. Charged once — after phase 1, when the
+    duration is known, before the expensive phase 2. Admin accounts
+    and anonymous (pre-accounts) jobs are never charged."""
+    uid = job.get("user_id")
+    if not uid or job.get("charged_minutes"):
+        return
+    user = accounts.get_user(uid)
+    if not user or user["role"] == "admin":
+        return
+    src = JOBS_DIR / job["id"] / "source.mp4"
+    try:
+        minutes = max(1, math.ceil(probe_duration(src) / 60.0))
+    except Exception:
+        minutes = 1
+    if not accounts.charge(uid, minutes, job["id"]):
+        raise RuntimeError(
+            f"credit မလောက် — {minutes} credits လိုတယ်, "
+            f"လက်ကျန် {user['credits']} ပဲ ရှိတယ်")
+    job["charged_minutes"] = minutes
+    _save(job)
+
+
+def _refund_charge(job):
+    uid = job.get("user_id")
+    minutes = job.get("charged_minutes") or 0
+    if uid and minutes:
+        accounts.refund(uid, minutes, job["id"])
+        job["charged_minutes"] = 0
+
+
 def _fail(job, e):
+    _refund_charge(job)
     job["status"] = "error"
     job["error"] = str(e)[-1500:]
     for s in job["steps"]:
@@ -534,6 +736,7 @@ def _finish(job):
 
 
 def _cancelled(job):
+    _refund_charge(job)
     job["status"] = "cancelled"
     job["error"] = "ရပ်လိုက်ပြီ — ဖျက်ရန် တောင်းဆိုထားသည်"
     job["finished_at"] = time.time()
@@ -556,6 +759,7 @@ def _worker(job):
         _save(job)
         run_job.run_phase1(workdir, job["url"], source_path=job.get("source_path"),
                            progress=_progress_fn(job))
+        _charge_for_job(job)
         _run_phase2(job)
         _finish(job)
     except JobCancelled:
@@ -803,7 +1007,7 @@ def telegram_status():
     from pipeline import telegram_send as tg
     info = {"configured": bool(tg.token()), "bot": None,
             "recipients": len(tg.recipients()),
-            "poller": tg.poller_status()}
+            "poller": tg.poller_status(), "payinfo": _pay_info()}
     if info["configured"]:
         try:
             info["bot"] = (tg.get_me() or {}).get("username")
@@ -969,6 +1173,64 @@ def _require_admin():
     return user
 
 
+@app.post("/api/auth/link-code")
+def auth_link_code():
+    """One-time 10-minute code the user types into the bot to link
+    this web account to their Telegram chat (no password ever
+    travels through Telegram)."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    code = str(secrets.randbelow(900000) + 100000)
+    _LINK_CODES[code] = (user["id"], time.time() + 600)
+    return jsonify({"code": code})
+
+
+@app.get("/api/admin/topups")
+def admin_topups():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    return jsonify({"topups": accounts.pending_topups()})
+
+
+@app.post("/api/admin/topups/<int:tid>")
+def admin_topup_decide(tid):
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    res = accounts.decide_topup(tid, data.get("decision") == "approved")
+    if not res:
+        return jsonify({"error": "ဆုံးဖြတ်ပြီးသား (သို့) မတွေ့ပါ"}), 409
+    if res.get("tg_chat_id"):
+        try:
+            from pipeline import telegram_send as tg
+            tg.send_message(
+                res["tg_chat_id"],
+                f"💳 Credit {res['credits']} ဝင်ပြီ — ကျေးဇူးတင်ပါတယ်!"
+                if data.get("decision") == "approved" else
+                "❌ Credit ဖြည့် တောင်းဆိုချက် ငြင်းခံရပါတယ်")
+        except Exception:
+            pass
+    return jsonify({"ok": True, "result": res})
+
+
+@app.get("/api/admin/topups/<int:tid>/proof")
+def admin_topup_proof(tid):
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    top = accounts.get_topup(tid)
+    if not top or not top.get("proof"):
+        return jsonify({"error": "ပုံ မရှိပါ"}), 404
+    return send_file(ROOT / "topups" / top["proof"])
+
+
+@app.post("/api/settings/payinfo")
+def payinfo_save():
+    data = request.get_json(force=True, silent=True) or {}
+    _env_write("PAY_INFO", (data.get("text") or "").strip()[:300])
+    return jsonify({"ok": True})
+
+
 @app.get("/api/admin/users")
 def admin_users():
     if not _require_admin():
@@ -985,7 +1247,14 @@ def admin_user_detail(uid):
     if not user:
         return jsonify({"error": "user မတွေ့ပါ"}), 404
     jobs = [j for j in _all_jobs() if j.get("user_id") == uid]
-    return jsonify({"user": user, "job_count": len(jobs)})
+    slim = [{"id": j["id"], "status": j.get("status"),
+             "url": j.get("url"), "mode": j.get("mode"),
+             "created_at": j.get("created_at"),
+             "charged_minutes": j.get("charged_minutes")}
+            for j in jobs[:10]]
+    return jsonify({"user": user, "job_count": len(jobs),
+                    "jobs": slim,
+                    "ledger": accounts.ledger_for(uid, 10)})
 
 
 @app.post("/api/admin/users/<int:uid>")

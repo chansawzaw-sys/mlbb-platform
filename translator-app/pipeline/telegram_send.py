@@ -239,6 +239,19 @@ def _markup(buttons):
         for row in buttons]})
 
 
+def send_keyboard(chat_id, text, rows):
+    """Persistent bottom menu (reply keyboard) — the navigation
+    layer customers tap instead of typing commands."""
+    tok = token()
+    if not tok:
+        raise RuntimeError("telegram bot token မရှိပါ")
+    markup = json.dumps({
+        "keyboard": [[{"text": t} for t in row] for row in rows],
+        "resize_keyboard": True})
+    return _call(tok, "sendMessage", chat_id=str(chat_id), text=text,
+                 reply_markup=markup)
+
+
 def send_photo(chat_id, photo_path, caption="", buttons=None):
     tok = token()
     if not tok:
