@@ -243,7 +243,10 @@ def _seg_untranslated(seg):
         return False  # source already Myanmar: identical is fine
     if (seg.get("provider") or "").startswith("fallback-source"):
         return True
-    return my == src and len(src) > 3
+    # Identical output counts as untranslated when the source has
+    # any letters (CJK included) — short drama lines are often 2-3
+    # chars, while pure numbers/names legitimately stay unchanged.
+    return my == src and any(ch.isalpha() for ch in src)
 
 
 def translation_stats(out):
