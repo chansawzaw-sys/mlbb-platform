@@ -1,14 +1,19 @@
 """Detect the burned-in caption band of a video (auto blur box).
 
-No OCR and no new dependencies: burned-in captions are a PERSISTENT
-strip of high-frequency detail (letter edges) sitting in the same
-rows across most of the video, while scene content changes. Sample
-frames evenly, measure per-row high-frequency energy with PIL +
-numpy, take a high percentile across frames (captions are absent
-during speech gaps, so the median would miss them), and report the
-strongest persistent band as box fractions {x, y, w, h} — the same
-shape the web editor's hand-drawn blur box uses. Returns None when
-nothing looks like a stable caption band.
+No OCR and no new dependencies: burned-in captions are strips of
+high-frequency detail (letter edges). Sample frames evenly and
+measure per-row high-frequency energy with PIL + numpy.
+
+Owner's rule (2026-11-09): blur where the text APPEARS AND DISAPPEARS
+(dialogue captions come and go with speech), not the thing that sits
+on screen the whole video (a fixed logo/title is hot in ~every frame
+and used to win). So the primary signal is DYNAMIC rows — hot in at
+least 2 samples but not in ~90%+ of them — clustered into a span,
+then grown into any adjacent steady caption rows. Only when no
+dynamic text exists do we fall back to the original persistent-band
+method (a high percentile across frames, strongest band). The box is
+{x, y, w, h} fractions — the same shape the web editor's hand-drawn
+blur box uses. Returns None when nothing looks like text.
 
 CLI: python -m pipeline.detect_text <video> -> JSON box or null
 """
@@ -22,8 +27,31 @@ from PIL import Image
 
 from .common import probe_duration
 
-_SAMPLES = 7
+_SAMPLES = 11
 _WIDTH = 320  # analysis width; plenty for band finding, fast
+
+
+def _runs(mask, min_len):
+    """Contiguous True runs of at least min_len, as (start, end)."""
+    runs, start = [], None
+    for i, v in enumerate(list(mask) + [False]):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            runs.append((start, i))
+            start = None
+    return [r for r in runs if r[1] - r[0] >= min_len]
+
+
+def _merge(runs, gap):
+    """Merge runs separated by at most gap rows."""
+    out = []
+    for r in runs:
+        if out and r[0] - out[-1][1] <= gap:
+            out[-1] = (out[-1][0], r[1])
+        else:
+            out.append(tuple(r))
+    return out
 
 
 def _frame_rows(video, at, tmpdir):
@@ -54,44 +82,63 @@ def detect_text_box(video):
         return None
     if not dur or dur < 2:
         return None
-    profiles, shape, mid_energy = [], None, None
+    frames = []  # (per-row profile, energy map) per sampled frame
     with tempfile.TemporaryDirectory() as td:
-        for f in (0.15, 0.28, 0.41, 0.5, 0.59, 0.72, 0.85):
+        for i in range(_SAMPLES):
+            f = 0.06 + 0.88 * i / max(1, _SAMPLES - 1)
             got = _frame_rows(video, dur * f, td)
             if got:
-                rows, energy = got
-                profiles.append(rows)
-                shape = energy.shape
-                if abs(f - 0.5) < 0.1:
-                    mid_energy = energy
-    if len(profiles) < 3 or shape is None or mid_energy is None:
+                frames.append(got)
+    if len(frames) < 3:
         return None
-    H, W = shape
-    stack = np.stack([p[:H] for p in profiles])
-    band_profile = np.percentile(stack, 70, axis=0)
-    # smooth over ~2% of height so single noisy rows can't split a band
+    H, W = frames[0][1].shape
+    n = len(frames)
     win = max(2, int(H * 0.02))
-    prof = np.convolve(band_profile, np.ones(win) / win, mode="same")
-    base = float(np.median(prof))
-    if base <= 0:
-        return None
-    hot = prof > base * 1.9
-    # contiguous hot runs, height between 4% and 32% of the frame
-    runs, start = [], None
-    for i, v in enumerate(list(hot) + [False]):
-        if v and start is None:
-            start = i
-        elif not v and start is not None:
-            runs.append((start, i))
-            start = None
-    runs = [r for r in runs if 0.04 <= (r[1] - r[0]) / H <= 0.32]
-    if not runs:
-        return None
-    # strongest run by mean energy
-    best = max(runs, key=lambda r: float(prof[r[0]:r[1]].mean()))
-    y0, y1 = best
-    # trim columns inside the band using the middle frame's energy map
-    col = mid_energy[y0:y1].mean(axis=0)
+    counts = np.zeros(H, dtype=int)
+    for rows, _e in frames:
+        prof = np.convolve(rows[:H], np.ones(win) / win, mode="same")
+        base = float(np.median(prof))
+        if base > 0:
+            counts += (prof > base * 1.9)
+    # -- dynamic text first: rows hot in >=2 samples but NOT ~always --
+    static_thr = int(np.ceil(0.9 * n))
+    dyn = (counts >= 2) & (counts < static_thr)
+    yspan = None
+    if dyn.any():
+        runs = _merge(_runs(dyn, max(2, int(H * 0.03))), int(H * 0.04))
+        if runs:
+            if runs[-1][1] - runs[0][0] <= 0.6 * H:
+                yspan = (runs[0][0], runs[-1][1])
+            else:
+                yspan = max(runs, key=lambda r: r[1] - r[0])
+            # grow into adjacent steady caption rows (a caption whose
+            # first line is on during most speech joins its flashing
+            # second line) — stops at rows that are rarely hot, so a
+            # distant always-on logo is never absorbed
+            y0, y1 = yspan
+            steady = max(2, n // 2)
+            while y0 > 0 and counts[y0 - 1] >= steady:
+                y0 -= 1
+            while y1 < H and counts[y1] >= steady:
+                y1 += 1
+            yspan = (y0, y1)
+    if yspan is None:
+        # -- fallback: the original persistent-band method --
+        stack = np.stack([p[:H] for p, _e in frames])
+        band_profile = np.percentile(stack, 70, axis=0)
+        prof = np.convolve(band_profile, np.ones(win) / win, mode="same")
+        base = float(np.median(prof))
+        if base <= 0:
+            return None
+        runs = [r for r in _runs(prof > base * 1.9, 1)
+                if 0.04 <= (r[1] - r[0]) / H <= 0.32]
+        if not runs:
+            return None
+        yspan = max(runs, key=lambda r: float(prof[r[0]:r[1]].mean()))
+    y0, y1 = yspan
+    # trim columns inside the band from the summed energy of all frames
+    esum = sum(e[y0:y1] for _r, e in frames)
+    col = esum.mean(axis=0)
     cbase = float(np.median(col)) or 1.0
     cols = np.where(col > cbase * 1.5)[0]
     if len(cols):
