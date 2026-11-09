@@ -1667,6 +1667,13 @@ def _run_translate_probe():
         except Exception:
             res["free_ok"] = False
         try:
+            got = translate_segments._batch_google([sample])
+            out = (got[0] if got else "") or ""
+            res["free_batch_ok"] = bool(out) and \
+                any("\u1000" <= c <= "\u109f" for c in out)
+        except Exception:
+            res["free_batch_ok"] = False
+        try:
             if gemini_translate.key_configured():
                 by = gemini_translate.translate_all(
                     [{"start": 0.0, "end": 1.0, "text": sample}])
@@ -1675,8 +1682,9 @@ def _run_translate_probe():
                     any("\u1000" <= c <= "\u109f" for c in out)
             else:
                 res["gemini_ok"] = False
-        except Exception:
+        except Exception as e:
             res["gemini_ok"] = False
+            res["gemini_err"] = str(e)[:200]
         (ROOT / ".translate_probe.json").write_text(
             json.dumps(res), encoding="utf-8")
     except Exception:

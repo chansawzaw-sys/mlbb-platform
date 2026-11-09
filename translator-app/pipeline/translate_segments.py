@@ -193,6 +193,17 @@ class _Chain:
             for attempt in range(attempts):
                 try:
                     out = (_with_timeout(fn, text) or "").strip()
+                    if out and out == text.strip() \
+                            and any(c.isalpha() for c in text) \
+                            and not any("\u1000" <= c <= "\u109f"
+                                        for c in out):
+                        # The provider ECHOED the source (MyMemory
+                        # does this for zh->my) — that is not a
+                        # translation; count it as a failure and
+                        # move on to the next provider.
+                        self.fails[name] = self.fails.get(name, 0) + 1
+                        last_err = RuntimeError(f"{name} echoed source")
+                        continue
                     if out:
                         self.good = name
                         _save_good(name)

@@ -20,6 +20,7 @@ CLI test (mocked in verification; live needs a real key + network):
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 from .common import PROJECT_ROOT
@@ -88,6 +89,30 @@ def key_configured():
     return bool(get_api_key())
 
 
+def _models():
+    """Model fallback order: the configured model first, then the
+    current Flash names. (A key created in late 2026 may not accept
+    gemini-2.0-flash at all — the live probe on 2026-11-09 showed
+    gemini_ok=false with the single-model client.)"""
+    env = (os.environ.get("GEMINI_MODEL") or "").strip()
+    out = []
+    for m in [env, "gemini-2.5-flash", "gemini-2.0-flash",
+              "gemini-1.5-flash"]:
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
+def _note_error(msg):
+    """Record the last Gemini failure (status/body snippet only —
+    NEVER the key) so /api/auth/me can surface it for diagnosis."""
+    try:
+        (PROJECT_ROOT / ".gemini_last_error").write_text(
+            f"{int(time.time())} {msg}"[:400], encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _extract_json_array(text):
     text = (text or "").strip()
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S)
@@ -120,13 +145,38 @@ def translate_all(segments, style="subs"):
         "generationConfig": {"responseMimeType": "application/json",
                              "temperature": 0.3},
     }
-    resp = requests.post(_API_TMPL.format(model=model), json=body, timeout=120,
-                         headers={"x-goog-api-key": key,
-                                  "Content-Type": "application/json"})
-    if resp.status_code != 200:
-        # NOTE: body may contain an error message but never the key.
-        raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:300]}")
-    data = resp.json()
+    data = None
+    last_err = None
+    for mdl in _models():
+        url = _API_TMPL.format(model=mdl)
+        for use_query in (False, True):
+            try:
+                resp = requests.post(
+                    url + (f"?key={key}" if use_query else ""),
+                    json=body, timeout=120,
+                    headers={**({} if use_query else
+                                {"x-goog-api-key": key}),
+                             "Content-Type": "application/json"})
+            except Exception as e:  # network-level: try the next shape
+                last_err = e
+                continue
+            if resp.status_code == 200:
+                data = resp.json()
+                break
+            # NOTE: body may contain an error message but never the key.
+            last_err = RuntimeError(
+                f"Gemini HTTP {resp.status_code} ({mdl}): "
+                f"{resp.text[:200]}")
+            if resp.status_code in (400, 404):
+                break  # model problem — next model, not auth style
+            if resp.status_code in (401, 403) and not use_query:
+                continue  # try query-param auth once
+            break
+        if data is not None:
+            break
+    if data is None:
+        _note_error(str(last_err))
+        raise RuntimeError(str(last_err))
     text_out = data["candidates"][0]["content"]["parts"][0]["text"]
     arr = _extract_json_array(text_out)
     result = {}
