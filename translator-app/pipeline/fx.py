@@ -35,7 +35,8 @@ ASPECT_STYLES = ("blur", "black", "crop")
 def has_fx(fx):
     if not fx:
         return False
-    return (bool(fx.get("blur")) or bool(fx.get("logo", {}).get("path"))
+    return (bool(fx.get("blur")) or bool(fx.get("blur_pieces"))
+            or bool(fx.get("logo", {}).get("path"))
             or (fx.get("aspect") or {}).get("ratio") in ASPECT_DIMS)
 
 
@@ -50,7 +51,30 @@ def filter_chain(fx, vw, vh):
     logo_path = logo.get("path")
     filters = []
     cur = "[0:v]"
-    blur = fx.get("blur")
+    # Piece-by-piece blur (owner's rule): each piece blurs only its
+    # own rows and only inside its time window — the text zone moves,
+    # so the blur follows it instead of covering one big fixed area.
+    # When pieces exist they REPLACE the single whole-video box.
+    pieces = fx.get("blur_pieces") or []
+    for i, p in enumerate(pieces):
+        try:
+            bx = min(max(float(p["x"]), 0.0), 0.99)
+            by = min(max(float(p["y"]), 0.0), 0.99)
+            bw = min(max(float(p["w"]), 0.01), 1.0 - bx)
+            bh = min(max(float(p["h"]), 0.01), 1.0 - by)
+            t0, t1 = float(p["t0"]), float(p["t1"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        sigma = float((fx.get("blur") or {}).get("strength") or 25)
+        filters.append(f"{cur}split=2[pb{i}][pc{i}]")
+        filters.append(
+            f"[pc{i}]crop=w='trunc(iw*{bw}/2)*2':h='trunc(ih*{bh}/2)*2'"
+            f":x='iw*{bx}':y='ih*{by}',gblur=sigma={sigma:.1f}[pblur{i}]")
+        filters.append(
+            f"[pb{i}][pblur{i}]overlay=x='main_w*{bx}':y='main_h*{by}'"
+            f":enable='between(t,{t0:.2f},{t1:.2f})'[pv{i}]")
+        cur = f"[pv{i}]"
+    blur = None if pieces else fx.get("blur")
     if blur:
         bx = min(max(float(blur["x"]), 0.0), 0.99)
         by = min(max(float(blur["y"]), 0.0), 0.99)

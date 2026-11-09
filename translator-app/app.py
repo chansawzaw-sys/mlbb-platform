@@ -619,16 +619,23 @@ def _tg_flow_prepare(chat_id):
             f"{max(1.0, dur * 0.3):.1f}", "-i", str(src),
             "-frames:v", "1", str(frame)])
         from pipeline import detect_text
-        box = detect_text.detect_text_box(src)
+        pieces = detect_text.detect_text_pieces(src)
+        box = None
+        if pieces:
+            dom = max(pieces, key=lambda p: p["t1"] - p["t0"])
+            box = {k: dom[k] for k in ("x", "y", "w", "h")}
+        else:
+            box = detect_text.detect_text_box(src)
         flow.update({"pid": pid, "src": str(src), "box": box,
-                     "step": "blur"})
+                     "pieces": pieces, "step": "blur"})
         rows = []
         if box:
             shown = pdir / "tg_frame_box.jpg"
-            detect_text.draw_box(frame, box, shown)
+            detect_text.draw_box(frame, pieces if pieces else box, shown)
             rows.append([("✅ ဒီနေရာ ဝါး", "b:ok"), ("မဝါးဘူး", "b:no")])
-            caption = ("🔍 စာတန်း နေရာ တွေ့ပါတယ် — အနီ အကွက် ကို ဝါးပြီး "
-                       "မြန်မာ စာတန်း ကို အဲဒီ အထဲ ထည့်ပေးပါမယ်။ နေရာ မှန်ပါသလား?")
+            caption = ("🔍 စာတန်း နေရာ တွေ့ပါတယ် — အနီ အကွက် နေရာတွေ ကို "
+                       "အပိုင်းလိုက် ဝါးပြီး မြန်မာ စာတန်း ကို အဓိက နေရာ ထဲ "
+                       "ထည့်ပေးပါမယ်။ နေရာ မှန်ပါသလား?")
         else:
             shown = frame
             rows.append([("မဝါးဘူး", "b:no")])
@@ -724,6 +731,8 @@ def _tg_start_flow_job(chat_id, flow):
     fx = {}
     if flow.get("blur"):
         fx["blur"] = {**flow["blur"], "strength": 25}
+    if flow.get("blur_pieces"):
+        fx["blur_pieces"] = flow["blur_pieces"]
     if flow.get("logo"):
         fx["logo"] = flow["logo"]
     if ratio != "orig":
@@ -788,10 +797,13 @@ def _on_tg_callback(cq):
         choice = data[2:]
         if choice == "ok":
             flow["blur"] = flow.get("box")
+            flow["blur_pieces"] = flow.get("pieces")
         elif choice == "no":
             flow["blur"] = None
+            flow["blur_pieces"] = None
         else:
             flow["blur"] = _BLUR_PRESETS.get(choice)
+            flow["blur_pieces"] = None
         flow["step"] = "mode"
         tg.send_message(chat_id, "ဘယ် ပုံစံ နဲ့ ထုတ်ချင်ပါသလဲ?",
                         buttons=[[("နှစ်မျိုးလုံး", "m:both")],

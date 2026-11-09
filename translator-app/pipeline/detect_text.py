@@ -107,16 +107,10 @@ def detect_text_box(video):
     if dyn.any():
         runs = _merge(_runs(dyn, max(2, int(H * 0.03))), int(H * 0.04))
         if runs:
-            # Owner's rule: ONE fixed box over the WHOLE extent where
-            # text appears/disappears — not piece by piece. Only
-            # clusters whose hot-mass is a small fraction of the
-            # strongest cluster's count as noise and are dropped
-            # before the span is taken.
-            mass = [float(counts[a:b].sum()) for a, b in runs]
-            keep = [r for r, m in zip(runs, mass)
-                    if m >= 0.15 * max(mass)]
-            if keep:
-                yspan = (keep[0][0], keep[-1][1])
+            if runs[-1][1] - runs[0][0] <= 0.6 * H:
+                yspan = (runs[0][0], runs[-1][1])
+            else:
+                yspan = max(runs, key=lambda r: r[1] - r[0])
             # grow into adjacent steady caption rows (a caption whose
             # first line is on during most speech joins its flashing
             # second line) — stops at rows that are rarely hot, so a
@@ -161,17 +155,126 @@ def detect_text_box(video):
             "w": round((x1 - x0) / W, 3), "h": round((y1 - y0) / H, 3)}
 
 
+def _piece_x(energies, y0, y1, W):
+    """Column extent of text inside rows [y0, y1) from energy maps."""
+    esum = sum(e[y0:y1] for e in energies)
+    col = esum.mean(axis=0)
+    cbase = float(np.median(col)) or 1.0
+    cols = np.where(col > cbase * 1.5)[0]
+    if len(cols):
+        x0 = max(0, int(cols.min()) - int(W * 0.02))
+        x1 = min(W, int(cols.max()) + int(W * 0.02))
+    else:
+        x0, x1 = 0, W
+    if (x1 - x0) / W < 0.35:
+        x0, x1 = int(W * 0.04), int(W * 0.96)
+    return x0, x1
+
+
+def _overlap(a, b):
+    lo = max(a[0], b[0])
+    hi = min(a[1], b[1])
+    return max(0, hi - lo)
+
+
+def detect_text_pieces(video):
+    """Owner's rule (2026-11-09, correcting the one-big-box idea):
+    blur PIECE BY PIECE — the text zone MOVES over the video (bottom
+    captions now, a centre title later), so return time-windowed
+    pieces [{x, y, w, h, t0, t1}]: each piece blurs only its own
+    rows, only while its text is on screen. Frames are sampled about
+    once a second; a frame's text rows are its hot runs; consecutive
+    frames whose spans overlap join one piece. [] when no text."""
+    video = Path(video)
+    try:
+        dur = probe_duration(video)
+    except Exception:
+        return []
+    if not dur or dur < 2:
+        return []
+    n = int(max(6, min(40, round(dur))))
+    step = dur / n
+    frames = []  # (t, span_or_None, energy)
+    with tempfile.TemporaryDirectory() as td:
+        for i in range(n):
+            t = (i + 0.5) * step
+            got = _frame_rows(video, t, td)
+            if not got:
+                frames.append((t, None, None))
+                continue
+            rows, energy = got
+            H = energy.shape[0]
+            win = max(2, int(H * 0.02))
+            prof = np.convolve(rows[:H], np.ones(win) / win, mode="same")
+            base = float(np.median(prof))
+            span = None
+            if base > 0:
+                runs = _merge(_runs(prof > base * 1.9,
+                                    max(2, int(H * 0.03))), int(H * 0.03))
+                runs = [r for r in runs if (r[1] - r[0]) <= 0.4 * H]
+                if runs:
+                    span = (runs[0][0], runs[-1][1])
+            frames.append((t, span, energy))
+    if not frames or frames[0][2] is None:
+        return []
+    H, W = frames[0][2].shape
+    pieces = []
+    for t, span, energy in frames:
+        if span is None:
+            continue
+        if pieces and t - pieces[-1]["t1"] <= step * 1.6:
+            p = pieces[-1]
+            ps = (p["y0"], p["y1"])
+            inter = _overlap(ps, span)
+            if inter >= 0.4 * min(ps[1] - ps[0], span[1] - span[0]):
+                p["y0"] = min(p["y0"], span[0])
+                p["y1"] = max(p["y1"], span[1])
+                p["t1"] = t + step / 2
+                p["energies"].append(energy)
+                continue
+        pieces.append({"y0": span[0], "y1": span[1],
+                       "t0": max(0.0, t - step / 2), "t1": t + step / 2,
+                       "energies": [energy]})
+    # drop slivers, then cap the count by merging the closest pair
+    pieces = [p for p in pieces if p["t1"] - p["t0"] >= 0.8] or pieces
+    while len(pieces) > 8:
+        best_i, best_d = 0, None
+        for i in range(len(pieces) - 1):
+            d = abs(pieces[i]["y0"] - pieces[i + 1]["y0"])
+            if best_d is None or d < best_d:
+                best_i, best_d = i, d
+        a, b = pieces[best_i], pieces[best_i + 1]
+        a["y0"], a["y1"] = min(a["y0"], b["y0"]), max(a["y1"], b["y1"])
+        a["t1"] = b["t1"]
+        a["energies"] += b["energies"]
+        pieces.pop(best_i + 1)
+    pad_y = int(H * 0.015)
+    out = []
+    for p in pieces:
+        y0 = max(0, p["y0"] - pad_y)
+        y1 = min(H, p["y1"] + pad_y)
+        x0, x1 = _piece_x(p["energies"], y0, y1, W)
+        out.append({"x": round(x0 / W, 3), "y": round(y0 / H, 3),
+                    "w": round((x1 - x0) / W, 3), "h": round((y1 - y0) / H, 3),
+                    "t0": round(p["t0"], 2), "t1": round(min(p["t1"], dur), 2)})
+    return out
+
+
 def draw_box(frame_img, box, out_path):
-    """Draw the proposed box on a frame image so a human can confirm
-    it at a glance (used by the Telegram confirm flow)."""
+    """Draw the proposed box(es) on a frame image so a human can
+    confirm them at a glance (used by the Telegram confirm flow).
+    `box` may be one box dict or a list of them (blur pieces)."""
     from PIL import ImageDraw
     im = Image.open(frame_img).convert("RGB")
     W, H = im.size
     d = ImageDraw.Draw(im)
-    x0, y0 = int(box["x"] * W), int(box["y"] * H)
-    x1, y1 = int((box["x"] + box["w"]) * W), int((box["y"] + box["h"]) * H)
-    for t in range(4):
-        d.rectangle([x0 - t, y0 - t, x1 + t, y1 + t], outline=(255, 60, 60))
+    boxes = box if isinstance(box, list) else [box]
+    for b in boxes:
+        x0, y0 = int(b["x"] * W), int(b["y"] * H)
+        x1, y1 = int((b["x"] + b["w"]) * W), int((b["y"] + b["h"]) * H)
+        for t in range(4):
+            d.rectangle([x0 - t, y0 - t, x1 + t, y1 + t],
+                        outline=(255, 60, 60))
     im.save(out_path, quality=88)
     return out_path
 
