@@ -16,7 +16,8 @@ import re
 import sys
 from pathlib import Path
 
-from .common import FONTS_DIR, probe_streams, run, target_maxrate_k
+from .common import (FONTS_DIR, ensure_fonts, probe_streams, run,
+                     target_maxrate_k)
 
 # Subtitle FONT CHOICES — all Myanmar UNICODE fonts bundled in assets/fonts.
 # Every one was verified to cover the full Myanmar block (U+1000–109F) and to
@@ -280,6 +281,7 @@ def video_size(input_mp4):
 
 def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
          blur_box=None, fx=None):
+    ensure_fonts()  # decode .ttf.b64 -> .ttf on deploys that lack them
     family = FONT_CHOICES.get(font, FONT_CHOICES[DEFAULT_FONT])
     width, height = video_size(input_mp4)
     if fx and (fx.get("aspect") or {}).get("ratio"):

@@ -9,6 +9,26 @@ _HAS_NICE = shutil.which("nice") is not None
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FONTS_DIR = PROJECT_ROOT / "assets" / "fonts"
 
+
+def ensure_fonts():
+    """Materialize the bundled Myanmar fonts. The fonts are BINARY
+    and the deploy channel (git via a text-only push) cannot carry
+    .ttf files, so the repo ships them as .ttf.b64 text; decode any
+    that are missing next to their encoded copy. Without this the
+    server had NO Myanmar font at all and libass drew every Burmese
+    glyph as an empty box (owner reports 2026-11-09)."""
+    import base64
+    try:
+        if not FONTS_DIR.exists():
+            return
+        for b64 in FONTS_DIR.glob("*.ttf.b64"):
+            ttf = b64.with_suffix("")
+            if not ttf.exists() or ttf.stat().st_size < 10_000:
+                ttf.write_bytes(base64.b64decode(
+                    b64.read_text(encoding="ascii")))
+    except Exception:
+        pass
+
 _CA_PATCHED = False
 
 
