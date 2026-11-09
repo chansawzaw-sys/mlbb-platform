@@ -44,6 +44,32 @@ Segments:
 __SEGMENTS_JSON__
 """
 
+PROMPT_SUBS = PROMPT
+
+# Dub mode (owner's rule, 2026-11-09): the voice NARRATES — retell the
+# scene like a storyteller, in flowing spoken Burmese. Subtitle-only
+# jobs keep the faithful style above; anything that will be SPOKEN
+# (dub and both) uses this one.
+PROMPT_DUB = """You are the narrator of a Burmese-dubbed video. Retell each segment below in natural, spoken Burmese (ပြောစကား) the way a storyteller narrates a story (ဇာတ်လမ်း ပြောသလို) — flowing, vivid, and easy to listen to.
+
+Rules:
+- Keep EVERY fact, event and line of meaning, in the same order — never invent, add, omit or soften anything.
+- You may rephrase freely and use natural storytelling connectors so the narration flows from segment to segment, as long as the meaning, tone and emotion stay exactly the same.
+- When a character speaks, voice it the way that character would say it in Burmese.
+- Keep personal names, place names, brand names and ALL numbers exactly as they are.
+- Keep each segment roughly as short as the original (it will be spoken in the same time window).
+
+Input is a JSON array of {"id": <int>, "text": "<english>"}.
+Output MUST be only a JSON array of {"id": <same int>, "my": "<burmese narration>"} with exactly the same ids, in the same order. No markdown fences, no commentary.
+
+Segments:
+__SEGMENTS_JSON__
+"""
+
+
+def _prompt_for(style):
+    return PROMPT_DUB if style == "dub" else PROMPT_SUBS
+
 
 def get_api_key():
     key = (os.environ.get("GEMINI_API_KEY") or "").strip()
@@ -71,8 +97,11 @@ def _extract_json_array(text):
     return json.loads(text[start:end + 1])
 
 
-def translate_all(segments):
+def translate_all(segments, style="subs"):
     """segments: list of dicts with 'text'. Returns {index: burmese_text}.
+
+    style: "subs" = faithful + idiomatic (subtitle jobs);
+    "dub" = storytelling narration (anything that will be spoken).
 
     Raises on ANY problem (no key, HTTP error, quota, bad/invalid JSON) so
     the caller can fall back to the free provider chain.
@@ -86,7 +115,7 @@ def translate_all(segments):
     payload_in = [{"id": i, "text": (s.get("text") or "").strip()}
                   for i, s in enumerate(segments)]
     body = {
-        "contents": [{"parts": [{"text": PROMPT.replace(
+        "contents": [{"parts": [{"text": _prompt_for(style).replace(
             "__SEGMENTS_JSON__", json.dumps(payload_in, ensure_ascii=False))}]}],
         "generationConfig": {"responseMimeType": "application/json",
                              "temperature": 0.3},

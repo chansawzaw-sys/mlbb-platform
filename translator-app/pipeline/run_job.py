@@ -26,7 +26,7 @@ def _marks(progress):
     return mark
 
 
-def run_phase1(workdir, url, source_path=None, progress=None):
+def run_phase1(workdir, url, source_path=None, progress=None, style="subs"):
     """Phase 1: download -> transcribe -> translate. Then the job waits for
     human review/edit of the Myanmar segments before phase 2."""
     workdir = Path(workdir)
@@ -50,7 +50,7 @@ def run_phase1(workdir, url, source_path=None, progress=None):
     mark("transcribe", "done")
 
     mark("translate", "running")
-    translate_segments.translate_segments(workdir)
+    translate_segments.translate_segments(workdir, style=style)
     mark("translate", "done")
     return src
 
@@ -104,7 +104,8 @@ def run_job(workdir, url, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
             fx=None, source_path=None, font=burn.DEFAULT_FONT,
             voice_rate=0, voice_pitch=0, subs=None):
     """Uninterrupted run (CLI/back-compat): phase 1 + phase 2, no review."""
-    run_phase1(workdir, url, source_path=source_path, progress=progress)
+    run_phase1(workdir, url, source_path=source_path, progress=progress,
+               style="subs" if mode == "subs" else "dub")
     return run_phase2(workdir, mode=mode, voice=voice, progress=progress,
                       fx=fx, font=font, voice_rate=voice_rate,
                       voice_pitch=voice_pitch, subs=subs)

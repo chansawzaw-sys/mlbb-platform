@@ -210,7 +210,7 @@ def translate_one(text):
     return _Chain().one(text)
 
 
-def translate_segments(workdir):
+def translate_segments(workdir, style="subs"):
     ensure_system_ca()
     workdir = Path(workdir)
     segs = load_segments(workdir / "segments_en.json")
@@ -219,7 +219,7 @@ def translate_segments(workdir):
         try:
             from . import gemini_translate
             if gemini_translate.key_configured():
-                by_idx = gemini_translate.translate_all(segs)
+                by_idx = gemini_translate.translate_all(segs, style=style)
                 out = [{**seg, "text_my": by_idx[i], "provider": "gemini"}
                        for i, seg in enumerate(segs)]
                 save_segments(out, workdir / "segments_my.json")

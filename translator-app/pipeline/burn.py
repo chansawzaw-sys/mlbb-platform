@@ -215,14 +215,21 @@ def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None):
         except Exception:
             box = None
     avail_w = width - 2 * margin_lr
-    for start, end, body in _parse_srt(srt_path):
+    events = list(_parse_srt(srt_path))
+    box_fs = None
+    if box:
+        rx, ry, rw, rh = box
+        cand = min(font_size, rh * 0.55)
+        # ONE fixed size for the whole video (owner's rule): the
+        # largest size at which EVERY line fits inside the box, so
+        # the subtitle size never jumps from line to line.
+        box_fs = min((_fit_box(b, family, cand, rw, rh)
+                      for _s, _e, b in events), default=cand)
+    for start, end, body in events:
         ev_ml, ev_mr = 0, 0
         if box:
-            rx, ry, rw, rh = box
-            cand = min(font_size, rh * 0.55)
-            fs = _fit_box(body, family, cand, rw, rh)
             body = (f"{{\\an5\\pos({rx + rw / 2:.0f},{ry + rh / 2:.0f})"
-                    f"\\fs{fs:.0f}}}") + body
+                    f"\\fs{box_fs:.0f}}}") + body
             # Per-event margins make libass wrap INSIDE the box width
             # (a \pos event otherwise wraps at the full-frame margins).
             ev_ml, ev_mr = int(rx), int(width - (rx + rw))
@@ -233,6 +240,35 @@ def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None):
         lines.append(f"Dialogue: 0,{start},{end},Default,,{ev_ml},{ev_mr},0,,{body}")
     Path(ass_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return ass_path
+
+
+def _map_box_aspect(box, sw, sh, tw, th, style):
+    """Map a blur box (fractions of the SOURCE frame) into fractions
+    of the reframed canvas, following fx.filter_chain's geometry:
+    blur/black fit the whole frame inside (decrease), crop fills and
+    centre-crops (increase). One formula: uniform scale + centred
+    offset (negative when cropping). None when the box falls (nearly)
+    entirely outside the canvas."""
+    if style == "crop":
+        s = max(tw / sw, th / sh)
+    else:
+        s = min(tw / sw, th / sh)
+    ox = (tw - sw * s) / 2.0
+    oy = (th - sh * s) / 2.0
+
+    def mx(f):
+        return (f * sw * s + ox) / tw
+
+    def my(f):
+        return (f * sh * s + oy) / th
+
+    x0 = min(max(mx(float(box["x"])), 0.0), 1.0)
+    y0 = min(max(my(float(box["y"])), 0.0), 1.0)
+    x1 = min(max(mx(float(box["x"]) + float(box["w"])), 0.0), 1.0)
+    y1 = min(max(my(float(box["y"]) + float(box["h"])), 0.0), 1.0)
+    if x1 - x0 < 0.03 or y1 - y0 < 0.02:
+        return None
+    return {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
 
 
 def video_size(input_mp4):
@@ -248,13 +284,18 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
     width, height = video_size(input_mp4)
     if fx and (fx.get("aspect") or {}).get("ratio"):
         # The fx graph reframes the canvas: lay subtitles out on the
-        # FINAL size, and drop in-box placement (the blur box belongs
-        # to the pre-reframe frame; the blur itself still applies).
+        # FINAL size, with the blur box MAPPED into canvas coordinates.
+        # (It used to be dropped, which threw the subtitles to the
+        # canvas bottom — outside the blurred area entirely.)
         from . import fx as _fxm
         dims = _fxm.ASPECT_DIMS.get(fx["aspect"]["ratio"])
         if dims:
+            sw, sh = width, height
             width, height = dims
-            blur_box = None
+            if blur_box:
+                blur_box = _map_box_aspect(
+                    blur_box, sw, sh, width, height,
+                    fx["aspect"].get("style") or "blur")
     ass_path = Path(srt_path).with_name(Path(srt_path).stem + ".layout.ass")
     srt_to_ass(srt_path, ass_path, width, height, family, subs,
                blur_box=blur_box)

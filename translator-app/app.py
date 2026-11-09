@@ -1089,7 +1089,8 @@ def _worker(job):
         job["status"] = "running"
         _save(job)
         run_job.run_phase1(workdir, job["url"], source_path=job.get("source_path"),
-                           progress=_progress_fn(job))
+                           progress=_progress_fn(job),
+                           style="subs" if job["mode"] == "subs" else "dub")
         _quote_for_job(job)
         _run_phase2(job)
         _finish(job)
