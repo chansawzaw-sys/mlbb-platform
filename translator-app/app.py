@@ -618,6 +618,9 @@ def _tg_flow_prepare(chat_id):
             pass
 
 
+_TG_VOICES = {"nilar": "my-MM-NilarNeural", "thiha": "my-MM-ThihaNeural"}
+
+
 def _tg_start_flow_job(chat_id, flow):
     """Final bot-flow step: credit/cap checks, then create the job
     from everything the flow collected (blur, mode, frame, speed)."""
@@ -649,6 +652,7 @@ def _tg_start_flow_job(chat_id, flow):
     job, err = _new_job({"url": flow.get("url")
                          or "https://telegram.org/file",
                          "mode": flow.get("mode") or "both",
+                         "voice": flow.get("voice"),
                          "speed_cap": flow.get("speed_cap") or 1.3})
     if err:
         tg.send_message(chat_id, "🙏 တောင်းပန်ပါတယ် — " + err)
@@ -682,7 +686,7 @@ def _tg_start_flow_job(chat_id, flow):
 
 
 def _on_tg_callback(cq):
-    """Inline-button taps for the bot flow: blur, mode, frame, speed."""
+    """Inline-button taps for the bot flow: blur, mode, frame, voice, speed."""
     from pipeline import telegram_send as tg
     tg.answer_callback(cq.get("id"))
     chat = (cq.get("message") or {}).get("chat") or {}
@@ -749,15 +753,25 @@ def _on_tg_callback(cq):
             return
         flow["ratio"] = ratio
         if (flow.get("mode") or "both") != "subs":
-            flow["step"] = "speed"
-            tg.send_message(chat_id, "အသံ အရှိန် ရွေးပေးပါ",
-                            buttons=[[("1.0×", "s:1.0"),
-                                      ("1.3× ပုံမှန်", "s:1.3"),
-                                      ("1.5×", "s:1.5")],
-                                     [("2×", "s:2.0"), ("3×", "s:3.0"),
-                                      ("4×", "s:4.0")]])
+            flow["step"] = "voice"
+            tg.send_message(chat_id, "အသံ ရွေးပေးပါ",
+                            buttons=[[("🎙 Nilar (မ)", "v:nilar"),
+                                      ("🎙 Thiha (ကျား)", "v:thiha")]])
             return
         _tg_start_flow_job(chat_id, flow)
+        return
+    if data.startswith("v:") and flow.get("step") == "voice":
+        voice = _TG_VOICES.get(data[2:])
+        if not voice:
+            return
+        flow["voice"] = voice
+        flow["step"] = "speed"
+        tg.send_message(chat_id, "အသံ အရှိန် ရွေးပေးပါ",
+                        buttons=[[("1.0×", "s:1.0"),
+                                  ("1.3× ပုံမှန်", "s:1.3"),
+                                  ("1.5×", "s:1.5")],
+                                 [("2×", "s:2.0"), ("3×", "s:3.0"),
+                                  ("4×", "s:4.0")]])
         return
     if data.startswith("s:") and flow.get("step") == "speed":
         try:
