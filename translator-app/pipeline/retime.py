@@ -3,10 +3,13 @@
 Rules (user's core requirement):
   * dub shorter than window  -> speed 1.0, pad with silence at the end.
   * dub longer than window   -> speed speech up with ffmpeg atempo,
-                                clamped to [1.0, 1.30].
-  * still too long at 1.30x  -> FREEZE the video: extend that segment by
-                                cloning its last frame for the excess time,
-                                so the speech is never cut off.
+                                clamped to [1.0, the job's speed cap].
+  * still too long at the cap -> SLOW the video segment down (down to
+                                0.80x) so the picture keeps moving while
+                                it stretches to fit the speech.
+  * still too long at 0.80x  -> FREEZE the video for the remainder:
+                                clone the last frame, so the speech is
+                                never cut off.
   * non-speech gaps keep the original audio at low volume (ambience).
 
 Implementation: split the source into chunks (gaps + segments), render each
@@ -24,6 +27,7 @@ from .common import (load_segments, probe_duration, run, save_segments,
                      target_maxrate_k, write_srt)
 
 MAX_SPEED = 1.30
+MIN_VSLOW = 0.80
 GAP_VOL = 0.25
 
 
@@ -38,13 +42,23 @@ def _plan(segs, total_dur, max_speed=MAX_SPEED):
         orig = max(0.1, end - start)
         tts_dur = float(seg.get("tts_duration") or 0)
         if tts_dur <= orig or tts_dur == 0:
-            speed, excess = 1.0, 0.0
+            speed, vslow, excess, new_dur = 1.0, 1.0, 0.0, orig
         else:
             speed = min(max_speed, tts_dur / orig)
-            excess = max(0.0, tts_dur / speed - orig)
+            new_dur = tts_dur / speed        # video duration required
+            if new_dur <= orig:
+                vslow, excess = 1.0, 0.0
+            else:
+                vslow = orig / new_dur
+                if vslow >= MIN_VSLOW:
+                    excess = 0.0             # slow-down alone covers it
+                else:
+                    vslow = MIN_VSLOW
+                    excess = new_dur - orig / MIN_VSLOW
         chunks.append({"kind": "seg", "start": start, "end": end, "seg_idx": idx,
-                       "speed": round(speed, 4), "excess": round(excess, 3),
-                       "new_dur": round(orig + excess, 3), "orig_dur": round(orig, 3)})
+                       "speed": round(speed, 4), "vslow": round(vslow, 4),
+                       "excess": round(excess, 3),
+                       "new_dur": round(new_dur, 3), "orig_dur": round(orig, 3)})
         cursor = end
     if total_dur - cursor > 0.05:
         chunks.append({"kind": "gap", "start": cursor, "end": total_dur})
@@ -57,7 +71,10 @@ def _plan(segs, total_dur, max_speed=MAX_SPEED):
 def _piece_vf(c, dur):
     # NOTE: trim INSIDE the filter chain, not output -t: an output -t
     # would also cut the tpad freeze frames we are trying to add.
-    vf = f"trim=duration={dur:.3f},setpts=PTS-STARTPTS,fps=30,format=yuv420p"
+    vf = f"trim=duration={dur:.3f},setpts=PTS-STARTPTS"
+    if c["kind"] == "seg" and c.get("vslow", 1.0) < 0.999:
+        vf += f",setpts=PTS/{c['vslow']:.4f}"
+    vf += ",fps=30,format=yuv420p"
     if c["kind"] == "seg" and c["excess"] > 0.01:
         vf += f",tpad=stop_mode=clone:stop_duration={c['excess']:.3f}"
     return vf
@@ -73,7 +90,10 @@ def _video_single_pass(src, chunks, out):
     filters, labels = [], []
     for n, c in enumerate(chunks):
         f = (f"[0:v]trim=start={c['start']:.3f}:end={c['end']:.3f},"
-             "setpts=PTS-STARTPTS,fps=30,format=yuv420p")
+             "setpts=PTS-STARTPTS")
+        if c["kind"] == "seg" and c.get("vslow", 1.0) < 0.999:
+            f += f",setpts=PTS/{c['vslow']:.4f}"
+        f += ",fps=30,format=yuv420p"
         if c["kind"] == "seg" and c["excess"] > 0.01:
             f += f",tpad=stop_mode=clone:stop_duration={c['excess']:.3f}"
         filters.append(f + f"[v{n}]")
@@ -140,7 +160,8 @@ def retime(workdir, max_speed=MAX_SPEED):
             new_segs.append({**seg,
                              "start_new": round(t_cursor, 3),
                              "end_new": round(t_cursor + c["new_dur"], 3),
-                             "speed": c["speed"], "freeze_extra": c["excess"]})
+                             "speed": c["speed"], "video_slow": c.get("vslow", 1.0),
+                             "freeze_extra": c["excess"]})
         else:
             # gap: original audio, lowered, padded/trimmed to chunk length
             run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['start']:.3f}", "-i", str(src),
@@ -166,7 +187,8 @@ def retime(workdir, max_speed=MAX_SPEED):
     # its window never changes the video track) — the video passes
     # through untouched (stream copy in the mux below) and the most
     # expensive encode of the whole job simply does not happen.
-    passthrough = all(c["kind"] == "gap" or c["excess"] <= 0.01
+    passthrough = all(c["kind"] == "gap"
+                      or (c["excess"] <= 0.01 and c.get("vslow", 1.0) >= 0.999)
                       for c in chunks)
     if passthrough:
         run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-i", str(dub_wav),
