@@ -34,6 +34,27 @@ def ensure_system_ca():
             pass
 
 
+def target_maxrate_k(input_mp4):
+    """Video maxrate (kbps) that keeps a re-encode in the SOURCE's size
+    class. CRF alone is quality-based: re-encoding a low-bitrate phone
+    or TikTok source at crf 23/24 ballooned one 12 MB job to 110 MB.
+    Anchor on the original source.mp4 sitting next to the input when
+    there is one (dub jobs burn the retimed intermediate, whose own
+    bitrate is already one re-encode away from the source)."""
+    try:
+        src = Path(input_mp4)
+        anchor = src.with_name("source.mp4")
+        if anchor.exists():
+            src = anchor
+        dur = probe_duration(src)
+        if dur <= 0:
+            return 1800
+        kbps = src.stat().st_size * 8 / dur / 1000.0
+        return int(max(450, min(2500, kbps * 1.1)))
+    except Exception:
+        return 1800
+
+
 def run(cmd, **kw):
     """Run a command, raise RuntimeError with stderr tail on failure.
 

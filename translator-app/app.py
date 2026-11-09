@@ -192,8 +192,50 @@ def _any_active_worker():
                for j in list(JOBS.values()))
 
 
+def _tg_shrink_for_send(out, dest, budget=47_000_000):
+    """Re-encode an oversized output so the bot can send it: fit into
+    a 480p-class box and cap the bitrate so the file lands under
+    `budget` bytes for its duration. Returns dest on success (and the
+    file really is under the bot cap), else None."""
+    from pipeline import telegram_send as tg
+    try:
+        dur = probe_duration(out)
+        if dur <= 0:
+            return None
+        from pipeline.common import probe_streams
+        vw = vh = None
+        for s in probe_streams(out):
+            if s.get("codec_type") == "video":
+                vw, vh = int(s["width"]), int(s["height"])
+                break
+        if not vw:
+            return None
+        # 480p-class box, orientation-aware, exact dims computed here:
+        # expression sizes AND force_original_aspect_ratio both make
+        # this ffmpeg build's filter setup fail, plain scale=W:H works.
+        box_w, box_h = (854, 480) if vw >= vh else (480, 854)
+        k = min(box_w / vw, box_h / vh, 1.0)
+        tw = max(2, int(vw * k) // 2 * 2)
+        th = max(2, int(vh * k) // 2 * 2)
+        vf = f"scale={tw}:{th}"
+        total_k = budget * 8 / dur / 1000.0 * 0.94
+        video_k = int(max(220, total_k - 96))
+        sh(["ffmpeg", "-y", "-v", "error", "-i", str(out), "-vf", vf,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+            "-maxrate", f"{video_k}k", "-bufsize", f"{2 * video_k}k",
+            "-c:a", "aac", "-b:a", "96k", str(dest)], timeout=1800)
+        if dest.exists() and dest.stat().st_size <= tg.MAX_BYTES:
+            return dest
+    except Exception:
+        pass
+    return None
+
+
 def _tg_deliver_async(job):
-    """A bot-submitted job finished: send the video back to its chat."""
+    """A bot-submitted job finished: send the video back to its chat.
+    Over the bot API's 50 MB cap the user still gets the video: a
+    480p-class compressed copy goes to the chat and the full-quality
+    file stays in their web jobs list (bot jobs are kept 24h)."""
     chat_id = job.get("tg_chat_id")
     if not chat_id:
         return
@@ -205,12 +247,30 @@ def _tg_deliver_async(job):
             if not out.exists():
                 return
             if out.stat().st_size > tg.MAX_BYTES:
-                tg.send_message(
-                    chat_id,
-                    f"✅ ပြီးပါပြီ — ဒါပေမဲ့ ဖိုင် {out.stat().st_size / 1e6:.0f}MB "
-                    "ဖြစ်နေလို့ Telegram ကနေ ပို့လို့ မရပါ (50MB အများဆုံး)")
-                job["tg"] = {"state": "failed", "to": job.get("tg_from"),
-                             "error": "file > 50MB"}
+                small = _tg_shrink_for_send(
+                    out, out.with_name("output_tg.mp4"))
+                if small:
+                    job["tg"] = {"state": "sending", "to": job.get("tg_from")}
+                    _save(job)
+                    tg.send_video(
+                        chat_id, small,
+                        caption="🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို\n"
+                                "(ဖိုင် ကြီးလို့ Telegram အတွက် ချုံ့ ထားတယ် — "
+                                "quality အပြည့်ကို web မှာ ယူပါ)")
+                    tg.send_message(chat_id, "🌐 quality အပြည့်: "
+                                             + APP_LINK
+                                             + "\n(Jobs ထဲမှာ ၂၄ နာရီ အတွင်း ယူပါ)")
+                    job["tg"] = {"state": "sent", "to": job.get("tg_from"),
+                                 "shrunk": True}
+                else:
+                    tg.send_message(
+                        chat_id,
+                        f"✅ ပြီးပါပြီ — ဒါပေမဲ့ ဖိုင် {out.stat().st_size / 1e6:.0f}MB "
+                        "ဖြစ်နေလို့ Telegram ကနေ ပို့လို့ မရပါ (bot အများဆုံး 50MB)\n"
+                        "🌐 web မှာ ယူပါ: " + APP_LINK
+                        + "\n(Jobs ထဲမှာ ၂၄ နာရီ အတွင်း ယူနိုင်တယ်)")
+                    job["tg"] = {"state": "failed", "to": job.get("tg_from"),
+                                 "error": "file > 50MB"}
             else:
                 job["tg"] = {"state": "sending", "to": job.get("tg_from")}
                 _save(job)

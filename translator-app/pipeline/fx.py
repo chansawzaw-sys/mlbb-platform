@@ -17,7 +17,7 @@ import json
 import sys
 from pathlib import Path
 
-from .common import probe_streams, run
+from .common import probe_streams, run, target_maxrate_k
 
 
 def video_size(path):
@@ -118,8 +118,10 @@ def apply_effects(input_mp4, output_mp4, fx):
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4)]
     if logo_path:
         cmd += ["-i", str(logo_path)]
+    mr = target_maxrate_k(input_mp4)
     cmd += ["-filter_complex", ";".join(filters), "-map", cur, "-map", "0:a?",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+            "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
             "-c:a", "copy", str(output_mp4)]
     run(cmd)
     return output_mp4

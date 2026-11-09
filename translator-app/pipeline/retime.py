@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 from .common import (load_segments, probe_duration, run, save_segments,
-                     write_srt)
+                     target_maxrate_k, write_srt)
 
 MAX_SPEED = 1.30
 GAP_VOL = 0.25
@@ -79,9 +79,11 @@ def _video_single_pass(src, chunks, out):
         filters.append(f + f"[v{n}]")
         labels.append(f"[v{n}]")
     filters.append("".join(labels) + f"concat=n={len(chunks)}:v=1:a=0[outv]")
+    mr = target_maxrate_k(src)
     run(["ffmpeg", "-y", "-v", "error", "-i", str(src),
          "-filter_complex", ";".join(filters), "-map", "[outv]",
-         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", str(out)],
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+         "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k", str(out)],
         timeout=1800)
 
 
@@ -89,12 +91,14 @@ def _video_chunked(src, chunks, cdir, out):
     """Original path: one encode per chunk + concat-copy. Kept as the
     fallback for very many chunks, or if the single pass ever fails."""
     vlist = []
+    mr = target_maxrate_k(src)
     for n, c in enumerate(chunks):
         dur = c["end"] - c["start"]
         vout = cdir / f"v{n:03d}.mp4"
         run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['start']:.3f}",
              "-i", str(src), "-vf", _piece_vf(c, dur), "-an",
              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+             "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
              str(vout)], timeout=1200)
         vlist.append(vout)
     lst = cdir / "vlist_fb.txt"
