@@ -1,20 +1,26 @@
 """Step 5: TIMING SYNC — fit the Myanmar dub into each segment's time window.
 
-Rules (user's core requirement):
-  * dub shorter than window  -> speed 1.0, pad with silence at the end.
-  * dub longer than window   -> speed speech up with ffmpeg atempo,
-                                clamped to [1.0, the job's speed cap].
-  * still too long at the cap -> SLOW the video segment down (down to
-                                0.80x) so the picture keeps moving while
-                                it stretches to fit the speech.
-  * still too long at 0.80x  -> FREEZE the video for the remainder:
-                                clone the last frame, so the speech is
-                                never cut off.
-  * non-speech gaps keep the original audio at low volume (ambience).
+Rules (owner's spec, revised 2026-11-09: the picture must NEVER stop):
+  * Fit order: speed the SPEECH up first (atempo, clamped to the job's
+    speed cap). Whatever timing difference remains is absorbed by the
+    VIDEO's playback rate — slow where the dub runs long, fast where
+    the dub runs short — so the picture keeps moving at all times.
+  * FREEZE FRAMES ARE GONE: no tpad/clone anywhere. In the extreme
+    tail (dub many times longer than its window even at the audio
+    cap) the video simply slows further; speech is still never cut.
+  * Video speed-up is capped at MAX_VFAST so a very short dub cannot
+    turn the picture into a fast-forward joke; the small remainder
+    pads with silence at the chunk tail (picture still moving).
+  * Under the narration, the ORIGINAL track plays as a quiet bed:
+    centre-cut when stereo (the original dialogue sits in the
+    centre and largely cancels; wide music/effects survive) at
+    BED_VOL — the owner wants the music kept as background only and
+    the original voices gone. Mono sources get a whisper-level bed.
+  * Non-speech gaps keep the original audio at low volume (ambience).
 
 Implementation: split the source into chunks (gaps + segments), render each
-chunk's video (with tpad freeze when needed) and audio (atempo-adjusted dub,
-or quiet original for gaps), concat both, and emit re-timed subtitle timings.
+chunk's video (rate-adjusted) and audio (atempo dub + quiet bed, or quiet
+original for gaps), concat both, and emit re-timed subtitle timings.
 
 CLI: python -m pipeline.retime <workdir>
 Reads source.mp4 + segments_my.json (with tts_file/tts_duration).
@@ -27,8 +33,11 @@ from .common import (load_segments, probe_duration, run, save_segments,
                      target_maxrate_k, write_srt)
 
 MAX_SPEED = 1.30
-MIN_VSLOW = 0.80
+MIN_VSLOW = 0.80   # legacy stat only; the plan no longer floors at it
+MAX_VFAST = 1.6    # fastest the picture may play for a short dub
 GAP_VOL = 0.25
+BED_VOL = 0.22         # music bed under narration (stereo, centre-cut)
+BED_VOL_MONO = 0.06    # mono: no centre-cut possible, keep it a whisper
 
 
 def _plan(segs, total_dur, max_speed=MAX_SPEED):
@@ -41,23 +50,27 @@ def _plan(segs, total_dur, max_speed=MAX_SPEED):
             chunks.append({"kind": "gap", "start": cursor, "end": start})
         orig = max(0.1, end - start)
         tts_dur = float(seg.get("tts_duration") or 0)
-        if tts_dur <= orig or tts_dur == 0:
-            speed, vslow, excess, new_dur = 1.0, 1.0, 0.0, orig
+        if tts_dur <= 0:
+            speed, vrate, new_dur = 1.0, 1.0, orig
         else:
-            speed = min(max_speed, tts_dur / orig)
-            new_dur = tts_dur / speed        # video duration required
-            if new_dur <= orig:
-                vslow, excess = 1.0, 0.0
+            # 1) the speech speeds up first (never slows down)
+            speed = min(max_speed, tts_dur / orig) if tts_dur > orig else 1.0
+            need = tts_dur / speed           # seconds the dub occupies
+            # 2) the PICTURE absorbs the rest by changing rate —
+            #    slower for a long dub, faster for a short one.
+            #    It never freezes (owner's rule).
+            if need >= orig:
+                vrate, new_dur = orig / need, need
             else:
-                vslow = orig / new_dur
-                if vslow >= MIN_VSLOW:
-                    excess = 0.0             # slow-down alone covers it
+                vrate = orig / need
+                if vrate > MAX_VFAST:
+                    vrate, new_dur = MAX_VFAST, orig / MAX_VFAST
                 else:
-                    vslow = MIN_VSLOW
-                    excess = new_dur - orig / MIN_VSLOW
+                    new_dur = need
         chunks.append({"kind": "seg", "start": start, "end": end, "seg_idx": idx,
-                       "speed": round(speed, 4), "vslow": round(vslow, 4),
-                       "excess": round(excess, 3),
+                       "speed": round(speed, 4), "vslow": round(vrate, 4),
+                       "vrate": round(vrate, 4),
+                       "excess": 0.0,
                        "new_dur": round(new_dur, 3), "orig_dur": round(orig, 3)})
         cursor = end
     if total_dur - cursor > 0.05:
@@ -111,14 +124,14 @@ def remap_pieces(plan, pieces):
 
 
 def _piece_vf(c, dur):
-    # NOTE: trim INSIDE the filter chain, not output -t: an output -t
-    # would also cut the tpad freeze frames we are trying to add.
+    # trim INSIDE the filter chain, then re-rate: setpts=PTS/<rate>
+    # stretches (rate<1) or compresses (rate>1) the chunk to exactly
+    # its planned new_dur. No tpad — the picture never freezes.
     vf = f"trim=duration={dur:.3f},setpts=PTS-STARTPTS"
-    if c["kind"] == "seg" and c.get("vslow", 1.0) < 0.999:
-        vf += f",setpts=PTS/{c['vslow']:.4f}"
+    vr = c.get("vrate", 1.0) if c["kind"] == "seg" else 1.0
+    if abs(vr - 1.0) > 0.001:
+        vf += f",setpts=PTS/{vr:.4f}"
     vf += ",fps=30,format=yuv420p"
-    if c["kind"] == "seg" and c["excess"] > 0.01:
-        vf += f",tpad=stop_mode=clone:stop_duration={c['excess']:.3f}"
     return vf
 
 
@@ -133,11 +146,10 @@ def _video_single_pass(src, chunks, out):
     for n, c in enumerate(chunks):
         f = (f"[0:v]trim=start={c['start']:.3f}:end={c['end']:.3f},"
              "setpts=PTS-STARTPTS")
-        if c["kind"] == "seg" and c.get("vslow", 1.0) < 0.999:
-            f += f",setpts=PTS/{c['vslow']:.4f}"
+        vr = c.get("vrate", 1.0) if c["kind"] == "seg" else 1.0
+        if abs(vr - 1.0) > 0.001:
+            f += f",setpts=PTS/{vr:.4f}"
         f += ",fps=30,format=yuv420p"
-        if c["kind"] == "seg" and c["excess"] > 0.01:
-            f += f",tpad=stop_mode=clone:stop_duration={c['excess']:.3f}"
         filters.append(f + f"[v{n}]")
         labels.append(f"[v{n}]")
     filters.append("".join(labels) + f"concat=n={len(chunks)}:v=1:a=0[outv]")
@@ -170,6 +182,37 @@ def _video_chunked(src, chunks, cdir, out):
          "-i", str(lst), "-c:v", "copy", str(out)], timeout=1200)
 
 
+def _atempo_chain(factor):
+    """atempo only accepts 0.5..100 per instance — chain for less."""
+    parts = []
+    f = float(factor)
+    while f < 0.5:
+        parts.append("atempo=0.5")
+        f /= 0.5
+    parts.append(f"atempo={f:.4f}")
+    return ",".join(parts)
+
+
+def _bed_chain(c, dur, stereo):
+    """Filter chain turning the source window into the quiet bed:
+    re-time it to the chunk's new duration exactly like the picture,
+    suppress the centre (dialogue) on stereo, drop to bed level."""
+    f = dur / max(0.05, c["new_dur"])      # audio tempo to fit window
+    chain = _atempo_chain(f)
+    if stereo:
+        # Side signal (L-R) in BOTH channels with the SAME sign:
+        # centre dialogue cancels in the subtraction, wide music
+        # survives — and unlike anti-phase stereo (c1=-(c0-c1)) it
+        # does not annihilate itself on mono fold-down (phone
+        # speakers, amix layout folds).
+        chain += (",pan=stereo|c0=c0-c1|c1=c0-c1"
+                  f",volume={BED_VOL}")
+    else:
+        chain += f",volume={BED_VOL_MONO}"
+    chain += f",apad,atrim=0:{c['new_dur']:.3f}"
+    return chain
+
+
 def retime(workdir, max_speed=MAX_SPEED):
     workdir = Path(workdir)
     src = workdir / "source.mp4"
@@ -183,6 +226,13 @@ def retime(workdir, max_speed=MAX_SPEED):
             break
     max_speed = max(1.0, min(4.0, float(max_speed or MAX_SPEED)))
     chunks = _plan(segs, total, max_speed)
+    src_stereo = False
+    src_has_audio = False
+    for s in probe_streams(src):
+        if s.get("codec_type") == "audio":
+            src_has_audio = True
+            src_stereo = int(s.get("channels") or 0) >= 2
+            break
 
     cdir = workdir / "chunks"
     cdir.mkdir(exist_ok=True)
@@ -197,13 +247,35 @@ def retime(workdir, max_speed=MAX_SPEED):
             seg = segs[c["seg_idx"]]
             tts_file = seg["tts_file"]
             af = f"atempo={c['speed']:.4f},apad,atrim=0:{c['new_dur']:.3f}"
-            run(["ffmpeg", "-y", "-v", "error", "-i", tts_file, "-af", af,
-                 "-ac", "2", "-ar", "44100", str(aout)], timeout=300)
+            made = False
+            if src_has_audio:
+                # Narration on top of the quiet original bed (music
+                # kept as background, original voices centre-cut).
+                fc = (f"[0:a]{af}[n];"
+                      f"[1:a]{_bed_chain(c, dur, src_stereo)}[b];"
+                      "[n][b]amix=inputs=2:duration=first:"
+                      "normalize=0[a]")
+                try:
+                    run(["ffmpeg", "-y", "-v", "error",
+                         "-i", tts_file,
+                         "-ss", f"{c['start']:.3f}", "-t", f"{dur:.3f}",
+                         "-i", str(src),
+                         "-filter_complex", fc, "-map", "[a]",
+                         "-ac", "2", "-ar", "44100", str(aout)],
+                        timeout=300)
+                    made = True
+                except Exception:
+                    made = False   # fall through to narration-only
+            if not made:
+                run(["ffmpeg", "-y", "-v", "error", "-i", tts_file,
+                     "-af", af, "-ac", "2", "-ar", "44100", str(aout)],
+                    timeout=300)
             new_segs.append({**seg,
                              "start_new": round(t_cursor, 3),
                              "end_new": round(t_cursor + c["new_dur"], 3),
-                             "speed": c["speed"], "video_slow": c.get("vslow", 1.0),
-                             "freeze_extra": c["excess"]})
+                             "speed": c["speed"], "video_slow": c.get("vrate", 1.0),
+                             "video_rate": c.get("vrate", 1.0),
+                             "freeze_extra": 0.0})
         else:
             # gap: original audio, lowered, padded/trimmed to chunk length
             run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['start']:.3f}", "-i", str(src),
@@ -224,13 +296,13 @@ def retime(workdir, max_speed=MAX_SPEED):
     dub_wav = workdir / "dub.wav"
     _concat(alist, dub_wav, False)
 
-    # Fast path: if NO segment needed a freeze frame, the retimed
-    # timeline IS the original timeline (speeding the AUDIO up to fit
-    # its window never changes the video track) — the video passes
-    # through untouched (stream copy in the mux below) and the most
-    # expensive encode of the whole job simply does not happen.
+    # Fast path: if NO segment changed the picture's timing at all
+    # (every chunk keeps its original duration), the retimed timeline
+    # IS the original timeline — the video passes through untouched
+    # (stream copy in the mux below) and the most expensive encode
+    # of the whole job simply does not happen.
     passthrough = all(c["kind"] == "gap"
-                      or (c["excess"] <= 0.01 and c.get("vslow", 1.0) >= 0.999)
+                      or abs(c["new_dur"] - c["orig_dur"]) <= 0.01
                       for c in chunks)
     if passthrough:
         run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-i", str(dub_wav),

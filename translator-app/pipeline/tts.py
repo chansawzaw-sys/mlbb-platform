@@ -27,7 +27,8 @@ from pathlib import Path
 
 import edge_tts
 
-from .common import ensure_system_ca, load_segments, probe_duration, save_segments
+from .common import (ensure_system_ca, load_segments, probe_duration,
+                     run, save_segments)
 
 DEFAULT_VOICE = "my-MM-NilarNeural"
 FALLBACK_VOICES = ["my-MM-NilarNeural", "my-MM-ThihaNeural"]
@@ -161,6 +162,7 @@ def synthesize(workdir, voice=DEFAULT_VOICE, rate=0, pitch=0):
             for i, seg in enumerate(segs)]
     jobs = [(i, t, o) for i, t, o in jobs if t]
     edge_ok = set()
+    failed = []
     if jobs:
         try:
             edge_ok = asyncio.run(_edge_all(jobs, voice, rate, pitch))
@@ -179,13 +181,52 @@ def synthesize(workdir, voice=DEFAULT_VOICE, rate=0, pitch=0):
             except Exception:
                 provider = None
         if provider is None:
-            _gtts_synth(text, out)
-            provider = "gtts:my"
+            try:
+                _gtts_synth(text, out)
+                provider = "gtts:my"
+            except Exception:
+                provider = None
+        if provider is None:
+            # One full-chain retry after a breath (transient network
+            # failures are the usual cause) — a single segment must
+            # not kill the whole job (audit A6).
+            time.sleep(2)
+            try:
+                _classic_synth(text, out)
+                if out.exists() and out.stat().st_size > 0:
+                    provider = "google-classic:my (retry)"
+            except Exception:
+                provider = None
+        if provider is None:
+            try:
+                _gtts_synth(text, out)
+                provider = "gtts:my (retry)"
+            except Exception:
+                provider = None
+        if provider is None:
+            # Last resort for THIS segment only: silence of the
+            # segment's own window length. The timeline stays exact,
+            # the subtitle still carries the line, the music bed
+            # still plays under it — and the failure is RECORDED on
+            # the segment, never silent. If most segments land here
+            # the job fails loudly below instead of shipping a
+            # mostly-silent dub.
+            dur = max(0.5, float(seg.get("end") or 0)
+                      - float(seg.get("start") or 0))
+            run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                 "-i", "anullsrc=r=44100:cl=stereo", "-t", f"{dur:.2f}",
+                 str(out)])
+            provider = "FAILED-silent"
+            failed.append(i)
         seg["tts_file"] = str(out)
         seg["tts_duration"] = round(probe_duration(out), 3)
         seg["tts_provider"] = provider
         seg["tts_rate"] = rate
         seg["tts_pitch"] = pitch
+    if jobs and len(failed) * 2 > len(jobs):
+        raise RuntimeError(
+            "အသံ ထုတ်တာ မရပါ — TTS service တွေ ခဏ အလုပ်မလုပ်ပါ။ "
+            "ခဏနေမှ ပြန်စမ်းပါ (credit လုံးဝ မဖြတ်ပါ)")
     save_segments(segs, workdir / "segments_my.json")
     return segs
 

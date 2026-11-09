@@ -168,6 +168,26 @@ def _backup_loop():
                 src = ROOT / n
                 if src.exists():
                     shutil.copy2(src, dest / n)
+            # users.db again — this time CONSISTENTLY: a live copy2
+            # of a SQLite file mid-write can capture a torn page.
+            # The backup API snapshots through SQLite itself
+            # (audit B4); this copy is the one to restore from.
+            try:
+                import sqlite3 as _sq
+                _c1 = _sq.connect(str(ROOT / "users.db"))
+                _c2 = _sq.connect(str(dest / "users.db.consistent"))
+                _c1.backup(_c2)
+                _c2.close()
+                _c1.close()
+            except Exception:
+                pass
+            # Payment proof screenshots + the payment QR are money
+            # evidence too — they were not backed up at all (B4).
+            if (ROOT / "topups").is_dir():
+                shutil.copytree(ROOT / "topups", dest / "topups",
+                                dirs_exist_ok=True)
+            if (ROOT / "payqr.png").exists():
+                shutil.copy2(ROOT / "payqr.png", dest / "payqr.png")
             days = sorted(p.name for p in (ROOT / "backups").iterdir()
                           if p.is_dir())
             for old in days[:-14]:
@@ -538,7 +558,12 @@ def _tg_menu_step(msg, chat_id, text):
             _LINK_FAILS[chat_id] = (count, until)
         if entry and entry[1] > time.time():
             _LINK_FAILS.pop(chat_id, None)
-            accounts.link_tg(entry[0], chat_id)
+            if not accounts.link_tg(entry[0], chat_id):
+                tg.send_message(
+                    chat_id, "⚠️ တောင်းပန်ပါတယ် — ဒီ Telegram က အခြား account "
+                             "တစ်ခု နဲ့ ချိတ်ထားပြီးသား ဖြစ်နေပါတယ်။ အရင် account "
+                             "က ဖြုတ်ပြီးမှ ပြန် ကြိုးစားပေးပါ 🙏")
+                return True
             user = accounts.get_user(entry[0])
             tg.send_message(
                 chat_id, f"✅ ချိတ်ဆက် ပြီးပါပြီ — 👤 {user['username']} "
@@ -837,6 +862,11 @@ def _on_tg_callback(cq):
                 except Exception:
                     pass
             tg.send_message(chat_id, f"ဆုံးဖြတ်ပြီး (#{tid})")
+        elif act == "ok":
+            tg.send_message(chat_id, "⚠️ approve မရပါ — ဆုံးဖြတ်ပြီးသား "
+                                     "ဖြစ်နိုင်သလို screenshot မရောက်သေးတာ "
+                                     "လည်း ဖြစ်နိုင်ပါတယ် (screenshot မရှိရင် "
+                                     "approve ပိတ်ထားပါတယ်)")
         return
     flow = _TG_FLOW.get(chat_id)
     if not flow:
@@ -1584,9 +1614,15 @@ def _owns(user, job):
 
 
 def _set_session(resp, token):
+    # Behind Caddy the app sees plain HTTP on loopback, so
+    # request.is_secure is False even for real HTTPS requests —
+    # trust the proxy's X-Forwarded-Proto as well, or the Secure
+    # flag never gets set in production (audit C6).
+    secure = request.is_secure or \
+        request.headers.get("X-Forwarded-Proto", "") == "https"
     resp.set_cookie(_SESSION_COOKIE, token, max_age=30 * 86400,
                     httponly=True, samesite="Lax",
-                    secure=request.is_secure)
+                    secure=secure)
     return resp
 
 
@@ -1761,7 +1797,10 @@ def auth_change_password():
     ok = accounts.set_password(user["id"], data.get("password"))
     if not ok:
         return jsonify({"error": "password အနည်းဆုံး ၆ လုံး ထားပါ"}), 400
-    return jsonify({"ok": True})
+    # set_password revoked every session (including this one);
+    # mint a fresh one so THIS device stays signed in.
+    resp = jsonify({"ok": True})
+    return _set_session(resp, accounts.new_session(user["id"]))
 
 
 @app.post("/api/admin/claim")
@@ -1810,7 +1849,8 @@ def admin_topup_decide(tid):
     data = request.get_json(force=True, silent=True) or {}
     res = accounts.decide_topup(tid, data.get("decision") == "approved")
     if not res:
-        return jsonify({"error": "ဆုံးဖြတ်ပြီးသား (သို့) မတွေ့ပါ"}), 409
+        return jsonify({"error": "ဆုံးဖြတ်ပြီးသား / မတွေ့ / screenshot "
+                                 "မရှိလို့ approve မရပါ"}), 409
     if res.get("tg_chat_id"):
         try:
             from pipeline import telegram_send as tg
@@ -1968,7 +2008,9 @@ def admin_user_update(uid):
         if not accounts.set_password(uid, data["new_password"]):
             return jsonify({"error": "password အနည်းဆုံး ၆ လုံး ထားပါ"}), 400
     if data.get("tg_chat_id"):
-        accounts.link_tg(uid, int(data["tg_chat_id"]))
+        if not accounts.link_tg(uid, int(data["tg_chat_id"])):
+            return jsonify({"error": "အဲ့ဒီ Telegram က အခြား account နဲ့ "
+                                     "ချိတ်ထားပြီးသား ဖြစ်နေပါတယ်"}), 400
     return jsonify({"user": accounts.get_user(uid)})
 
 
@@ -2107,6 +2149,22 @@ def create_job():
         cand = PREVIEWS_DIR / str(preview_id) / "source.mp4"
         if cand.exists():
             job["source_path"] = str(cand)
+    if ACCOUNTS_ENFORCED and me and me["role"] != "admin" \
+            and job.get("source_path"):
+        # Web pre-check (audit B5): when the preview already knows
+        # the duration, refuse up front like the bot does instead of
+        # burning minutes of server work before the post-phase-1
+        # quote check fails the job anyway.
+        try:
+            _mins = max(1, math.ceil(
+                probe_duration(job["source_path"]) / 60.0))
+        except Exception:
+            _mins = None
+        if _mins and (me["credits"] or 0) < _mins:
+            return jsonify({
+                "error": f"credit မလောက်ပါ — ဒီ video အတွက် {_mins} "
+                         f"credits လိုပါတယ်, လက်ကျန် {me['credits']} "
+                         "credits ပဲ ရှိပါတယ်"}), 400
     JOBS[job["id"]] = job
     _save(job)
     job["worker_started"] = True

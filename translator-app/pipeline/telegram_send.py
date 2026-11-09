@@ -219,19 +219,50 @@ def poll_once():
         for u in updates:
             msg = u.get("message")
             if msg:
-                try:
-                    MESSAGE_HANDLER(msg)
-                except Exception:
-                    pass
+                _dispatch(MESSAGE_HANDLER, msg)
     if CALLBACK_HANDLER:
         for u in updates:
             cq = u.get("callback_query")
             if cq:
-                try:
-                    CALLBACK_HANDLER(cq)
-                except Exception:
-                    pass
+                _dispatch(CALLBACK_HANDLER, cq)
     return len(updates)
+
+
+_CHAT_LOCKS = {}
+_CH_LOCKS_G = threading.Lock()
+
+
+def _chat_lock(cid):
+    with _CH_LOCKS_G:
+        lk = _CHAT_LOCKS.get(cid)
+        if lk is None:
+            lk = _CHAT_LOCKS[cid] = threading.Lock()
+        return lk
+
+
+def _dispatch(handler, payload):
+    """Run one update's handler on its own thread (owner complaint
+    2026-11-09: button taps felt slow). Handlers used to run inline
+    in the polling loop, so one slow update — a photo download, a
+    long API call — delayed every tap behind it, and the tap's
+    answerCallbackQuery waited too. Now the loop only dispatches;
+    a per-chat lock keeps ONE chat's updates in order (flow steps
+    must not race each other) while other chats proceed at once."""
+    # Message payloads carry chat at the top level; callback
+    # payloads nest it under "message".
+    chat = ((payload.get("message") or {}).get("chat")
+            or payload.get("chat") or {})
+    cid = str(chat.get("id")
+              or (payload.get("from") or {}).get("id") or "?")
+
+    def _run():
+        with _chat_lock(cid):
+            try:
+                handler(payload)
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def send_message(chat_id, text, buttons=None, keyboard=None):

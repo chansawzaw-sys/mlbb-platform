@@ -98,7 +98,7 @@ def probe_duration(path):
 
 def probe_streams(path):
     p = run(["ffprobe", "-v", "error", "-show_entries",
-             "stream=codec_type,codec_name,width,height,r_frame_rate,duration",
+             "stream=codec_type,codec_name,width,height,r_frame_rate,duration,channels,channel_layout",
              "-of", "json", str(path)])
     return json.loads(p.stdout)["streams"]
 

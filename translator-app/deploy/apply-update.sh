@@ -26,10 +26,22 @@ if [ "${1:-}" = "--auto" ]; then
   flock -n 9 || exit 0
 fi
 
-if [ "$AUTO" -eq 1 ]; then
-  # Never restart the app out from under a running job: skip this tick
-  # entirely (the pull is retried next tick, so nothing is lost).
-  if python3 - "$APP" <<'PYEOF'
+# Heartbeat: every auto tick leaves a line in the update log, so a
+# skipped/silent timer is VISIBLE afterwards instead of a mystery
+# (ticks were repeatedly lost during 2026-11-08/09 with no trace).
+log_tick() {
+  [ "$AUTO" -eq 1 ] || return 0
+  local line
+  line="$(date '+%Y-%m-%d %H:%M:%S') $1"
+  echo "$line" >> "$APP/.update-log" 2>/dev/null || true
+  if [ "$(wc -l < "$APP/.update-log" 2>/dev/null || echo 0)" -gt 500 ]; then
+    tail -n 200 "$APP/.update-log" > "$APP/.update-log.tmp" 2>/dev/null \
+      && mv "$APP/.update-log.tmp" "$APP/.update-log" || true
+  fi
+}
+
+job_active() {
+  python3 - "$APP" <<'PYEOF'
 import json
 import sys
 import time
@@ -51,9 +63,27 @@ for p in app.glob("jobs/*/job.json"):
         sys.exit(0)  # a queued job is waiting
 sys.exit(1)
 PYEOF
-  then
+}
+
+if [ "$AUTO" -eq 1 ]; then
+  # Never restart the app out from under a running job: skip this tick
+  # entirely (the pull is retried next tick, so nothing is lost).
+  if job_active; then
     echo "A job is running; deferring the update to the next tick."
+    log_tick "deferred (job running)"
     exit 0
+  fi
+else
+  # Manual runs used to restart mid-job without a word (a stalled
+  # job died this way). Warn and require an explicit yes.
+  if job_active; then
+    echo "WARNING: a job is running right now. Updating restarts the app and will STOP that job."
+    printf 'Type yes to update anyway, anything else to cancel: '
+    read -r FORCE
+    if [ "$FORCE" != "yes" ]; then
+      echo "Cancelled — the job was left alone."
+      exit 0
+    fi
   fi
 fi
 
@@ -63,6 +93,7 @@ git pull
 AFTER="$(git rev-parse HEAD)"
 if [ "$BEFORE" = "$AFTER" ]; then
   echo "Already up to date ($AFTER)."
+  log_tick "tick ok (no change)"
   exit 0
 fi
 echo "Updating $BEFORE -> $AFTER"
@@ -70,6 +101,7 @@ echo "Updating $BEFORE -> $AFTER"
 # Safety gate: never sync Python that does not compile.
 if ! python3 -m py_compile translator-app/app.py translator-app/pipeline/*.py; then
   echo "ERROR: new code does not compile; staying on the old version."
+  log_tick "FAILED (new code does not compile)"
   exit 1
 fi
 
@@ -86,5 +118,6 @@ if [ "$AUTO" -eq 0 ]; then
   fi
 fi
 
-timeout --kill-after=10 600 bash "$APP/deploy/translator-bootstrap.sh" || { echo "BOOTSTRAP FAILED OR TIMED OUT"; exit 1; }
+timeout --kill-after=10 600 bash "$APP/deploy/translator-bootstrap.sh" || { echo "BOOTSTRAP FAILED OR TIMED OUT"; log_tick "FAILED (bootstrap)"; exit 1; }
+log_tick "updated -> $AFTER"
 echo "APPLY_UPDATE_DONE"

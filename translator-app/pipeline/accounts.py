@@ -263,18 +263,31 @@ def mark_has_job(user_id):
 
 
 def set_password(user_id, password):
+    """Set a new password AND revoke every existing session for
+    the account: a password change/reset is exactly the moment
+    other logins must die (audit C7). The caller may mint a fresh
+    session for the device that made the change."""
     if not password or len(password) < 6:
         return False
     with _LOCK, _db() as conn:
         conn.execute("UPDATE users SET pass_hash = ? WHERE id = ?",
                      (generate_password_hash(password), int(user_id)))
+        conn.execute("DELETE FROM sessions WHERE user_id = ?",
+                     (int(user_id),))
     return True
 
 
 def link_tg(user_id, chat_id):
-    with _LOCK, _db() as conn:
-        conn.execute("UPDATE users SET tg_chat_id = ? WHERE id = ?",
-                     (int(chat_id), int(user_id)))
+    """Link a Telegram chat to an account. tg_chat_id is UNIQUE:
+    a chat already linked to ANOTHER account is a clean refusal
+    (False), never an IntegrityError 500 (audit B6)."""
+    try:
+        with _LOCK, _db() as conn:
+            conn.execute("UPDATE users SET tg_chat_id = ? WHERE id = ?",
+                         (int(chat_id), int(user_id)))
+        return True
+    except sqlite3.IntegrityError:
+        return False
 
 
 def user_for_tg(chat_id):
@@ -399,8 +412,17 @@ def dormant_users(days=60, exclude_ids=()):
 def decide_topup(topup_id, ok):
     """Admin decision, exactly-once: the status guard means a second
     tap (or a second admin surface) can never credit twice. Returns
-    {user_id, credits, tg_chat_id} when this call decided it."""
+    {user_id, credits, tg_chat_id} when this call decided it.
+    APPROVAL additionally requires a proof screenshot on file: a
+    top-up whose proof download failed must never be creditable
+    sight-unseen (audit A10) — rejection stays possible."""
     with _LOCK, _db() as conn:
+        if ok:
+            prow = conn.execute(
+                "SELECT proof FROM topups WHERE id = ?",
+                (int(topup_id),)).fetchone()
+            if prow is None or not (prow["proof"] or "").strip():
+                return None
         cur = conn.execute(
             "UPDATE topups SET status = ?, decided_at = ? "
             "WHERE id = ? AND status = 'pending'",
