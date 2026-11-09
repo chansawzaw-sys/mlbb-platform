@@ -357,6 +357,13 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
          blur_box=None, fx=None):
     ensure_fonts()  # decode .ttf.b64 -> .ttf on deploys that lack them
     family = FONT_CHOICES.get(font, FONT_CHOICES[DEFAULT_FONT])
+    # Never deliver silent tofu again: if the chosen family's font
+    # file is still missing, the job must FAIL LOUDLY here instead
+    # of burning placeholder boxes the customer can't read.
+    _ff = _FONT_FILES.get(family)
+    if _ff and not (FONTS_DIR / _ff).exists():
+        raise RuntimeError(
+            f"Myanmar font မရှိပါ ({_ff}) — server admin ကို ပြောပါ")
     width, height = video_size(input_mp4)
     if fx and (fx.get("aspect") or {}).get("ratio"):
         # The fx graph reframes the canvas: lay subtitles out on the

@@ -495,6 +495,35 @@ systemctl daemon-reload
 systemctl enable --now translator-autoupdate.timer >/dev/null 2>&1 || true
 echo "Auto-update timer installed (checks GitHub every 15 min)."
 
+# --- 13b. Myanmar fonts -------------------------------------------------------------------------
+# The repo ships the fonts as .ttf.b64 (the push channel is text
+# only). The app service runs as an unprivileged system user and
+# CANNOT write into $APP_DIR, so the runtime decode in the app
+# silently failed and subtitles rendered as tofu boxes. Decode
+# HERE, as root, and register the fonts system-wide as well, so
+# libass finds the families via fontconfig even if fontsdir is
+# ignored by the local ffmpeg/libass build.
+python3 - "$APP_DIR" <<'PYEOF'
+import base64
+import sys
+from pathlib import Path
+
+fd = Path(sys.argv[1]) / "assets" / "fonts"
+if fd.exists():
+    for b in fd.glob("*.ttf.b64"):
+        t = b.with_suffix("")
+        if not t.exists() or t.stat().st_size < 10_000:
+            t.write_bytes(base64.b64decode(b.read_text()))
+    print("Fonts materialized:",
+          sorted(p.name for p in fd.glob("*.ttf")))
+PYEOF
+mkdir -p /usr/local/share/fonts/vt
+cp -f "$APP_DIR"/assets/fonts/*.ttf /usr/local/share/fonts/vt/ 2>/dev/null || true
+if command -v fc-cache >/dev/null 2>&1; then
+  fc-cache -f >/dev/null 2>&1 || true
+  echo "System fonts registered (fc-cache done)."
+fi
+
 # --- 14. start + health checks ----------------------------------------------------------------
 systemctl restart "$SERVICE_NAME"
 echo "Waiting for the app on http://127.0.0.1:${INTERNAL_PORT}/ ..."
