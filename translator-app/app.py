@@ -1648,6 +1648,7 @@ def auth_logout():
 
 _PROBE = {"running": False}
 _PROBE_LOCK = threading.Lock()
+_BOOT_TS = time.time()
 
 
 def _run_translate_probe():
@@ -1700,7 +1701,11 @@ def _translate_probe_maybe():
         data = json.loads(pf.read_text(encoding="utf-8"))
     except Exception:
         data = None
-    if not data or time.time() - float(data.get("ts") or 0) > 1800:
+    # Stale when older than 30 min OR older than this process: a
+    # fresh deploy must re-probe at once, not serve the previous
+    # build's verdict (build 126's first check hit exactly that).
+    if not data or float(data.get("ts") or 0) < _BOOT_TS \
+            or time.time() - float(data.get("ts") or 0) > 1800:
         with _PROBE_LOCK:
             if not _PROBE["running"]:
                 _PROBE["running"] = True
