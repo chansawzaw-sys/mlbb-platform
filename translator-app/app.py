@@ -453,6 +453,33 @@ def _tg_menu_step(msg, chat_id, text):
     flow = _TG_FLOW.get(chat_id)
     acct = accounts.user_for_tg(chat_id)
     photos = msg.get("photo")
+    if flow and flow.get("step") == "logo_img":
+        file_id, ext = None, ".jpg"
+        if photos:
+            file_id = photos[-1]["file_id"]
+        else:
+            doc = msg.get("document") or {}
+            if (doc.get("mime_type") or "").startswith("image/"):
+                file_id = doc.get("file_id")
+                e = Path(doc.get("file_name") or "").suffix.lower()
+                if e in (".png", ".jpg", ".jpeg", ".webp"):
+                    ext = e
+        if file_id:
+            dest = UPLOADS_DIR / f"{uuid.uuid4().hex[:12]}{ext}"
+            try:
+                tg.download_file(file_id, dest)
+            except Exception:
+                tg.send_message(chat_id, "⚠️ တောင်းပန်ပါတယ် — ပုံ ယူလို့ မရပါ။ "
+                                         "နောက်တစ်ခါ ပြန်ပို့ပေးပါ 🙏")
+                return True
+            flow["logo_file"] = str(dest)
+            flow["step"] = "logo_pos"
+            tg.send_message(chat_id, "Logo ကို ဘယ်နေရာ ထားမလဲ",
+                            buttons=[[("↖ အပေါ်-ဘယ်", "g:tl"),
+                                      ("↗ အပေါ်-ညာ", "g:tr")],
+                                     [("↙ အောက်-ဘယ်", "g:bl"),
+                                      ("↘ အောက်-ညာ", "g:br")]])
+            return True
     if photos and flow and flow.get("step") == "topup_proof" and acct:
         amount = flow.get("amount") or 0
         tid = accounts.create_topup(acct["id"], amount, None)
@@ -621,9 +648,23 @@ def _tg_flow_prepare(chat_id):
 _TG_VOICES = {"nilar": "my-MM-NilarNeural", "thiha": "my-MM-ThihaNeural"}
 
 
+def _tg_after_logo(chat_id, flow):
+    """Logo settled (placed or skipped): dub/both continue to the
+    voice step; subs-only jobs start right away (no voice to pick)."""
+    from pipeline import telegram_send as tg
+    if (flow.get("mode") or "both") != "subs":
+        flow["step"] = "voice"
+        tg.send_message(chat_id, "အသံ ရွေးပေးပါ",
+                        buttons=[[("🎙 Nilar (မ)", "v:nilar"),
+                                  ("🎙 Thiha (ကျား)", "v:thiha")]])
+        return
+    _tg_start_flow_job(chat_id, flow)
+
+
 def _tg_start_flow_job(chat_id, flow):
     """Final bot-flow step: credit/cap checks, then create the job
-    from everything the flow collected (blur, mode, frame, speed)."""
+    from everything the flow collected (blur, mode, frame, logo,
+    voice, speed)."""
     from pipeline import telegram_send as tg
     ratio = flow.get("ratio") or "orig"
     acct = accounts.user_for_tg(chat_id)
@@ -665,6 +706,8 @@ def _tg_start_flow_job(chat_id, flow):
     fx = {}
     if flow.get("blur"):
         fx["blur"] = {**flow["blur"], "strength": 25}
+    if flow.get("logo"):
+        fx["logo"] = flow["logo"]
     if ratio != "orig":
         fx["aspect"] = {"ratio": ratio, "style": "blur"}
     if fx:
@@ -686,7 +729,8 @@ def _tg_start_flow_job(chat_id, flow):
 
 
 def _on_tg_callback(cq):
-    """Inline-button taps for the bot flow: blur, mode, frame, voice, speed."""
+    """Inline-button taps for the bot flow: blur, mode, frame, logo,
+    voice, speed."""
     from pipeline import telegram_send as tg
     tg.answer_callback(cq.get("id"))
     chat = (cq.get("message") or {}).get("chat") or {}
@@ -752,13 +796,27 @@ def _on_tg_callback(cq):
         if ratio != "orig" and ratio not in fx_mod.ASPECT_DIMS:
             return
         flow["ratio"] = ratio
-        if (flow.get("mode") or "both") != "subs":
-            flow["step"] = "voice"
-            tg.send_message(chat_id, "အသံ ရွေးပေးပါ",
-                            buttons=[[("🎙 Nilar (မ)", "v:nilar"),
-                                      ("🎙 Thiha (ကျား)", "v:thiha")]])
+        flow["step"] = "logo"
+        tg.send_message(chat_id, "Logo ထည့်ဦးမလား",
+                        buttons=[[("🚫 မထည့်", "l:skip"),
+                                  ("🖼 ထည့်မယ်", "l:yes")]])
+        return
+    if data.startswith("l:") and flow.get("step") == "logo":
+        if data == "l:yes":
+            flow["step"] = "logo_img"
+            tg.send_message(chat_id, "Logo ပုံ ပို့ပေးပါ (PNG/JPG) — "
+                                     "နောက်ခံ မပါတဲ့ PNG ဆို ပိုကောင်းပါတယ် 🙏")
             return
-        _tg_start_flow_job(chat_id, flow)
+        _tg_after_logo(chat_id, flow)
+        return
+    if data.startswith("g:") and flow.get("step") == "logo_pos":
+        pos = {"g:tl": (0.0, 0.0), "g:tr": (1.0, 0.0),
+               "g:bl": (0.0, 1.0), "g:br": (1.0, 1.0)}.get(data)
+        if pos and flow.get("logo_file"):
+            flow["logo"] = {"path": flow["logo_file"], "pos_x": pos[0],
+                            "pos_y": pos[1], "size_pct": 18,
+                            "opacity": 70, "saturation": 100}
+        _tg_after_logo(chat_id, flow)
         return
     if data.startswith("v:") and flow.get("step") == "voice":
         voice = _TG_VOICES.get(data[2:])
