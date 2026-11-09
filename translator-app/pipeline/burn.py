@@ -139,30 +139,85 @@ def _fit_font_size(text, family, base_fs, avail_w):
     return floor
 
 
-def _fit_box(text, family, base_fs, rect_w, rect_h):
+def _wrap_lines(text, family, fs, avail_w):
+    """Greedy word-wrap with EXPLICIT \\N breaks, measured with the
+    real font (PIL). Returns (wrapped_text, n_lines). We wrap
+    ourselves because libass does not reliably wrap \\pos events at
+    the box margins — an unwrapped long line at a small size is a
+    black smear on a phone. PIL slightly OVERestimates Myanmar
+    widths (combining marks), which only makes wraps happen a
+    little early — the safe direction."""
+    try:
+        from PIL import ImageFont
+        fname = _FONT_FILES.get(family)
+        if not fname or avail_w <= 0:
+            return text, 1
+        path = FONTS_DIR / fname
+        if not path.exists():
+            return text, 1
+        font = ImageFont.truetype(str(path), max(8, int(round(fs))))
+        out_lines = []
+        for hard in str(text).split("\\N"):
+            words = hard.split()
+            if not words:
+                continue
+            cur = words[0]
+            for w in words[1:]:
+                trial = cur + " " + w
+                if font.getlength(trial) <= avail_w * 0.96:
+                    cur = trial
+                else:
+                    out_lines.append(cur)
+                    cur = w
+            out_lines.append(cur)
+        if not out_lines:
+            return text, 1
+        return "\\N".join(out_lines), len(out_lines)
+    except Exception:
+        return text, 1
+
+
+def _fit_box_wrapped(text, family, cand, rect_w, rect_h, min_fs):
+    """Largest size <= cand at which the PIL-wrapped text fits the
+    box in at most 3 lines, tolerating up to ~30% height spill
+    (centred, so it reads as a slightly taller subtitle block over
+    the blur — far better than shrinking to invisibility)."""
+    fs = float(cand)
+    while fs > min_fs:
+        _t, n = _wrap_lines(text, family, fs, rect_w)
+        if n <= 3 and n * fs * 1.35 <= rect_h * 1.3:
+            return fs
+        fs *= 0.92
+    return min_fs
+
+
+def _fit_box(text, family, base_fs, rect_w, rect_h,
+             min_fs=10.0, max_lines=_FIT_MAX_LINES):
     """Font size that fits text INSIDE a rect (the user's blur box).
 
-    Hard rule: the block's HEIGHT must fit rect_h (it is centered in
-    the box, so overflow would spill both ways). Preferred: also at
-    most _FIT_MAX_LINES lines. Returns the largest size satisfying
-    both when one exists, else the largest height-fitting size (a
-    3-line small text inside the box beats a 2-line text spilling
-    out of it). base_fs if unmeasurable."""
+    Preferred: the block's HEIGHT fits rect_h in at most max_lines
+    lines. But readability is a hard floor: the size never drops
+    below min_fs — a long line in a short box used to collapse the
+    whole video's fixed size to ~10-16px, which after the Telegram
+    shrink is simply invisible on a phone (owner report 2026-11-09:
+    'no Myanmar text' on a job that had burned it at fs16). Below
+    the floor the block may spill slightly over the box edges —
+    readable beats perfectly contained."""
     if _est_lines(text, family, base_fs, rect_w) is None:
         return base_fs
     fs = float(base_fs)
     best = None  # largest fs whose height fits (any line count)
-    while fs >= 10:
+    while fs >= min_fs:
         lines = _est_lines(text, family, fs, rect_w)
         if lines is None:
             return base_fs
         if lines * fs * 1.35 <= rect_h * 0.96:
             if best is None:
                 best = fs
-            if lines <= _FIT_MAX_LINES:
+            if lines <= max_lines:
                 return fs
         fs *= 0.9
-    return best if best is not None else 10.0
+    return best if best is not None else min_fs
 
 
 def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None):
@@ -223,12 +278,17 @@ def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None):
         cand = min(font_size, rh * 0.55)
         # ONE fixed size for the whole video (owner's rule): the
         # largest size at which EVERY line fits inside the box, so
-        # the subtitle size never jumps from line to line.
-        box_fs = min((_fit_box(b, family, cand, rw, rh)
+        # the subtitle size never jumps from line to line — but never
+        # under the readability floor (long lines wrap to 3 lines
+        # instead of shrinking the whole video's text to nothing).
+        min_fs = max(18.0, width * 0.028)
+        box_fs = min((_fit_box_wrapped(b, family, cand, rw, rh, min_fs)
                       for _s, _e, b in events), default=cand)
+        box_fs = max(box_fs, min_fs)
     for start, end, body in events:
         ev_ml, ev_mr = 0, 0
         if box:
+            body, _n = _wrap_lines(body, family, box_fs, rw)
             body = (f"{{\\an5\\pos({rx + rw / 2:.0f},{ry + rh / 2:.0f})"
                     f"\\fs{box_fs:.0f}}}") + body
             # Per-event margins make libass wrap INSIDE the box width
