@@ -255,20 +255,20 @@ def _tg_deliver_async(job):
                     tg.send_video(
                         chat_id, small,
                         caption="🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို\n"
-                                "(ဖိုင် ကြီးလို့ Telegram အတွက် ချုံ့ ထားတယ် — "
-                                "quality အပြည့်ကို web မှာ ယူပါ)")
-                    tg.send_message(chat_id, "🌐 quality အပြည့်: "
+                                "(ဖိုင် ကြီးလို့ Telegram အတွက် ချုံ့ ထားပါတယ် — "
+                                "quality အပြည့် ကို web app မှာ ယူနိုင်ပါတယ် 🙏)")
+                    tg.send_message(chat_id, "🌐 quality အပြည့် ကို ဒီမှာ ယူနိုင်ပါတယ်: "
                                              + APP_LINK
-                                             + "\n(Jobs ထဲမှာ ၂၄ နာရီ အတွင်း ယူပါ)")
+                                             + "\n(Jobs စာရင်းထဲမှာ ၂၄ နာရီ အတွင်း ယူပေးပါ)")
                     job["tg"] = {"state": "sent", "to": job.get("tg_from"),
                                  "shrunk": True}
                 else:
                     tg.send_message(
                         chat_id,
-                        f"✅ ပြီးပါပြီ — ဒါပေမဲ့ ဖိုင် {out.stat().st_size / 1e6:.0f}MB "
-                        "ဖြစ်နေလို့ Telegram ကနေ ပို့လို့ မရပါ (bot အများဆုံး 50MB)\n"
-                        "🌐 web မှာ ယူပါ: " + APP_LINK
-                        + "\n(Jobs ထဲမှာ ၂၄ နာရီ အတွင်း ယူနိုင်တယ်)")
+                        f"✅ video ပြီးပါပြီ — ဒါပေမဲ့ ဖိုင် {out.stat().st_size / 1e6:.0f}MB "
+                        "ဖြစ်နေလို့ Telegram bot ကနေ ပို့လို့ မရပါ (အများဆုံး 50MB ပါ)\n"
+                        "🌐 web app မှာ ယူနိုင်ပါတယ်: " + APP_LINK
+                        + "\n(Jobs စာရင်းထဲမှာ ၂၄ နာရီ အတွင်း ယူပေးပါ) 🙏")
                     job["tg"] = {"state": "failed", "to": job.get("tg_from"),
                                  "error": "file > 50MB"}
             else:
@@ -276,7 +276,8 @@ def _tg_deliver_async(job):
                 _save(job)
                 tg.send_video(chat_id, out,
                               caption="🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို\n"
-                                      + (job.get("url") or ""))
+                                      + (job.get("url") or "")
+                                      + "\n🙏 ကျေးဇူးတင်ပါတယ်")
                 job["tg"] = {"state": "sent", "to": job.get("tg_from")}
         except Exception as e:
             job["tg"] = {"state": "failed", "to": job.get("tg_from"),
@@ -294,8 +295,8 @@ def _tg_error_async(job):
     def go():
         try:
             from pipeline import telegram_send as tg
-            tg.send_message(chat_id, "❌ မလုပ်နိုင်ပါ: "
-                            + str(job.get("error") or "")[:300])
+            tg.send_message(chat_id, "🙏 တောင်းပန်ပါတယ် — ဒီ video ကို လုပ်လို့ မရပါ ဖြစ်သွားပါတယ်\nအကြောင်း: "
+                            + str(job.get("error") or "")[:300] + "\nlink ကို ပြန်စစ်ပြီး နောက်တစ်ခါ ပို့ကြည့်ပေးပါ 🙏")
         except Exception:
             pass
 
@@ -329,20 +330,20 @@ def _on_tg_message(msg):
                 if j.get("tg_chat_id") == chat_id
                 and j.get("status") in ("queued", "running")]
         if mine:
-            tg.send_message(chat_id, "⏳ သင့် အရင် video မပြီးသေးပါ — "
-                                     "ပြီးရင် နောက် တစ်ခု ပို့ပါ")
+            tg.send_message(chat_id, "⏳ ရှင့် အရင် video လုပ်နေဆဲ ဖြစ်ပါတယ် — "
+                                     "ပြီးသွားမှ နောက်တစ်ခု ပို့ပေးပါ 🙏")
             return
         if (vid.get("file_size") or 0) > 20 * 1000 * 1000:
-            tg.send_message(chat_id, "⚠️ ဒီ file က 20MB ထက် ကြီးနေပါတယ် "
-                                     "— link ပို့ပေးပါ")
+            tg.send_message(chat_id, "⚠️ တောင်းပန်ပါတယ် — ဒီ file က 20MB ထက် ကြီးနေလို့ bot က လက်ခံလို့ မရပါ။ "
+                                     "video ရဲ့ link ကို ပို့ပေးပါ 🙏")
             return
         frm = msg.get("from") or {}
         _TG_FLOW[chat_id] = {
             "file_id": vid["file_id"], "step": "prepare",
             "from": frm.get("username") or frm.get("first_name"),
             "ts": time.time()}
-        tg.send_message(chat_id, "⏳ file ယူနေတယ် — ဝါးမယ့် နေရာ "
-                                 "ရွေးဖို့ ပုံ ပို့ပေးမယ်")
+        tg.send_message(chat_id, "⏳ file ကို ယူနေပါတယ် — ခဏ စောင့်ပေးပါ။ ဝါးမယ့် နေရာ "
+                                 "ရွေးဖို့ ပုံ ပို့ပေးပါမယ်")
         threading.Thread(target=_tg_flow_prepare, args=(chat_id,),
                          daemon=True).start()
         return
@@ -365,14 +366,14 @@ def _on_tg_message(msg):
     m = re.search(r"https?://\S+", text)
     if not m:
         tg.send_message(chat_id,
-                        "🎬 ဘာသာပြန်ချင်တဲ့ video link ကို ပို့ပါ (YouTube / TikTok)")
+                        "🎬 ဘာသာပြန် လိုတဲ့ video ရဲ့ link ကို ပို့ပေးပါ (YouTube / TikTok) 🙏")
         return
     mine = [j for j in JOBS.values()
             if j.get("tg_chat_id") == chat_id
             and j.get("status") in ("queued", "running")]
     if mine:
         tg.send_message(chat_id,
-                        "⏳ သင့် အရင် video မပြီးသေးပါ — ပြီးရင် နောက် link ပို့ပါ")
+                        "⏳ ရှင့် အရင် video လုပ်နေဆဲ ဖြစ်ပါတယ် — ပြီးသွားမှ နောက် link ပို့ပေးပါ 🙏")
         return
     frm = msg.get("from") or {}
     _TG_FLOW[chat_id] = {
@@ -380,7 +381,7 @@ def _on_tg_message(msg):
         "from": frm.get("username") or frm.get("first_name"),
         "ts": time.time()}
     tg.send_message(chat_id,
-                    "⏳ video ယူနေတယ် — ဝါးမယ့် နေရာ ရွေးဖို့ ပုံ ပို့ပေးမယ်")
+                    "⏳ video ကို ယူနေပါတယ် — ခဏ စောင့်ပေးပါ။ ဝါးမယ့် နေရာ ရွေးဖို့ ပုံ ပို့ပေးပါမယ်")
     threading.Thread(target=_tg_flow_prepare, args=(chat_id,),
                      daemon=True).start()
 
@@ -401,7 +402,7 @@ _LINK_FAILS = {}   # chat_id -> (fail_count, locked_until) — code guessing
 # link), the message carries the app link AND the install reminder.
 APP_LINK = os.environ.get("VT_APP_URL", "https://85-155-149-58.sslip.io")
 _LINK_HINT = ("\n🔗 App: " + APP_LINK +
-              "\n📲 တစ်ခါတည်း ဒေါင်းထားပါ: link ကို browser မှာ ဖွင့်ပြီး "
+              "\n📲 app အဖြစ် ထည့်ထားနိုင်ပါတယ်: link ကို browser မှာ ဖွင့်ပြီး "
               "menu (⋮) → «Add to Home screen»")
 
 
@@ -437,10 +438,10 @@ def _may_submit(chat_id):
 def _deny_submit(chat_id):
     from pipeline import telegram_send as tg
     if _bot_open():
-        tg.send_message(chat_id, "အရင် 👤 Username ချိတ် (Menu ထဲက) ပါ"
+        tg.send_message(chat_id, "🙏 video ထုတ်ဖို့ အရင် 👤 Username ချိတ်ပေးပါ (အောက်က Menu ထဲက «👤 Username ချိတ်» ကို နှိပ်ပါ)"
                         + _LINK_HINT)
     else:
-        tg.send_message(chat_id, "🔒 အခုတော့ admin အတွက်ပဲ ဖွင့်ထားပါတယ်")
+        tg.send_message(chat_id, "🔒 တောင်းပန်ပါတယ် — အခုတော့ ဆိုင် မဖွင့်သေးပါ။ ဖွင့်တဲ့ အခါ အသိပေးပါမယ် 🙏")
 
 
 def _tg_menu_step(msg, chat_id, text):
@@ -479,8 +480,8 @@ def _tg_menu_step(msg, chat_id, text):
                                 cap + "\n(ပုံ ယူမရ)", buttons=buttons)
         except Exception:
             pass
-        tg.send_message(chat_id, "✅ တောင်းဆိုချက် admin ဆီ ပို့ပြီ — "
-                                 "စစ်ပြီးရင် credit ဝင်လာမယ်")
+        tg.send_message(chat_id, "✅ တောင်းဆိုချက် ပို့ပြီးပါပြီ — "
+                                 "စစ်ဆေးပြီးတာနဲ့ credit ဝင်လာပါမယ်။ ကျေးဇူးတင်ပါတယ် 🙏")
         return True
     if not text:
         return False
@@ -489,8 +490,8 @@ def _tg_menu_step(msg, chat_id, text):
     if flow and flow.get("step") == "link" and not is_menu:
         fails = _LINK_FAILS.get(chat_id)
         if fails and fails[1] > time.time():
-            tg.send_message(chat_id, "🔒 code အမှား များလို့ ခဏ ပိတ်ထား "
-                                     "တယ် — ၃၀ မိနစ် စောင့်ပါ")
+            tg.send_message(chat_id, "🔒 code မှား ထည့်တာ များလို့ ခဏ ပိတ်ထားပါတယ် — "
+                                     "၃၀ မိနစ် စောင့်ပြီးမှ ပြန် ကြိုးစားပေးပါ 🙏")
             return True
         entry = _LINK_CODES.pop(text.strip(), None)
         _TG_FLOW.pop(chat_id, None)
@@ -503,34 +504,34 @@ def _tg_menu_step(msg, chat_id, text):
             accounts.link_tg(entry[0], chat_id)
             user = accounts.get_user(entry[0])
             tg.send_message(
-                chat_id, f"✅ ချိတ်ပြီးပြီ — 👤 {user['username']} "
-                         f"(💳 {user['credits']} credits)")
+                chat_id, f"✅ ချိတ်ဆက် ပြီးပါပြီ — 👤 {user['username']} "
+                         f"(💳 {user['credits']} credits)\nအခု video link ပို့ပြီး သုံးနိုင်ပါပြီ 🙏")
         else:
-            tg.send_message(chat_id, "❌ code မမှန် (သို့) သက်တမ်း ကုန်ပြီ "
-                                     "— web account card မှာ code အသစ် ထုတ်ပါ")
+            tg.send_message(chat_id, "❌ တောင်းပန်ပါတယ် — code မမှန်ပါ (သို့) သက်တမ်း ကုန်သွားပါပြီ။ "
+                                     "web app ရဲ့ account card မှာ code အသစ် ထုတ်ပြီး ပြန်ပို့ပေးပါ 🙏")
         return True
     if flow and flow.get("step") == "topup_amount" and not is_menu:
         try:
             amount = int(text.strip())
             assert 1 <= amount <= 100000
         except Exception:
-            tg.send_message(chat_id, "နံပါတ် ပဲ ပို့ပါ (ဥပမာ 100)")
+            tg.send_message(chat_id, "🙏 နံပါတ် ပဲ ပို့ပေးပါ (ဥပမာ — 100)")
             return True
         flow["amount"] = amount
         flow["step"] = "topup_proof"
-        tg.send_message(chat_id, "📸 အခု လွှဲပြီး screenshot ပို့လိုက်ပါ")
+        tg.send_message(chat_id, "📸 ငွေ လွှဲပြီးရင် screenshot ပို့ပေးပါ 🙏")
         return True
     if text == "🎬 Video ထုတ်မယ်":
-        tg.send_message(chat_id, "🎬 video link (YouTube / TikTok) သို့ "
-                                 "video file ကို ဒီမှာ ပို့လိုက်ပါ")
+        tg.send_message(chat_id, "🎬 video link (YouTube / TikTok) ကို ပို့ပေးပါ — သို့ "
+                                 "video file ကို ဒီမှာ တင်ပေးပါ 🙏")
         return True
     if text == "💳 လက်ကျန်":
         if acct:
             tg.send_message(chat_id, f"💳 👤 {acct['username']} — "
-                                     f"လက်ကျန် {acct['credits']} credits")
+                                     f"လက်ကျန် {acct['credits']} credits ရှိပါတယ်")
         else:
-            tg.send_message(chat_id, "အရင် 👤 Username ချိတ်ပါ — web "
-                                     "account card မှာ code ထုတ်ရမယ်" + _LINK_HINT)
+            tg.send_message(chat_id, "🙏 အရင် 👤 Username ချိတ်ပေးပါ — web "
+                                     "app ရဲ့ account card မှာ code ထုတ်ပြီး ဒီမှာ ပို့ရပါမယ်" + _LINK_HINT)
         return True
     if text == "👤 Username ချိတ်":
         if acct:
@@ -539,24 +540,24 @@ def _tg_menu_step(msg, chat_id, text):
         else:
             _TG_FLOW[chat_id] = {"step": "link", "ts": time.time()}
             tg.send_message(chat_id, "🔑 web app ရဲ့ 👤 account card မှာ "
-                                     "'TG ချိတ်ရန် code' ထုတ်ပြီး အဲဒီ "
-                                     "code ကို ဒီမှာ ပို့ပါ" + _LINK_HINT)
+                                     "«TG ချိတ်ရန် code» ထုတ်ပြီး အဲဒီ "
+                                     "code ကို ဒီမှာ ပို့ပေးပါ" + _LINK_HINT)
         return True
     if text == "💰 Credit ဖြည့်":
         if not acct:
-            tg.send_message(chat_id, "အရင် 👤 Username ချိတ်ပါ — "
-                                     "ပြီးမှ credit ဖြည့်လို့ရမယ်" + _LINK_HINT)
+            tg.send_message(chat_id, "🙏 credit ဖြည့်ဖို့ အရင် 👤 Username ချိတ်ပေးပါ"
+                                     "" + _LINK_HINT)
             return True
         _TG_FLOW[chat_id] = {"step": "topup_amount", "ts": time.time()}
         info = _pay_info()
         tg.send_message(chat_id, "💰 ငွေ လွှဲရန်:\n"
-                        + (info or "admin ဆီ နံပါတ် မေးပါ")
-                        + "\n\nဘယ်နှ credits ဖြည့်မလဲ — နံပါတ် ပဲ "
-                          "ပို့ပါ (ဥပမာ 100)")
+                        + (info or "နံပါတ် ကို admin ဆီ မေးပေးပါ")
+                        + "\n\nဘယ်နှစ် credits ဖြည့်ချင်ပါသလဲ — နံပါတ် ပဲ "
+                          "ပို့ပေးပါ (ဥပမာ 100)")
         qr = ROOT / "payqr.png"
         if qr.exists():
             try:
-                tg.send_photo(chat_id, qr, caption="📸 QR scan ပြီး လွှဲပါ")
+                tg.send_photo(chat_id, qr, caption="📸 QR ကို scan ပြီး လွှဲပေးပါ 🙏")
             except Exception:
                 pass
         return True
@@ -599,20 +600,20 @@ def _tg_flow_prepare(chat_id):
             shown = pdir / "tg_frame_box.jpg"
             detect_text.draw_box(frame, box, shown)
             rows.append([("✅ ဒီနေရာ ဝါး", "b:ok"), ("မဝါးဘူး", "b:no")])
-            caption = ("🔍 စာတန်း နေရာ တွေ့တယ် — အနီ အကွက် ကို ဝါးပြီး "
-                       "မြန်မာ စာတန်း အဲဒီ အထဲ ထည့်ပေးမယ်။ မှန်လား?")
+            caption = ("🔍 စာတန်း နေရာ တွေ့ပါတယ် — အနီ အကွက် ကို ဝါးပြီး "
+                       "မြန်မာ စာတန်း ကို အဲဒီ အထဲ ထည့်ပေးပါမယ်။ နေရာ မှန်ပါသလား?")
         else:
             shown = frame
             rows.append([("မဝါးဘူး", "b:no")])
-            caption = ("စာတန်း နေရာ auto မတွေ့ဘူး — ဝါးချင်တဲ့ အပိုင်း "
-                       "ရွေးပါ (မဝါးချင် 'မဝါးဘူး')")
+            caption = ("စာတန်း နေရာ auto မတွေ့ပါ — ဝါးချင်တဲ့ အပိုင်း ကို "
+                       "ရွေးပေးပါ (မဝါးချင်ရင် «မဝါးဘူး» ကို နှိပ်ပါ)")
         rows.append([("အပေါ်", "b:top"), ("အလယ်", "b:mid"),
                      ("အောက်", "b:bot")])
         tg.send_photo(chat_id, shown, caption=caption, buttons=rows)
     except Exception as e:
         _TG_FLOW.pop(chat_id, None)
         try:
-            tg.send_message(chat_id, "❌ video ယူလို့ မရပါ: " + str(e)[:200])
+            tg.send_message(chat_id, "🙏 တောင်းပန်ပါတယ် — video ယူလို့ မရပါ ဖြစ်သွားပါတယ်: " + str(e)[:200])
         except Exception:
             pass
 
@@ -626,23 +627,23 @@ def _tg_start_flow_job(chat_id, flow):
     if not tg.is_admin(chat_id):
         if not acct:
             _TG_FLOW.pop(chat_id, None)
-            tg.send_message(chat_id, "အရင် 👤 Username ချိတ် "
-                                     "(Menu ထဲက) ပါ — account "
-                                     "ရှိမှ job ထုတ်လို့ရမယ်" + _LINK_HINT)
+            tg.send_message(chat_id, "🙏 video ထုတ်ဖို့ အရင် 👤 Username ချိတ်ပေးပါ "
+                                     "(အောက်က Menu ထဲက) — account "
+                                     "ချိတ်ပြီးမှ ထုတ်လို့ရပါမယ်" + _LINK_HINT)
             return
         need = flow.get("minutes") or 1
         if (acct["credits"] or 0) < need:
             _TG_FLOW.pop(chat_id, None)
             tg.send_message(chat_id,
-                            f"💳 credit မလောက် — ဒီ video က {need} "
-                            f"credits လိုတယ်, လက်ကျန် "
-                            f"{acct['credits']} ပဲ ရှိတယ်")
+                            f"💳 တောင်းပန်ပါတယ် — credit မလောက်ပါ။ ဒီ video အတွက် {need} "
+                            f"credits လိုပါတယ်, လက်ကျန် "
+                            f"{acct['credits']} credits ပဲ ရှိပါတယ်။ Menu ထဲက «💰 Credit ဖြည့်» နဲ့ ဖြည့်နိုင်ပါတယ် 🙏")
             return
     if (not tg.is_admin(chat_id)
             and _tg_daily_count(chat_id) >= _TG_DAILY_CAP):
         _TG_FLOW.pop(chat_id, None)
-        tg.send_message(chat_id, "🚫 ဒီနေ့ အတွက် job ကန့်သတ် ပြည့်ပြီ "
-                                 "— မနက်ဖြန် ပြန်လာပါ")
+        tg.send_message(chat_id, "🚫 တောင်းပန်ပါတယ် — ဒီနေ့ အတွက် job ကန့်သတ် ပြည့်သွားပါပြီ။ "
+                                 "မနက်ဖြန် ပြန် ကြိုးစားပေးပါ 🙏")
         return
     _TG_FLOW.pop(chat_id, None)
     job, err = _new_job({"url": flow.get("url")
@@ -650,7 +651,7 @@ def _tg_start_flow_job(chat_id, flow):
                          "mode": flow.get("mode") or "both",
                          "speed_cap": flow.get("speed_cap") or 1.3})
     if err:
-        tg.send_message(chat_id, "❌ " + err)
+        tg.send_message(chat_id, "🙏 တောင်းပန်ပါတယ် — " + err)
         return
     if flow.get("file_id"):
         job["url"] = "📁 Telegram file"
@@ -672,12 +673,12 @@ def _tg_start_flow_job(chat_id, flow):
     _TG_PENDING.append(job["id"])
     if _any_active_worker() or len(_TG_PENDING) > 1:
         tg.send_message(chat_id,
-                        f"✅ လက်ခံရပြီ — တန်းစီ {len(_TG_PENDING)} ခုမြောက်, "
-                        "အရင် job တွေ ပြီးရင် စပါမယ်")
+                        f"✅ လက်ခံရရှိပါပြီ — တန်းစီ {len(_TG_PENDING)} ခုမြောက် ဖြစ်ပါတယ်။ "
+                        "အရင် job တွေ ပြီးတာနဲ့ စလုပ်ပေးပါမယ် 🙏")
     else:
         tg.send_message(chat_id,
-                        "✅ လက်ခံရပြီ — စလုပ်နေပါပြီ, ပြီးရင် ဒီမှာပဲ "
-                        "ဗီဒီယို တန်း ပို့ပေးပါမယ်")
+                        "✅ လက်ခံရရှိပါပြီ — စလုပ်နေပါပြီ။ ပြီးတာနဲ့ ဒီမှာပဲ "
+                        "ဗီဒီယို တန်း ပို့ပေးပါမယ် 🙏")
 
 
 def _on_tg_callback(cq):
@@ -703,9 +704,9 @@ def _on_tg_callback(cq):
                 try:
                     tg.send_message(
                         res["tg_chat_id"],
-                        f"💳 Credit {res['credits']} ဝင်ပြီ — "
-                        "ကျေးဇူးတင်ပါတယ်!" if act == "ok" else
-                        "❌ Credit ဖြည့် တောင်းဆိုချက် ငြင်းခံရပါတယ်")
+                        f"💳 Credit {res['credits']} ဝင်ပါပြီ — "
+                        "ကျေးဇူးတင်ပါတယ် 🙏" if act == "ok" else
+                        "🙏 တောင်းပန်ပါတယ် — Credit ဖြည့် တောင်းဆိုချက် ကို လက်ခံလို့ မရပါ ဖြစ်သွားပါတယ်။ လွှဲပြီး screenshot ကို စစ်ပြီး ပြန် ပို့ကြည့်ပေးပါ")
                 except Exception:
                     pass
             tg.send_message(chat_id, f"ဆုံးဖြတ်ပြီး (#{tid})")
@@ -715,7 +716,7 @@ def _on_tg_callback(cq):
         return
     if time.time() - flow.get("ts", 0) > 30 * 60:
         _TG_FLOW.pop(chat_id, None)
-        tg.send_message(chat_id, "⏰ အချိန် ကုန်သွားပြီ — link ပြန်ပို့ပါ")
+        tg.send_message(chat_id, "⏰ အချိန် ကုန်သွားပါပြီ — link ကို ပြန်ပို့ပေးပါ 🙏")
         return
     if data.startswith("b:") and flow.get("step") == "blur":
         choice = data[2:]
@@ -726,7 +727,7 @@ def _on_tg_callback(cq):
         else:
             flow["blur"] = _BLUR_PRESETS.get(choice)
         flow["step"] = "mode"
-        tg.send_message(chat_id, "ဘယ် ပုံစံ ထုတ်မလဲ?",
+        tg.send_message(chat_id, "ဘယ် ပုံစံ နဲ့ ထုတ်ချင်ပါသလဲ?",
                         buttons=[[("နှစ်မျိုးလုံး", "m:both")],
                                  [("စာတန်း ပဲ", "m:subs"),
                                   ("အသံ ပဲ", "m:dub")]])
@@ -737,7 +738,7 @@ def _on_tg_callback(cq):
             return
         flow["mode"] = mode
         flow["step"] = "frame"
-        tg.send_message(chat_id, "Frame (ဗီဒီယို အချိုး) ရွေးပါ",
+        tg.send_message(chat_id, "Frame (ဗီဒီယို အချိုး) ရွေးပေးပါ",
                         buttons=[[("မူရင်း", "f:orig"), ("9:16", "f:9:16"),
                                   ("16:9", "f:16:9")],
                                  [("1:1", "f:1:1"), ("4:5", "f:4:5")]])
@@ -749,7 +750,7 @@ def _on_tg_callback(cq):
         flow["ratio"] = ratio
         if (flow.get("mode") or "both") != "subs":
             flow["step"] = "speed"
-            tg.send_message(chat_id, "အသံ အရှိန် ရွေးပါ",
+            tg.send_message(chat_id, "အသံ အရှိန် ရွေးပေးပါ",
                             buttons=[[("1.0×", "s:1.0"),
                                       ("1.3× ပုံမှန်", "s:1.3"),
                                       ("1.5×", "s:1.5")],
@@ -827,31 +828,65 @@ def _cleanup_job(jid):
         shutil.rmtree(pdir, ignore_errors=True)
 
 
+def _job_minutes(job):
+    src = JOBS_DIR / job["id"] / "source.mp4"
+    try:
+        return max(1, math.ceil(probe_duration(src) / 60.0))
+    except Exception:
+        return 1
+
+
+def _quote_for_job(job):
+    """Admission check after phase 1 (the duration is known): a
+    non-admin account must COVER 1 credit per started minute — but
+    nothing is deducted here. Owner rule (2026-11-09): credits move
+    only when the video is actually produced; a job that fails or is
+    cancelled is never charged."""
+    uid = job.get("user_id")
+    if not uid:
+        return
+    user = accounts.get_user(uid)
+    if not user or user["role"] == "admin":
+        return
+    minutes = _job_minutes(job)
+    job["quote_minutes"] = minutes
+    _save(job)
+    if (user["credits"] or 0) < minutes:
+        raise RuntimeError(
+            f"credit မလောက်ပါ — ဒီ video အတွက် {minutes} credits "
+            f"လိုပါတယ်, လက်ကျန် {user['credits']} credits ပဲ ရှိပါတယ်")
+
+
 def _charge_for_job(job):
-    """Credits: a non-admin account pays 1 credit per STARTED minute
-    of the source video. Charged once — after phase 1, when the
-    duration is known, before the expensive phase 2. Admin accounts
-    and anonymous (pre-accounts) jobs are never charged."""
+    """Success-only charge, called from _finish once the video
+    exists: deduct the quoted minutes. If the balance dropped below
+    the quote after admission (a concurrent job spent it), take what
+    is there and record the shortfall — the finished video is still
+    delivered. Admin and anonymous jobs are never charged."""
     uid = job.get("user_id")
     if not uid or job.get("charged_minutes"):
         return
     user = accounts.get_user(uid)
     if not user or user["role"] == "admin":
         return
-    src = JOBS_DIR / job["id"] / "source.mp4"
-    try:
-        minutes = max(1, math.ceil(probe_duration(src) / 60.0))
-    except Exception:
-        minutes = 1
+    minutes = job.get("quote_minutes") or _job_minutes(job)
+    paid = minutes
     if not accounts.charge(uid, minutes, job["id"]):
-        raise RuntimeError(
-            f"credit မလောက် — {minutes} credits လိုတယ်, "
-            f"လက်ကျန် {user['credits']} ပဲ ရှိတယ်")
-    job["charged_minutes"] = minutes
+        paid = max(0, min(user["credits"] or 0, minutes))
+        if paid:
+            accounts.charge(uid, paid, job["id"])
+        if paid < minutes:
+            job["charge_shortfall"] = minutes - paid
+    job["charged_minutes"] = paid
     _save(job)
 
 
 def _refund_charge(job):
+    # Charges now settle only at _finish (charge_settled), after
+    # which a failure can no longer occur — so this is a no-op safety
+    # net for any pre-finish charge, kept for symmetry.
+    if job.get("charge_settled"):
+        return
     uid = job.get("user_id")
     minutes = job.get("charged_minutes") or 0
     if uid and minutes:
@@ -883,12 +918,41 @@ def _run_phase2(job):
                        max_speed=job.get("speed_cap") or 1.3)
 
 
+_KEEP_DONE_PER_USER = 2
+
+
+def _enforce_done_cap(job):
+    """Owner rule (2026-11-09): per account, keep only the newest 2
+    finished videos — when a 3rd is produced, the oldest is deleted
+    (files included), whatever its time-retention window says. Bot
+    jobs without an account group under their Telegram chat."""
+    uid = job.get("user_id")
+    tg = job.get("tg_chat_id")
+    if uid:
+        mine = [j for j in _all_jobs() if j.get("user_id") == uid]
+    elif tg:
+        mine = [j for j in _all_jobs()
+                if j.get("tg_chat_id") == tg and not j.get("user_id")]
+    else:
+        return
+    done = sorted(
+        (j for j in mine if j.get("status") == "done"),
+        key=lambda j: j.get("finished_at") or j.get("created_at") or 0,
+        reverse=True)
+    for old in done[_KEEP_DONE_PER_USER:]:
+        if old["id"] != job["id"]:
+            _cleanup_job(old["id"])
+
+
 def _finish(job):
+    _charge_for_job(job)
+    job["charge_settled"] = True
     job["status"] = "done"
     job["current"] = None
     job["finished_at"] = time.time()
     _schedule_cleanup(job)
     _save(job)
+    _enforce_done_cap(job)
     _tg_deliver_async(job)
 
 
@@ -916,7 +980,7 @@ def _worker(job):
         _save(job)
         run_job.run_phase1(workdir, job["url"], source_path=job.get("source_path"),
                            progress=_progress_fn(job))
-        _charge_for_job(job)
+        _quote_for_job(job)
         _run_phase2(job)
         _finish(job)
     except JobCancelled:
@@ -1382,9 +1446,9 @@ def admin_topup_decide(tid):
             from pipeline import telegram_send as tg
             tg.send_message(
                 res["tg_chat_id"],
-                f"💳 Credit {res['credits']} ဝင်ပြီ — ကျေးဇူးတင်ပါတယ်!"
+                f"💳 Credit {res['credits']} ဝင်ပါပြီ — ကျေးဇူးတင်ပါတယ် 🙏"
                 if data.get("decision") == "approved" else
-                "❌ Credit ဖြည့် တောင်းဆိုချက် ငြင်းခံရပါတယ်")
+                "🙏 တောင်းပန်ပါတယ် — Credit ဖြည့် တောင်းဆိုချက် ကို လက်ခံလို့ မရပါ ဖြစ်သွားပါတယ်။ လွှဲပြီး screenshot ကို စစ်ပြီး ပြန် ပို့ကြည့်ပေးပါ")
         except Exception:
             pass
     return jsonify({"ok": True, "result": res})
@@ -1540,7 +1604,7 @@ def admin_user_update(uid):
 def _tg_worker(job, chat_id, out_path):
     from pipeline import telegram_send as tg
     try:
-        caption = "🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို\n" + (job.get("url") or "")
+        caption = "🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို\n" + (job.get("url") or "") + "\n🙏 ကျေးဇူးတင်ပါတယ်"
         tg.send_video(chat_id, out_path, caption=caption)
         job["tg"] = {**(job.get("tg") or {}), "state": "sent"}
     except Exception as e:

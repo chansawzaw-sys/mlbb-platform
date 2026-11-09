@@ -26,14 +26,14 @@ _LOCK = threading.Lock()
 _ME_CACHE = {}
 _POLLER_STARTED = False
 
-WELCOME = ("✅ မှတ်ပုံတင်ပြီးပါပြီ!\n"
-           "🎬 ဘာသာပြန်ချင်တဲ့ video link (YouTube / TikTok) ကို "
-           "ဒီမှာ ပို့လိုက်ပါ — ပြီးသွားရင် ဗီဒီယို ဒီ chat ထဲ "
-           "ပြန်ပို့ပေးပါမယ်။\n"
+WELCOME = ("မင်္ဂလာပါ 🙏 မှတ်ပုံတင် ပြီးပါပြီ ✅\n"
+           "🎬 ဘာသာပြန် လိုတဲ့ video link (YouTube / TikTok) ကို "
+           "ဒီမှာ ပို့ပေးပါ — ပြီးတာနဲ့ ဗီဒီယို ကို ဒီ chat ထဲမှာပဲ "
+           "ပြန်ပို့ ပေးပါမယ်\n"
            "🔗 App: https://85-155-149-58.sslip.io\n"
-           "📲 တစ်ခါတည်း ဒေါင်းထားပါ: အဲဒီ link ကို browser မှာ ဖွင့်ပြီး "
-           "menu (⋮) → «Add to Home screen» နှိပ်ရင် app အဖြစ် "
-           "ထည့်ထားလို့ရတယ်")
+           "📲 အဲဒီ link ကို browser မှာ ဖွင့်ပြီး menu (⋮) → "
+           "«Add to Home screen» နှိပ်ရင် app အဖြစ် ထည့်ထားနိုင်ပါတယ်\n"
+           "အောက်က Menu ခလုတ်တွေ နဲ့လည်း သုံးနိုင်ပါတယ် 👇")
 
 # Diagnostics for the settings card: when the poller last completed
 # a poll and what it last choked on (if anything).
