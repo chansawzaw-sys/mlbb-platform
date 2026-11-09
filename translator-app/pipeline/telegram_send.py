@@ -248,6 +248,19 @@ def send_message(chat_id, text, buttons=None, keyboard=None):
     return _call(tok, "sendMessage", **params)
 
 
+def edit_message(chat_id, message_id, text, buttons=None):
+    """Edit a sent message in place (the number-picker refreshes its
+    selection line without spamming a new message per tap)."""
+    tok = token()
+    if not tok:
+        raise RuntimeError("telegram bot token မရှိပါ")
+    params = {"chat_id": str(chat_id), "message_id": int(message_id),
+              "text": text}
+    if buttons:
+        params["reply_markup"] = _markup(buttons)
+    return _call(tok, "editMessageText", **params)
+
+
 def _markup(buttons):
     """buttons: rows of (label, callback_data) -> inline keyboard JSON."""
     return json.dumps({"inline_keyboard": [

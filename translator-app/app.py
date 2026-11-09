@@ -632,7 +632,12 @@ def _tg_flow_prepare(chat_id):
         if box:
             shown = pdir / "tg_frame_box.jpg"
             detect_text.draw_box(frame, pieces if pieces else box, shown)
-            rows.append([("✅ ဒီနေရာ ဝါး", "b:ok"), ("မဝါးဘူး", "b:no")])
+            if len(pieces) >= 2:
+                rows.append([("✅ အကုန် ဝါး", "b:ok"),
+                             ("🔢 နံပတ် ရွေး ဝါး", "b:pick")])
+                rows.append([("မဝါးဘူး", "b:no")])
+            else:
+                rows.append([("✅ ဒီနေရာ ဝါး", "b:ok"), ("မဝါးဘူး", "b:no")])
             caption = ("🔍 စာတန်း နေရာ တွေ့ပါတယ် — ဘောင် တစ်ခုချင်း ကို "
                        "နံပတ် နဲ့ အရောင် ခွဲထားပါတယ်။ အပိုင်းလိုက် ဝါးပြီး "
                        "မြန်မာ စာတန်း ကို အဓိက နေရာ ထဲ ထည့်ပေးပါမယ်။ "
@@ -644,6 +649,7 @@ def _tg_flow_prepare(chat_id):
                        "ရွေးပေးပါ (မဝါးချင်ရင် «မဝါးဘူး» ကို နှိပ်ပါ)")
         rows.append([("အပေါ်", "b:top"), ("အလယ်", "b:mid"),
                      ("အောက်", "b:bot")])
+        flow["blur_rows"] = rows
         tg.send_photo(chat_id, shown, caption=caption, buttons=rows)
     except Exception as e:
         _TG_FLOW.pop(chat_id, None)
@@ -651,6 +657,36 @@ def _tg_flow_prepare(chat_id):
             tg.send_message(chat_id, "🙏 တောင်းပန်ပါတယ် — video ယူလို့ မရပါ ဖြစ်သွားပါတယ်: " + str(e)[:200])
         except Exception:
             pass
+
+
+def _tg_ask_mode(chat_id):
+    from pipeline import telegram_send as tg
+    tg.send_message(chat_id, "ဘယ် ပုံစံ နဲ့ ထုတ်ချင်ပါသလဲ?",
+                    buttons=[[("နှစ်မျိုးလုံး", "m:both")],
+                             [("စာတန်း ပဲ", "m:subs"),
+                              ("အသံ ပဲ", "m:dub")]])
+
+
+def _tg_pick_text(flow):
+    pick = sorted(flow.get("pick") or [])
+    sel = ", ".join(str(i + 1) for i in pick) if pick else "မရှိသေး"
+    return ("🔢 ဝါးမယ့် နံပတ် တွေကို နှိပ်ပြီး ရွေးပေးပါ\n"
+            f"ရွေးထားတာ: {sel}")
+
+
+def _tg_pick_rows(flow):
+    pieces = flow.get("pieces") or []
+    pick = flow.get("pick") or set()
+    rows, row = [], []
+    for i in range(len(pieces)):
+        row.append((f"{'✅ ' if i in pick else ''}{i + 1}", f"n:{i}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([("✔️ ဒါပဲ ဝါး", "n:go"), ("↩️ နောက်ပြန်", "n:back")])
+    return rows
 
 
 _TG_VOICES = {"nilar": "my-MM-NilarNeural", "thiha": "my-MM-ThihaNeural"}
@@ -796,6 +832,14 @@ def _on_tg_callback(cq):
         return
     if data.startswith("b:") and flow.get("step") == "blur":
         choice = data[2:]
+        if choice == "pick":
+            flow["step"] = "blurpick"
+            flow["pick"] = set()
+            res = tg.send_message(chat_id, _tg_pick_text(flow),
+                                  buttons=_tg_pick_rows(flow))
+            if isinstance(res, dict):
+                flow["pick_msg"] = res.get("message_id")
+            return
         if choice == "ok":
             flow["blur"] = flow.get("box")
             flow["blur_pieces"] = flow.get("pieces")
@@ -806,10 +850,48 @@ def _on_tg_callback(cq):
             flow["blur"] = _BLUR_PRESETS.get(choice)
             flow["blur_pieces"] = None
         flow["step"] = "mode"
-        tg.send_message(chat_id, "ဘယ် ပုံစံ နဲ့ ထုတ်ချင်ပါသလဲ?",
-                        buttons=[[("နှစ်မျိုးလုံး", "m:both")],
-                                 [("စာတန်း ပဲ", "m:subs"),
-                                  ("အသံ ပဲ", "m:dub")]])
+        _tg_ask_mode(chat_id)
+        return
+    if data.startswith("n:") and flow.get("step") == "blurpick":
+        act = data[2:]
+        if act == "back":
+            flow["step"] = "blur"
+            tg.send_message(chat_id, "ဝါးမယ့် နေရာ ပြန် ရွေးပေးပါ 🙏",
+                            buttons=flow.get("blur_rows") or
+                            [[("✅ အကုန် ဝါး", "b:ok"),
+                              ("မဝါးဘူး", "b:no")]])
+            return
+        if act == "go":
+            pick = flow.get("pick") or set()
+            pieces = flow.get("pieces") or []
+            chosen = [pieces[i] for i in sorted(pick) if i < len(pieces)]
+            if not chosen:
+                tg.send_message(chat_id, "အရင် နံပတ် တစ်ခု ရွေးပေးပါ 🙏")
+                return
+            flow["blur_pieces"] = chosen
+            dom = max(chosen, key=lambda p: p["t1"] - p["t0"])
+            flow["blur"] = {k: dom[k] for k in ("x", "y", "w", "h")}
+            flow["step"] = "mode"
+            _tg_ask_mode(chat_id)
+            return
+        try:
+            idx = int(act)
+        except ValueError:
+            return
+        pick = flow.setdefault("pick", set())
+        if idx in pick:
+            pick.discard(idx)
+        else:
+            pick.add(idx)
+        try:
+            tg.edit_message(chat_id, flow.get("pick_msg"),
+                            _tg_pick_text(flow),
+                            buttons=_tg_pick_rows(flow))
+        except Exception:
+            res = tg.send_message(chat_id, _tg_pick_text(flow),
+                                  buttons=_tg_pick_rows(flow))
+            if isinstance(res, dict):
+                flow["pick_msg"] = res.get("message_id")
         return
     if data.startswith("m:") and flow.get("step") == "mode":
         mode = data[2:]
