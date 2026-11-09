@@ -36,7 +36,14 @@
     border-radius: 12px; padding: 14px; display: none; }
   .card.show { display: block; }
   .step { display: flex; gap: 8px; align-items: center; padding: 7px 0; font-size: 14px; color: #99a; }
-  .jobrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid #ffffff14; font-size: 14px; }
+  .jobrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid #ffffff14; font-size: 14px; flex-wrap: wrap; }
+  .jobrow button, .tgpick button { width: auto; margin-top: 0; padding: 8px 12px; font-size: 13.5px; border-radius: 9px; }
+  .jobitem { display: block; }
+  .jobitem .jhead { display: flex; gap: 6px; align-items: center; }
+  .jobitem .jurl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .jobitem .jmeta { color: #99a; font-size: 12.5px; margin-top: 2px; }
+  .jobitem .jbtns { display: flex; gap: 6px; margin-top: 8px; }
+  .jobitem .jbtns button { flex: 1; }
   .step.running { color: #fff; }
   .step.done { color: #7dd87d; }
   .step.error { color: #ff8080; }
@@ -669,6 +676,12 @@ function mmss(sec) {
   sec = Math.max(0, Math.round(sec));
   return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
 }
+function leftFmt(sec) {
+  sec = Math.max(0, Math.round(sec));
+  if (sec >= 3600)
+    return Math.floor(sec / 3600) + " နာရီ " + Math.floor(sec % 3600 / 60) + " မိနစ်";
+  return mmss(sec);
+}
 async function loadJobs() {
   try {
     const d = await (await fetch("/api/jobs")).json();
@@ -678,22 +691,23 @@ async function loadJobs() {
       return;
     }
     el.innerHTML = d.jobs.map(j => {
-      let extra = "";
+      const parts = [];
       if ((j.status === "running" || j.status === "queued") && j.current)
-        extra = " — " + j.current;
+        parts.push(j.current);
       if (j.status === "done" && j.cleanup_at)
-        extra = " — ဖျက်ရန် " + mmss(j.cleanup_at - Date.now() / 1000) + " ကျန်";
-      let tg = "";
+        parts.push("ဖျက်ရန် " + leftFmt(j.cleanup_at - Date.now() / 1000) + " ကျန်");
       if (j.status === "done" && j.tg) {
-        if (j.tg.state === "sending") tg = " — 📨 ပို့နေဆဲ…";
-        else if (j.tg.state === "sent") tg = " — 📨 " + (j.tg.to ? "@" + j.tg.to : "") + " ဆီ ပို့ပြီး ✓";
-        else if (j.tg.state === "failed") tg = " — 📨 ပို့မရ ❌";
+        if (j.tg.state === "sending") parts.push("📨 ပို့နေဆဲ…");
+        else if (j.tg.state === "sent") parts.push("📨 " + (j.tg.to ? "@" + j.tg.to : "") + " ဆီ ပို့ပြီး ✓");
+        else if (j.tg.state === "failed") parts.push("📨 ပို့မရ ❌");
       }
       const tgBtn = j.status === "done"
-        ? `<button class="ghost" onclick="tgPick('${j.id}')">📨 TG</button> ` : "";
-      return `<div class="jobrow"><span>${ST_ICON[j.status] || "•"} ${shortUrl(j.url)}${extra}${tg}</span>` +
-        `<span>${tgBtn}<button class="ghost" onclick="attachJob('${j.id}')">ကြည့်</button> ` +
-        `<button class="ghost" onclick="delJob('${j.id}','${j.status}')">ဖျက်</button></span></div>` +
+        ? `<button class="ghost" onclick="tgPick('${j.id}')">📨 TG</button>` : "";
+      return `<div class="jobrow jobitem">` +
+        `<div class="jhead">${ST_ICON[j.status] || "•"} <span class="jurl">${shortUrl(j.url)}</span></div>` +
+        (parts.length ? `<div class="jmeta">${parts.join(" · ")}</div>` : "") +
+        `<div class="jbtns">${tgBtn}<button class="ghost" onclick="attachJob('${j.id}')">ကြည့်</button>` +
+        `<button class="ghost" onclick="delJob('${j.id}','${j.status}')">ဖျက်</button></div></div>` +
         `<div class="tgpick" id="tgpick-${j.id}" style="display:none"></div>`;
     }).join("");
   } catch (e) {}
@@ -1108,6 +1122,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 103</p>
+<p class="hint" id="buildTag" style="text-align:center">build 104</p>
 </body>
 </html>
