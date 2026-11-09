@@ -312,7 +312,7 @@ def detect_text_pieces(video):
         a["t1"] = b["t1"]
         a["count"] += b["count"]
         formed.pop(best_i + 1)
-    pad_y = int(H * 0.015)
+    pad_y = int(H * 0.025)
     out = []
     for f in formed:
         y0 = max(0, f["y0"] - pad_y)

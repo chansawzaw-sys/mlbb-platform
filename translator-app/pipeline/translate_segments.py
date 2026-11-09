@@ -210,6 +210,24 @@ def translate_one(text):
     return _Chain().one(text)
 
 
+def _fill_missing(out):
+    """No silent gaps (owner complaint 2026-11-09: subtitle lines
+    missing from the finished video). Batch endpoints — Gemini
+    included — sometimes return an EMPTY string for a segment, and
+    write_srt/TTS then skip it, leaving a hole. Retry each empty
+    segment once per-segment; the chain's own last resort is the
+    source text, so a line is never dropped silently."""
+    chain = None
+    for seg in out:
+        if (seg.get("text") or "").strip() \
+                and not (seg.get("text_my") or "").strip():
+            if chain is None:
+                chain = _Chain()
+            seg["text_my"], seg["provider"] = \
+                chain.one(seg["text"].strip())
+    return out
+
+
 def translate_segments(workdir, style="subs"):
     ensure_system_ca()
     workdir = Path(workdir)
@@ -222,6 +240,7 @@ def translate_segments(workdir, style="subs"):
                 by_idx = gemini_translate.translate_all(segs, style=style)
                 out = [{**seg, "text_my": by_idx[i], "provider": "gemini"}
                        for i, seg in enumerate(segs)]
+                out = _fill_missing(out)
                 save_segments(out, workdir / "segments_my.json")
                 write_srt(out, workdir / "subs_my.srt")
                 return out
@@ -257,6 +276,7 @@ def translate_segments(workdir, style="subs"):
                 results[i] = chain.one(texts[i])
     out = [{**seg, "text_my": results[i][0], "provider": results[i][1]}
            for i, seg in enumerate(segs)]
+    out = _fill_missing(out)
     save_segments(out, workdir / "segments_my.json")
     write_srt(out, workdir / "subs_my.srt")
     return out
