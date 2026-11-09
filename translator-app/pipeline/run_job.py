@@ -80,8 +80,15 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
     mark("tts", "done")
 
     mark("retime", "running")
-    retime.retime(workdir, max_speed=max_speed or retime.MAX_SPEED)
+    plan = retime.retime(workdir, max_speed=max_speed or retime.MAX_SPEED)
     mark("retime", "done")
+    if fx and fx.get("blur_pieces"):
+        # Blur pieces were timed on the ORIGINAL video; the retime
+        # just stretched/shrank the picture, so re-time the windows
+        # too (a copy — the job's stored fx keeps source times, so a
+        # re-render remaps from the originals again, never twice).
+        fx = {**fx, "blur_pieces": retime.remap_pieces(
+            plan, fx["blur_pieces"])}
 
     mark("finalize", "running")
     base = workdir / "retimed.mp4"

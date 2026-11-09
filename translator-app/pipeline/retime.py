@@ -68,6 +68,48 @@ def _plan(segs, total_dur, max_speed=MAX_SPEED):
     return chunks
 
 
+def time_map(plan):
+    """[(src_t, dst_t)] breakpoints of a retime plan: chunk ends in
+    source time against their cumulative retimed positions."""
+    pts = [(0.0, 0.0)]
+    dst = 0.0
+    for c in plan["chunks"]:
+        dst += float(c["new_dur"])
+        pts.append((float(c["end"]), round(dst, 3)))
+    return pts
+
+
+def map_time(pts, t):
+    if t <= 0:
+        return 0.0
+    for (s0, d0), (s1, d1) in zip(pts, pts[1:]):
+        if t <= s1:
+            if s1 - s0 <= 0:
+                return d1
+            return d0 + (d1 - d0) * (t - s0) / (s1 - s0)
+    return pts[-1][1]
+
+
+def remap_pieces(plan, pieces):
+    """Move blur-piece windows from SOURCE time into RETIMED time.
+    The pieces are detected against the original video, but dub/both
+    jobs re-time the picture (segments stretch/shrink), so without
+    this the blur fires at the wrong moments — blurring scenes with
+    no captions and missing the caption when it is on screen (owner
+    report 2026-11-09). Passthrough plans map identically."""
+    if not pieces:
+        return pieces
+    pts = time_map(plan)
+    out = []
+    for p in pieces:
+        t0 = map_time(pts, float(p["t0"]))
+        t1 = map_time(pts, float(p["t1"]))
+        if t1 - t0 < 0.2:
+            t1 = t0 + 0.2
+        out.append({**p, "t0": round(t0, 2), "t1": round(t1, 2)})
+    return out
+
+
 def _piece_vf(c, dur):
     # NOTE: trim INSIDE the filter chain, not output -t: an output -t
     # would also cut the tpad freeze frames we are trying to add.
