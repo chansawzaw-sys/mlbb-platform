@@ -268,6 +268,16 @@
     <option value="padauk">ပိတောက် (Padauk Bold)</option>
   </select>
 
+  <label>စာတန်း အရောင်</label>
+  <select id="subColor">
+    <option value="white" selected>အဖြူ (မူလ)</option>
+    <option value="yellow">အဝါ</option>
+    <option value="blue">အပြာ</option>
+    <option value="green">အစိမ်း</option>
+    <option value="red">အနီ</option>
+    <option value="black">အမဲ</option>
+  </select>
+
   <button id="go">စတင်လုပ်မယ်</button>
 
   <div class="card" id="card">
@@ -536,7 +546,8 @@ $("go").onclick = async () => {
                           subs: {size_pct: Number($("subSize").value),
                                  width_pct: Number($("subWidth").value),
                                  bottom_pct: Number($("subBottom").value),
-                                 align: $("subAlign").value},
+                                 align: $("subAlign").value,
+                                 color: $("subColor").value},
                           preview_id: previewId, fx})});
   const job = await res.json();
   if (!res.ok) { $("err").textContent = job.error || "အမှားတစ်ခု ဖြစ်သွားပြီ"; $("go").disabled = false; return; }
@@ -1122,6 +1133,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 109</p>
+<p class="hint" id="buildTag" style="text-align:center">build 110</p>
 </body>
 </html>

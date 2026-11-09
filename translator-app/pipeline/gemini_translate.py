@@ -30,6 +30,8 @@ _API_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:gen
 PROMPT = """You are a professional video translator. Translate each English subtitle segment below into natural, spoken Burmese (Myanmar) — the way a Myanmar narrator would actually SAY it (ပြောစကား), not stiff written style.
 
 Rules:
+- Stay FAITHFUL to what is actually said in the video: translate everything, in order — never add, omit, summarise, soften or censor anything.
+- At the same time, render the MEANING in smooth, natural Burmese that fits the scene (အဓိပ္ပာယ် ဆီလျော်အောင်): if a literal rendering sounds awkward, rephrase freely — as long as the meaning, tone and emotion stay exactly the same.
 - Translate idioms and slang by MEANING, never word-by-word.
 - Keep personal names, place names, brand names and ALL numbers exactly as they are.
 - Keep each translation roughly as short as the original (it will be spoken in the same time window).

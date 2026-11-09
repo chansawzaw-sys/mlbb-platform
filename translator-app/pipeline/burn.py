@@ -43,6 +43,13 @@ _BASE_OUTLINE = 3 / 288       # outline thickness, same scaling
 _BASE_SHADOW = 1 / 288
 
 
+SUB_COLORS = {  # subtitle text colours, ASS &HAABBGGRR
+    "white": "&H00FFFFFF", "yellow": "&H0000FFFF",
+    "blue": "&H00FFA500", "green": "&H0000E600",
+    "red": "&H002828FF", "black": "&H00000000",
+}
+
+
 def normalize_subs(subs):
     """Clamp a user subs dict to sane ranges; missing keys get defaults."""
     subs = subs or {}
@@ -54,6 +61,7 @@ def normalize_subs(subs):
             v = float(SUBS_DEFAULTS[key])
         out[key] = max(lo, min(hi, v))
     out["align"] = "top" if subs.get("align") == "top" else "bottom"
+    out["color"] = subs.get("color") if subs.get("color") in SUB_COLORS else "white"
     return out
 
 
@@ -179,10 +187,14 @@ def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None):
          "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
          "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
          "Alignment, MarginL, MarginR, MarginV, Encoding"),
-        # CINEMATIC style: BOLD, white text, strong black outline + soft
-        # shadow, NO background box (BorderStyle=1) — reads on bright/dark.
-        (f"Style: Default,{family},{font_size:.1f},&H00FFFFFF,&H000000FF,"
-         f"&H00000000,&H60000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},"
+        # CINEMATIC style: BOLD text (colour selectable), strong
+        # outline + soft shadow, NO background box (BorderStyle=1) —
+        # reads on bright/dark. Black text gets a WHITE outline so it
+        # stays readable.
+        (f"Style: Default,{family},{font_size:.1f},"
+         f"{SUB_COLORS[cfg['color']]},&H000000FF,"
+         f"{'&H00FFFFFF' if cfg['color'] == 'black' else '&H00000000'},"
+         f"&H60000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},"
          f"{alignment},{margin_lr},{margin_lr},{margin_v},1"),
         "",
         "[Events]",

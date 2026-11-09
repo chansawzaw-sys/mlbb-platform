@@ -648,23 +648,39 @@ def _tg_flow_prepare(chat_id):
 _TG_VOICES = {"nilar": "my-MM-NilarNeural", "thiha": "my-MM-ThihaNeural"}
 
 
-def _tg_after_logo(chat_id, flow):
-    """Logo settled (placed or skipped): dub/both continue to the
-    voice step; subs-only jobs start right away (no voice to pick)."""
+_TG_SUB_COLORS = ("white", "yellow", "blue", "green", "red", "black")
+
+
+def _tg_voice_step(chat_id, flow):
     from pipeline import telegram_send as tg
-    if (flow.get("mode") or "both") != "subs":
-        flow["step"] = "voice"
-        tg.send_message(chat_id, "အသံ ရွေးပေးပါ",
-                        buttons=[[("🎙 Nilar (မ)", "v:nilar"),
-                                  ("🎙 Thiha (ကျား)", "v:thiha")]])
+    flow["step"] = "voice"
+    tg.send_message(chat_id, "အသံ ရွေးပေးပါ",
+                    buttons=[[("🎙 Nilar (မ)", "v:nilar"),
+                              ("🎙 Thiha (ကျား)", "v:thiha")]])
+
+
+def _tg_after_logo(chat_id, flow):
+    """Logo settled (placed or skipped): modes that burn subtitles
+    (both/subs) pick a subtitle colour next; dub-only has no
+    subtitles, so it goes straight to the voice step."""
+    from pipeline import telegram_send as tg
+    if (flow.get("mode") or "both") == "dub":
+        _tg_voice_step(chat_id, flow)
         return
-    _tg_start_flow_job(chat_id, flow)
+    flow["step"] = "color"
+    tg.send_message(chat_id, "စာတန်း အရောင် ရွေးပေးပါ",
+                    buttons=[[("🤍 အဖြူ", "c:white"),
+                              ("💛 အဝါ", "c:yellow"),
+                              ("💙 အပြာ", "c:blue")],
+                             [("💚 အစိမ်း", "c:green"),
+                              ("❤️ အနီ", "c:red"),
+                              ("🖤 အမဲ", "c:black")]])
 
 
 def _tg_start_flow_job(chat_id, flow):
     """Final bot-flow step: credit/cap checks, then create the job
     from everything the flow collected (blur, mode, frame, logo,
-    voice, speed)."""
+    colour, voice, speed)."""
     from pipeline import telegram_send as tg
     ratio = flow.get("ratio") or "orig"
     acct = accounts.user_for_tg(chat_id)
@@ -694,6 +710,8 @@ def _tg_start_flow_job(chat_id, flow):
                          or "https://telegram.org/file",
                          "mode": flow.get("mode") or "both",
                          "voice": flow.get("voice"),
+                         "subs": ({"color": flow["sub_color"]}
+                                  if flow.get("sub_color") else None),
                          "speed_cap": flow.get("speed_cap") or 1.3})
     if err:
         tg.send_message(chat_id, "🙏 တောင်းပန်ပါတယ် — " + err)
@@ -730,7 +748,7 @@ def _tg_start_flow_job(chat_id, flow):
 
 def _on_tg_callback(cq):
     """Inline-button taps for the bot flow: blur, mode, frame, logo,
-    voice, speed."""
+    colour, voice, speed."""
     from pipeline import telegram_send as tg
     tg.answer_callback(cq.get("id"))
     chat = (cq.get("message") or {}).get("chat") or {}
@@ -817,6 +835,14 @@ def _on_tg_callback(cq):
                             "pos_y": pos[1], "size_pct": 18,
                             "opacity": 70, "saturation": 100}
         _tg_after_logo(chat_id, flow)
+        return
+    if data.startswith("c:") and flow.get("step") == "color":
+        if data[2:] in _TG_SUB_COLORS:
+            flow["sub_color"] = data[2:]
+        if (flow.get("mode") or "both") == "both":
+            _tg_voice_step(chat_id, flow)
+            return
+        _tg_start_flow_job(chat_id, flow)
         return
     if data.startswith("v:") and flow.get("step") == "voice":
         voice = _TG_VOICES.get(data[2:])
@@ -1729,6 +1755,9 @@ def _build_subs(data):
         "width_pct": _clamp_num(s.get("width_pct"), 50, 100, 95),
         "bottom_pct": _clamp_num(s.get("bottom_pct"), 2, 25, 10),
         "align": "top" if s.get("align") == "top" else "bottom",
+        "color": s.get("color") if s.get("color") in
+                 ("white", "yellow", "blue", "green", "red", "black")
+                 else "white",
     }
 
 

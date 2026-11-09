@@ -107,10 +107,16 @@ def detect_text_box(video):
     if dyn.any():
         runs = _merge(_runs(dyn, max(2, int(H * 0.03))), int(H * 0.04))
         if runs:
-            if runs[-1][1] - runs[0][0] <= 0.6 * H:
-                yspan = (runs[0][0], runs[-1][1])
-            else:
-                yspan = max(runs, key=lambda r: r[1] - r[0])
+            # Owner's rule: ONE fixed box over the WHOLE extent where
+            # text appears/disappears — not piece by piece. Only
+            # clusters whose hot-mass is a small fraction of the
+            # strongest cluster's count as noise and are dropped
+            # before the span is taken.
+            mass = [float(counts[a:b].sum()) for a, b in runs]
+            keep = [r for r, m in zip(runs, mass)
+                    if m >= 0.15 * max(mass)]
+            if keep:
+                yspan = (keep[0][0], keep[-1][1])
             # grow into adjacent steady caption rows (a caption whose
             # first line is on during most speech joins its flashing
             # second line) — stops at rows that are rarely hot, so a
