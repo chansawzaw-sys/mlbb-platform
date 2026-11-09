@@ -353,15 +353,43 @@ def video_size(input_mp4):
     raise RuntimeError(f"no video stream in {input_mp4}")
 
 
+def _fonts_dir():
+    """The directory libass should load the Myanmar fonts from.
+
+    Normal case: the bundled dir (deploy decodes the .b64 copies
+    there as root). If the files are STILL missing at burn time,
+    decode them into a /tmp cache the service can always write —
+    the burn must not depend on deploy state. Falls back to the
+    bundled dir so the caller's existence check can fail loudly."""
+    ensure_fonts()
+    if all((FONTS_DIR / f).exists() for f in _FONT_FILES.values()):
+        return FONTS_DIR
+    import base64
+    import tempfile
+    cache = Path(tempfile.gettempdir()) / "vt-fonts"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        for b in FONTS_DIR.glob("*.ttf.b64"):
+            t = cache / b.with_suffix("").name
+            if not t.exists() or t.stat().st_size < 10_000:
+                t.write_bytes(base64.b64decode(
+                    b.read_text(encoding="ascii")))
+        if all((cache / f).exists() for f in _FONT_FILES.values()):
+            return cache
+    except Exception:
+        pass
+    return FONTS_DIR
+
+
 def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
          blur_box=None, fx=None):
-    ensure_fonts()  # decode .ttf.b64 -> .ttf on deploys that lack them
+    fonts_dir = _fonts_dir()
     family = FONT_CHOICES.get(font, FONT_CHOICES[DEFAULT_FONT])
     # Never deliver silent tofu again: if the chosen family's font
     # file is still missing, the job must FAIL LOUDLY here instead
     # of burning placeholder boxes the customer can't read.
     _ff = _FONT_FILES.get(family)
-    if _ff and not (FONTS_DIR / _ff).exists():
+    if _ff and not (fonts_dir / _ff).exists():
         raise RuntimeError(
             f"Myanmar font မရှိပါ ({_ff}) — server admin ကို ပြောပါ")
     width, height = video_size(input_mp4)
@@ -383,7 +411,7 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
     srt_to_ass(srt_path, ass_path, width, height, family, subs,
                blur_box=blur_box)
     ass = str(ass_path.resolve()).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-    fontsdir = str(FONTS_DIR).replace("\\", "/").replace(":", "\\:")
+    fontsdir = str(fonts_dir).replace("\\", "/").replace(":", "\\:")
     if fx:
         from . import fx as fx_mod
         if fx_mod.has_fx(fx):

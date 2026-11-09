@@ -1656,9 +1656,19 @@ def auth_me():
                 "SELECT 1 FROM users WHERE role = 'admin'").fetchone()
     except sqlite3.Error:
         claim_open = True
+    fonts = {}
+    try:
+        from pipeline import burn as _burn
+        from pipeline.common import FONTS_DIR as _FD
+        fonts = {fam: ((_FD / fn).exists()
+                       and (_FD / fn).stat().st_size > 10_000)
+                 for fam, fn in _burn._FONT_FILES.items()}
+    except Exception:
+        fonts = {}
     return jsonify({"user": _current_user(),
                     "admin_claim_open": claim_open,
-                    "enforced": ACCOUNTS_ENFORCED})
+                    "enforced": ACCOUNTS_ENFORCED,
+                    "fonts": fonts})
 
 
 @app.post("/api/auth/change-password")
