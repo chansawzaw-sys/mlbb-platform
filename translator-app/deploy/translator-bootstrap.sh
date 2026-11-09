@@ -109,7 +109,7 @@ free -h || true
 # --- 2. packages: python, ffmpeg, caddy, tools --------------------------------
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y curl git ufw file python3 python3-venv ffmpeg
+apt-get install -y curl git ufw file python3 python3-venv ffmpeg nodejs
 
 if ! command -v caddy >/dev/null 2>&1; then
   # Official Caddy apt repository (stable, deterministic on Ubuntu 24.04).

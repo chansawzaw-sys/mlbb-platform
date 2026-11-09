@@ -26,7 +26,7 @@ from pathlib import Path
 from .common import PROJECT_ROOT
 
 DEFAULT_MODEL = "gemini-2.0-flash"
-_API_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+_API_TMPL = "https://generativelanguage.googleapis.com/{ver}/models/{model}:generateContent"
 
 PROMPT = """You are a professional video translator. Translate each English subtitle segment below into natural, spoken Burmese (Myanmar) — the way a Myanmar narrator would actually SAY it (ပြောစကား), not stiff written style.
 
@@ -146,37 +146,42 @@ def translate_all(segments, style="subs"):
                              "temperature": 0.3},
     }
     data = None
-    last_err = None
+    attempts = []
+    last_body = ""
     for mdl in _models():
-        url = _API_TMPL.format(model=mdl)
-        for use_query in (False, True):
-            try:
-                resp = requests.post(
-                    url + (f"?key={key}" if use_query else ""),
-                    json=body, timeout=120,
-                    headers={**({} if use_query else
-                                {"x-goog-api-key": key}),
-                             "Content-Type": "application/json"})
-            except Exception as e:  # network-level: try the next shape
-                last_err = e
-                continue
-            if resp.status_code == 200:
-                data = resp.json()
+        for ver in ("v1beta", "v1"):
+            url = _API_TMPL.format(ver=ver, model=mdl)
+            for use_query in (False, True):
+                try:
+                    resp = requests.post(
+                        url + (f"?key={key}" if use_query else ""),
+                        json=body, timeout=120,
+                        headers={**({} if use_query else
+                                    {"x-goog-api-key": key}),
+                                 "Content-Type": "application/json"})
+                except Exception as e:  # network-level: next shape
+                    attempts.append(f"{mdl}@{ver}=net:{e}"[:60])
+                    continue
+                if resp.status_code == 200:
+                    data = resp.json()
+                    break
+                # NOTE: body may hold an error message, never the key.
+                attempts.append(f"{mdl}@{ver}={resp.status_code}")
+                last_body = resp.text[:200]
+                if resp.status_code in (400, 404):
+                    break  # model/version problem — move on
+                if resp.status_code in (401, 403) and not use_query:
+                    continue  # try query-param auth once
                 break
-            # NOTE: body may contain an error message but never the key.
-            last_err = RuntimeError(
-                f"Gemini HTTP {resp.status_code} ({mdl}): "
-                f"{resp.text[:200]}")
-            if resp.status_code in (400, 404):
-                break  # model problem — next model, not auth style
-            if resp.status_code in (401, 403) and not use_query:
-                continue  # try query-param auth once
-            break
+            if data is not None:
+                break
         if data is not None:
             break
     if data is None:
-        _note_error(str(last_err))
-        raise RuntimeError(str(last_err))
+        msg = ("Gemini failed: " + "; ".join(attempts)
+               + f" | last: {last_body}")
+        _note_error(msg)
+        raise RuntimeError(msg)
     text_out = data["candidates"][0]["content"]["parts"][0]["text"]
     arr = _extract_json_array(text_out)
     result = {}
