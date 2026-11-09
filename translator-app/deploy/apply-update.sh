@@ -41,9 +41,14 @@ for p in app.glob("jobs/*/job.json"):
         j = json.loads(p.read_text())
     except Exception:
         continue
-    if j.get("status") in ("queued", "running") \
-            and time.time() - p.stat().st_mtime < 25 * 60:
+    age = time.time() - p.stat().st_mtime
+    # Running jobs heartbeat their file, so 25 min of freshness is a
+    # live job; a QUEUED job has no heartbeat, so give the queue a
+    # longer window before an update may restart over it.
+    if j.get("status") == "running" and age < 25 * 60:
         sys.exit(0)  # an active job exists
+    if j.get("status") == "queued" and age < 120 * 60:
+        sys.exit(0)  # a queued job is waiting
 sys.exit(1)
 PYEOF
   then

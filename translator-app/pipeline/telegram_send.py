@@ -350,11 +350,16 @@ def download_file(file_id, dest_path):
         raise RuntimeError("telegram file မရပါ")
     import requests
     url = f"https://api.telegram.org/file/bot{tok}/{path}"
+    # Via .part + rename: a dropped connection must not leave a
+    # truncated file that later steps treat as the whole video.
+    dest_path = Path(dest_path)
+    tmp = dest_path.with_name(dest_path.name + ".part")
     with requests.get(url, stream=True, timeout=300) as r:
         r.raise_for_status()
-        with open(dest_path, "wb") as fh:
+        with open(tmp, "wb") as fh:
             for chunk in r.iter_content(chunk_size=1 << 18):
                 fh.write(chunk)
+    tmp.replace(dest_path)
     return dest_path
 
 

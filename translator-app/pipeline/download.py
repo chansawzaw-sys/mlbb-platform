@@ -47,12 +47,20 @@ def _tiktok_fallback(url: str, workdir: Path) -> dict:
     if not play:
         raise RuntimeError(f"tikwm resolver returned no video URL: {payload!r:.200}")
     out = workdir / "source.mp4"
+    # Stream to a .part file and rename only when complete: an
+    # interrupted download must never leave a truncated source.mp4
+    # behind for the shared preview cache to reuse forever.
+    tmp = workdir / "source.mp4.part"
     with requests.get(play, headers=headers, timeout=180, stream=True) as resp:
         resp.raise_for_status()
-        with open(out, "wb") as f:
+        with open(tmp, "wb") as f:
             for chunk in resp.iter_content(1 << 20):
                 if chunk:
                     f.write(chunk)
+    if tmp.stat().st_size < 10_000:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError("tikwm download came back empty/truncated")
+    tmp.replace(out)
     author = data.get("author") or {}
     return {
         "title": data.get("title"),
@@ -170,20 +178,23 @@ def _xhs_fallback(url: str, workdir: Path) -> dict:
         video_urls = []
         last_err = e
     out = workdir / "source.mp4"
+    tmp = workdir / "source.mp4.part"
     for vu in video_urls:
         try:
             with requests.get(vu, headers=headers, timeout=180,
                               stream=True) as resp:
                 resp.raise_for_status()
-                with open(out, "wb") as f:
+                with open(tmp, "wb") as f:
                     for chunk in resp.iter_content(1 << 20):
                         if chunk:
                             f.write(chunk)
-            if out.exists() and out.stat().st_size > 100_000:
+            if tmp.exists() and tmp.stat().st_size > 100_000:
+                tmp.replace(out)
                 return {"title": None, "duration": None,
                         "webpage_url": cands[0], "uploader": None}
         except Exception as e:
             last_err = e
+        tmp.unlink(missing_ok=True)
     raise RuntimeError(f"XHS resolver found no downloadable video: {last_err}")
 
 

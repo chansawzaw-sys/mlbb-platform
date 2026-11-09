@@ -282,6 +282,16 @@ def _tg_deliver_async(job):
         except Exception as e:
             job["tg"] = {"state": "failed", "to": job.get("tg_from"),
                          "error": str(e)[:200]}
+            # A failed delivery must not be silent: tell the customer
+            # where else to get the video (same promise as oversized).
+            try:
+                tg.send_message(
+                    chat_id,
+                    "🙏 တောင်းပန်ပါတယ် — video ပို့လို့ အဆင်မပြေ ဖြစ်သွားပါတယ်\n"
+                    "🌐 web app မှာ ယူနိုင်ပါတယ်: " + APP_LINK
+                    + "\n(Jobs စာရင်းထဲမှာ ၂၄ နာရီ အတွင်း ယူပေးပါ)")
+            except Exception:
+                pass
         _save(job)
 
     threading.Thread(target=go, daemon=True).start()
@@ -604,13 +614,17 @@ def _tg_flow_prepare(chat_id):
             pid, pdir = _preview_dir("tg-file:" + flow["file_id"])
             pdir.mkdir(parents=True, exist_ok=True)
             src = pdir / "source.mp4"
-            if not src.exists():
+            if not _src_valid(src):
+                src.unlink(missing_ok=True)
                 tg.download_file(flow["file_id"], src)
         else:
+            if not _public_url_ok(flow["url"]):
+                raise RuntimeError("ဒီ လင့်ခ် ကို သုံးလို့ မရပါ")
             pid, pdir = _preview_dir(flow["url"])
             pdir.mkdir(parents=True, exist_ok=True)
             src = pdir / "source.mp4"
-            if not src.exists():
+            if not _src_valid(src):
+                src.unlink(missing_ok=True)
                 dl_mod.download(flow["url"], pdir)
         dur = probe_duration(src)
         flow["minutes"] = max(1, math.ceil(dur / 60.0))
@@ -764,6 +778,7 @@ def _tg_start_flow_job(chat_id, flow):
         job["url"] = "📁 Telegram file"
     if acct and not tg.is_admin(chat_id):
         job["user_id"] = acct["id"]
+        accounts.mark_has_job(acct["id"])
     job["source_path"] = flow.get("src")
     fx = {}
     if flow.get("blur"):
@@ -1237,6 +1252,60 @@ def voices():
     return jsonify([{"id": v, "label": v} for v in tts.FALLBACK_VOICES])
 
 
+def _public_url_ok(url):
+    """SSRF guard: downloads run server-side, so a customer-supplied
+    link must resolve to PUBLIC addresses only — no loopback,
+    private, link-local, reserved or multicast targets (a hostname
+    with ANY bad record is refused whole)."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+    try:
+        host = urlparse(url).hostname
+        if not host:
+            return False
+        for info in socket.getaddrinfo(host, None,
+                                       proto=socket.IPPROTO_TCP):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local \
+                    or ip.is_reserved or ip.is_multicast \
+                    or ip.is_unspecified:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _src_valid(path):
+    """A cached preview source is reusable only as a COMPLETE,
+    probeable video — a truncated file left by an interrupted
+    download must never poison the cache for every later job on
+    the same link."""
+    try:
+        return path.exists() and path.stat().st_size > 50_000 \
+            and probe_duration(path) > 0
+    except Exception:
+        return False
+
+
+_PREVIEW_HITS = {}
+
+
+def _preview_allowed():
+    """Previews fetch arbitrary URLs on the server's bandwidth:
+    cap them per user (or per IP when accounts are off)."""
+    me = _current_user()
+    key = f"u{me['id']}" if me else f"ip:{_client_ip()}"
+    now = time.time()
+    hits = [t for t in _PREVIEW_HITS.get(key, []) if now - t < 3600]
+    if len(hits) >= 30:
+        _PREVIEW_HITS[key] = hits
+        return False
+    hits.append(now)
+    _PREVIEW_HITS[key] = hits
+    return True
+
+
 def _preview_dir(url):
     pid = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
     return pid, PREVIEWS_DIR / pid
@@ -1249,11 +1318,16 @@ def make_preview():
     url = (data.get("url") or "").strip()
     if not url.startswith(("http://", "https://")):
         return jsonify({"error": "လင့်ခ် မမှန်ပါ"}), 400
+    if not _public_url_ok(url):
+        return jsonify({"error": "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"}), 400
+    if not _preview_allowed():
+        return jsonify({"error": "ခဏ ခဏ မစမ်းပါနဲ့ — ခဏ စောင့်ပြီး ပြန် စမ်းပါ"}), 429
     pid, pdir = _preview_dir(url)
     pdir.mkdir(parents=True, exist_ok=True)
     src = pdir / "source.mp4"
     try:
-        if not src.exists():
+        if not _src_valid(src):
+            src.unlink(missing_ok=True)
             dl_mod.download(url, pdir)
         dur = probe_duration(src)
         w, h = fx_mod.video_size(src)
@@ -1540,11 +1614,22 @@ def auth_register():
                         accounts.new_session(user["id"]))
 
 
+def _client_ip():
+    """The real client IP for throttles/lockouts. Caddy APPENDS the
+    client it received the connection from at the END of
+    X-Forwarded-For; everything earlier in the header is supplied by
+    the client itself — keying the login lockout on the raw header
+    let an attacker rotate it away."""
+    xff = request.headers.get("X-Forwarded-For") or ""
+    if xff:
+        return xff.split(",")[-1].strip()
+    return request.remote_addr or ""
+
+
 @app.post("/api/auth/login")
 def auth_login():
     data = request.get_json(force=True, silent=True) or {}
-    ip = (request.headers.get("X-Forwarded-For") or
-          request.remote_addr or "")
+    ip = _client_ip()
     user, err = accounts.authenticate(data.get("username"),
                                       data.get("password"), ip)
     if err:
@@ -1786,7 +1871,8 @@ def admin_user_update(uid):
     if "disabled" in data:
         accounts.set_disabled(uid, bool(data["disabled"]))
     if data.get("credits_delta"):
-        accounts.adjust_credits(uid, int(data["credits_delta"]))
+        if accounts.adjust_credits(uid, int(data["credits_delta"])) is None:
+            return jsonify({"error": "credit မလုံလောက်ပါ — အဲဒီလောက် လျှော့လို့ မရပါ"}), 400
     if data.get("new_password"):
         if not accounts.set_password(uid, data["new_password"]):
             return jsonify({"error": "password အနည်းဆုံး ၆ လုံး ထားပါ"}), 400
@@ -1812,7 +1898,7 @@ def _tg_worker(job, chat_id, out_path):
 def send_telegram(jid):
     from pipeline import telegram_send as tg
     job = _load_job(jid)
-    if not job:
+    if not job or not _owns(_current_user(), job):
         return jsonify({"error": "job မတွေ့ပါ"}), 404
     out = JOBS_DIR / jid / "output.mp4"
     if not out.exists():
@@ -1888,6 +1974,8 @@ def _new_job(data):
         return None, "font မမှန်ပါ"
     if not url.startswith(("http://", "https://")):
         return None, "လင့်ခ် မမှန်ပါ"
+    if not _public_url_ok(url):
+        return None, "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"
     if mode not in ("subs", "dub", "both"):
         return None, "mode မမှန်ပါ"
     job = {
@@ -1914,6 +2002,7 @@ def create_job():
     me = _current_user()
     if me:
         job["user_id"] = me["id"]
+        accounts.mark_has_job(me["id"])
     preview_id = data.get("preview_id")
     if preview_id:
         # A preview may be reused ONLY for the very link it was taken
@@ -1964,6 +2053,25 @@ def _all_jobs():
             JOBS[jid] = j
             _save(j)
             _schedule_cleanup(j)
+            if j.get("tg_chat_id"):
+                # A queued bot job died with the restart — the
+                # customer must be TOLD, not left waiting forever.
+                _tg_error_async(j)
+        elif jid not in JOBS and j.get("status") in ("done", "error") \
+                and jid not in CLEANUP_TIMERS:
+            # Cleanup timers are in-memory: after a restart, re-arm
+            # whatever is left of this job's retention window (and
+            # delete at once when it already passed).
+            fin = j.get("finished_at") or j.get("created_at") or time.time()
+            remain = _job_retention(j) - (time.time() - float(fin))
+            if remain <= 0:
+                _cleanup_job(jid)
+                continue
+            t = threading.Timer(remain, _cleanup_job, args=(jid,))
+            t.daemon = True
+            t.start()
+            CLEANUP_TIMERS[jid] = t
+            j["cleanup_at"] = time.time() + remain
         res.append(j)
     res.sort(key=lambda j: j.get("created_at") or 0, reverse=True)
     return res
@@ -2014,7 +2122,7 @@ def _load_job(jid):
 def job_segments(jid):
     """Segments for the review/edit step (after phase 1)."""
     job = _load_job(jid)
-    if not job:
+    if not job or not _owns(_current_user(), job):
         return jsonify({"error": "job မတွေ့ပါ"}), 404
     seg_path = JOBS_DIR / jid / "segments_my.json"
     if not seg_path.exists():
@@ -2038,7 +2146,7 @@ def job_review(jid):
     edit-and-rerun path) and on a legacy waiting_review job.
     """
     job = _load_job(jid)
-    if not job:
+    if not job or not _owns(_current_user(), job):
         return jsonify({"error": "job မတွေ့ပါ"}), 404
     if job["status"] not in ("waiting_review", "done"):
         return jsonify({"error": "ဒီ job က ပြင်ဆင်ရန် အဆင့် မဟုတ်ပါ"}), 409
@@ -2071,6 +2179,9 @@ def job_review(jid):
 
 @app.get("/api/jobs/<jid>/download")
 def download_job(jid):
+    job = _load_job(jid)
+    if not job or not _owns(_current_user(), job):
+        return jsonify({"error": "မပြီးသေးပါ"}), 404
     out = JOBS_DIR / jid / "output.mp4"
     if not out.exists():
         return jsonify({"error": "မပြီးသေးပါ"}), 404
@@ -2081,6 +2192,9 @@ def download_job(jid):
 def stream_job(jid):
     """Inline playback for the result preview (the download route's
     attachment header prevents some phone browsers from playing it)."""
+    job = _load_job(jid)
+    if not job or not _owns(_current_user(), job):
+        return jsonify({"error": "မပြီးသေးပါ"}), 404
     out = JOBS_DIR / jid / "output.mp4"
     if not out.exists():
         return jsonify({"error": "မပြီးသေးပါ"}), 404
@@ -2092,7 +2206,7 @@ def delete_job(jid):
     """Delete a job and all its files right now (the user asked for no
     leftovers; otherwise the 15-minute auto-cleanup does it)."""
     job = _load_job(jid)
-    if not job:
+    if not job or not _owns(_current_user(), job):
         return jsonify({"error": "job မတွေ့ပါ"}), 404
     if job["status"] in ("queued", "running"):
         # Stop it instead of refusing: the worker checks cancel_requested
@@ -2119,7 +2233,7 @@ def delete_job(jid):
 def _segments_or_error(jid):
     """(job, segments, error_response) — segments None when error is set."""
     job = _load_job(jid)
-    if not job:
+    if not job or not _owns(_current_user(), job):
         return None, None, (jsonify({"error": "job မတွေ့ပါ"}), 404)
     seg_path = JOBS_DIR / jid / "segments_my.json"
     if not seg_path.exists():
@@ -2208,7 +2322,7 @@ def job_review_bulk(jid):
     segments, the remaining segments keep their current text.
     """
     job = _load_job(jid)
-    if not job:
+    if not job or not _owns(_current_user(), job):
         return jsonify({"error": "job မတွေ့ပါ"}), 404
     if job["status"] not in ("waiting_review", "done"):
         return jsonify({"error": "ဒီ job က ပြင်ဆင်ရန် အဆင့် မဟုတ်ပါ"}), 409
@@ -2245,24 +2359,35 @@ def job_review_bulk(jid):
 
 
 def _startup_sweep():
-    """Remove leftovers from before a restart: job folders and preview
-    caches older than an hour are deleted (nothing is kept long-term)."""
+    """Remove leftovers from before a restart — honouring each job's
+    own retention window (bot jobs are promised 24h; the old flat
+    1-hour sweep broke that promise on every restart). Queued/running
+    leftovers are left for the load-time heal in _all_jobs."""
     now = time.time()
     for d in list(JOBS_DIR.iterdir()):
         if not d.is_dir():
             continue
-        ref, url = None, None
+        meta = None
         try:
             meta = json.loads((d / "job.json").read_text(encoding="utf-8"))
-            ref = meta.get("finished_at") or meta.get("created_at")
-            url = meta.get("url")
+        except Exception:
+            meta = None
+        if meta and meta.get("status") in ("done", "error"):
+            ref = meta.get("finished_at") or meta.get("created_at") or 0
+            if now - float(ref) > _job_retention(meta):
+                shutil.rmtree(d, ignore_errors=True)
+                url = meta.get("url")
+                if url:
+                    _, pdir = _preview_dir(url)
+                    shutil.rmtree(pdir, ignore_errors=True)
+            continue
+        if meta:
+            continue
+        try:
+            if now - d.stat().st_mtime > 3600:
+                shutil.rmtree(d, ignore_errors=True)
         except Exception:
             pass
-        if ref and now - float(ref) > 3600:
-            shutil.rmtree(d, ignore_errors=True)
-            if url:
-                _, pdir = _preview_dir(url)
-                shutil.rmtree(pdir, ignore_errors=True)
     for d in list(PREVIEWS_DIR.iterdir()):
         try:
             if d.is_dir() and now - d.stat().st_mtime > 3600:

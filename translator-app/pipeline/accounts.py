@@ -81,6 +81,8 @@ def _db():
     cols = [r[1] for r in conn.execute("PRAGMA table_info(users)")]
     if "last_login" not in cols:
         conn.execute("ALTER TABLE users ADD COLUMN last_login REAL")
+    if "has_job" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN has_job INTEGER DEFAULT 0")
     return conn
 
 
@@ -240,16 +242,24 @@ def set_disabled(user_id, disabled):
 
 
 def adjust_credits(user_id, delta):
-    """Manual admin adjustment; the balance never goes negative."""
+    """Manual admin adjustment — ledger-backed like every other
+    credit move (the old version updated the balance with NO ledger
+    row and silently clamped at zero, so the audit trail had holes
+    exactly where manual moves happened). A move that would take the
+    balance below zero is refused whole (returns None)."""
+    return apply_credit(user_id, int(delta), "admin-adjust")
+
+
+def mark_has_job(user_id):
+    """Sticky flag: this account has submitted at least one job.
+    The dormant sweep trusts this (plus the caller's live job list),
+    not just job folders still on disk — those are deleted 15 min /
+    24 h after finishing, long before the 60-day sweep runs."""
+    if not user_id:
+        return
     with _LOCK, _db() as conn:
-        row = conn.execute("SELECT credits FROM users WHERE id = ?",
-                           (int(user_id),)).fetchone()
-        if row is None:
-            return None
-        new = max(0, row["credits"] + int(delta))
-        conn.execute("UPDATE users SET credits = ? WHERE id = ?",
-                     (new, int(user_id)))
-    return new
+        conn.execute("UPDATE users SET has_job = 1 WHERE id = ?",
+                     (int(user_id),))
 
 
 def set_password(user_id, password):
@@ -379,6 +389,7 @@ def dormant_users(days=60, exclude_ids=()):
     with _db() as conn:
         rows = conn.execute(
             "SELECT * FROM users WHERE role != 'admin' AND credits = 0 "
+            "AND COALESCE(has_job, 0) = 0 "
             "AND COALESCE(last_login, created_at) < ?",
             (cutoff,)).fetchall()
     return [_public(r) for r in rows

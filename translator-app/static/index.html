@@ -237,6 +237,13 @@
   <label>မြန်မာ အသံ (အသံထွက် အတွက်)</label>
   <select id="voice"></select>
 
+  <label>အသံ မြန်နှုန်း <span class="hint" id="voiceRateVal">ပုံမှန်</span></label>
+  <input type="range" id="voiceRate" min="-50" max="100" step="5" value="0"
+         oninput="$('voiceRateVal').textContent = (this.value > 0 ? '+' : '') + this.value + '%'">
+  <label>အသံ အနိမ့်အမြင့် <span class="hint" id="voicePitchVal">ပုံမှန်</span></label>
+  <input type="range" id="voicePitch" min="-50" max="50" step="5" value="0"
+         oninput="$('voicePitchVal').textContent = (this.value > 0 ? '+' : '') + this.value + 'Hz'">
+
   <label>အသံ အရှိန်နှုန်း အများဆုံး (သူ့အချိန်နဲ့ မမှီရင် ဘယ်လောက်ထိ မြန်ပေးမလဲ)</label>
   <select id="speedCap">
     <option value="1.0">1.0× — မမြန်ဘူး (မမှီရင် frame ရပ်မယ်)</option>
@@ -542,6 +549,8 @@ $("go").onclick = async () => {
   const res = await fetch("/api/jobs", {method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({url, mode: document.querySelector("input[name=mode]:checked").value,
                           voice: $("voice").value, font: $("font").value,
+                          voice_rate: Number($("voiceRate").value),
+                          voice_pitch: Number($("voicePitch").value),
                           speed_cap: Number($("speedCap").value),
                           subs: {size_pct: Number($("subSize").value),
                                  width_pct: Number($("subWidth").value),
@@ -679,9 +688,13 @@ const ACTIVE_ST = ["queued", "running", "waiting_review"];
 const ST_ICON = {queued: "⏳", running: "🔄", waiting_review: "✏️",
                  done: "✅", error: "❌", cancelled: "⏹"};
 let lastStatus = {};
+function escHtml(s) {
+  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
 function shortUrl(u) {
-  try { return new URL(u).hostname.replace("www.", "") + " …" + (u || "").slice(-6); }
-  catch (e) { return (u || "").slice(0, 40); }
+  try { return escHtml(new URL(u).hostname.replace("www.", "") + " …" + (u || "").slice(-6)); }
+  catch (e) { return escHtml((u || "").slice(0, 40)); }
 }
 function mmss(sec) {
   sec = Math.max(0, Math.round(sec));
@@ -1112,7 +1125,7 @@ window.tgPick = async function (id) {
       return;
     }
     box.innerHTML = `<select id="tgsel-${id}">` + rs.map(r =>
-      `<option value="${r.chat_id}">${r.username ? "@" + r.username : (r.name || r.chat_id)}</option>`).join("") +
+      `<option value="${escHtml(r.chat_id)}">${escHtml(r.username ? "@" + r.username : (r.name || r.chat_id))}</option>`).join("") +
       `</select> <button class="ghost" onclick="tgSend('${id}')">ပို့မယ်</button>`;
   } catch (e) { box.innerHTML = '<p class="err">စာရင်း ယူလို့ မရပါ</p>'; }
 };
@@ -1133,6 +1146,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 117</p>
+<p class="hint" id="buildTag" style="text-align:center">build 118</p>
 </body>
 </html>
