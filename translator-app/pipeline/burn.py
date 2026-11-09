@@ -118,7 +118,11 @@ def _est_lines(text, family, fs, avail_w):
         if not path.exists() or not plain:
             return None
         font = ImageFont.truetype(str(path), max(8, int(round(fs))))
-        w = font.getlength(plain)
+        # PIL overestimates Myanmar advance widths by ~1.4x versus
+        # libass/HarfBuzz shaping (combining marks) — measured on a
+        # real render (626 vs ~450 px). Correct for it; the wrap
+        # estimates below use the same factor.
+        w = font.getlength(plain) * 0.75
         return int(w // max(1.0, avail_w * 0.94)) + 1
     except Exception:
         return None
@@ -164,7 +168,7 @@ def _wrap_lines(text, family, fs, avail_w):
             cur = words[0]
             for w in words[1:]:
                 trial = cur + " " + w
-                if font.getlength(trial) <= avail_w * 0.96:
+                if font.getlength(trial) * 0.75 <= avail_w * 0.96:
                     cur = trial
                 else:
                     out_lines.append(cur)
@@ -185,7 +189,7 @@ def _fit_box_wrapped(text, family, cand, rect_w, rect_h, min_fs):
     fs = float(cand)
     while fs > min_fs:
         _t, n = _wrap_lines(text, family, fs, rect_w)
-        if n <= 3 and n * fs * 1.35 <= rect_h * 1.3:
+        if n <= 3 and n * fs * 1.35 <= max(rect_h * 1.3, fs * 3.0):
             return fs
         fs *= 0.92
     return min_fs
@@ -275,16 +279,26 @@ def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None):
     box_fs = None
     if box:
         rx, ry, rw, rh = box
-        cand = min(font_size, rh * 0.55)
+        # Recap-style prominence (owner's reference, 2026-11-09):
+        # the in-box text should read like a proper bottom subtitle
+        # — big and bold — not shrink to whatever a short blur box
+        # happens to allow. The box still CENTRES the text; the
+        # size targets the normal subtitle prominence and only
+        # shrinks toward the floor when lines are long.
+        cand = min(font_size, max(rh * 0.55, height * 0.040))
         # ONE fixed size for the whole video (owner's rule): the
-        # largest size at which EVERY line fits inside the box, so
-        # the subtitle size never jumps from line to line — but never
-        # under the readability floor (long lines wrap to 3 lines
-        # instead of shrinking the whole video's text to nothing).
-        min_fs = max(18.0, width * 0.028)
-        box_fs = min((_fit_box_wrapped(b, family, cand, rw, rh, min_fs)
-                      for _s, _e, b in events), default=cand)
-        box_fs = max(box_fs, min_fs)
+        # largest size at which EVERY line fits, so the subtitle
+        # size never jumps from line to line — but never under the
+        # readability floor (long lines wrap to 3 lines instead of
+        # shrinking the whole video's text to nothing).
+        min_fs = max(20.0, height * 0.030)
+        # The fixed size serves the TYPICAL cue: size it so ~80% of
+        # cues fit at that size; the longest few wrap to extra lines
+        # at the same size instead of shrinking everyone's text.
+        fits = sorted(_fit_box_wrapped(b, family, cand, rw, rh, min_fs)
+                      for _s, _e, b in events)
+        box_fs = fits[int(len(fits) * 0.2)] if fits else cand
+        box_fs = max(min(box_fs, cand), min_fs)
     for start, end, body in events:
         ev_ml, ev_mr = 0, 0
         if box:
