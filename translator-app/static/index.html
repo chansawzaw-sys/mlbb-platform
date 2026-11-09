@@ -92,7 +92,7 @@
   <h1>🎬 ဗီဒီယို မြန်မာဘာသာပြန် <span style="float:right"><button class="ghost" id="keyToggle" title="Gemini key" style="width:auto;padding:4px 12px">🔑</button> <button class="ghost" id="tgToggle" title="Telegram bot setting" style="width:auto;padding:4px 12px">🤖</button></span></h1>
   <p class="sub">ဗီဒီယိုလင့်ခ် ထည့်ရုံနဲ့ — စာသားထုတ် → မြန်မာပြန် → စာတန်းထိုး (ရုပ်ရှင်ပုံစံ) / အသံထွက် အစအဆုံးလုပ်ပေးမယ်။ အသံကို အချိန်ကိုက်အောင် အမြန်ညှိ၊ မလုံလောက်ရင် ဖရိမ်ရပ်ပြီး ဆက်ပြောပေးမယ်။</p>
 
-  <div class="card show" id="keyCard">
+  <div class="card" id="keyCard">
     <h3 style="margin-top:0">🔑 Gemini key (ဘာသာပြန် အတွက်)</h3>
     <p class="hint">Key ရှိရင် ဘာသာပြန် <b>မြန်ပြီး အရည်အသွေး ကောင်း</b>တယ်။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="keyState">…</span></p>
     <input type="password" id="keyInput" placeholder="Gemini key (AQ. / AIza နဲ့ စတယ်) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
@@ -102,7 +102,7 @@
     </div>
   </div>
 
-  <div class="card show" id="tgCard">
+  <div class="card" id="tgCard">
     <h3 style="margin-top:0">🤖 Telegram bot (ပြီးရင် တန်းပို့ရန်)</h3>
     <p class="hint">BotFather မှာ bot တစ်ခု လုပ်ပြီး token ကို ဒီမှာ ထည့်ပါ (<b>chat ထဲ မပို့ပါနဲ့</b>)။ ပို့ချင်တဲ့သူက အဲဒီ bot ကို Telegram မှာ <b>Start တစ်ခါ နှိပ်ထား</b>ရမယ် — ပြီးရင် အလုပ်များ စာရင်းကနေ 📨 TG ခလုတ်နဲ့ တန်းပို့နိုင်ပြီ။ အခြေအနေ: <span id="tgState">…</span></p>
     <input type="password" id="tgInput" placeholder="Bot token (123456789:AA…) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
@@ -800,7 +800,16 @@ setInterval(loadJobs, 15000);
 /* ---------------- Gemini key settings ---------------- */
 async function loadKeyState() {
   try {
-    const d = await (await fetch("/api/settings/gemini-key")).json();
+    const r = await fetch("/api/settings/gemini-key");
+    const d = await r.json();
+    // Owner-only card: a non-admin's 403 payload has no "configured"
+    // field — treating that as "not configured" used to RE-SHOW the
+    // card to customers (owner report 2026-11-10). On any non-OK
+    // response the card stays hidden, full stop.
+    if (!r.ok || !("configured" in d)) {
+      $("keyCard").classList.remove("show");
+      return;
+    }
     $("keyState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
     $("keyToggle").textContent = d.configured ? "🔑 ✅" : "🔑";
     // Once a key is saved the card tucks itself away; the small 🔑
@@ -808,7 +817,10 @@ async function loadKeyState() {
     $("keyCard").classList.toggle("show", !d.configured);
   } catch (e) { $("keyState").textContent = "?"; }
 }
-$("keyToggle").onclick = () => $("keyCard").classList.toggle("show");
+$("keyToggle").onclick = () => {
+  if (!ME || ME.role !== "admin") return;
+  $("keyCard").classList.toggle("show");
+};
 $("keySave").onclick = async () => {
   const key = $("keyInput").value.trim();
   if (!key) { alert("key အရင် ထည့်ပါ"); return; }
@@ -829,7 +841,13 @@ loadKeyState();
 /* ---------------- Telegram delivery ---------------- */
 async function loadTgState() {
   try {
-    const d = await (await fetch("/api/settings/telegram")).json();
+    const r = await fetch("/api/settings/telegram");
+    const d = await r.json();
+    if (!r.ok || !("configured" in d)) {
+      // Owner-only card (same 403 trap as the key card).
+      $("tgCard").classList.remove("show");
+      return;
+    }
     $("tgState").textContent = d.configured
       ? `✅ ချိတ်ပြီး (@${d.bot || "?"}) — Start နှိပ်ထားသူ ${d.recipients} ယောက်`
       : "❌ မချိတ်ရသေး";
@@ -847,7 +865,10 @@ async function loadTgState() {
     $("tgCard").classList.toggle("show", !d.configured);
   } catch (e) { $("tgState").textContent = "?"; }
 }
-$("tgToggle").onclick = () => $("tgCard").classList.toggle("show");
+$("tgToggle").onclick = () => {
+  if (!ME || ME.role !== "admin") return;
+  $("tgCard").classList.toggle("show");
+};
 $("tgSave").onclick = async () => {
   const tok = $("tgInput").value.trim();
   if (!tok) { alert("token အရင် ထည့်ပါ"); return; }
@@ -1146,6 +1167,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 129</p>
+<p class="hint" id="buildTag" style="text-align:center">build 130</p>
 </body>
 </html>
