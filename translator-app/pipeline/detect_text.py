@@ -177,7 +177,31 @@ def _frame_bands(video, t, td):
     base = float(np.median(prof))
     if base <= 0:
         return []
-    runs = _merge(_runs(prof > base * 1.9, max(2, int(H * 0.025))),
+    # Letterboxed uploads (a 16:9 picture floating in blurred fill —
+    # the common re-upload shape) broke detection completely: the
+    # fill drags the median down, so the WHOLE picture clears 1.9x
+    # base as one 34%-tall run, the caption spike welds into it, and
+    # the height filter kills everything (owner's drama, 2026-11-10:
+    # zero pieces). Fix: find the active picture region from a broad
+    # profile and re-base INSIDE it — within the picture the caption
+    # spikes above the scene median exactly like the full-frame case
+    # this detector was proven on. Full-frame videos are unchanged
+    # (their picture region is ~the whole frame).
+    broad = np.convolve(prof, np.ones(max(2, int(H * 0.10)))
+                        / max(2, int(H * 0.10)), mode="same")
+    pic_runs = _runs(broad > base * 1.35, max(2, int(H * 0.05)))
+    y_lo, y_hi = 0, H
+    if pic_runs:
+        pa, pb = max(pic_runs, key=lambda r: r[1] - r[0])
+        if pb - pa < 0.92 * H:
+            y_lo, y_hi = pa, pb
+            base = float(np.median(prof[y_lo:y_hi]))
+            if base <= 0:
+                return []
+    hot = (prof > base * 1.9)
+    hot[:y_lo] = False
+    hot[y_hi:] = False
+    runs = _merge(_runs(hot, max(2, int(H * 0.025))),
                   int(H * 0.03))
     # Stroke map: pixels far above the frame's typical detail level.
     # A column "carries text" when the band holds >=2 stroke pixels in
@@ -287,7 +311,11 @@ def detect_text_pieces(video):
         t1 = p["last_t"]
         span_s = t1 - p["t0"] + step
         presence = len(bands) * step / span_s
-        if span_s < 1.0 or presence < 0.45:
+        # A piece with >=4 separate caption sightings is real even
+        # when its stretch is dialogue-light (presence < 0.45) —
+        # letterboxed dramas hit exactly that in quiet scenes and
+        # lost their later caption coverage entirely (2026-11-10).
+        if span_s < 1.0 or (presence < 0.45 and len(bands) < 4):
             continue
         formed.append({
             "y0": int(np.median([b["y0"] for b in bands])),
@@ -298,8 +326,53 @@ def detect_text_pieces(video):
             "count": len(bands)})
     if not formed:
         return []
+    # Merge same-row pieces separated by short caption-less gaps
+    # (scene changes, quiet stretches): the blur band is the same
+    # physical strip, and leaving gaps means captions there go
+    # unblurred. y/x become count-weighted means of the members.
+    formed.sort(key=lambda f: f["t0"])
+    merged = []
+    for f in formed:
+        if merged:
+            a = merged[-1]
+            inter = _overlap((a["y0"], a["y1"]), (f["y0"], f["y1"]))
+            if inter >= 0.5 * min(a["y1"] - a["y0"], f["y1"] - f["y0"]) \
+                    and f["t0"] - a["t1"] <= 15.0:
+                n0, n1 = a["count"], f["count"]
+                for k in ("y0", "y1", "x0", "x1"):
+                    a[k] = (a[k] * n0 + f[k] * n1) // (n0 + n1)
+                a["t1"] = max(a["t1"], f["t1"])
+                a["count"] = n0 + n1
+                continue
+        merged.append(dict(f))
+    formed = merged
     strongest = max(f["count"] for f in formed)
     formed = [f for f in formed if f["count"] >= max(3, 0.25 * strongest)]
+    # Dominant-row fill: captions in these dramas live on ONE fixed
+    # strip, but quiet/dark stretches fail the shape tests and leave
+    # coverage gaps where captions then stay unblurred (the owner's
+    # recurring complaint). If one row was proven across many
+    # sightings, extend THAT row over uncovered windows — blurring
+    # an empty strip for a few seconds is harmless; missing a
+    # caption is not.
+    if formed:
+        dom = max(formed, key=lambda f: f["count"])
+        cover = sorted(
+            (f["t0"], f["t1"]) for f in formed
+            if _overlap((f["y0"], f["y1"]), (dom["y0"], dom["y1"]))
+            >= 0.5 * min(f["y1"] - f["y0"], dom["y1"] - dom["y0"]))
+        gaps, cur = [], 0.0
+        for a, b in cover:
+            if a - cur > step:
+                gaps.append((cur, a))
+            cur = max(cur, b)
+        if dur - cur > step:
+            gaps.append((cur, dur))
+        for a, b in gaps:
+            formed.append({"y0": dom["y0"], "y1": dom["y1"],
+                           "x0": dom["x0"], "x1": dom["x1"],
+                           "t0": a, "t1": b, "count": dom["count"]})
+        formed.sort(key=lambda f: f["t0"])
     while len(formed) > 8:
         best_i, best_d = 0, None
         for i in range(len(formed) - 1):
