@@ -228,6 +228,30 @@ def _fill_missing(out):
     return out
 
 
+def _seg_untranslated(seg):
+    """True when a segment effectively stayed in the source
+    language: the chain's last-resort fallback fired, or the
+    'translation' is byte-identical to a non-Myanmar source.
+    (Owner report 2026-11-09: a finished job whose TXT export was
+    entirely Chinese — every provider had failed and the source
+    text silently stood in as the 'translation'.)"""
+    src = (seg.get("text") or "").strip()
+    my = (seg.get("text_my") or "").strip()
+    if not src or not my:
+        return False
+    if any("\u1000" <= ch <= "\u109f" for ch in src):
+        return False  # source already Myanmar: identical is fine
+    if (seg.get("provider") or "").startswith("fallback-source"):
+        return True
+    return my == src and len(src) > 3
+
+
+def translation_stats(out):
+    total = sum(1 for s in out if (s.get("text") or "").strip())
+    un = sum(1 for s in out if _seg_untranslated(s))
+    return {"total": total, "untranslated": un}
+
+
 def translate_segments(workdir, style="subs"):
     ensure_system_ca()
     workdir = Path(workdir)

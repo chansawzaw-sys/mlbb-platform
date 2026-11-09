@@ -50,7 +50,16 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs"):
     mark("transcribe", "done")
 
     mark("translate", "running")
-    translate_segments.translate_segments(workdir, style=style)
+    _segs = translate_segments.translate_segments(workdir, style=style)
+    _st = translate_segments.translation_stats(_segs or [])
+    if _st["total"] >= 4 and _st["untranslated"] * 2 > _st["total"]:
+        # Every translation route failed and the source text stood
+        # in as a fake 'translation' (owner got a finished video
+        # subtitled in Chinese). Fail LOUDLY instead: the job
+        # errors, no credit is charged, the customer retries later.
+        raise RuntimeError(
+            "ဘာသာပြန် မရပါ — ဘာသာပြန် service တွေ ခဏ အလုပ်မလုပ်ပါ။ "
+            "ခဏနေမှ ပြန်စမ်းပါ (credit လုံးဝ မဖြတ်ပါ)")
     mark("translate", "done")
     return src
 

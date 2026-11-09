@@ -1646,6 +1646,61 @@ def auth_logout():
     return resp
 
 
+_PROBE = {"running": False}
+_PROBE_LOCK = threading.Lock()
+
+
+def _run_translate_probe():
+    """Live translation self-test (one short Chinese sentence):
+    can the free chain produce Myanmar right now, and can Gemini?
+    Result cached to .translate_probe.json for /api/auth/me."""
+    try:
+        from pipeline import gemini_translate, translate_segments
+        res = {"ts": time.time(), "gemini_ok": None, "free_ok": None,
+               "free_provider": None}
+        sample = "你好，这是一个测试。"
+        try:
+            out, prov = translate_segments.translate_one(sample)
+            res["free_ok"] = bool(out) and out.strip() != sample \
+                and any("\u1000" <= c <= "\u109f" for c in out)
+            res["free_provider"] = prov
+        except Exception:
+            res["free_ok"] = False
+        try:
+            if gemini_translate.key_configured():
+                by = gemini_translate.translate_all(
+                    [{"start": 0.0, "end": 1.0, "text": sample}])
+                out = by.get(0) or ""
+                res["gemini_ok"] = bool(out) and \
+                    any("\u1000" <= c <= "\u109f" for c in out)
+            else:
+                res["gemini_ok"] = False
+        except Exception:
+            res["gemini_ok"] = False
+        (ROOT / ".translate_probe.json").write_text(
+            json.dumps(res), encoding="utf-8")
+    except Exception:
+        pass
+    finally:
+        _PROBE["running"] = False
+
+
+def _translate_probe_maybe():
+    pf = ROOT / ".translate_probe.json"
+    data = None
+    try:
+        data = json.loads(pf.read_text(encoding="utf-8"))
+    except Exception:
+        data = None
+    if not data or time.time() - float(data.get("ts") or 0) > 1800:
+        with _PROBE_LOCK:
+            if not _PROBE["running"]:
+                _PROBE["running"] = True
+                threading.Thread(target=_run_translate_probe,
+                                 daemon=True).start()
+    return data
+
+
 @app.get("/api/auth/me")
 def auth_me():
     import sqlite3
@@ -1665,10 +1720,23 @@ def auth_me():
                  for fam, fn in _burn._FONT_FILES.items()}
     except Exception:
         fonts = {}
+    i18n = {"probe": _translate_probe_maybe()}
+    try:
+        from pipeline import gemini_translate as _gt
+        i18n["gemini_configured"] = bool(_gt.key_configured())
+    except Exception:
+        i18n["gemini_configured"] = None
+    try:
+        i18n["last_provider"] = (
+            (ROOT / ".translate_good").read_text(
+                encoding="utf-8").strip() or None)
+    except Exception:
+        i18n["last_provider"] = None
     return jsonify({"user": _current_user(),
                     "admin_claim_open": claim_open,
                     "enforced": ACCOUNTS_ENFORCED,
-                    "fonts": fonts})
+                    "fonts": fonts,
+                    "i18n": i18n})
 
 
 @app.post("/api/auth/change-password")
