@@ -181,18 +181,20 @@ def _wrap_lines(text, family, fs, avail_w):
         return text, 1
 
 
-def _fit_box_wrapped(text, family, cand, rect_w, rect_h, min_fs):
-    """Largest size <= cand at which the PIL-wrapped text fits the
-    box in at most 3 lines, tolerating up to ~30% height spill
-    (centred, so it reads as a slightly taller subtitle block over
-    the blur — far better than shrinking to invisibility)."""
+def _fit_box_strict(text, family, cand, rect_w, rect_h, min_fs):
+    """Largest size <= cand at which the PIL-wrapped text fits
+    STRICTLY inside the box: the full block height (lines x leading)
+    stays within the box height and the text spans the full box
+    width (owner's rule, 2026-11-09: use the blurred band's whole
+    width, left edge to right edge, but never cross its top or
+    bottom). Returns None when no size >= min_fs fits."""
     fs = float(cand)
-    while fs > min_fs:
+    while fs >= min_fs:
         _t, n = _wrap_lines(text, family, fs, rect_w)
-        if n <= 3 and n * fs * 1.35 <= max(rect_h * 1.3, fs * 3.0):
+        if n <= 5 and n * fs * 1.35 <= rect_h * 0.98:
             return fs
-        fs *= 0.92
-    return min_fs
+        fs *= 0.94
+    return None
 
 
 def _fit_box(text, family, base_fs, rect_w, rect_h,
@@ -279,26 +281,22 @@ def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None):
     box_fs = None
     if box:
         rx, ry, rw, rh = box
-        # Recap-style prominence (owner's reference, 2026-11-09):
-        # the in-box text should read like a proper bottom subtitle
-        # — big and bold — not shrink to whatever a short blur box
-        # happens to allow. The box still CENTRES the text; the
-        # size targets the normal subtitle prominence and only
-        # shrinks toward the floor when lines are long.
-        cand = min(font_size, max(rh * 0.55, height * 0.040))
-        # ONE fixed size for the whole video (owner's rule): the
-        # largest size at which EVERY line fits, so the subtitle
-        # size never jumps from line to line — but never under the
-        # readability floor (long lines wrap to 3 lines instead of
-        # shrinking the whole video's text to nothing).
-        min_fs = max(20.0, height * 0.030)
-        # The fixed size serves the TYPICAL cue: size it so ~80% of
-        # cues fit at that size; the longest few wrap to extra lines
-        # at the same size instead of shrinking everyone's text.
-        fits = sorted(_fit_box_wrapped(b, family, cand, rw, rh, min_fs)
-                      for _s, _e, b in events)
-        box_fs = fits[int(len(fits) * 0.2)] if fits else cand
-        box_fs = max(min(box_fs, cand), min_fs)
+        # Owner's placement rule (2026-11-09): the Myanmar text sits
+        # ON the blurred band, spanning its FULL width (left edge to
+        # right edge), and the block must NOT cross the band's top
+        # or bottom. So the size is governed by the box itself: ONE
+        # fixed size for the whole video = the largest size at which
+        # EVERY cue, wrapped to the full box width, fits strictly
+        # inside the box height. (This supersedes the recap-style
+        # spill of builds 119-120.) Only a cue that cannot fit even
+        # at the floor size wraps past the box — readable beats
+        # invisible for that rare pathological line.
+        cand = min(font_size, rh * 0.62)
+        min_fs = max(14.0, height * 0.020)
+        fits = [_fit_box_strict(b, family, cand, rw, rh, min_fs)
+                for _s, _e, b in events]
+        ok = [f for f in fits if f is not None]
+        box_fs = min(ok) if len(ok) == len(fits) and ok else min_fs
     for start, end, body in events:
         ev_ml, ev_mr = 0, 0
         if box:
