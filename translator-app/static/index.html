@@ -89,7 +89,7 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>🎬 ဗီဒီယို မြန်မာဘာသာပြန် <span style="float:right"><button class="ghost" id="keyToggle" title="Gemini key" style="width:auto;padding:4px 12px">🔑</button> <button class="ghost" id="tgToggle" title="Telegram bot setting" style="width:auto;padding:4px 12px">🤖</button></span></h1>
+  <h1>🎬 ဗီဒီယို မြန်မာဘာသာပြန် <span style="float:right"><button class="ghost" id="keyToggle" title="Gemini key" style="width:auto;padding:4px 12px">🔑</button> <button class="ghost" id="oaToggle" title="OpenAI key" style="width:auto;padding:4px 12px">🧠</button> <button class="ghost" id="tgToggle" title="Telegram bot setting" style="width:auto;padding:4px 12px">🤖</button></span></h1>
   <p class="sub">ဗီဒီယိုလင့်ခ် ထည့်ရုံနဲ့ — စာသားထုတ် → မြန်မာပြန် → စာတန်းထိုး (ရုပ်ရှင်ပုံစံ) / အသံထွက် အစအဆုံးလုပ်ပေးမယ်။ အသံကို အချိန်ကိုက်အောင် အမြန်ညှိ၊ အသံ ရှည်ရင် ပုံကို နှေးပြီး ဆက်ပြောပေးမယ်။</p>
 
   <div class="card" id="keyCard">
@@ -99,6 +99,16 @@
     <div class="row">
       <button class="ghost" id="keySave">သိမ်းမယ်</button>
       <button class="ghost" id="keyDel">ဖျက်မယ်</button>
+    </div>
+  </div>
+
+  <div class="card" id="oaCard">
+    <h3 style="margin-top:0">🧠 OpenAI key (ဘာသာပြန် engine — အဓိက)</h3>
+    <p class="hint">OpenAI credit နဲ့ ဘာသာပြန်ရင် <b>စိတ်ချရပြီး ဈေး အလွန် သက်သာ</b>တယ် (video တစ်ခု ~$0.002)။ Key ရှိရင် ဒီ engine ကို အရင် သုံးတယ်။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="oaState">…</span></p>
+    <input type="password" id="oaInput" placeholder="OpenAI key (sk- နဲ့ စတယ်) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+    <div class="row">
+      <button class="ghost" id="oaSave">သိမ်းမယ်</button>
+      <button class="ghost" id="oaDel">ဖျက်မယ်</button>
     </div>
   </div>
 
@@ -838,6 +848,43 @@ $("keyDel").onclick = async () => {
 };
 loadKeyState();
 
+/* ---------------- OpenAI key settings ---------------- */
+async function loadOaState() {
+  try {
+    const r = await fetch("/api/settings/openai-key");
+    const d = await r.json();
+    // Owner-only card, same rule as the Gemini card: any non-OK or
+    // field-less response (a customer's 403) keeps it hidden.
+    if (!r.ok || !("configured" in d)) {
+      $("oaCard").classList.remove("show");
+      return;
+    }
+    $("oaState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
+    $("oaToggle").textContent = d.configured ? "🧠 ✅" : "🧠";
+    $("oaCard").classList.toggle("show", !d.configured);
+  } catch (e) { $("oaState").textContent = "?"; }
+}
+$("oaToggle").onclick = () => {
+  if (!ME || ME.role !== "admin") return;
+  $("oaCard").classList.toggle("show");
+};
+$("oaSave").onclick = async () => {
+  const key = $("oaInput").value.trim();
+  if (!key) { alert("key အရင် ထည့်ပါ"); return; }
+  const res = await fetch("/api/settings/openai-key", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({key})});
+  const d = await res.json();
+  if (!res.ok) { alert(d.error || "သိမ်းလို့ မရပါ"); return; }
+  $("oaInput").value = "";
+  loadOaState();
+  alert("သိမ်းပြီးပြီ — နောက် job တွေမှာ OpenAI နဲ့ ပြန်ပေးမယ်");
+};
+$("oaDel").onclick = async () => {
+  await fetch("/api/settings/openai-key", {method: "DELETE"});
+  loadOaState();
+};
+loadOaState();
+
 /* ---------------- Telegram delivery ---------------- */
 async function loadTgState() {
   try {
@@ -960,8 +1007,10 @@ async function loadMe() {
     if (ME && ME.role !== "admin") {
       // Customers never see the owner's key / bot settings cards.
       $("keyCard").classList.remove("show");
+      $("oaCard").classList.remove("show");
       $("tgCard").classList.remove("show");
       $("keyToggle").style.display = "none";
+      $("oaToggle").style.display = "none";
       $("tgToggle").style.display = "none";
     }
     if (ME) loadPayQr();
@@ -1167,6 +1216,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 133</p>
+<p class="hint" id="buildTag" style="text-align:center">build 134</p>
 </body>
 </html>

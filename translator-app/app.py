@@ -1496,6 +1496,47 @@ def gemini_key_delete():
     return jsonify({"ok": True, "configured": False})
 
 
+# ---------- OpenAI key (server-side only, same rules as Gemini) ----------
+
+@app.get("/api/settings/openai-key")
+def openai_key_status():
+    from pipeline import openai_translate
+    return jsonify({"configured": openai_translate.key_configured()})
+
+
+@app.post("/api/settings/openai-key")
+def openai_key_save():
+    data = request.get_json(force=True) or {}
+    key = (data.get("key") or "").strip()
+    ok_format = key.startswith("sk-") and 20 <= len(key) <= 200 \
+        and all(ch.isalnum() or ch in "._-" for ch in key)
+    if not ok_format:
+        return jsonify({"error": "key မမှန်ပါ — OpenAI key (sk- နဲ့ စတာ) ဖြစ်ရပါမယ်"}), 400
+    env_path = ROOT / ".env"
+    lines = []
+    if env_path.exists():
+        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
+                 if not ln.startswith("OPENAI_API_KEY=")]
+    lines.append(f"OPENAI_API_KEY={key}")
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        os.chmod(env_path, 0o600)
+    except Exception:
+        pass
+    return jsonify({"ok": True, "configured": True})
+
+
+@app.delete("/api/settings/openai-key")
+def openai_key_delete():
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
+                 if not ln.startswith("OPENAI_API_KEY=")]
+        env_path.write_text("\n".join(lines) + ("\n" if lines else ""),
+                            encoding="utf-8")
+    return jsonify({"ok": True, "configured": False})
+
+
 # ---------- Telegram delivery (commercial direction) ----------
 # Finished videos can be sent straight to Telegram users from the
 # app. Telegram's rule: a bot may only message people who messaged
@@ -1722,6 +1763,19 @@ def _run_translate_probe():
         except Exception as e:
             res["gemini_ok"] = False
             res["gemini_err"] = str(e)[:200]
+        try:
+            from pipeline import openai_translate
+            if openai_translate.key_configured():
+                by = openai_translate.translate_all(
+                    [{"start": 0.0, "end": 1.0, "text": sample}])
+                out = by.get(0) or ""
+                res["openai_ok"] = bool(out) and \
+                    any("\u1000" <= c <= "\u109f" for c in out)
+            else:
+                res["openai_ok"] = False
+        except Exception as e:
+            res["openai_ok"] = False
+            res["openai_err"] = str(e)[:200]
         (ROOT / ".translate_probe.json").write_text(
             json.dumps(res), encoding="utf-8")
     except Exception:
@@ -1775,6 +1829,11 @@ def auth_me():
         i18n["gemini_configured"] = bool(_gt.key_configured())
     except Exception:
         i18n["gemini_configured"] = None
+    try:
+        from pipeline import openai_translate as _oa
+        i18n["openai_configured"] = bool(_oa.key_configured())
+    except Exception:
+        i18n["openai_configured"] = None
     try:
         i18n["last_provider"] = (
             (ROOT / ".translate_good").read_text(

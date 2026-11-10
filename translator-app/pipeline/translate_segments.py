@@ -386,7 +386,24 @@ def translate_segments(workdir, style="subs"):
     workdir = Path(workdir)
     segs = load_segments(workdir / "segments_en.json")
     report = {"batch": {}, "chain": {}, "fill": {}}
-    # 0. Gemini batch — first choice when a key is configured.
+    # 0. OpenAI batch — the PRIMARY engine since build 134 (owner
+    # holds prepaid OpenAI credit). Any failure falls through to
+    # Gemini, with the error kept in the report for diagnosis.
+    if segs:
+        try:
+            from . import openai_translate
+            if openai_translate.key_configured():
+                by_idx = openai_translate.translate_all(segs, style=style)
+                out = [{**seg, "text_my": by_idx[i], "provider": "openai"}
+                       for i, seg in enumerate(segs)]
+                out = _fill_missing(out, report)
+                _write_report(workdir, report)
+                save_segments(out, workdir / "segments_my.json")
+                write_srt(out, workdir / "subs_my.srt")
+                return out
+        except Exception as e:
+            report["openai_err"] = str(e)[:120]
+    # 0b. Gemini batch — when a key is configured.
     if segs:
         try:
             from . import gemini_translate
