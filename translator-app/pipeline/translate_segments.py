@@ -3,7 +3,9 @@
 Provider chain:
   0. Gemini Flash (only when GEMINI_API_KEY is configured server-side —
      see pipeline/gemini_translate.py): ONE request for ALL segments,
-     natural spoken Burmese. Any failure -> fall through to the free chain.
+     natural spoken Burmese. Any failure -> OpenAI (build 134 module,
+     when configured), then the free chain below. (Order set by the
+     owner 2026-11-11, build 136: Gemini -> OpenAI -> free.)
   1. deep-translator GoogleTranslator (unofficial Google Translate endpoint)
   2. `translators` library -> Microsoft Bing Translator web endpoint
   3. keep the source text (never drop a cue)
@@ -386,9 +388,25 @@ def translate_segments(workdir, style="subs"):
     workdir = Path(workdir)
     segs = load_segments(workdir / "segments_en.json")
     report = {"batch": {}, "chain": {}, "fill": {}}
-    # 0. OpenAI batch — the PRIMARY engine since build 134 (owner
-    # holds prepaid OpenAI credit). Any failure falls through to
-    # Gemini, with the error kept in the report for diagnosis.
+    # 0. Gemini batch — the PRIMARY engine since build 136 (owner's
+    # order 2026-11-11: fresh Gemini key first, OpenAI second, the
+    # free chain last). Any failure falls through to OpenAI, with the
+    # error kept in the report for diagnosis.
+    if segs:
+        try:
+            from . import gemini_translate
+            if gemini_translate.key_configured():
+                by_idx = gemini_translate.translate_all(segs, style=style)
+                out = [{**seg, "text_my": by_idx[i], "provider": "gemini"}
+                       for i, seg in enumerate(segs)]
+                out = _fill_missing(out, report)
+                _write_report(workdir, report)
+                save_segments(out, workdir / "segments_my.json")
+                write_srt(out, workdir / "subs_my.srt")
+                return out
+        except Exception as e:
+            report["gemini_err"] = str(e)[:120]
+    # 0b. OpenAI batch — second engine, when a key is configured.
     if segs:
         try:
             from . import openai_translate
@@ -403,21 +421,6 @@ def translate_segments(workdir, style="subs"):
                 return out
         except Exception as e:
             report["openai_err"] = str(e)[:120]
-    # 0b. Gemini batch — when a key is configured.
-    if segs:
-        try:
-            from . import gemini_translate
-            if gemini_translate.key_configured():
-                by_idx = gemini_translate.translate_all(segs, style=style)
-                out = [{**seg, "text_my": by_idx[i], "provider": "gemini"}
-                       for i, seg in enumerate(segs)]
-                out = _fill_missing(out, report)
-                _write_report(workdir, report)
-                save_segments(out, workdir / "segments_my.json")
-                write_srt(out, workdir / "subs_my.srt")
-                return out
-        except Exception:
-            pass  # any Gemini failure -> free chain below, as designed
     texts = [(seg.get("text") or "").strip() for seg in segs]
     results = [None] * len(segs)
     # 1. Batched free endpoints — one request per chunk, Google first,
