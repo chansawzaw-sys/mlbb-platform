@@ -16,6 +16,7 @@ returned correct Burmese. On a normal residential IP, provider 1 usually works.
 CLI: python -m pipeline.translate_segments <workdir>
 Reads segments_en.json, writes segments_my.json + subs_my.srt (original timings).
 """
+import random
 import re
 import sys
 import time
@@ -180,6 +181,11 @@ def _is_throttle(err):
         or "quota" in s or "403" in s
 
 
+_PACE_S = 1.1        # min seconds between two requests to one provider
+_PACE_JITTER = 0.4   # plus a small random spread, so the requests do
+                     # not march in a perfectly regular robot rhythm
+
+
 class _Chain:
     """Per-segment fallback chain with a memory: a provider that works
     is tried first; one that fails twice is skipped for the rest of
@@ -191,7 +197,15 @@ class _Chain:
     while the endpoint is throttling the server IP, which is how a
     whole job's chain collapsed in ~2 minutes on 2026-11-09 while the
     single-sentence probe still passed. Every call's outcome is also
-    recorded in self.report for the job's translate_report.json."""
+    recorded in self.report for the job's translate_report.json.
+
+    D2 (2026-11-10): requests to the same provider are PACED — at
+    least _PACE_S seconds apart, plus jitter. The 21:19 job's report
+    showed the whole Google family hard-throttled from the server IP
+    while Bing carried 24 segments and then the burst tripped its
+    limit too; slow, steady requests keep the one working carrier
+    alive for the whole job instead of burning it in the first
+    minute."""
 
     def __init__(self):
         self.good = _load_good()
@@ -199,6 +213,18 @@ class _Chain:
         self.cooldown = {}
         self.report = {}
         self._slept_at = 0.0
+        self._last = {}
+        self.paced = 0.0
+
+    def _pace(self, name):
+        now = time.time()
+        last = self._last.get(name)
+        if last is not None:
+            wait = _PACE_S - (now - last) + random.uniform(0, _PACE_JITTER)
+            if wait > 0:
+                time.sleep(wait)
+                self.paced += wait
+        self._last[name] = time.time()
 
     def _note(self, name, ok, err=None):
         r = self.report.setdefault(name, {"ok": 0, "fail": 0, "last": ""})
@@ -218,6 +244,7 @@ class _Chain:
         for name, fn in ready + cooling:
             if self.fails.get(name, 0) >= 2:
                 continue
+            self._pace(name)
             attempts = 1 if self.good else 2
             for attempt in range(attempts):
                 try:
@@ -274,7 +301,14 @@ def _fill_missing(out, report=None):
     D1 (2026-11-10): ECHOED segments (batch returned the source text
     unchanged) are rescued the same way — a minority of echoes used
     to ship silently as foreign-language subtitles because only the
-    empty case was retried."""
+    empty case was retried.
+
+    D2 (2026-11-10): fallback-source segments (the main chain gave
+    up on them) are rescued too — earlier they were skipped here,
+    which made every fill pass blind to exactly the segments a
+    throttled job produces most. A fresh chain has fresh fail
+    counters, and by fill time (let alone the second wind's) the
+    provider may well have recovered."""
     chain = None
     for seg in out:
         if not (seg.get("text") or "").strip():
@@ -282,7 +316,8 @@ def _fill_missing(out, report=None):
         empty = not (seg.get("text_my") or "").strip()
         echoed = not empty and _seg_untranslated(seg) \
             and not (seg.get("provider") or "").startswith("fallback-source")
-        if empty or echoed:
+        failed = (seg.get("provider") or "").startswith("fallback-source")
+        if empty or echoed or failed:
             if chain is None:
                 chain = _Chain()
             new_my, new_prov = chain.one(seg["text"].strip())
@@ -294,6 +329,7 @@ def _fill_missing(out, report=None):
                 seg["text_my"], seg["provider"] = new_my, new_prov
     if report is not None and chain is not None:
         report["fill"] = chain.report
+        report["fill_paced_s"] = round(chain.paced, 1)
     return out
 
 
@@ -404,9 +440,29 @@ def translate_segments(workdir, style="subs"):
             else:
                 results[i] = chain.one(texts[i])
     report["chain"] = chain.report
+    report["paced_s"] = round(chain.paced, 1)
     out = [{**seg, "text_my": results[i][0], "provider": results[i][1]}
            for i, seg in enumerate(segs)]
     out = _fill_missing(out, report)
+    # D2 "second wind": the 21:19 job died with 24 of ~50 segments
+    # translated — the working provider was throttled mid-job and the
+    # first fill pass ran while it was still cooling down. When real
+    # progress was made but a remainder is left, wait out the
+    # throttle window ONCE and run one more fill pass with a fresh
+    # chain before giving up. Costs under a minute; rescues exactly
+    # the near-miss jobs that used to fail whole.
+    stats = translation_stats(out)
+    if stats["untranslated"] > 0 \
+            and stats["total"] - stats["untranslated"] > 0:
+        pause = 40.0 if stats["untranslated"] >= 5 else 6.0
+        report["second_wind"] = {
+            "remaining_before": stats["untranslated"], "pause_s": pause}
+        time.sleep(pause)
+        tmp = {}
+        out = _fill_missing(out, tmp)
+        report["fill2"] = tmp.get("fill", {})
+        report["second_wind"]["remaining_after"] = \
+            translation_stats(out)["untranslated"]
     _write_report(workdir, report)
     save_segments(out, workdir / "segments_my.json")
     write_srt(out, workdir / "subs_my.srt")
