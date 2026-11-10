@@ -2132,6 +2132,8 @@ def _build_subs(data):
         "color": s.get("color") if s.get("color") in
                  ("white", "yellow", "blue", "green", "red", "black")
                  else "white",
+        "placement": s.get("placement") if s.get("placement") in
+                     ("box", "bottom", "top") else "box",
     }
 
 

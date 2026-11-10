@@ -85,42 +85,16 @@
     font-family: inherit; resize: vertical; }
   input[type=file] { width: 100%; color: #cfd4ea; font-size: 13px; }
   h3 { font-size: 15px; margin: 18px 0 2px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 12px; }
+  .chip { width: auto; margin-top: 0; padding: 10px 14px; border-radius: 999px;
+          background: #232842; color: #dfe3f5; border: 1px solid #343a55; font-size: 14px; }
+  .chip.on { background: #2b5cff; border-color: #2b5cff; font-weight: 700; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>🎬 ဗီဒီယို မြန်မာဘာသာပြန် <span style="float:right"><button class="ghost" id="keyToggle" title="Gemini key" style="width:auto;padding:4px 12px">🔑</button> <button class="ghost" id="oaToggle" title="OpenAI key" style="width:auto;padding:4px 12px">🧠</button> <button class="ghost" id="tgToggle" title="Telegram bot setting" style="width:auto;padding:4px 12px">🤖</button></span></h1>
+  <h1>🎬 ဗီဒီယို မြန်မာဘာသာပြန်</h1>
   <p class="sub">ဗီဒီယိုလင့်ခ် ထည့်ရုံနဲ့ — စာသားထုတ် → မြန်မာပြန် → စာတန်းထိုး (ရုပ်ရှင်ပုံစံ) / အသံထွက် အစအဆုံးလုပ်ပေးမယ်။ အသံကို အချိန်ကိုက်အောင် အမြန်ညှိ၊ အသံ ရှည်ရင် ပုံကို နှေးပြီး ဆက်ပြောပေးမယ်။</p>
-
-  <div class="card" id="keyCard">
-    <h3 style="margin-top:0">🔑 Gemini key (ဘာသာပြန် အတွက်)</h3>
-    <p class="hint">Key ရှိရင် ဘာသာပြန် <b>မြန်ပြီး အရည်အသွေး ကောင်း</b>တယ်။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="keyState">…</span></p>
-    <input type="password" id="keyInput" placeholder="Gemini key (AQ. / AIza နဲ့ စတယ်) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
-    <div class="row">
-      <button class="ghost" id="keySave">သိမ်းမယ်</button>
-      <button class="ghost" id="keyDel">ဖျက်မယ်</button>
-    </div>
-  </div>
-
-  <div class="card" id="oaCard">
-    <h3 style="margin-top:0">🧠 OpenAI key (ဘာသာပြန် engine — အဓိက)</h3>
-    <p class="hint">OpenAI credit နဲ့ ဘာသာပြန်ရင် <b>စိတ်ချရပြီး ဈေး အလွန် သက်သာ</b>တယ် (video တစ်ခု ~$0.002)။ Key ရှိရင် ဒီ engine ကို အရင် သုံးတယ်။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="oaState">…</span></p>
-    <input type="password" id="oaInput" placeholder="OpenAI key (sk- နဲ့ စတယ်) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
-    <div class="row">
-      <button class="ghost" id="oaSave">သိမ်းမယ်</button>
-      <button class="ghost" id="oaDel">ဖျက်မယ်</button>
-    </div>
-  </div>
-
-  <div class="card" id="tgCard">
-    <h3 style="margin-top:0">🤖 Telegram bot (ပြီးရင် တန်းပို့ရန်)</h3>
-    <p class="hint">BotFather မှာ bot တစ်ခု လုပ်ပြီး token ကို ဒီမှာ ထည့်ပါ (<b>chat ထဲ မပို့ပါနဲ့</b>)။ ပို့ချင်တဲ့သူက အဲဒီ bot ကို Telegram မှာ <b>Start တစ်ခါ နှိပ်ထား</b>ရမယ် — ပြီးရင် အလုပ်များ စာရင်းကနေ 📨 TG ခလုတ်နဲ့ တန်းပို့နိုင်ပြီ။ အခြေအနေ: <span id="tgState">…</span></p>
-    <input type="password" id="tgInput" placeholder="Bot token (123456789:AA…) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
-    <div class="row">
-      <button class="ghost" id="tgSave">သိမ်းမယ်</button>
-      <button class="ghost" id="tgDel">ဖျက်မယ်</button>
-    </div>
-  </div>
 
   <div class="card show" id="accountCard">
     <h3 style="margin-top:0">👤 အကောင့်</h3>
@@ -179,123 +153,173 @@
     <div class="row">
       <button class="ghost" id="botOpenBtn">…</button>
     </div>
-  </div>
-
-  <label>ဗီဒီယိုလင့်ခ်</label>
-  <input type="url" id="url" placeholder="https://www.youtube.com/watch?v=...">
-
-  <button class="ghost" id="previewBtn">🔍 Preview ယူမယ် — Logo ထားရန် / မူရင်းစာ ဝါးရန် ပြင်ရန်</button>
-  <p class="err" id="pvErr"></p>
-
-  <div class="card" id="editor">
-    <label style="margin-top:0">ပြင်မယ့် ဖရိမ် အချိန် <span class="val" id="scrubVal"></span></label>
-    <input type="range" id="scrub" min="0" max="10" step="0.1" value="2">
-    <div id="stage">
-      <img id="frameImg" alt="preview frame">
-      <div id="blurRect"></div>
-      <img id="logoEl" alt="logo">
-      <div id="subSample">ဒါက နမူနာ စာတန်း ဖြစ်ပါတယ် — စာတန်းရဲ့ အကျယ်၊ အရွယ်အစားနဲ့ နေရာကို ဒီမှာ မြင်နိုင်ပါတယ်</div>
-    </div>
-    <p class="hint">ပုံပေါ်မှာ — <b>Logo</b> ကို လက်နဲ့ ဆွဲရွေ့ နေရာချပါ။ <b>မူရင်းစာ ဝါးချင်</b>ရင် ဝါးချင်တဲ့နေရာကို လက်နဲ့ ဆွဲပြီး အကွက်ဆွဲပါ (အကွက်ဟောင်းထဲ ဆွဲရင် ရွေ့တယ်၊ နေရာသစ်မှာ ဆွဲရင် အကွက်အသစ် ဖြစ်တယ်)။ ဝါးထားတဲ့ အကွက်က ဗီဒီယို တစ်လျှောက်လုံး ဝါးပေးမယ်။</p>
-
-    <h3>🏷️ Logo</h3>
-    <label>Logo ပုံ တင်ရန် (PNG ဆိုရင် နောက်ခံပွင့် ပိုကောင်းတယ်)</label>
-    <input type="file" id="logoFile" accept="image/png,image/jpeg,image/webp">
-    <label>Logo အရွယ် <span class="val" id="logoSizeVal"></span></label>
-    <input type="range" id="logoSize" min="5" max="50" value="18">
-    <label>Logo ဖျော့မှု (အလင်း-အမှိန်) <span class="val" id="logoOpacityVal"></span></label>
-    <input type="range" id="logoOpacity" min="10" max="100" value="70">
-    <label>Logo ကာလာ ဖျော့မှု <span class="val" id="logoSatVal"></span></label>
-    <input type="range" id="logoSat" min="0" max="100" value="100">
+  <div class="card" id="keyCard">
+    <h3 style="margin-top:0">🔑 Gemini key (ဘာသာပြန် အတွက်)</h3>
+    <p class="hint">Key ရှိရင် ဘာသာပြန် <b>မြန်ပြီး အရည်အသွေး ကောင်း</b>တယ်။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="keyState">…</span></p>
+    <input type="password" id="keyInput" placeholder="Gemini key (AQ. / AIza နဲ့ စတယ်) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <div class="row">
-      <button class="ghost" data-corner="0,0">↖ ဘယ်ပေါ်</button>
-      <button class="ghost" data-corner="1,0">↗ ညာပေါ်</button>
-      <button class="ghost" data-corner="0,1">↙ ဘယ်အောက်</button>
-      <button class="ghost" data-corner="1,1">↘ ညာအောက်</button>
+      <button class="ghost" id="keySave">သိမ်းမယ်</button>
+      <button class="ghost" id="keyDel">ဖျက်မယ်</button>
     </div>
+  </div>
 
-    <h3>🌫️ မူရင်းစာ ဝါးရန်</h3>
-    <label>ဝါးအား <span class="val" id="blurVal"></span></label>
-    <input type="range" id="blurStrength" min="5" max="60" value="25">
+  <div class="card" id="oaCard">
+    <h3 style="margin-top:0">🧠 OpenAI key (ဘာသာပြန် engine — အဓိက)</h3>
+    <p class="hint">OpenAI credit နဲ့ ဘာသာပြန်ရင် <b>စိတ်ချရပြီး ဈေး အလွန် သက်သာ</b>တယ် (video တစ်ခု ~$0.002)။ Key ရှိရင် ဒီ engine ကို အရင် သုံးတယ်။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="oaState">…</span></p>
+    <input type="password" id="oaInput" placeholder="OpenAI key (sk- နဲ့ စတယ်) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <div class="row">
-      <button class="ghost" id="blurClear">အကွက် ဖျက်မယ်</button>
+      <button class="ghost" id="oaSave">သိမ်းမယ်</button>
+      <button class="ghost" id="oaDel">ဖျက်မယ်</button>
     </div>
-    <p class="hint">💡 ဝါး အကွက် ဆွဲထားရင် မြန်မာ စာတန်းကို အဲဒီ အကွက် <b>အတွင်းမှာပဲ</b> စာလုံး အရွယ်ပါ ချိန်ပြီး ထိုးပေးမယ် (အကွက် မရှိရင် ပုံမှန် နေရာ)။</p>
-
-    <h3>🔤 စာတန်း ပုံစံ</h3>
-    <label>စာအရွယ်အစား <span class="val" id="subSizeVal"></span></label>
-    <input type="range" id="subSize" min="60" max="160" value="100">
-    <label>စာတန်းအကျယ် (ဖရိမ်အကျယ်ရဲ့ %) <span class="val" id="subWidthVal"></span></label>
-    <input type="range" id="subWidth" min="50" max="100" value="95">
-    <label>အစွန်းက အကွာအဝေး (ဖရိမ်အမြင့်ရဲ့ %) <span class="val" id="subBottomVal"></span></label>
-    <input type="range" id="subBottom" min="2" max="25" value="10">
-    <label>စာတန်း နေရာ</label>
-    <select id="subAlign">
-      <option value="bottom" selected>⬇️ အောက်ခြေ</option>
-      <option value="top">⬆️ အပေါ်</option>
-    </select>
-    <p class="hint">အပေါ်က ပုံပေါ်မှာ နမူနာစာတန်း ပေါ်နေတယ် — slider တွေ ရွေ့ရင် ပုံစံ တန်းမြင်ရမယ်။ ဒီ setting တွေက Preview မယူဘဲ စတင်ရင်လည်း အကျုံးဝင်တယ်။</p>
   </div>
 
-  <label>ထုတ်ပေးမယ့် ပုံစံ</label>
-  <div class="modes">
-    <label><input type="radio" name="mode" value="subs"><span>စာတန်းထိုး</span></label>
-    <label><input type="radio" name="mode" value="dub"><span>အသံထွက်</span></label>
-    <label><input type="radio" name="mode" value="both" checked><span>နှစ်မျိုးလုံး</span></label>
+  <div class="card" id="tgCard">
+    <h3 style="margin-top:0">🤖 Telegram bot (ပြီးရင် တန်းပို့ရန်)</h3>
+    <p class="hint">BotFather မှာ bot တစ်ခု လုပ်ပြီး token ကို ဒီမှာ ထည့်ပါ (<b>chat ထဲ မပို့ပါနဲ့</b>)။ ပို့ချင်တဲ့သူက အဲဒီ bot ကို Telegram မှာ <b>Start တစ်ခါ နှိပ်ထား</b>ရမယ် — ပြီးရင် အလုပ်များ စာရင်းကနေ 📨 TG ခလုတ်နဲ့ တန်းပို့နိုင်ပြီ။ အခြေအနေ: <span id="tgState">…</span></p>
+    <input type="password" id="tgInput" placeholder="Bot token (123456789:AA…) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+    <div class="row">
+      <button class="ghost" id="tgSave">သိမ်းမယ်</button>
+      <button class="ghost" id="tgDel">ဖျက်မယ်</button>
+    </div>
+  </div>
   </div>
 
-  <label>မြန်မာ အသံ (အသံထွက် အတွက်)</label>
-  <select id="voice"></select>
+  <div class="card show" id="wizCard">
+    <div id="wizProg" class="hint" style="margin-bottom:8px"></div>
 
-  <label>အသံ မြန်နှုန်း <span class="hint" id="voiceRateVal">ပုံမှန်</span></label>
-  <input type="range" id="voiceRate" min="-50" max="100" step="5" value="0"
-         oninput="$('voiceRateVal').textContent = (this.value > 0 ? '+' : '') + this.value + '%'">
-  <label>အသံ အနိမ့်အမြင့် <span class="hint" id="voicePitchVal">ပုံမှန်</span></label>
-  <input type="range" id="voicePitch" min="-50" max="50" step="5" value="0"
-         oninput="$('voicePitchVal').textContent = (this.value > 0 ? '+' : '') + this.value + 'Hz'">
+    <div id="stageWrap" style="display:none">
+      <label style="margin-top:0">ပြင်မယ့် ဖရိမ် အချိန် <span class="val" id="scrubVal"></span></label>
+      <input type="range" id="scrub" min="0" max="10" step="0.1" value="2">
+      <div id="stage">
+        <img id="frameImg" alt="preview frame">
+        <div id="blurRect"></div>
+        <img id="logoEl" alt="logo">
+        <div id="subSample">နမူနာ စာတန်း</div>
+      </div>
+    </div>
 
-  <label>အသံ အရှိန်နှုန်း အများဆုံး (သူ့အချိန်နဲ့ မမှီရင် ဘယ်လောက်ထိ မြန်ပေးမလဲ)</label>
-  <select id="speedCap">
-    <option value="1.0">1.0× — မမြန်ဘူး (မမှီရင် frame ရပ်မယ်)</option>
-    <option value="1.3" selected>1.3× — ပုံမှန်</option>
-    <option value="1.5">1.5×</option>
-    <option value="2.0">2.0×</option>
-    <option value="3.0">3.0×</option>
-    <option value="4.0">4.0× — အမြန်ဆုံး (ရပ်ချိန် မရှိသလောက်)</option>
-  </select>
+    <div class="wstep" data-step="1">
+      <label style="margin-top:0">🔗 ဗီဒီယိုလင့်ခ်</label>
+      <input type="url" id="url" placeholder="https://www.youtube.com/watch?v=...">
+      <p class="hint">YouTube / TikTok / Facebook / RedNote လင့်ခ် ထည့်ပါ — ပြီးရင် «နောက်သို့» နှိပ်ပါ</p>
+    </div>
 
-  <label>Frame (ဗီဒီယို အချိုး ပြောင်းရန်)</label>
-  <select id="aspect">
-    <option value="">မူရင်း (မပြောင်း)</option>
-    <option value="9:16">9:16 — TikTok / Reels</option>
-    <option value="16:9">16:9 — YouTube</option>
-    <option value="1:1">1:1 — လေးထောင့်</option>
-    <option value="4:5">4:5 — Facebook ပို့စ်</option>
-  </select>
-  <select id="aspectStyle">
-    <option value="blur">ဘေး ဝါး (အပြည့် မြင်ရမယ်)</option>
-    <option value="black">ဘေး အနက်</option>
-    <option value="crop">ဖြည့် ဖြတ် (ဘေး ပျောက်မယ်)</option>
-  </select>
+    <div class="wstep" data-step="2" style="display:none">
+      <label style="margin-top:0">▶️ Preview + ပုံစံ</label>
+      <button class="ghost" id="previewBtn">🔍 Preview ယူမယ်</button>
+      <p class="err" id="pvErr"></p>
+      <button class="ghost" id="pvSkip" style="display:none">Preview မရလည်း ဆက်သွားမယ်</button>
+      <label>ထုတ်ပေးမယ့် ပုံစံ</label>
+      <div class="chips" id="modeChips">
+        <button class="chip" data-mode="subs">စာတန်းထိုး</button>
+        <button class="chip" data-mode="dub">အသံထွက်</button>
+        <button class="chip on" data-mode="both">နှစ်မျိုးလုံး</button>
+      </div>
+      <label>Frame အချိုး</label>
+      <div class="chips" id="aspectChips">
+        <button class="chip on" data-aspect="">မူရင်း</button>
+        <button class="chip" data-aspect="9:16">9:16</button>
+        <button class="chip" data-aspect="16:9">16:9</button>
+        <button class="chip" data-aspect="1:1">1:1</button>
+        <button class="chip" data-aspect="4:5">4:5</button>
+      </div>
+      <div class="chips" id="aspectStyleChips">
+        <button class="chip on" data-astyle="blur">ဘေးဝါး</button>
+        <button class="chip" data-astyle="black">ဘေးအနက်</button>
+        <button class="chip" data-astyle="crop">ဖြည့်ဖြတ်</button>
+      </div>
+    </div>
 
-  <label>စာတန်း Font (အားလုံး Myanmar Unicode)</label>
-  <select id="font">
-    <option value="noto" selected>Noto Sans Myanmar — ထူ (ရုပ်ရှင်ပုံစံ မူလ)</option>
-    <option value="pyidaungsu">ပြည်ထောင်စု (Pyidaungsu)</option>
-    <option value="padauk">ပိတောက် (Padauk Bold)</option>
-  </select>
+    <div class="wstep" data-step="3" style="display:none">
+      <label style="margin-top:0">🌫️ မူရင်းစာ ဝါးရန်</label>
+      <p class="hint">ဝါးချင်တဲ့ နေရာကို အပေါ်က ပုံပေါ်မှာ လက်နဲ့ ဆွဲပြီး အကွက် ဆွဲပါ (အကွက်ဟောင်း ထဲ ဆွဲရင် ရွေ့တယ်)။ မဝါးချင်ရင် «မဝါးဘူး» နှိပ်ပါ</p>
+      <div class="row">
+        <button class="ghost" id="blurClear">အကွက် ဖျက်မယ်</button>
+        <button class="ghost" id="blurSkip">မဝါးဘူး</button>
+      </div>
+      <p class="hint" id="blurState"></p>
+    </div>
 
-  <label>စာတန်း အရောင်</label>
-  <select id="subColor">
-    <option value="white" selected>အဖြူ (မူလ)</option>
-    <option value="yellow">အဝါ</option>
-    <option value="blue">အပြာ</option>
-    <option value="green">အစိမ်း</option>
-    <option value="red">အနီ</option>
-    <option value="black">အမဲ</option>
-  </select>
+    <div class="wstep" data-step="4" style="display:none">
+      <label style="margin-top:0">🔤 စာတန်း</label>
+      <label>စာတန်း နေရာ</label>
+      <div class="chips" id="placeChips">
+        <button class="chip on" data-place="box">ဝါးထားတဲ့ အကွက်ထဲမှာ</button>
+        <button class="chip" data-place="bottom">အောက်ခြေ</button>
+        <button class="chip" data-place="top">အပေါ်</button>
+      </div>
+      <p class="hint" id="placeNote"></p>
+      <label>စာအရွယ်အစား</label>
+      <div class="chips" id="sizeChips">
+        <button class="chip" data-size="80">သေး</button>
+        <button class="chip on" data-size="100">လတ်</button>
+        <button class="chip" data-size="130">ကြီး</button>
+      </div>
+      <label>စာတန်း အရောင်</label>
+      <div class="chips" id="colorChips">
+        <button class="chip on" data-color="white">အဖြူ</button>
+        <button class="chip" data-color="yellow">အဝါ</button>
+        <button class="chip" data-color="blue">အပြာ</button>
+        <button class="chip" data-color="green">အစိမ်း</button>
+        <button class="chip" data-color="red">အနီ</button>
+        <button class="chip" data-color="black">အမဲ</button>
+      </div>
+      <label>စာတန်း Font (အားလုံး Myanmar Unicode)</label>
+      <select id="font">
+        <option value="noto" selected>Noto Sans Myanmar — ထူ (ရုပ်ရှင်ပုံစံ မူလ)</option>
+        <option value="pyidaungsu">ပြည်ထောင်စု (Pyidaungsu)</option>
+        <option value="padauk">ပိတောက် (Padauk Bold)</option>
+      </select>
+    </div>
 
-  <button id="go">စတင်လုပ်မယ်</button>
+    <div class="wstep" data-step="5" style="display:none">
+      <label style="margin-top:0">🏷️ Logo</label>
+      <label>Logo ပုံ တင်ရန် (PNG ဆိုရင် နောက်ခံပွင့် ပိုကောင်းတယ်)</label>
+      <input type="file" id="logoFile" accept="image/png,image/jpeg,image/webp">
+      <p class="hint">တင်ပြီးရင် အပေါ်က ပုံပေါ်က Logo ကို လက်နဲ့ ဆွဲရွေ့ နေရာချပါ, ဒါမှမဟုတ် ထောင့် ခလုတ် နှိပ်ပါ</p>
+      <div class="row">
+        <button class="ghost" data-corner="0,0">↖ ဘယ်ပေါ်</button>
+        <button class="ghost" data-corner="1,0">↗ ညာပေါ်</button>
+        <button class="ghost" data-corner="0,1">↙ ဘယ်အောက်</button>
+        <button class="ghost" data-corner="1,1">↘ ညာအောက်</button>
+      </div>
+      <div class="row">
+        <button class="ghost" id="logoSkip">Logo မထည့်ဘူး</button>
+      </div>
+      <p class="hint" id="logoState"></p>
+    </div>
+
+    <div class="wstep" data-step="6" style="display:none">
+      <label style="margin-top:0">🎙 မြန်မာ အသံ</label>
+      <div class="chips" id="voiceChips"></div>
+    </div>
+
+    <div class="wstep" data-step="7" style="display:none">
+      <label style="margin-top:0">⏩ အသံ အရှိန်</label>
+      <p class="hint">အသံ သူ့အချိန်နဲ့ မမှီရင် ဘယ်လောက်ထိ မြန်ပေးမလဲ — အသံ ရှည်ရင် ပုံကို နှေးပြီး ဆက်ပြောပေးမယ် (frame မရပ်ပါ)</p>
+      <input type="range" id="wizSpeed" min="1" max="4" step="0.1" value="1.3">
+      <p style="text-align:center"><b id="wizSpeedVal">1.3×</b></p>
+      <div class="chips" id="speedChips">
+        <button class="chip" data-speed="1.0">1.0×</button>
+        <button class="chip" data-speed="1.3">1.3× ပုံမှန်</button>
+        <button class="chip" data-speed="1.5">1.5×</button>
+        <button class="chip" data-speed="2.0">2.0×</button>
+        <button class="chip" data-speed="3.0">3.0×</button>
+        <button class="chip" data-speed="4.0">4.0×</button>
+      </div>
+    </div>
+
+    <div class="wstep" data-step="8" style="display:none">
+      <label style="margin-top:0">✅ အကျဉ်းချုပ်</label>
+      <div id="wizSummary" class="hint" style="white-space:pre-line"></div>
+      <button id="go">🎬 စတင်လုပ်မယ်</button>
+    </div>
+
+    <div class="row" style="margin-top:12px">
+      <button class="ghost" id="wizBack" style="display:none">← နောက်သို့</button>
+      <button class="ghost" id="wizNext">နောက်သို့ →</button>
+    </div>
+  </div>
 
   <div class="card" id="card">
     <div id="steps"></div>
@@ -351,12 +375,17 @@ let logoId = null;
 let logoPos = {x: 1, y: 0};          // 0..1 across travel range (W-logoW, H-logoH)
 let blur = null;                      // {x,y,w,h} normalized
 
-fetch("/api/voices").then(r => r.json()).then(vs => {
-  $("voice").innerHTML = vs.map(v => `<option value="${v.id}">${v.label}</option>`).join("");
-}).catch(() => {
-  $("voice").innerHTML = `<option value="my-MM-NilarNeural">အမျိုးသမီး (Nilar)</option>
-                          <option value="my-MM-ThihaNeural">အမျိုးသား (Thiha)</option>`;
-});
+function voiceChips(vs) {
+  $("voiceChips").innerHTML = vs.map(v =>
+    `<button class="chip${v.id === W.voice ? " on" : ""}" data-voice="${v.id}">${v.label}</button>`).join("");
+  $("voiceChips").querySelectorAll(".chip").forEach(c => c.onclick = () => {
+    $("voiceChips").querySelectorAll(".chip").forEach(x => x.classList.remove("on"));
+    c.classList.add("on"); W.voice = c.dataset.voice;
+  });
+}
+fetch("/api/voices").then(r => r.json()).then(voiceChips).catch(() =>
+  voiceChips([{id: "my-MM-NilarNeural", label: "အမျိုးသမီး (Nilar)"},
+              {id: "my-MM-ThihaNeural", label: "အမျိုးသား (Thiha)"}]));
 
 /* ---------------- preview ---------------- */
 $("previewBtn").onclick = async () => {
@@ -373,10 +402,11 @@ $("previewBtn").onclick = async () => {
     const t0 = Math.min(2, Math.max(pv.duration - 0.2, 0));
     $("scrub").max = Math.max(pv.duration - 0.15, 0); $("scrub").value = t0;
     loadFrame(t0);
-    $("editor").classList.add("show");
-  } catch (e) { $("pvErr").textContent = e.message; }
+    W.pvFailed = false; $("pvSkip").style.display = "none"; wizShow();
+  } catch (e) { $("pvErr").textContent = e.message;
+    W.pvFailed = true; $("pvSkip").style.display = ""; wizGate(); }
   $("previewBtn").disabled = false;
-  $("previewBtn").textContent = "🔍 Preview ယူမယ် — Logo ထားရန် / မူရင်းစာ ဝါးရန် ပြင်ရန်";
+  $("previewBtn").textContent = "🔍 Preview ယူမယ်";
 };
 
 function loadFrame(t) {
@@ -401,15 +431,12 @@ function relPos(e) {
 function layoutLogo() {
   if (!logoId) return;
   const {w, h} = stageSize();
-  logoEl.style.width = ($("logoSize").value / 100 * w) + "px";
+  logoEl.style.width = (18 / 100 * w) + "px";
   const lw = logoEl.offsetWidth, lh = logoEl.offsetHeight;
   logoEl.style.left = (logoPos.x * Math.max(w - lw, 0)) + "px";
   logoEl.style.top  = (logoPos.y * Math.max(h - lh, 0)) + "px";
-  logoEl.style.opacity = $("logoOpacity").value / 100;
-  logoEl.style.filter = "saturate(" + ($("logoSat").value / 100) + ")";
-  $("logoSizeVal").textContent = $("logoSize").value + "%";
-  $("logoOpacityVal").textContent = $("logoOpacity").value + "%";
-  $("logoSatVal").textContent = $("logoSat").value + "%";
+  logoEl.style.opacity = 0.7;
+  logoEl.style.filter = "saturate(1)";
 }
 function layoutBlur() {
   if (!blur) { blurRect.style.display = "none"; return; }
@@ -417,30 +444,31 @@ function layoutBlur() {
   blurRect.style.display = "block";
   blurRect.style.left = (blur.x * w) + "px"; blurRect.style.top = (blur.y * h) + "px";
   blurRect.style.width = (blur.w * w) + "px"; blurRect.style.height = (blur.h * h) + "px";
-  blurRect.style.backdropFilter = "blur(" + Math.max(3, $("blurStrength").value / 4) + "px)";
-  $("blurVal").textContent = $("blurStrength").value;
+  blurRect.style.backdropFilter = "blur(6px)";
 }
 
-/* subtitle layout live preview (mirrors burn.py math: base font size is
-   26/288 of frame height at 100%) */
+/* subtitle sample follows the wizard choices (placement / size /
+   colour); mirrors burn.py: base font size is 26/288 of height */
 function layoutSubs() {
   const el = $("subSample");
-  const size = Number($("subSize").value), width = Number($("subWidth").value),
-        bottom = Number($("subBottom").value);
-  el.style.display = previewId ? "block" : "none";
-  el.style.width = width + "%";
-  el.style.fontSize = Math.max(8, stageSize().h * (26 / 288) * size / 100) + "px";
-  if ($("subAlign").value === "top") {
-    el.style.top = bottom + "%"; el.style.bottom = "auto";
+  if (!previewId) { el.style.display = "none"; return; }
+  el.style.display = "block";
+  el.style.fontSize = Math.max(8, stageSize().h * (26 / 288) * W.subSize / 100) + "px";
+  el.style.color = W.color === "black" ? "#000" : W.color;
+  el.style.textShadow = W.color === "black"
+    ? "0 0 3px #fff, 0 0 3px #fff" : "0 0 3px #000, 0 0 3px #000";
+  if (W.place === "box" && blur) {
+    const {w, h} = stageSize();
+    el.style.left = (blur.x * w) + "px"; el.style.width = (blur.w * w) + "px";
+    el.style.top = (blur.y * h) + "px"; el.style.bottom = "auto";
+    el.style.transform = "none";
   } else {
-    el.style.bottom = bottom + "%"; el.style.top = "auto";
+    el.style.left = "50%"; el.style.width = "95%";
+    el.style.transform = "translateX(-50%)";
+    if (W.place === "top") { el.style.top = "10%"; el.style.bottom = "auto"; }
+    else { el.style.bottom = "10%"; el.style.top = "auto"; }
   }
-  $("subSizeVal").textContent = size + "%";
-  $("subWidthVal").textContent = width + "%";
-  $("subBottomVal").textContent = bottom + "%";
 }
-["subSize", "subWidth", "subBottom"].forEach(id => $(id).oninput = layoutSubs);
-$("subAlign").onchange = layoutSubs;
 
 /* logo upload */
 $("logoFile").onchange = async () => {
@@ -453,25 +481,33 @@ $("logoFile").onchange = async () => {
   logoEl.src = URL.createObjectURL(f);
   logoEl.style.display = "block";
   logoEl.onload = layoutLogo;
+  W.logoChoice = "yes";
+  $("logoState").textContent = "✅ Logo ရှိတယ် — နေရာ ချိန်ပြီး နောက် ဆက်ပါ";
+  wizGate();
 };
-["logoSize", "logoOpacity", "logoSat"].forEach(id => $(id).oninput = layoutLogo);
-$("blurStrength").oninput = layoutBlur;
 document.querySelectorAll("[data-corner]").forEach(b => b.onclick = () => {
   const [x, y] = b.dataset.corner.split(",").map(Number);
   logoPos = {x, y}; layoutLogo();
 });
-$("blurClear").onclick = () => { blur = null; layoutBlur(); };
+$("blurClear").onclick = () => { blur = null; W.blurChoice = null;
+  layoutBlur(); $("blurState").textContent = ""; wizGate(); };
+$("blurSkip").onclick = () => { blur = null; W.blurChoice = "no";
+  layoutBlur(); $("blurState").textContent = "မဝါးဘူး ရွေးထားတယ်"; wizGate(); };
+$("logoSkip").onclick = () => { logoId = null; W.logoChoice = "no";
+  logoEl.style.display = "none";
+  $("logoState").textContent = "Logo မထည့်ဘူး ရွေးထားတယ်"; wizGate(); };
+$("pvSkip").onclick = () => { if (!$("wizNext").disabled) $("wizNext").onclick(); };
 
 /* pointer editing: drag logo / draw or move blur rect */
 let drag = null;
 function onDown(e) {
   const p = relPos(e);
-  if (e.target === logoEl) {
+  if (W.step === 5 && e.target === logoEl && logoId) {
     const {w, h} = stageSize();
     drag = {kind: "logo", dx: p.x * w - logoEl.offsetLeft, dy: p.y * h - logoEl.offsetTop};
-  } else if (e.target === blurRect && blur) {
+  } else if (W.step === 3 && e.target === blurRect && blur) {
     drag = {kind: "blur-move", dx: p.x - blur.x, dy: p.y - blur.y};
-  } else if (e.target === stage || e.target === frameImg) {
+  } else if (W.step === 3 && (e.target === stage || e.target === frameImg)) {
     drag = {kind: "blur-draw", sx: p.x, sy: p.y};
     blur = {x: p.x, y: p.y, w: 0, h: 0};
   }
@@ -497,8 +533,14 @@ function onMove(e) {
   }
 }
 function onUp() {
-  if (drag && drag.kind === "blur-draw" && blur && (blur.w < 0.02 || blur.h < 0.02)) {
-    blur = null; layoutBlur();
+  if (drag && drag.kind === "blur-draw") {
+    if (blur && (blur.w < 0.02 || blur.h < 0.02)) {
+      blur = null; layoutBlur();
+    } else if (blur) {
+      W.blurChoice = "yes";
+      $("blurState").textContent = "✅ အကွက် ရှိတယ် — နောက် ဆက်ပါ";
+      wizGate();
+    }
   }
   drag = null;
 }
@@ -506,6 +548,119 @@ stage.addEventListener("pointerdown", onDown);
 stage.addEventListener("pointermove", onMove);
 stage.addEventListener("pointerup", onUp);
 stage.addEventListener("pointercancel", onUp);
+
+/* ---------------- wizard controller (build 135) ----------------
+   One step at a time; a step must be complete before Next unlocks.
+   The mode chosen in step 2 shapes the path: subs-only skips the
+   voice/speed steps, dub-only skips the subtitle step. */
+const W = { step: 1, mode: "both", aspect: "", aspectStyle: "blur",
+            blurChoice: null, place: "box", subSize: 100, color: "white",
+            logoChoice: null, voice: "my-MM-ThihaNeural", speed: 1.3,
+            pvFailed: false };
+const WIZ_NAMES = {1: "လင့်ခ်", 2: "Preview", 3: "ဝါး", 4: "စာတန်း",
+                   5: "Logo", 6: "အသံ", 7: "အရှိန်", 8: "အကျဉ်းချုပ်"};
+function wizSteps() {
+  const s = [1, 2, 3];
+  if (W.mode !== "dub") s.push(4);
+  s.push(5);
+  if (W.mode !== "subs") s.push(6, 7);
+  s.push(8);
+  return s;
+}
+function wizGate() {
+  let ok = true;
+  if (W.step === 1) ok = $("url").value.trim().length > 3;
+  else if (W.step === 2) ok = !!previewId || W.pvFailed;
+  else if (W.step === 3) ok = !!W.blurChoice;
+  else if (W.step === 5) ok = !!W.logoChoice;
+  $("wizNext").disabled = !ok;
+}
+function wizShow() {
+  const seq = wizSteps();
+  if (!seq.includes(W.step)) W.step = seq[seq.length - 1];
+  document.querySelectorAll(".wstep").forEach(p =>
+    p.style.display = Number(p.dataset.step) === W.step ? "" : "none");
+  const idx = seq.indexOf(W.step);
+  $("wizProg").textContent = "အဆင့် " + (idx + 1) + "/" + seq.length
+    + " — " + WIZ_NAMES[W.step];
+  $("stageWrap").style.display =
+    (previewId && W.step >= 2 && W.step <= 5) ? "" : "none";
+  $("wizBack").style.display = idx > 0 ? "" : "none";
+  $("wizNext").style.display = idx < seq.length - 1 ? "" : "none";
+  if (W.step === 4) placeRefresh();
+  if (W.step === 8) wizSummaryRender();
+  wizGate();
+  layoutSubs();
+}
+$("wizNext").onclick = () => {
+  const s = wizSteps(), i = s.indexOf(W.step);
+  if (i >= 0 && i < s.length - 1) { W.step = s[i + 1]; wizShow(); }
+};
+$("wizBack").onclick = () => {
+  const s = wizSteps(), i = s.indexOf(W.step);
+  if (i > 0) { W.step = s[i - 1]; wizShow(); }
+};
+function chipWire(id, attr, fn) {
+  $(id).querySelectorAll(".chip").forEach(c => c.onclick = () => {
+    $(id).querySelectorAll(".chip").forEach(x => x.classList.remove("on"));
+    c.classList.add("on"); fn(c.dataset[attr]); wizShow();
+  });
+}
+function syncChips(id, attr, val) {
+  $(id).querySelectorAll(".chip").forEach(x =>
+    x.classList.toggle("on", x.dataset[attr] === String(val)));
+}
+chipWire("modeChips", "mode", v => W.mode = v);
+chipWire("aspectChips", "aspect", v => W.aspect = v);
+chipWire("aspectStyleChips", "astyle", v => W.aspectStyle = v);
+chipWire("placeChips", "place", v => W.place = v);
+chipWire("sizeChips", "size", v => W.subSize = Number(v));
+chipWire("colorChips", "color", v => W.color = v);
+chipWire("speedChips", "speed", v => {
+  W.speed = Number(v); $("wizSpeed").value = v; speedLabel();
+});
+function speedLabel() {
+  $("wizSpeedVal").textContent = Number(W.speed).toFixed(1) + "×";
+}
+$("wizSpeed").oninput = () => {
+  W.speed = Number($("wizSpeed").value); speedLabel();
+  syncChips("speedChips", "speed", Number(W.speed).toFixed(1));
+};
+function placeRefresh() {
+  const boxChip = document.querySelector('#placeChips [data-place="box"]');
+  if (!blur) {
+    if (W.place === "box") { W.place = "bottom"; syncChips("placeChips", "place", "bottom"); }
+    boxChip.style.opacity = ".4"; boxChip.style.pointerEvents = "none";
+    $("placeNote").textContent = "ဝါး အကွက် မရှိလို့ «အကွက်ထဲမှာ» ရွေးလို့ မရပါ — အောက်/အပေါ် ရွေးပါ";
+  } else {
+    boxChip.style.opacity = ""; boxChip.style.pointerEvents = "";
+    $("placeNote").textContent = "";
+  }
+  layoutSubs();
+}
+function wizSummaryRender() {
+  const mins = previewDur ? Math.ceil(previewDur / 60) : null;
+  const lines = [
+    "🔗 " + $("url").value.trim(),
+    "🎞 ပုံစံ: " + ({subs: "စာတန်းထိုး", dub: "အသံထွက်", both: "နှစ်မျိုးလုံး"})[W.mode]
+      + (W.aspect ? " · Frame " + W.aspect + " (" + W.aspectStyle + ")" : " · Frame မူရင်း"),
+    "🌫 ဝါး: " + (blur && W.blurChoice === "yes" ? "ဝါးမယ်" : "မဝါးဘူး"),
+  ];
+  if (W.mode !== "dub")
+    lines.push("🔤 စာတန်း: " + ({box: "အကွက်ထဲမှာ", bottom: "အောက်ခြေ", top: "အပေါ်"})[W.place]
+      + " · အရွယ် " + W.subSize + "% · အရောင် " + W.color);
+  lines.push("🏷 Logo: " + (logoId && W.logoChoice === "yes" ? "ထည့်မယ်" : "မထည့်ဘူး"));
+  if (W.mode !== "subs") {
+    lines.push("🎙 အသံ: " + (W.voice.includes("Nilar") ? "Nilar (မ)" : "Thiha (ကျား)"));
+    lines.push("⏩ အရှိန်: " + Number(W.speed).toFixed(1) + "×");
+  }
+  lines.push(mins
+    ? "💳 ကုန်ကျ ခန့်မှန်း: " + mins + " credits (မအောင်မြင်ရင် မဖြတ်ပါ)"
+      + (ME && ME.role === "admin" ? " — admin မို့ မဖြတ်ပါ" : "")
+    : "💳 ကုန်ကျ: video အရှည် အလိုက်, 1 မိနစ် 1 credit (မအောင်မြင်ရင် မဖြတ်ပါ)");
+  $("wizSummary").textContent = lines.join("\n");
+}
+wizShow();
 
 /* ---------- fresh start when a new link is put in ----------
    The previous video's preview, blur box, logo placement and job
@@ -527,8 +682,13 @@ function resetForNewLink() {
   $("dl").style.display = "none"; $("jobDl").style.display = "none";
   $("cleanupNote").style.display = "none"; $("doneBtns").style.display = "none";
   $("go").disabled = false;
+  W.step = 1; W.blurChoice = null; W.logoChoice = null; W.pvFailed = false;
+  $("pvSkip").style.display = "none";
+  $("blurState").textContent = ""; $("logoState").textContent = "";
+  wizShow();
 }
 $("url").addEventListener("input", () => {
+  wizGate();
   const u = $("url").value.trim();
   if ((previewUrl && u !== previewUrl) || (!previewUrl && currentJobId)) {
     resetForNewLink();
@@ -550,23 +710,22 @@ $("go").onclick = async () => {
   $("cleanupNote").style.display = "none"; $("doneBtns").style.display = "none";
   $("card").style.display = "block"; $("steps").innerHTML = "စတင်နေပြီ…";
   const fx = {};
-  if ($("aspect").value) fx.aspect = {ratio: $("aspect").value,
-                                      style: $("aspectStyle").value};
-  if (blur) fx.blur = {...blur, strength: Number($("blurStrength").value)};
-  if (logoId) fx.logo = {logo_id: logoId, pos_x: logoPos.x, pos_y: logoPos.y,
-    size_pct: Number($("logoSize").value), opacity: Number($("logoOpacity").value),
-    saturation: Number($("logoSat").value)};
+  if (W.aspect) fx.aspect = {ratio: W.aspect, style: W.aspectStyle};
+  if (blur && W.blurChoice === "yes") fx.blur = {...blur, strength: 25};
+  if (logoId && W.logoChoice === "yes") fx.logo = {
+    logo_id: logoId, pos_x: logoPos.x, pos_y: logoPos.y,
+    size_pct: 18, opacity: 70, saturation: 100};
   const res = await fetch("/api/jobs", {method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({url, mode: document.querySelector("input[name=mode]:checked").value,
-                          voice: $("voice").value, font: $("font").value,
-                          voice_rate: Number($("voiceRate").value),
-                          voice_pitch: Number($("voicePitch").value),
-                          speed_cap: Number($("speedCap").value),
-                          subs: {size_pct: Number($("subSize").value),
-                                 width_pct: Number($("subWidth").value),
-                                 bottom_pct: Number($("subBottom").value),
-                                 align: $("subAlign").value,
-                                 color: $("subColor").value},
+    body: JSON.stringify({url, mode: W.mode,
+                          voice: W.voice, font: $("font").value,
+                          voice_rate: 0, voice_pitch: 0,
+                          speed_cap: W.speed,
+                          subs: {size_pct: W.subSize,
+                                 width_pct: W.place === "box" ? 100 : 95,
+                                 bottom_pct: 10,
+                                 align: W.place === "top" ? "top" : "bottom",
+                                 placement: W.place,
+                                 color: W.color},
                           preview_id: previewId, fx})});
   const job = await res.json();
   if (!res.ok) { $("err").textContent = job.error || "အမှားတစ်ခု ဖြစ်သွားပြီ"; $("go").disabled = false; return; }
@@ -821,16 +980,11 @@ async function loadKeyState() {
       return;
     }
     $("keyState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
-    $("keyToggle").textContent = d.configured ? "🔑 ✅" : "🔑";
     // Once a key is saved the card tucks itself away; the small 🔑
     // button by the title reopens it whenever the key needs changing.
     $("keyCard").classList.toggle("show", !d.configured);
   } catch (e) { $("keyState").textContent = "?"; }
 }
-$("keyToggle").onclick = () => {
-  if (!ME || ME.role !== "admin") return;
-  $("keyCard").classList.toggle("show");
-};
 $("keySave").onclick = async () => {
   const key = $("keyInput").value.trim();
   if (!key) { alert("key အရင် ထည့်ပါ"); return; }
@@ -860,14 +1014,9 @@ async function loadOaState() {
       return;
     }
     $("oaState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
-    $("oaToggle").textContent = d.configured ? "🧠 ✅" : "🧠";
     $("oaCard").classList.toggle("show", !d.configured);
   } catch (e) { $("oaState").textContent = "?"; }
 }
-$("oaToggle").onclick = () => {
-  if (!ME || ME.role !== "admin") return;
-  $("oaCard").classList.toggle("show");
-};
 $("oaSave").onclick = async () => {
   const key = $("oaInput").value.trim();
   if (!key) { alert("key အရင် ထည့်ပါ"); return; }
@@ -908,14 +1057,9 @@ async function loadTgState() {
     if (d.payinfo !== undefined && $("payInfo")) $("payInfo").value = d.payinfo || "";
     // Once a token is saved the card tucks itself away (the 🤖
     // button in the header reopens it), like the Gemini key card.
-    $("tgToggle").textContent = d.configured ? "🤖 ✅" : "🤖";
     $("tgCard").classList.toggle("show", !d.configured);
   } catch (e) { $("tgState").textContent = "?"; }
 }
-$("tgToggle").onclick = () => {
-  if (!ME || ME.role !== "admin") return;
-  $("tgCard").classList.toggle("show");
-};
 $("tgSave").onclick = async () => {
   const tok = $("tgInput").value.trim();
   if (!tok) { alert("token အရင် ထည့်ပါ"); return; }
@@ -1009,9 +1153,6 @@ async function loadMe() {
       $("keyCard").classList.remove("show");
       $("oaCard").classList.remove("show");
       $("tgCard").classList.remove("show");
-      $("keyToggle").style.display = "none";
-      $("oaToggle").style.display = "none";
-      $("tgToggle").style.display = "none";
     }
     if (ME) loadPayQr();
     if (ME) {
@@ -1216,6 +1357,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 134</p>
+<p class="hint" id="buildTag" style="text-align:center">build 135</p>
 </body>
 </html>

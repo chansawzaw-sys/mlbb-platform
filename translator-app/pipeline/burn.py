@@ -63,6 +63,13 @@ def normalize_subs(subs):
         out[key] = max(lo, min(hi, v))
     out["align"] = "top" if subs.get("align") == "top" else "bottom"
     out["color"] = subs.get("color") if subs.get("color") in SUB_COLORS else "white"
+    # Wizard placement choice (build 135): "box" = inside the blur
+    # rect (the long-standing default, also what TG jobs get — they
+    # send no placement); "bottom"/"top" = the normal layout even
+    # when a blur rect exists (the blur still applies, the text just
+    # does not live in it).
+    out["placement"] = subs.get("placement") \
+        if subs.get("placement") in ("box", "bottom", "top") else "box"
     return out
 
 
@@ -265,8 +272,9 @@ def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None):
     # Blur-box placement: when the user drew a blur rect (fractions of
     # the frame) to hide the original subtitles, the Myanmar text goes
     # INSIDE that box — centered, with its size fitted to the box.
+    # Skipped when the user picked bottom/top placement (build 135).
     box = None
-    if blur_box:
+    if blur_box and cfg.get("placement", "box") == "box":
         try:
             bx = min(max(float(blur_box["x"]), 0.0), 0.99)
             by = min(max(float(blur_box["y"]), 0.0), 0.99)
