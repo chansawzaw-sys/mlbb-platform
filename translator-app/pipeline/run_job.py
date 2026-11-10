@@ -57,9 +57,31 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs"):
         # in as a fake 'translation' (owner got a finished video
         # subtitled in Chinese). Fail LOUDLY instead: the job
         # errors, no credit is charged, the customer retries later.
+        # D1: append the compact provider breakdown from the job's
+        # translate_report.json so the failure says WHICH route
+        # failed and why, not just that translation failed.
+        _detail = ""
+        try:
+            import json as _json
+            _rep = _json.loads((workdir / "translate_report.json")
+                               .read_text(encoding="utf-8"))
+            _parts = []
+            for _sec in ("batch", "chain", "fill"):
+                for _name, _r in (_rep.get(_sec) or {}).items():
+                    _ok = _r.get("ok", 0)
+                    _bad = _r.get("fail", _r.get("bad", 0))
+                    _err = (_r.get("err") or _r.get("last") or "")[:48]
+                    if _ok or _bad:
+                        _parts.append(f"{_name} {_ok}ok/{_bad}x")
+                    if _err:
+                        _parts.append(f"{_name}: {_err}")
+            if _parts:
+                _detail = " [" + "; ".join(_parts[:6]) + "]"
+        except Exception:
+            pass
         raise RuntimeError(
             "ဘာသာပြန် မရပါ — ဘာသာပြန် service တွေ ခဏ အလုပ်မလုပ်ပါ။ "
-            "ခဏနေမှ ပြန်စမ်းပါ (credit လုံးဝ မဖြတ်ပါ)")
+            "ခဏနေမှ ပြန်စမ်းပါ (credit လုံးဝ မဖြတ်ပါ)" + _detail)
     mark("translate", "done")
     return src
 

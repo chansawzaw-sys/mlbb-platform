@@ -174,19 +174,48 @@ def _chunks(texts, limit=4000):
     return groups
 
 
+def _is_throttle(err):
+    s = str(err).lower()
+    return "429" in s or "too many" in s or "rate" in s \
+        or "quota" in s or "403" in s
+
+
 class _Chain:
     """Per-segment fallback chain with a memory: a provider that works
     is tried first; one that fails twice is skipped for the rest of
-    the job; once a good provider is known there are no retry sleeps."""
+    the job; once a good provider is known there are no retry sleeps.
+
+    D1 (2026-11-10): a provider that answers with a rate-limit style
+    error goes into a 30 s cooldown — it is tried LAST (and only if
+    nothing else worked) instead of being hammered once per segment
+    while the endpoint is throttling the server IP, which is how a
+    whole job's chain collapsed in ~2 minutes on 2026-11-09 while the
+    single-sentence probe still passed. Every call's outcome is also
+    recorded in self.report for the job's translate_report.json."""
 
     def __init__(self):
         self.good = _load_good()
         self.fails = {}
+        self.cooldown = {}
+        self.report = {}
+        self._slept_at = 0.0
+
+    def _note(self, name, ok, err=None):
+        r = self.report.setdefault(name, {"ok": 0, "fail": 0, "last": ""})
+        if ok:
+            r["ok"] += 1
+        else:
+            r["fail"] += 1
+            if err is not None:
+                r["last"] = str(err)[:80]
 
     def one(self, text):
         order = sorted(_PROVIDERS, key=lambda p: p[0] != self.good)
+        now = time.time()
+        ready = [p for p in order if self.cooldown.get(p[0], 0) <= now]
+        cooling = [p for p in order if self.cooldown.get(p[0], 0) > now]
         last_err = None
-        for name, fn in order:
+        for name, fn in ready + cooling:
             if self.fails.get(name, 0) >= 2:
                 continue
             attempts = 1 if self.good else 2
@@ -203,14 +232,27 @@ class _Chain:
                         # move on to the next provider.
                         self.fails[name] = self.fails.get(name, 0) + 1
                         last_err = RuntimeError(f"{name} echoed source")
+                        self._note(name, False, last_err)
                         continue
                     if out:
                         self.good = name
                         _save_good(name)
+                        self._note(name, True)
                         return out, name
+                    self._note(name, False, "empty reply")
                 except Exception as e:
                     last_err = e
                     self.fails[name] = self.fails.get(name, 0) + 1
+                    self._note(name, False, e)
+                    if _is_throttle(e):
+                        self.cooldown[name] = time.time() + 30
+                        # One short pause per burst window lets the
+                        # endpoint's per-IP pressure drop instead of
+                        # every segment re-tripping the limit.
+                        if time.time() - self._slept_at > 10:
+                            self._slept_at = time.time()
+                            time.sleep(2.0)
+                        break
                     if attempt + 1 < attempts:
                         time.sleep(1.0)
         return text, f"fallback-source ({last_err})"
@@ -221,21 +263,37 @@ def translate_one(text):
     return _Chain().one(text)
 
 
-def _fill_missing(out):
+def _fill_missing(out, report=None):
     """No silent gaps (owner complaint 2026-11-09: subtitle lines
     missing from the finished video). Batch endpoints — Gemini
     included — sometimes return an EMPTY string for a segment, and
     write_srt/TTS then skip it, leaving a hole. Retry each empty
     segment once per-segment; the chain's own last resort is the
-    source text, so a line is never dropped silently."""
+    source text, so a line is never dropped silently.
+
+    D1 (2026-11-10): ECHOED segments (batch returned the source text
+    unchanged) are rescued the same way — a minority of echoes used
+    to ship silently as foreign-language subtitles because only the
+    empty case was retried."""
     chain = None
     for seg in out:
-        if (seg.get("text") or "").strip() \
-                and not (seg.get("text_my") or "").strip():
+        if not (seg.get("text") or "").strip():
+            continue
+        empty = not (seg.get("text_my") or "").strip()
+        echoed = not empty and _seg_untranslated(seg) \
+            and not (seg.get("provider") or "").startswith("fallback-source")
+        if empty or echoed:
             if chain is None:
                 chain = _Chain()
-            seg["text_my"], seg["provider"] = \
-                chain.one(seg["text"].strip())
+            new_my, new_prov = chain.one(seg["text"].strip())
+            # Keep whichever result is actually translated.
+            if not _seg_untranslated({**seg, "text_my": new_my,
+                                       "provider": new_prov}):
+                seg["text_my"], seg["provider"] = new_my, new_prov
+            elif empty:
+                seg["text_my"], seg["provider"] = new_my, new_prov
+    if report is not None and chain is not None:
+        report["fill"] = chain.report
     return out
 
 
@@ -266,10 +324,32 @@ def translation_stats(out):
     return {"total": total, "untranslated": un}
 
 
+def _usable(src, out):
+    """A batch item counts only if it is non-empty and not a source
+    echo (D1: batch replies used to be accepted wholesale once the
+    marker alignment matched, so echoed segments shipped as foreign
+    subtitles and a poisoned chunk hid behind a good provider name)."""
+    o = (out or "").strip()
+    if not o:
+        return False
+    return not _seg_untranslated(
+        {"text": src, "text_my": o, "provider": "batch"})
+
+
+def _write_report(workdir, report):
+    try:
+        import json
+        (workdir / "translate_report.json").write_text(
+            json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def translate_segments(workdir, style="subs"):
     ensure_system_ca()
     workdir = Path(workdir)
     segs = load_segments(workdir / "segments_en.json")
+    report = {"batch": {}, "chain": {}, "fill": {}}
     # 0. Gemini batch — first choice when a key is configured.
     if segs:
         try:
@@ -278,7 +358,8 @@ def translate_segments(workdir, style="subs"):
                 by_idx = gemini_translate.translate_all(segs, style=style)
                 out = [{**seg, "text_my": by_idx[i], "provider": "gemini"}
                        for i, seg in enumerate(segs)]
-                out = _fill_missing(out)
+                out = _fill_missing(out, report)
+                _write_report(workdir, report)
                 save_segments(out, workdir / "segments_my.json")
                 write_srt(out, workdir / "subs_my.srt")
                 return out
@@ -288,22 +369,32 @@ def translate_segments(workdir, style="subs"):
     results = [None] * len(segs)
     # 1. Batched free endpoints — one request per chunk, Google first,
     # then the gtx endpoint (a different bucket) for whatever is left.
+    # Each returned item is validated on its own (non-empty, not an
+    # echo); bad items fall to the per-segment chain below.
     for group in _chunks(texts):
         if all(not texts[i] for i in group):
             for i in group:
                 results[i] = ("", "empty")
             continue
         got, prov = None, None
-        try:
-            got, prov = _batch_google([texts[i] for i in group]), "google-batch"
-        except Exception:
+        for batch_fn, batch_name in ((_batch_google, "google-batch"),
+                                     (_batch_gtx, "gtx-batch")):
             try:
-                got, prov = _batch_gtx([texts[i] for i in group]), "gtx-batch"
-            except Exception:
-                got = None  # the chain below handles it segment by segment
+                got, prov = batch_fn([texts[i] for i in group]), batch_name
+                break
+            except Exception as e:
+                report["batch"].setdefault(
+                    batch_name, {"ok": 0, "bad": 0, "err": ""})["err"] = \
+                    str(e)[:80]
         if got:
+            b = report["batch"].setdefault(
+                prov, {"ok": 0, "bad": 0, "err": ""})
             for i, t in zip(group, got):
-                results[i] = (t, prov)
+                if _usable(texts[i], t):
+                    results[i] = (t, prov)
+                    b["ok"] += 1
+                else:
+                    b["bad"] += 1
     # 2. Per-segment chain (with memory) for whatever is left.
     chain = _Chain()
     for i, seg in enumerate(segs):
@@ -312,9 +403,11 @@ def translate_segments(workdir, style="subs"):
                 results[i] = ("", "empty")
             else:
                 results[i] = chain.one(texts[i])
+    report["chain"] = chain.report
     out = [{**seg, "text_my": results[i][0], "provider": results[i][1]}
            for i, seg in enumerate(segs)]
-    out = _fill_missing(out)
+    out = _fill_missing(out, report)
+    _write_report(workdir, report)
     save_segments(out, workdir / "segments_my.json")
     write_srt(out, workdir / "subs_my.srt")
     return out
