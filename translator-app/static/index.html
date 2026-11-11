@@ -44,17 +44,14 @@
   .jobitem .jmeta { color: #99a; font-size: 12.5px; margin-top: 2px; }
   .jobitem .jbtns { display: flex; gap: 6px; margin-top: 8px; }
   .jobitem .jbtns button { flex: 1; }
-  /* ---------- API usage board tiles (build 139) ---------- */
-  .apiGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
-  .apiTile { background: #101325; border: 1px solid #2b3050; border-radius: 10px;
-    padding: 10px 12px; cursor: pointer; }
-  .apiTile .an { color: #99a; font-size: 12.5px; }
-  .apiTile .ac { font-size: 22px; font-weight: 700; color: #fff; margin-top: 2px; }
-  .apiTile .ac small { font-size: 12.5px; font-weight: 400; color: #99a; }
-  .apiTile .adet { display: none; margin-top: 8px; padding-top: 8px;
-    border-top: 1px solid #ffffff14; font-size: 12.5px; color: #bbc; line-height: 1.7; }
-  .apiTile.open { border-color: #2b5cff; }
-  .apiTile.open .adet { display: block; }
+  /* ---------- API usage board rows (build 140) ---------- */
+  .apiRow { display: flex; justify-content: space-between; align-items: center;
+    gap: 10px; padding: 9px 2px; border-bottom: 1px solid #ffffff14; }
+  .apiRow:last-child { border-bottom: none; }
+  .apiRow .an { font-size: 14px; color: #fff; }
+  .apiRow .ad { color: #99a; font-size: 12px; margin-top: 2px; }
+  .apiRow .ac { font-size: 20px; font-weight: 700; color: #fff; white-space: nowrap; }
+  .apiRow .ac small { font-size: 12px; font-weight: 400; color: #99a; }
   .step.running { color: #fff; }
   .step.done { color: #7dd87d; }
   .step.error { color: #ff8080; }
@@ -1216,19 +1213,17 @@ async function loadApiStats() {
     }
     const total = d.total || 0;
     $("apiStats").innerHTML = "<p class='hint'>စုစုပေါင်း <b>" + total +
-      "</b> ပုဒ် — အကွက်လေးကို နှိပ်ရင် အသေးစိတ် ပေါ်လာပါမယ်</p>" +
-      "<div class='apiGrid'>" + names.map(n => {
+      "</b> ပုဒ်</p>" + names.map(n => {
         const pct = total ? Math.round(counts[n] * 100 / total) : 0;
         const when = last[n] ? new Date(last[n] * 1000).toLocaleString(
           "en-GB", {day: "numeric", month: "short",
                     hour: "2-digit", minute: "2-digit"}) : "—";
-        return "<div class='apiTile' onclick='this.classList.toggle(\"open\")'>" +
+        return "<div class='apiRow'><div>" +
           "<div class='an'>" + (API_LABELS[n] || escHtml(n)) + "</div>" +
-          "<div class='ac'>" + counts[n] + " <small>ပုဒ်</small></div>" +
-          "<div class='adet'>စာကြောင်း: " + (segs[n] || 0) + "<br>" +
-          "ဝေစု: " + pct + "%<br>နောက်ဆုံး သုံးချိန်: " + when +
-          "</div></div>";
-      }).join("") + "</div>";
+          "<div class='ad'>စာကြောင်း " + (segs[n] || 0) + " · ဝေစု " +
+          pct + "% · နောက်ဆုံး " + when + "</div></div>" +
+          "<div class='ac'>" + counts[n] + " <small>ပုဒ်</small></div></div>";
+      }).join("");
   } catch (e) {}
 }
 $("apiStatsBtn").onclick = loadApiStats;
@@ -1449,6 +1444,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 139</p>
+<p class="hint" id="buildTag" style="text-align:center">build 140</p>
 </body>
 </html>
