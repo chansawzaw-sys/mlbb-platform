@@ -424,7 +424,28 @@ def translate_segments(workdir, style="subs"):
                 return out
         except Exception as e:
             report["openai_err"] = str(e)[:120]
-    # 0c. Apps Script batch — third engine (build 137, owner request
+    # 0c. OpenRouter batch — third engine (build 147, owner chose it
+    # 2026-11-11): direct OpenAI is region-blocked from the VPS, so
+    # the same wallet idea runs through OpenRouter (US aggregator,
+    # Gemini models first, story-style prompts apply). Any failure
+    # falls through to Apps Script, then the free chain.
+    if segs:
+        try:
+            from . import openrouter_translate
+            if openrouter_translate.key_configured():
+                by_idx = openrouter_translate.translate_all(
+                    segs, style=style)
+                out = [{**seg, "text_my": by_idx[i],
+                        "provider": "openrouter"}
+                       for i, seg in enumerate(segs)]
+                out = _fill_missing(out, report)
+                _write_report(workdir, report)
+                save_segments(out, workdir / "segments_my.json")
+                write_srt(out, workdir / "subs_my.srt")
+                return out
+        except Exception as e:
+            report["openrouter_err"] = str(e)[:120]
+    # 0d. Apps Script batch — fourth engine (build 137, owner request
     # 2026-11-10): the owner's own Google account translates via
     # LanguageApp, so the throttled VPS IP never touches Google.
     # Reliable fallback before the free chain; literal Google quality,
