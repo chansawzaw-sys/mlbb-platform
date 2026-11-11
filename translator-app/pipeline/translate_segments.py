@@ -424,7 +424,29 @@ def translate_segments(workdir, style="subs"):
                 return out
         except Exception as e:
             report["openai_err"] = str(e)[:120]
-    # 0c. OpenRouter batch — third engine (build 147, owner chose it
+    # 0c. xKiro batch — third engine (build 155, owner chose it
+    # 2026-11-11): a young OpenAI-compatible gateway whose free
+    # tier plus $5 Telegram-verification credit reach DeepSeek V4
+    # Flash cheaper than OpenRouter, with free Mistral/Cohere
+    # models behind it. Any failure falls through to OpenRouter.
+    if segs:
+        try:
+            from . import xkiro_translate
+            if xkiro_translate.key_configured():
+                by_idx = xkiro_translate.translate_all(
+                    segs, style=style)
+                label = xkiro_translate.last_label()
+                out = [{**seg, "text_my": by_idx[i],
+                        "provider": label}
+                       for i, seg in enumerate(segs)]
+                out = _fill_missing(out, report)
+                _write_report(workdir, report)
+                save_segments(out, workdir / "segments_my.json")
+                write_srt(out, workdir / "subs_my.srt")
+                return out
+        except Exception as e:
+            report["xkiro_err"] = str(e)[:120]
+    # 0d. OpenRouter batch — fourth engine (build 147, owner chose it
     # 2026-11-11): direct OpenAI is region-blocked from the VPS, so
     # the same wallet idea runs through OpenRouter (US aggregator,
     # Gemini models first, story-style prompts apply). Any failure
@@ -446,7 +468,7 @@ def translate_segments(workdir, style="subs"):
                 return out
         except Exception as e:
             report["openrouter_err"] = str(e)[:120]
-    # 0d. Apps Script batch — fourth engine (build 137, owner request
+    # 0e. Apps Script batch — fifth engine (build 137, owner request
     # 2026-11-10): the owner's own Google account translates via
     # LanguageApp, so the throttled VPS IP never touches Google.
     # Reliable fallback before the free chain; literal Google quality,

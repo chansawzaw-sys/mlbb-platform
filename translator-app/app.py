@@ -1578,6 +1578,45 @@ def openrouter_key_delete():
     return jsonify({"ok": True, "configured": False})
 
 
+@app.get("/api/settings/xkiro-key")
+def xkiro_key_status():
+    from pipeline import xkiro_translate
+    return jsonify({"configured": xkiro_translate.key_configured()})
+
+
+@app.post("/api/settings/xkiro-key")
+def xkiro_key_save():
+    data = request.get_json(force=True) or {}
+    key = (data.get("key") or "").strip()
+    ok_format = 20 <= len(key) <= 200 \
+        and all(ch.isalnum() or ch in "._-" for ch in key)
+    if not ok_format:
+        return jsonify({"error": "key မမှန်ပါ — xKiro key ဖြစ်ရပါမယ်"}), 400
+    env_path = ROOT / ".env"
+    lines = []
+    if env_path.exists():
+        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
+                 if not ln.startswith("XKIRO_API_KEY=")]
+    lines.append(f"XKIRO_API_KEY={key}")
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        os.chmod(env_path, 0o600)
+    except Exception:
+        pass
+    return jsonify({"ok": True, "configured": True})
+
+
+@app.delete("/api/settings/xkiro-key")
+def xkiro_key_delete():
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
+                 if not ln.startswith("XKIRO_API_KEY=")]
+        env_path.write_text("\n".join(lines) + ("\n" if lines else ""),
+                            encoding="utf-8")
+    return jsonify({"ok": True, "configured": False})
+
+
 # ---------- Telegram delivery (commercial direction) ----------
 # Finished videos can be sent straight to Telegram users from the
 # app. Telegram's rule: a bot may only message people who messaged
@@ -1875,6 +1914,25 @@ def _run_translate_probe():
         except Exception:
             res["openrouter_model"] = None
         try:
+            from pipeline import xkiro_translate
+            if xkiro_translate.key_configured():
+                by = xkiro_translate.translate_all(
+                    [{"start": 0.0, "end": 1.0, "text": sample}])
+                out = by.get(0) or ""
+                res["xkiro_ok"] = bool(out) and \
+                    any("\u1000" <= c <= "\u109f" for c in out)
+            else:
+                res["xkiro_ok"] = False
+        except Exception as e:
+            res["xkiro_ok"] = False
+            res["xkiro_err"] = str(e)[:400]
+        try:
+            res["xkiro_model"] = (
+                (ROOT / ".xkiro_last_model").read_text(
+                    encoding="utf-8").strip() or None)
+        except Exception:
+            res["xkiro_model"] = None
+        try:
             from pipeline import apps_script_translate
             if apps_script_translate.configured():
                 by = apps_script_translate.translate_all(
@@ -1950,6 +2008,11 @@ def auth_me():
         i18n["openrouter_configured"] = bool(_or.key_configured())
     except Exception:
         i18n["openrouter_configured"] = None
+    try:
+        from pipeline import xkiro_translate as _xk
+        i18n["xkiro_configured"] = bool(_xk.key_configured())
+    except Exception:
+        i18n["xkiro_configured"] = None
     try:
         from pipeline import apps_script_translate as _as
         i18n["apps_script_configured"] = bool(_as.configured())

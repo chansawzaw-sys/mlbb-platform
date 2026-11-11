@@ -223,6 +223,16 @@
     </div>
   </div>
 
+  <div class="card" id="xkCard">
+    <h3 style="margin-top:0">🚀 xKiro key (ဘာသာပြန် engine)</h3>
+    <p class="hint">xKiro gateway ကနေ <b>DeepSeek V4 Flash</b> ကို ဈေးသက်သက်သာသာ (Telegram verify လုပ်ရင် $5 credit အခမဲ့) နဲ့ free model တွေ သုံးတဲ့ လမ်းပါ။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="xkState">…</span></p>
+    <input type="password" id="xkInput" placeholder="xKiro key ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+    <div class="row">
+      <button class="ghost" id="xkSave">သိမ်းမယ်</button>
+      <button class="ghost" id="xkDel">ဖျက်မယ်</button>
+    </div>
+  </div>
+
   <div class="card" id="asCard">
     <h3 style="margin-top:0">📜 Apps Script (အခမဲ့ ဘာသာပြန် လမ်း)</h3>
     <p class="hint">ရှင့် Google account ပေါ်က Apps Script (LanguageApp) ကနေ ဘာသာပြန်တယ် — VPS IP ငြိတာ မရှိလို့ job အပြည့် မပြိုဘူး။ အရည်အသွေးက Google Translate ပုံမှန် (ဇာတ်လမ်း ဟန် မဟုတ်ပါ) — Gemini/OpenAI ရရင် သူတို့ အရင် သုံးပြီး, မရမှ ဒီ လမ်း ယူပါတယ်။ Web App URL + secret ကို ဒီမှာပဲ ထည့်ပါ — <b>chat ထဲ လုံးဝ မပို့ပါနဲ့</b>။ အခြေအနေ: <span id="asState">…</span></p>
@@ -1130,6 +1140,38 @@ $("orDel").onclick = async () => {
 };
 loadOrState();
 
+/* ---------------- xKiro settings ---------------- */
+async function loadXkState() {
+  try {
+    const r = await fetch("/api/settings/xkiro-key");
+    const d = await r.json();
+    // Owner-only card, same rule as the other key cards: any non-OK
+    // or field-less response (a customer's 403) keeps it hidden.
+    if (!r.ok || !("configured" in d)) {
+      $("xkCard").classList.remove("show");
+      return;
+    }
+    $("xkState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
+    $("xkCard").classList.add("show");
+  } catch (e) { $("xkState").textContent = "?"; }
+}
+$("xkSave").onclick = async () => {
+  const key = $("xkInput").value.trim();
+  if (!key) { alert("key အရင် ထည့်ပါ"); return; }
+  const res = await fetch("/api/settings/xkiro-key", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({key})});
+  const d = await res.json();
+  if (!res.ok) { alert(d.error || "သိမ်းလို့ မရပါ"); return; }
+  $("xkInput").value = "";
+  loadXkState();
+  alert("သိမ်းပြီးပြီ — နောက် job တွေမှာ xKiro နဲ့ ပြန်ပေးမယ်");
+};
+$("xkDel").onclick = async () => {
+  await fetch("/api/settings/xkiro-key", {method: "DELETE"});
+  loadXkState();
+};
+loadXkState();
+
 /* ---------------- Apps Script settings ---------------- */
 async function loadAsState() {
   try {
@@ -1271,6 +1313,7 @@ loadTgState();
 let ME = null;
 const API_LABELS = {gemini: "Gemini", openai: "OpenAI",
   openrouter: "OpenRouter (Paid)", "openrouter-free": "OpenRouter (Free)",
+  xkiro: "xKiro (Paid)", "xkiro-free": "xKiro (Free)",
   "apps-script": "Apps Script", "google-batch": "Google batch (free)",
   "gtx-batch": "gtx batch (free)", google: "Google (free)",
   gtx: "gtx (free)", bing: "Bing (free)", mymemory: "MyMemory (free)"};
@@ -1280,7 +1323,7 @@ async function loadApiStats() {
     const counts = d.counts || {}, segs = d.segs || {}, last = d.last || {};
     const total = d.total || 0;
     const order = ["gemini", "openai", "openrouter", "openrouter-free",
-      "apps-script"];
+      "xkiro", "xkiro-free", "apps-script"];
     const names = order.concat(Object.keys(counts)
       .filter(n => !order.includes(n))
       .sort((a, b) => counts[b] - counts[a]));
@@ -1327,6 +1370,9 @@ function renderEngineStats() {
     row("OpenRouter" + (p.openrouter_ok && p.openrouter_model
       ? " (" + escHtml(p.openrouter_model) + ")" : ""),
       I18N.openrouter_configured, p.openrouter_ok) +
+    row("xKiro" + (p.xkiro_ok && p.xkiro_model
+      ? " (" + escHtml(p.xkiro_model) + ")" : ""),
+      I18N.xkiro_configured, p.xkiro_ok) +
     row("Apps Script", I18N.apps_script_configured, p.apps_script_ok) +
     row("Free chain", true, p.free_ok) +
     "</div>" +
@@ -1365,6 +1411,7 @@ async function loadMe() {
       $("keyCard").classList.remove("show");
       $("oaCard").classList.remove("show");
       $("orCard").classList.remove("show");
+      $("xkCard").classList.remove("show");
       $("asCard").classList.remove("show");
       $("tgCard").classList.remove("show");
     }
@@ -1574,6 +1621,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 154</p>
+<p class="hint" id="buildTag" style="text-align:center">build 155</p>
 </body>
 </html>
