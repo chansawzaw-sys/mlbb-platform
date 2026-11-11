@@ -385,14 +385,14 @@ def _on_tg_message(msg):
             # Welcome + menu keyboard in ONE call (two calls made
             # the menu visibly trail the greeting).
             tg.send_message(chat_id, tg.WELCOME, keyboard=_MENU_ROWS)
-            if tg.is_admin(chat_id):
+            if _recovery_allowed(chat_id):
                 # Lockout hint (build 158): if an admin account is
                 # disabled, tell the owner the recovery phrase.
                 try:
                     if any(u["disabled"] for u in accounts.list_admins()):
                         tg.send_message(
                             chat_id, "⚠️ Admin account ပိတ်နေတာ တွေ့ပါတယ် — "
-                                     "ပြန်ဖွင့်ဖို့ «Admin ပြန်ဖွင့်» လို့ "
+                                     "ပြန်ဖွင့်ဖို့ «" + _RECOVERY_PHRASE + "» လို့ "
                                      "ဒီမှာ ပို့ပေးပါ")
                 except Exception:
                     pass
@@ -485,14 +485,68 @@ def _deny_submit(chat_id):
         tg.send_message(chat_id, "🔒 တောင်းပန်ပါတယ် — အခုတော့ ဆိုင် မဖွင့်သေးပါ။ ဖွင့်တဲ့ အခါ အသိပေးပါမယ် 🙏")
 
 
+# ------------------------------------------------------------------
+# Lockout recovery phrase (build 160). The Burmese words are built
+# from explicit codepoints on purpose: the build-158 literals had
+# the tone marks in the wrong order and dropped a consonant, so the
+# owner's correctly typed phrase could never match and the bot fell
+# through to the job flow (proven live 2026-11-12 00:25). Matching
+# is tolerant: zero-width chars and quote marks are stripped, and a
+# tone-mark-free skeleton accepts keyboard ordering variants; the
+# legacy build-158 spelling stays accepted for copy-paste.
+_RECOVERY_PHRASE = ("Admin " + "\u1015\u103c\u1014\u103a" + " "
+                    + "\u1016\u103d\u1004\u103a\u1010\u1037")
+_RECOVERY_LEGACY = ("Admin " + "\u1015\u103c\u1014\u103a" + " "
+                    + "\u1016\u103d\u1004\u1037\u103a")
+
+
+def _phrase_norm(s):
+    s = s or ""
+    for ch in ("\u200b", "\u200c", "\u00ab", "\u00bb", "\u201c",
+               "\u201d", '"', "'"):
+        s = s.replace(ch, "")
+    return " ".join(s.split()).strip().lower()
+
+
+def _phrase_skeleton(s):
+    s = _phrase_norm(s)
+    for ch in ("\u1037", "\u103a", "\u1039"):
+        s = s.replace(ch, "")
+    return s.replace(" ", "")
+
+
+_RECOVERY_SET = {_phrase_norm(_RECOVERY_PHRASE),
+                 _phrase_norm("\U0001F513 " + _RECOVERY_PHRASE),
+                 _phrase_norm(_RECOVERY_LEGACY),
+                 _phrase_norm("\U0001F513 " + _RECOVERY_LEGACY),
+                 "/recover_admin"}
+_RECOVERY_SKEL = {_phrase_skeleton(_RECOVERY_PHRASE),
+                  _phrase_skeleton(_RECOVERY_LEGACY)}
+
+
+def _is_recovery_text(text):
+    return (_phrase_norm(text) in _RECOVERY_SET
+            or _phrase_skeleton(text) in _RECOVERY_SKEL)
+
+
+def _recovery_allowed(chat_id):
+    """Owner-only recovery: the fixed Telegram chat, or a chat
+    linked to an admin account (linking itself required that
+    account's web login, so the chat is the account holder's)."""
+    from pipeline import telegram_send as tg
+    if tg.is_admin(chat_id):
+        return True
+    acct = accounts.user_for_tg(chat_id)
+    return bool(acct and acct.get("role") == "admin")
+
+
 def _tg_menu_step(msg, chat_id, text):
     """Bot account menu + the link / top-up conversations. Returns
     True when the message was consumed by one of them. These are
     ACCOUNT functions (open to anyone who linked an account); job
     submission stays behind the admin lock in the caller."""
     from pipeline import telegram_send as tg
-    if tg.is_admin(chat_id) and (text or "").strip() in (
-            "🔓 Admin ပြန်ဖွင့်", "Admin ပြန်ဖွင့်", "/recover_admin"):
+    if _is_recovery_text(text) and _recovery_allowed(chat_id):
         # Lockout recovery (build 158): ONLY the owner's fixed
         # Telegram chat can do this — that chat id IS the owner's
         # identity, no password involved. Re-enables every disabled
