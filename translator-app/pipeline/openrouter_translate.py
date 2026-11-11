@@ -28,19 +28,32 @@ _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def _models():
-    """Configured model first, then Gemini 2.5 Flash, then GPT-4o
-    mini, then Gemini 2.0 Flash. A 404 (model missing) or a 403
-    (that PROVIDER refuses this region — live probe 2026-11-11:
-    Google models answer 403 'not available in your region' even
-    via OpenRouter) moves to the NEXT model; only 401 (bad key)
-    and 402 (no credit) stop the walk."""
+    """Configured model first, then the name brands, then the
+    providers that do not region-block this server, ending with
+    FREE variants. Live probe 2026-11-11 (build 149): Google AND
+    OpenAI models both answer 403 (region) even via OpenRouter,
+    and google/gemini-2.0-flash-001 is retired (404) — so the walk
+    continues to DeepSeek (paid, ~$0.001/video) and then the free
+    DeepSeek/Qwen/Llama endpoints. A 404/403/402/429 moves to the
+    NEXT model; only 401 (bad key) stops the walk."""
     env = (os.environ.get("OPENROUTER_MODEL") or "").strip()
     out = []
     for m in [env, "google/gemini-2.5-flash", "openai/gpt-4o-mini",
-              "google/gemini-2.0-flash-001"]:
+              "deepseek/deepseek-chat-v3-0324",
+              "deepseek/deepseek-chat-v3-0324:free",
+              "qwen/qwen3-235b-a22b:free",
+              "meta-llama/llama-3.3-70b-instruct:free"]:
         if m and m not in out:
             out.append(m)
     return out
+
+
+def _note_model(mdl):
+    try:
+        (PROJECT_ROOT / ".openrouter_last_model").write_text(
+            mdl, encoding="utf-8")
+    except Exception:
+        pass
 
 
 def get_api_key():
@@ -96,13 +109,16 @@ def translate_all(segments, style="subs"):
             continue
         if resp.status_code == 200:
             data = resp.json()
+            _note_model(mdl)
             break
         attempts.append(f"{mdl}={resp.status_code}")
         last_body = resp.text[:200]
-        if resp.status_code in (401, 402):
-            break  # bad key / no credit — other models won't help
-        # 404 (model missing), 403 (provider region refusal) or
-        # anything else: try the next model.
+        if resp.status_code == 401:
+            break  # bad key — no model will help
+        # 402 (this model needs credit), 403 (provider region
+        # refusal), 404 (model missing), 429 (rate limit) or
+        # anything else: try the next model — the free endpoints
+        # at the end of the list answer when the paid ones cannot.
     if data is None:
         msg = ("OpenRouter failed: " + "; ".join(attempts)
                + f" | last: {last_body}")

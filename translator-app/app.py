@@ -1869,6 +1869,12 @@ def _run_translate_probe():
             res["openrouter_ok"] = False
             res["openrouter_err"] = str(e)[:200]
         try:
+            res["openrouter_model"] = (
+                (ROOT / ".openrouter_last_model").read_text(
+                    encoding="utf-8").strip() or None)
+        except Exception:
+            res["openrouter_model"] = None
+        try:
             from pipeline import apps_script_translate
             if apps_script_translate.configured():
                 by = apps_script_translate.translate_all(

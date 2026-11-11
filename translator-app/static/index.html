@@ -1322,7 +1322,9 @@ function renderEngineStats() {
   box.innerHTML = "<div class='apiGrid'>" +
     row("Gemini", I18N.gemini_configured, p.gemini_ok) +
     row("OpenAI", I18N.openai_configured, p.openai_ok) +
-    row("OpenRouter", I18N.openrouter_configured, p.openrouter_ok) +
+    row("OpenRouter" + (p.openrouter_ok && p.openrouter_model
+      ? " (" + escHtml(p.openrouter_model) + ")" : ""),
+      I18N.openrouter_configured, p.openrouter_ok) +
     row("Apps Script", I18N.apps_script_configured, p.apps_script_ok) +
     row("Free chain", true, p.free_ok) +
     "</div>" +
@@ -1570,6 +1572,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 149</p>
+<p class="hint" id="buildTag" style="text-align:center">build 150</p>
 </body>
 </html>
