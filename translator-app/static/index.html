@@ -44,14 +44,18 @@
   .jobitem .jmeta { color: #99a; font-size: 12.5px; margin-top: 2px; }
   .jobitem .jbtns { display: flex; gap: 6px; margin-top: 8px; }
   .jobitem .jbtns button { flex: 1; }
-  /* ---------- API usage board rows (build 140) ---------- */
-  .apiRow { display: flex; justify-content: space-between; align-items: center;
-    gap: 10px; padding: 9px 2px; border-bottom: 1px solid #ffffff14; }
-  .apiRow:last-child { border-bottom: none; }
-  .apiRow .an { font-size: 14px; color: #fff; }
-  .apiRow .ad { color: #99a; font-size: 12px; margin-top: 2px; }
-  .apiRow .ac { font-size: 20px; font-weight: 700; color: #fff; white-space: nowrap; }
-  .apiRow .ac small { font-size: 12px; font-weight: 400; color: #99a; }
+  /* ---------- API usage board boxes (build 141) ---------- */
+  .apiGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+  .apiBox { background: #101325; border: 1px solid #2b3050; border-radius: 10px;
+    padding: 12px; text-align: center; }
+  .apiBox .an { color: #99a; font-size: 12.5px; }
+  .apiBox .ac { font-size: 24px; font-weight: 700; color: #fff; margin-top: 3px; }
+  .apiBox .ac small { font-size: 12.5px; font-weight: 400; color: #99a; }
+  .apiTotal { background: #101325; border: 1px solid #2b5cff; border-radius: 10px;
+    padding: 12px; text-align: center; margin-top: 8px; }
+  .apiTotal .an { color: #bbc; font-size: 13px; }
+  .apiTotal .ac { font-size: 26px; font-weight: 700; color: #fff; margin-top: 3px; }
+  .apiTotal .ac small { font-size: 13px; font-weight: 400; color: #99a; }
   .step.running { color: #fff; }
   .step.done { color: #7dd87d; }
   .step.error { color: #ff8080; }
@@ -1204,26 +1208,20 @@ const API_LABELS = {gemini: "Gemini", openai: "OpenAI",
 async function loadApiStats() {
   try {
     const d = await (await fetch("/api/admin/api-stats")).json();
-    const counts = d.counts || {}, segs = d.segs || {}, last = d.last || {};
-    const names = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
-    if (!names.length) {
-      $("apiStats").innerHTML = "<p class='hint'>မှတ်တမ်း မရှိသေးပါ — " +
-        "နောက် job တွေ ပြန်ပြီးတာနဲ့ ဒီမှာ ပေါ်လာပါမယ်</p>";
-      return;
-    }
+    const counts = d.counts || {};
     const total = d.total || 0;
-    $("apiStats").innerHTML = "<p class='hint'>စုစုပေါင်း <b>" + total +
-      "</b> ပုဒ်</p>" + names.map(n => {
-        const pct = total ? Math.round(counts[n] * 100 / total) : 0;
-        const when = last[n] ? new Date(last[n] * 1000).toLocaleString(
-          "en-GB", {day: "numeric", month: "short",
-                    hour: "2-digit", minute: "2-digit"}) : "—";
-        return "<div class='apiRow'><div>" +
-          "<div class='an'>" + (API_LABELS[n] || escHtml(n)) + "</div>" +
-          "<div class='ad'>စာကြောင်း " + (segs[n] || 0) + " · ဝေစု " +
-          pct + "% · နောက်ဆုံး " + when + "</div></div>" +
-          "<div class='ac'>" + counts[n] + " <small>ပုဒ်</small></div></div>";
-      }).join("");
+    const order = ["gemini", "openai", "apps-script"];
+    const names = order.concat(Object.keys(counts)
+      .filter(n => !order.includes(n))
+      .sort((a, b) => counts[b] - counts[a]));
+    const box = n => "<div class='apiBox'><div class='an'>" +
+      (API_LABELS[n] || escHtml(n)) + "</div><div class='ac'>" +
+      (counts[n] || 0) + " <small>ပုဒ်</small></div></div>";
+    $("apiStats").innerHTML =
+      "<div class='apiTotal'><div class='an'>📹 စုစုပေါင်း ထုတ်ပြီး ဗီဒီယို</div>" +
+      "<div class='ac'>" + total + " <small>ပုဒ်</small></div></div>" +
+      "<div class='apiGrid'>" + names.map(box).join("") + "</div>" +
+      "<p class='hint'>မှတ်တမ်း က build 138 နောက်ပိုင်း job တွေက စတာပါ</p>";
   } catch (e) {}
 }
 $("apiStatsBtn").onclick = loadApiStats;
@@ -1444,6 +1442,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 140</p>
+<p class="hint" id="buildTag" style="text-align:center">build 141</p>
 </body>
 </html>
