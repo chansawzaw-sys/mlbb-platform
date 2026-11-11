@@ -1950,6 +1950,16 @@ def auth_link_code():
     return jsonify({"code": code})
 
 
+@app.get("/api/admin/api-stats")
+def admin_api_stats():
+    """Which translation API produced how many videos (build 138).
+    Counts live in pipeline/api_stats.py (server-side JSON)."""
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    from pipeline import api_stats
+    return jsonify(api_stats.read())
+
+
 @app.get("/api/admin/topups")
 def admin_topups():
     if not _require_admin():

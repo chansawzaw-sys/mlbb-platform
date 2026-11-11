@@ -132,6 +132,11 @@
     <div id="adminResults" style="margin-top:8px"></div>
     <h4>💰 Credit ဖြည့် တောင်းဆိုချက်များ</h4>
     <div id="topupList"><p class="hint">…</p></div>
+    <h4>📊 API အသုံးပြုမှု — ဘယ် API နဲ့ ဘယ်နှပုဒ် ပြန်ပြီးပြီလဲ</h4>
+    <div id="apiStats"><p class="hint">…</p></div>
+    <div class="row">
+      <button class="ghost" id="apiStatsBtn">🔄 ပြန်စစ်မယ်</button>
+    </div>
     <h4>🏦 ငွေဖြည့် လိပ်စာ / QR သတ်မှတ်ရန်</h4>
     <input id="payInfo" placeholder="ငွေလွှဲ နံပါတ်/အမည် (ဥပမာ KPay 09… နာမည်) — customer မြင်ရမယ်" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <div class="row">
@@ -1184,6 +1189,33 @@ loadTgState();
 
 // ---------- accounts ----------
 let ME = null;
+const API_LABELS = {gemini: "Gemini", openai: "OpenAI",
+  "apps-script": "Apps Script", "google-batch": "Google batch (free)",
+  "gtx-batch": "gtx batch (free)", google: "Google (free)",
+  gtx: "gtx (free)", bing: "Bing (free)", mymemory: "MyMemory (free)"};
+async function loadApiStats() {
+  try {
+    const d = await (await fetch("/api/admin/api-stats")).json();
+    const counts = d.counts || {}, segs = d.segs || {}, last = d.last || {};
+    const names = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+    if (!names.length) {
+      $("apiStats").innerHTML = "<p class='hint'>မှတ်တမ်း မရှိသေးပါ — " +
+        "နောက် job တွေ ပြန်ပြီးတာနဲ့ ဒီမှာ ပေါ်လာပါမယ်</p>";
+      return;
+    }
+    $("apiStats").innerHTML = "<p class='hint'>စုစုပေါင်း <b>" +
+      (d.total || 0) + "</b> ပုဒ်</p>" + names.map(n => {
+        const when = last[n] ? new Date(last[n] * 1000).toLocaleString(
+          "en-GB", {day: "numeric", month: "short",
+                    hour: "2-digit", minute: "2-digit"}) : "";
+        return "<p style='margin:4px 0'>• <b>" +
+          (API_LABELS[n] || escHtml(n)) + "</b> — " + counts[n] + " ပုဒ်" +
+          (segs[n] ? " (စာကြောင်း " + segs[n] + ")" : "") +
+          (when ? " · နောက်ဆုံး: " + when : "") + "</p>";
+      }).join("");
+  } catch (e) {}
+}
+$("apiStatsBtn").onclick = loadApiStats;
 async function loadMe() {
   try {
     const r = await (await fetch("/api/auth/me")).json();
@@ -1191,7 +1223,7 @@ async function loadMe() {
     $("authOut").style.display = ME ? "none" : "";
     $("authIn").style.display = ME ? "" : "none";
     $("adminCard").classList.toggle("show", !!(ME && ME.role === "admin"));
-    if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); loadWall(); }
+    if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); loadWall(); loadApiStats(); }
     if (ME && ME.role !== "admin") {
       // Customers never see the owner's key / bot settings cards.
       $("keyCard").classList.remove("show");
@@ -1401,6 +1433,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 137</p>
+<p class="hint" id="buildTag" style="text-align:center">build 138</p>
 </body>
 </html>

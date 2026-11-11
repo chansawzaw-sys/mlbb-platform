@@ -82,6 +82,13 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs"):
         raise RuntimeError(
             "ဘာသာပြန် မရပါ — ဘာသာပြန် service တွေ ခဏ အလုပ်မလုပ်ပါ။ "
             "ခဏနေမှ ပြန်စမ်းပါ (credit လုံးဝ မဖြတ်ပါ)" + _detail)
+    # Admin usage board (build 138): count this video under the API
+    # that translated most of it. Best-effort — never breaks a job.
+    try:
+        from . import api_stats
+        api_stats.record(_segs or [])
+    except Exception:
+        pass
     mark("translate", "done")
     return src
 
