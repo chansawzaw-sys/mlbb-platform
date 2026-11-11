@@ -60,6 +60,18 @@ def _note_model(mdl):
         pass
 
 
+LAST_MODEL = None
+
+
+def last_label():
+    """Usage-board label for the most recent success (build 152,
+    owner order): videos translated by a FREE endpoint and by a
+    PAID model are counted in separate boxes."""
+    if LAST_MODEL and LAST_MODEL.endswith(":free"):
+        return "openrouter-free"
+    return "openrouter"
+
+
 def get_api_key():
     key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
     if key:
@@ -114,6 +126,7 @@ def translate_all(segments, style="subs"):
         if resp.status_code == 200:
             data = resp.json()
             _note_model(mdl)
+            globals()["LAST_MODEL"] = mdl
             break
         attempts.append(f"{mdl}={resp.status_code}")
         last_body = resp.text[:200]

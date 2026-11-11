@@ -1269,7 +1269,8 @@ loadTgState();
 
 // ---------- accounts ----------
 let ME = null;
-const API_LABELS = {gemini: "Gemini", openai: "OpenAI", openrouter: "OpenRouter",
+const API_LABELS = {gemini: "Gemini", openai: "OpenAI",
+  openrouter: "OpenRouter (Paid)", "openrouter-free": "OpenRouter (Free)",
   "apps-script": "Apps Script", "google-batch": "Google batch (free)",
   "gtx-batch": "gtx batch (free)", google: "Google (free)",
   gtx: "gtx (free)", bing: "Bing (free)", mymemory: "MyMemory (free)"};
@@ -1278,7 +1279,8 @@ async function loadApiStats() {
     const d = await (await fetch("/api/admin/api-stats")).json();
     const counts = d.counts || {}, segs = d.segs || {}, last = d.last || {};
     const total = d.total || 0;
-    const order = ["gemini", "openai", "openrouter", "apps-script"];
+    const order = ["gemini", "openai", "openrouter", "openrouter-free",
+      "apps-script"];
     const names = order.concat(Object.keys(counts)
       .filter(n => !order.includes(n))
       .sort((a, b) => counts[b] - counts[a]));
@@ -1572,6 +1574,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 151</p>
+<p class="hint" id="buildTag" style="text-align:center">build 152</p>
 </body>
 </html>

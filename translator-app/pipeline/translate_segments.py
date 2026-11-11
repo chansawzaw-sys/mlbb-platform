@@ -435,8 +435,9 @@ def translate_segments(workdir, style="subs"):
             if openrouter_translate.key_configured():
                 by_idx = openrouter_translate.translate_all(
                     segs, style=style)
+                label = openrouter_translate.last_label()
                 out = [{**seg, "text_my": by_idx[i],
-                        "provider": "openrouter"}
+                        "provider": label}
                        for i, seg in enumerate(segs)]
                 out = _fill_missing(out, report)
                 _write_report(workdir, report)
