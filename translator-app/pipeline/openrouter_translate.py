@@ -28,13 +28,16 @@ _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def _models():
-    """Configured model first, then Gemini-class models (the style
-    prompts are written for them), then a GPT mini as last resort —
-    a 404 (model not available) moves to the next one."""
+    """Configured model first, then Gemini 2.5 Flash, then GPT-4o
+    mini, then Gemini 2.0 Flash. A 404 (model missing) or a 403
+    (that PROVIDER refuses this region — live probe 2026-11-11:
+    Google models answer 403 'not available in your region' even
+    via OpenRouter) moves to the NEXT model; only 401 (bad key)
+    and 402 (no credit) stop the walk."""
     env = (os.environ.get("OPENROUTER_MODEL") or "").strip()
     out = []
-    for m in [env, "google/gemini-2.5-flash",
-              "google/gemini-2.0-flash-001", "openai/gpt-4o-mini"]:
+    for m in [env, "google/gemini-2.5-flash", "openai/gpt-4o-mini",
+              "google/gemini-2.0-flash-001"]:
         if m and m not in out:
             out.append(m)
     return out
@@ -96,9 +99,10 @@ def translate_all(segments, style="subs"):
             break
         attempts.append(f"{mdl}={resp.status_code}")
         last_body = resp.text[:200]
-        if resp.status_code in (401, 402, 403):
-            break  # bad key / no credit / no access — models won't help
-        # 404 (model missing) or anything else: try the next model.
+        if resp.status_code in (401, 402):
+            break  # bad key / no credit — other models won't help
+        # 404 (model missing), 403 (provider region refusal) or
+        # anything else: try the next model.
     if data is None:
         msg = ("OpenRouter failed: " + "; ".join(attempts)
                + f" | last: {last_body}")
