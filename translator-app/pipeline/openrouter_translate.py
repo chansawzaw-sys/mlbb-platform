@@ -30,19 +30,23 @@ _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 def _models():
     """Configured model first, then the name brands, then the
     providers that do not region-block this server, ending with
-    FREE variants. Live probe 2026-11-11 (build 149): Google AND
-    OpenAI models both answer 403 (region) even via OpenRouter,
-    and google/gemini-2.0-flash-001 is retired (404) — so the walk
-    continues to DeepSeek (paid, ~$0.001/video) and then the free
-    DeepSeek/Qwen/Llama endpoints. A 404/403/402/429 moves to the
-    NEXT model; only 401 (bad key) stops the walk."""
+    FREE variants. Live probe 2026-11-11 (build 150): Google AND
+    OpenAI models both answer 403 (region) even via OpenRouter;
+    paid DeepSeek answers 402 (wallet empty); the DeepSeek/Qwen/
+    Llama :free endpoints I guessed in build 150 are RETIRED
+    (404). The live OpenRouter catalog that day lists only 13
+    free models; the multilingual chat ones are Google's Gemma 4
+    (open-weight, served by third-party hosts, so the Google
+    region wall does not apply) and Baidu ERNIE — those are the
+    free tail now. A 404/403/402/429 moves to the NEXT model;
+    only 401 (bad key) stops the walk."""
     env = (os.environ.get("OPENROUTER_MODEL") or "").strip()
     out = []
     for m in [env, "google/gemini-2.5-flash", "openai/gpt-4o-mini",
               "deepseek/deepseek-chat-v3-0324",
-              "deepseek/deepseek-chat-v3-0324:free",
-              "qwen/qwen3-235b-a22b:free",
-              "meta-llama/llama-3.3-70b-instruct:free"]:
+              "google/gemma-4-31b-it:free",
+              "google/gemma-4-26b-a4b-it:free",
+              "baidu/ernie-5.5-flash-preview:free"]:
         if m and m not in out:
             out.append(m)
     return out
