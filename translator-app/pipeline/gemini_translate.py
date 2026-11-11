@@ -45,7 +45,27 @@ Segments:
 __SEGMENTS_JSON__
 """
 
-PROMPT_SUBS = PROMPT
+# Subtitle style (owner's rule, 2026-11-11, build 142): even for
+# subtitle-only jobs the Burmese must read like a STORY being told
+# (ဇာတ်လမ်းဆန်ဆန်) — flowing spoken Burmese, connected across
+# segments — while staying complete and faithful to what is said.
+# (Before build 142, subs used the plain faithful PROMPT above and
+# only dub mode had the storyteller voice.)
+PROMPT_SUBS = """You are a Burmese storyteller subtitling a video. Render each segment below in natural, spoken Burmese (ပြောစကား) told like a story (ဇာတ်လမ်း ပြောသလို) — smooth and flowing from segment to segment, the way a narrator tells the tale — NOT stiff, word-by-word translation.
+
+Rules:
+- Stay COMPLETE and FAITHFUL to what is actually said in the video: translate everything, in order — never add, omit, summarise, soften or censor anything.
+- Within that faithfulness, phrase it the way a Burmese storyteller would say it: natural connectors and natural word order, idioms and slang by MEANING never word-by-word, so consecutive segments read like one continuous story and the emotion of the scene carries through.
+- Keep personal names, place names, brand names and ALL numbers exactly as they are.
+- Keep each translation roughly as short as the original (it must fit the same on-screen window).
+- Do not add explanations, notes or extra sentences.
+
+Input is a JSON array of {"id": <int>, "text": "<source segment>"}.
+Output MUST be only a JSON array of {"id": <same int>, "my": "<burmese translation>"} with exactly the same ids, in the same order. No markdown fences, no commentary.
+
+Segments:
+__SEGMENTS_JSON__
+"""
 
 # Dub mode (owner's rule, 2026-11-09): the voice NARRATES — retell the
 # scene like a storyteller, in flowing spoken Burmese. Subtitle-only
