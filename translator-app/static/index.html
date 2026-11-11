@@ -153,10 +153,14 @@
     <div id="adminResults" style="margin-top:8px"></div>
     <h4>💰 Credit ဖြည့် တောင်းဆိုချက်များ</h4>
     <div id="topupList"><p class="hint">…</p></div>
-    <h4>📊 API အသုံးပြုမှု — ဘယ် API နဲ့ ဘယ်နှပုဒ် ပြန်ပြီးပြီလဲ</h4>
-    <div id="apiStats"><p class="hint">…</p></div>
     <div class="row">
-      <button class="ghost" id="apiStatsBtn">🔄 ပြန်စစ်မယ်</button>
+      <button class="ghost" id="apiToggle">📊 API အသုံးပြုမှု</button>
+    </div>
+    <div id="apiPanel" style="display:none">
+      <div id="apiStats"><p class="hint">…</p></div>
+      <div class="row">
+        <button class="ghost" id="apiStatsBtn">🔄 ပြန်စစ်မယ်</button>
+      </div>
     </div>
     <h4>🏦 ငွေဖြည့် လိပ်စာ / QR သတ်မှတ်ရန်</h4>
     <input id="payInfo" placeholder="ငွေလွှဲ နံပါတ်/အမည် (ဥပမာ KPay 09… နာမည်) — customer မြင်ရမယ်" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
@@ -1245,6 +1249,12 @@ async function loadApiStats() {
   } catch (e) {}
 }
 $("apiStatsBtn").onclick = loadApiStats;
+$("apiToggle").onclick = () => {
+  const p = $("apiPanel");
+  const open = p.style.display === "none";
+  p.style.display = open ? "" : "none";
+  if (open) loadApiStats();
+};
 async function loadMe() {
   try {
     const r = await (await fetch("/api/auth/me")).json();
@@ -1252,7 +1262,7 @@ async function loadMe() {
     $("authOut").style.display = ME ? "none" : "";
     $("authIn").style.display = ME ? "" : "none";
     $("adminCard").classList.toggle("show", !!(ME && ME.role === "admin"));
-    if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); loadWall(); loadApiStats(); }
+    if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); loadWall(); }
     if (ME && ME.role !== "admin") {
       // Customers never see the owner's key / bot settings cards.
       $("keyCard").classList.remove("show");
@@ -1464,6 +1474,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 143</p>
+<p class="hint" id="buildTag" style="text-align:center">build 144</p>
 </body>
 </html>
