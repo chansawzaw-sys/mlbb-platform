@@ -385,6 +385,17 @@ def _on_tg_message(msg):
             # Welcome + menu keyboard in ONE call (two calls made
             # the menu visibly trail the greeting).
             tg.send_message(chat_id, tg.WELCOME, keyboard=_MENU_ROWS)
+            if tg.is_admin(chat_id):
+                # Lockout hint (build 158): if an admin account is
+                # disabled, tell the owner the recovery phrase.
+                try:
+                    if any(u["disabled"] for u in accounts.list_admins()):
+                        tg.send_message(
+                            chat_id, "⚠️ Admin account ပိတ်နေတာ တွေ့ပါတယ် — "
+                                     "ပြန်ဖွင့်ဖို့ «Admin ပြန်ဖွင့်» လို့ "
+                                     "ဒီမှာ ပို့ပေးပါ")
+                except Exception:
+                    pass
         return
     if not text:
         return
@@ -480,6 +491,26 @@ def _tg_menu_step(msg, chat_id, text):
     ACCOUNT functions (open to anyone who linked an account); job
     submission stays behind the admin lock in the caller."""
     from pipeline import telegram_send as tg
+    if tg.is_admin(chat_id) and (text or "").strip() in (
+            "🔓 Admin ပြန်ဖွင့်", "Admin ပြန်ဖွင့်", "/recover_admin"):
+        # Lockout recovery (build 158): ONLY the owner's fixed
+        # Telegram chat can do this — that chat id IS the owner's
+        # identity, no password involved. Re-enables every disabled
+        # admin account so the owner can log straight back in with
+        # the admin password they know.
+        fixed = [u for u in accounts.list_admins() if u["disabled"]]
+        n = sum(1 for u in fixed
+                if accounts.set_disabled(u["id"], False))
+        if n:
+            tg.send_message(
+                chat_id, f"✅ Admin account {n} ခု ပြန်ဖွင့်ပြီးပါပြီ — "
+                         "web app မှာ မူလ password နဲ့ တန်း login "
+                         "ဝင်နိုင်ပါပြီ 🙏")
+        else:
+            tg.send_message(
+                chat_id, "ပြန်ဖွင့်စရာ ပိတ်နေတဲ့ admin account မရှိပါ — "
+                         "အားလုံး ပုံမှန် ဖြစ်နေပါတယ်")
+        return True
     flow = _TG_FLOW.get(chat_id)
     acct = accounts.user_for_tg(chat_id)
     photos = msg.get("photo")

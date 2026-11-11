@@ -205,6 +205,16 @@ def admin_counts():
     return len(rows), sum(1 for r in rows if not r["disabled"])
 
 
+def list_admins():
+    """All admin accounts (public dicts) — used by the bot-side
+    lockout recovery (build 158)."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM users WHERE role = 'admin' "
+            "ORDER BY id").fetchall()
+    return [_public(r) for r in rows]
+
+
 def claim_admin(username, recovery_tg_id=None):
     """One-shot: promote `username` to admin ONLY while no admin
     exists yet. Returns True if it happened.
