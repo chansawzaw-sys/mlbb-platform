@@ -405,6 +405,13 @@
     <p class="err" id="err"></p>
     <video id="preview" controls playsinline preload="metadata" style="display:none"></video>
     <a class="dl" id="dl" style="display:none">⬇️ ရလာတဲ့ ဗီဒီယို ဒေါင်းလုပ် (.mp4)</a>
+    <p class="hint" id="dlHint" style="display:none">ဒေါင်းနှိပ်ရင် တိုးတက်မှု % ပြပြီး ဖုန်း Downloads folder ထဲ တန်းဝင်ပါတယ်</p>
+    <div id="dlProg" style="display:none;margin:8px 0">
+      <div style="background:#22304a;border-radius:6px;height:10px;overflow:hidden">
+        <div id="dlBar" style="background:#57b25e;height:100%;width:0%"></div>
+      </div>
+      <p class="hint" id="dlPct" style="margin:4px 0 0"></p>
+    </div>
     <div class="row" id="jobDl" style="display:none">
       <a class="dlbtn" id="jobDlTxt" download>📄 မြန်မာ စာသား (TXT)</a>
       <a class="dlbtn" id="jobDlSrt" download>📄 မြန်မာ SRT</a>
@@ -920,6 +927,7 @@ async function poll(id) {
     clearInterval(timer); $("go").disabled = false;
     currentJobId = id;
     $("dl").href = "/api/jobs/" + id + "/download"; $("dl").style.display = "block";
+    $("dlHint").style.display = "block";
     fillDl("jobDl", id); $("jobDl").style.display = "flex";
     $("preview").src = "/api/jobs/" + id + "/stream"; $("preview").style.display = "block";
     try { $("preview").scrollIntoView({behavior: "smooth", block: "center"}); } catch (e) {}
@@ -1631,6 +1639,44 @@ $("paySave").addEventListener("click", async () => {
     body: JSON.stringify({text: $("payInfo").value})});
   alert("သိမ်းပြီး");
 });
+/* Download with live % progress, saved straight into the phone's
+   Downloads folder (build 159). Falls back to the browser's own
+   downloader if streaming fetch is unavailable or fails. */
+$("dl").addEventListener("click", async (e) => {
+  e.preventDefault();
+  const url = $("dl").getAttribute("href");
+  if (!url) return;
+  const prog = $("dlProg"), bar = $("dlBar"), pct = $("dlPct");
+  try {
+    const res = await fetch(url);
+    if (!res.ok || !res.body || !res.body.getReader) throw new Error("nf");
+    const total = Number(res.headers.get("Content-Length") || 0);
+    const reader = res.body.getReader();
+    const chunks = []; let got = 0;
+    prog.style.display = "block"; bar.style.width = "0%";
+    pct.textContent = "ဒေါင်းနေတယ် — 0%";
+    for (;;) {
+      const r = await reader.read();
+      if (r.done) break;
+      chunks.push(r.value); got += r.value.length;
+      const p = total ? Math.floor(got / total * 100) : null;
+      bar.style.width = (p || 0) + "%";
+      pct.textContent = "ဒေါင်းနေတယ် — " + (p !== null ? p + "% · " : "") +
+        (got / 1e6).toFixed(1) + (total ? " / " + (total / 1e6).toFixed(1) : "") + " MB";
+    }
+    const blob = new Blob(chunks, {type: "video/mp4"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "myanmar-" + (currentJobId || "video") + ".mp4";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    bar.style.width = "100%";
+    pct.textContent = "✅ ဒေါင်းပြီး — ဖုန်း Downloads folder ထဲ ရောက်ပါပြီ";
+  } catch (err) {
+    prog.style.display = "none";
+    window.location.href = url;
+  }
+});
 window.tgPick = async function (id) {
   const box = $("tgpick-" + id);
   if (box.style.display !== "none") { box.style.display = "none"; return; }
@@ -1640,10 +1686,11 @@ window.tgPick = async function (id) {
     const d = await (await fetch("/api/telegram/recipients")).json();
     const rs = d.recipients || [];
     if (!rs.length) {
-      box.innerHTML = '<p class="hint">Start နှိပ်ထားသူ မရှိသေးပါ — ပို့ချင်တဲ့သူက bot ကို အရင် Start နှိပ်ရမယ်</p>';
+      box.innerHTML = '<p class="hint">ကိုယ့် Telegram မချိတ်ရသေးပါ — bot မှာ «👤 Username ချိတ်» အရင် လုပ်ပြီးမှ ပို့လို့ရပါမယ် (သူများ Telegram ကို ပို့လို့ မရပါ)</p>';
       return;
     }
-    box.innerHTML = `<select id="tgsel-${id}">` + rs.map(r =>
+    box.innerHTML = '<p class="hint">ကိုယ့် Telegram ကိုပဲ ပို့နိုင်ပါတယ်</p>' +
+      `<select id="tgsel-${id}">` + rs.map(r =>
       `<option value="${escHtml(r.chat_id)}">${escHtml(r.username ? "@" + r.username : (r.name || r.chat_id))}</option>`).join("") +
       `</select> <button class="ghost" onclick="tgSend('${id}')">ပို့မယ်</button>`;
   } catch (e) { box.innerHTML = '<p class="err">စာရင်း ယူလို့ မရပါ</p>'; }
@@ -1665,6 +1712,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 158</p>
+<p class="hint" id="buildTag" style="text-align:center">build 159</p>
 </body>
 </html>

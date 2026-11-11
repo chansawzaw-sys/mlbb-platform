@@ -1753,10 +1753,39 @@ def apps_script_delete():
     return jsonify({"ok": True, "configured": False})
 
 
+def _own_tg_chats(user, job=None):
+    """Telegram chats this user may send videos to: ONLY their own
+    (build 159 — a finished video must never land in a stranger's
+    Telegram). Own = the account's linked chat; a bot-submitted
+    job's origin chat; and for the owner, the fixed admin chat."""
+    from pipeline import telegram_send as tg
+    chats = set()
+    if user:
+        if user.get("tg_chat_id"):
+            chats.add(int(user["tg_chat_id"]))
+        if user.get("role") == "admin":
+            chats.add(int(tg.FIXED_ADMIN_CHAT_ID))
+    if job and job.get("tg_chat_id"):
+        chats.add(int(job["tg_chat_id"]))
+    return chats
+
+
 @app.get("/api/telegram/recipients")
 def telegram_recipients():
     from pipeline import telegram_send as tg
-    return jsonify({"recipients": tg.recipients()})
+    user = _current_user()
+    if user is None:
+        if ACCOUNTS_ENFORCED:
+            return jsonify({"error": "login အရင် ဝင်ပါ"}), 401
+        return jsonify({"recipients": tg.recipients()})
+    allr = tg.recipients()
+    own = _own_tg_chats(user)
+    out = [r for r in allr if r["chat_id"] in own]
+    known = {r["chat_id"] for r in out}
+    for cid in sorted(own - known):
+        out.append({"chat_id": cid, "username": None,
+                    "name": "ကိုယ့် Telegram"})
+    return jsonify({"recipients": out})
 
 
 # ------------------------------------------------------------------
@@ -2404,9 +2433,18 @@ def send_telegram(jid):
     if not out.exists():
         return jsonify({"error": "ဗီဒီယို မပြီးသေးပါ"}), 400
     data = request.get_json(force=True) or {}
-    chat_id = data.get("chat_id")
-    if not chat_id or not tg.is_recipient(chat_id):
-        return jsonify({"error": "လက်ခံသူ မတွေ့ပါ — bot ကို Start နှိပ်ထားသူ ဖြစ်ရပါမယ်"}), 400
+    user = _current_user()
+    if user is None and not ACCOUNTS_ENFORCED:
+        allowed = {r["chat_id"] for r in tg.recipients()}
+    else:
+        allowed = _own_tg_chats(user, job)
+    try:
+        chat_id = int(data.get("chat_id"))
+    except (TypeError, ValueError):
+        chat_id = None
+    if chat_id is None or chat_id not in allowed:
+        return jsonify({"error": "ကိုယ့် Telegram ကိုပဲ ပို့လို့ရပါတယ် — "
+                                 "သူများ Telegram ကို ပို့ခွင့် မရှိပါ"}), 403
     size = out.stat().st_size
     if size > tg.MAX_BYTES:
         return jsonify({"error": f"ဖိုင် {size / 1e6:.0f}MB ရှိနေတယ် — Telegram bot က 50MB အထိပဲ ပို့လို့ရပါတယ်"}), 400
@@ -2703,7 +2741,12 @@ def download_job(jid):
     out = JOBS_DIR / jid / "output.mp4"
     if not out.exists():
         return jsonify({"error": "မပြီးသေးပါ"}), 404
-    return send_file(out, as_attachment=True, download_name=f"myanmar-{jid}.mp4")
+    # conditional=True (build 159): Range requests get 206 partial
+    # content — downloads can resume instead of restarting, and
+    # download managers / the phone browser can pull in parallel.
+    return send_file(out, as_attachment=True,
+                     download_name=f"myanmar-{jid}.mp4",
+                     conditional=True)
 
 
 @app.get("/api/jobs/<jid>/stream")
@@ -2716,7 +2759,7 @@ def stream_job(jid):
     out = JOBS_DIR / jid / "output.mp4"
     if not out.exists():
         return jsonify({"error": "မပြီးသေးပါ"}), 404
-    return send_file(out, as_attachment=False)
+    return send_file(out, as_attachment=False, conditional=True)
 
 
 @app.delete("/api/jobs/<jid>")
