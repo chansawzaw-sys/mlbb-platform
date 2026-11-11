@@ -59,7 +59,7 @@ Rules:
 - FIRST read all the segments together and understand the whole story; then render each segment so it fits the storyline and flows with its neighbours — never translate a segment in isolation.
 - NAMES IN ENGLISH: write every personal name, place name and brand name in English (Latin letters) — for a Chinese name use its pinyin/English form; never write a name in Burmese script and never translate a name's meaning. Keep ALL numbers exactly as they are.
 - Keep each translation roughly as short as the original (it must fit the same on-screen window).
-- Do not add explanations, notes or extra sentences.
+- Do not add explanations, notes or extra sentences. NO bracketed glosses: never put a parenthetical explanation after a name, a term or any line, and never give a name twice (like "Wang Zhong (Manager Wang)") — every name and term appears ONCE, in its single chosen form, and the translation speaks for itself.
 
 Input is a JSON array of {"id": <int>, "text": "<source segment>"}.
 Output MUST be only a JSON array of {"id": <same int>, "my": "<burmese translation>"} with exactly the same ids, in the same order. No markdown fences, no commentary.
@@ -81,6 +81,7 @@ Rules:
 - When a character speaks, voice it the way that character would say it in Burmese.
 - NAMES IN ENGLISH: write every personal name, place name and brand name in English (Latin letters) — for a Chinese name use its pinyin/English form; never write a name in Burmese script and never translate a name's meaning. Keep ALL numbers exactly as they are.
 - Keep each segment roughly as short as the original (it will be spoken in the same time window).
+- Do not add explanations, notes or extra sentences. NO bracketed glosses: never put a parenthetical explanation after a name, a term or any line, and never give a name twice (like "Wang Zhong (Manager Wang)") — every name and term appears ONCE, in its single chosen form, and the translation speaks for itself.
 
 Input is a JSON array of {"id": <int>, "text": "<english>"}.
 Output MUST be only a JSON array of {"id": <same int>, "my": "<burmese narration>"} with exactly the same ids, in the same order. No markdown fences, no commentary.
