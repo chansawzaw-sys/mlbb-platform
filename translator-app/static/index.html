@@ -1029,9 +1029,11 @@ async function loadKeyState() {
       return;
     }
     $("keyState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
-    // Once a key is saved the card tucks itself away; the small 🔑
-    // button by the title reopens it whenever the key needs changing.
-    $("keyCard").classList.toggle("show", !d.configured);
+    // Build 146: the card always shows for the admin inside the
+    // ⚙️ Settings panel (the panel itself governs visibility), so a
+    // saved key can be replaced any time. Non-admins never get here:
+    // the 403 path above keeps the card hidden, full stop.
+    $("keyCard").classList.add("show");
   } catch (e) { $("keyState").textContent = "?"; }
 }
 $("keySave").onclick = async () => {
@@ -1063,7 +1065,7 @@ async function loadOaState() {
       return;
     }
     $("oaState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
-    $("oaCard").classList.toggle("show", !d.configured);
+    $("oaCard").classList.add("show");
   } catch (e) { $("oaState").textContent = "?"; }
 }
 $("oaSave").onclick = async () => {
@@ -1095,7 +1097,7 @@ async function loadAsState() {
       return;
     }
     $("asState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
-    $("asCard").classList.toggle("show", !d.configured);
+    $("asCard").classList.add("show");
   } catch (e) { $("asState").textContent = "?"; }
 }
 $("asSave").onclick = async () => {
@@ -1139,7 +1141,7 @@ async function loadTgState() {
     if (d.payinfo !== undefined && $("payInfo")) $("payInfo").value = d.payinfo || "";
     // Once a token is saved the card tucks itself away (the 🤖
     // button in the header reopens it), like the Gemini key card.
-    $("tgCard").classList.toggle("show", !d.configured);
+    $("tgCard").classList.add("show");
   } catch (e) { $("tgState").textContent = "?"; }
 }
 $("tgSave").onclick = async () => {
@@ -1483,6 +1485,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 145</p>
+<p class="hint" id="buildTag" style="text-align:center">build 146</p>
 </body>
 </html>
