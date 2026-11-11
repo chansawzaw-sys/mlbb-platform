@@ -56,7 +56,8 @@ PROMPT_SUBS = """You are a Burmese storyteller subtitling a video. Render each s
 Rules:
 - Stay COMPLETE and FAITHFUL to what is actually said in the video: translate everything, in order — never add, omit, summarise, soften or censor anything.
 - Within that faithfulness, phrase it the way a Burmese storyteller would say it: natural connectors and natural word order, idioms and slang by MEANING never word-by-word, so consecutive segments read like one continuous story and the emotion of the scene carries through.
-- Keep personal names, place names, brand names and ALL numbers exactly as they are.
+- FIRST read all the segments together and understand the whole story; then render each segment so it fits the storyline and flows with its neighbours — never translate a segment in isolation.
+- NAMES IN ENGLISH: write every personal name, place name and brand name in English (Latin letters) — for a Chinese name use its pinyin/English form; never write a name in Burmese script and never translate a name's meaning. Keep ALL numbers exactly as they are.
 - Keep each translation roughly as short as the original (it must fit the same on-screen window).
 - Do not add explanations, notes or extra sentences.
 
@@ -76,8 +77,9 @@ PROMPT_DUB = """You are the narrator of a Burmese-dubbed video. Retell each segm
 Rules:
 - Keep EVERY fact, event and line of meaning, in the same order — never invent, add, omit or soften anything.
 - You may rephrase freely and use natural storytelling connectors so the narration flows from segment to segment, as long as the meaning, tone and emotion stay exactly the same.
+- FIRST read all the segments together and understand the whole story; then narrate each segment so it fits the storyline and flows with its neighbours — never translate a segment in isolation, never word-by-word.
 - When a character speaks, voice it the way that character would say it in Burmese.
-- Keep personal names, place names, brand names and ALL numbers exactly as they are.
+- NAMES IN ENGLISH: write every personal name, place name and brand name in English (Latin letters) — for a Chinese name use its pinyin/English form; never write a name in Burmese script and never translate a name's meaning. Keep ALL numbers exactly as they are.
 - Keep each segment roughly as short as the original (it will be spoken in the same time window).
 
 Input is a JSON array of {"id": <int>, "text": "<english>"}.
