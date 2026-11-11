@@ -154,16 +154,19 @@
     <h4>💰 Credit ဖြည့် တောင်းဆိုချက်များ</h4>
     <div id="topupList"><p class="hint">…</p></div>
     <div class="row">
-      <button class="ghost" id="apiToggle">📊 API အသုံးပြုမှု</button>
+      <button class="ghost" id="apiToggle">📊 API အသုံးပြုမှု · Engine အခြေအနေ</button>
     </div>
     <div id="apiPanel" style="display:none">
+      <h4 style="margin:4px 0">🔌 Engine အခြေအနေ — ဘယ် လမ်း အလုပ်လုပ်လဲ</h4>
+      <div id="engineStats"><p class="hint">…</p></div>
+      <h4 style="margin:10px 0 4px">📊 ထုတ်ပြီး အရေအတွက်</h4>
       <div id="apiStats"><p class="hint">…</p></div>
       <div class="row">
         <button class="ghost" id="apiStatsBtn">🔄 ပြန်စစ်မယ်</button>
       </div>
     </div>
     <div class="row">
-      <button class="ghost" id="setToggle">⚙️ Settings</button>
+      <button class="ghost" id="setToggle">⚙️ Settings — key · QR · ငွေလက်ခံ</button>
     </div>
     <div id="settingsPanel" style="display:none">
     <h4>🏦 ငွေဖြည့် လိပ်စာ / QR သတ်မှတ်ရန်</h4>
@@ -1275,7 +1278,7 @@ async function loadApiStats() {
     const d = await (await fetch("/api/admin/api-stats")).json();
     const counts = d.counts || {}, segs = d.segs || {}, last = d.last || {};
     const total = d.total || 0;
-    const order = ["gemini", "openai", "apps-script"];
+    const order = ["gemini", "openai", "openrouter", "apps-script"];
     const names = order.concat(Object.keys(counts)
       .filter(n => !order.includes(n))
       .sort((a, b) => counts[b] - counts[a]));
@@ -1298,11 +1301,47 @@ async function loadApiStats() {
   } catch (e) {}
 }
 $("apiStatsBtn").onclick = loadApiStats;
+/* Engine health board (build 148): the server already probes every
+   translation engine, but the result was never shown anywhere — the
+   owner had to ask which path works. Rendered from /api/auth/me's
+   i18n block (configured flags + probe verdicts). */
+let I18N = null;
+function renderEngineStats() {
+  const box = $("engineStats");
+  if (!box) return;
+  if (!I18N) { box.innerHTML = "<p class='hint'>…</p>"; return; }
+  const p = I18N.probe || {};
+  const hasP = !!p.ts;
+  const row = (name, conf, ok) => {
+    const st = !conf ? "⚪ မထည့်ရသေး"
+      : !hasP ? "⏳ စစ်နေဆဲ"
+      : ok ? "✅ အလုပ်လုပ်တယ်" : "❌ မရသေး";
+    return "<div class='apiBox'><div class='an'>" + name +
+      "</div><div class='ad'>" + st + "</div></div>";
+  };
+  box.innerHTML = "<div class='apiGrid'>" +
+    row("Gemini", I18N.gemini_configured, p.gemini_ok) +
+    row("OpenAI", I18N.openai_configured, p.openai_ok) +
+    row("OpenRouter", I18N.openrouter_configured, p.openrouter_ok) +
+    row("Apps Script", I18N.apps_script_configured, p.apps_script_ok) +
+    row("Free chain", true, p.free_ok) +
+    "</div>" +
+    (I18N.last_provider
+      ? "<p class='hint'>နောက်ဆုံး job မှာ သုံးခဲ့တဲ့ လမ်း: " +
+        escHtml(I18N.last_provider) + "</p>" : "");
+}
+async function refreshEngineStats() {
+  try {
+    const r = await (await fetch("/api/auth/me")).json();
+    I18N = r.i18n || null;
+  } catch (e) {}
+  renderEngineStats();
+}
 $("apiToggle").onclick = () => {
   const p = $("apiPanel");
   const open = p.style.display === "none";
   p.style.display = open ? "" : "none";
-  if (open) loadApiStats();
+  if (open) { loadApiStats(); refreshEngineStats(); }
 };
 $("setToggle").onclick = () => {
   const p = $("settingsPanel");
@@ -1312,15 +1351,17 @@ async function loadMe() {
   try {
     const r = await (await fetch("/api/auth/me")).json();
     ME = r.user;
+    I18N = r.i18n || null;
     $("authOut").style.display = ME ? "none" : "";
     $("authIn").style.display = ME ? "" : "none";
     $("adminCard").classList.toggle("show", !!(ME && ME.role === "admin"));
-    if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); loadWall(); }
+    if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); loadWall(); renderEngineStats(); }
     if (ME && ME.role !== "admin") {
       // Customers never see the owner's key / bot settings cards.
       $("keyCard").classList.remove("show");
       $("oaCard").classList.remove("show");
       $("orCard").classList.remove("show");
+      $("asCard").classList.remove("show");
       $("tgCard").classList.remove("show");
     }
     if (ME) loadPayQr();
@@ -1481,7 +1522,8 @@ async function loadPayQr() {
     $("qrDel").style.display = show ? "" : "none";
     if ($("qrPrevBox")) $("qrPrevBox").style.display = show ? "" : "none";
   }
-  if ($("payText")) $("payText").textContent = r.text || "";
+  if ($("payText")) $("payText").textContent = r.text ||
+    "ငွေလွှဲ လိပ်စာ မထည့်ရသေးပါ — အောက် QR ကို scan ဖတ်ပါ, QR မရှိရင် Telegram bot ကနေ admin ကို မေးပါ";
   if ($("payQr")) {
     $("payQr").style.display = show ? "" : "none";
     if (show) $("payQr").src = "/pay-qr.png?t=" + Date.now();
@@ -1528,6 +1570,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 147</p>
+<p class="hint" id="buildTag" style="text-align:center">build 148</p>
 </body>
 </html>
