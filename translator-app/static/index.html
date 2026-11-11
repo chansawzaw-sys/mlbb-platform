@@ -1278,6 +1278,7 @@ async function loadAdminUsers() {
     div.className = "jobrow";
     const info = document.createElement("span");
     info.textContent = "👤 " + u.username + " · 💳 " + u.credits +
+      (u.role === "admin" ? " · 👑 admin" : "") +
       (u.disabled ? " · 🚫 ပိတ်ထား" : "") +
       (u.tg_chat_id ? " · TG ✓" : "");
     const plus = document.createElement("button");
@@ -1291,7 +1292,10 @@ async function loadAdminUsers() {
     const det = document.createElement("button");
     det.className = "ghost"; det.textContent = "အသေးစိတ်";
     det.addEventListener("click", () => adminDetail(u.id, div));
-    div.append(info, plus, ban, det);
+    // Admin accounts never get a ပိတ် button (build 157): disabling
+    // one would lock the whole shop out of its own admin.
+    if (u.role === "admin") div.append(info, plus, det);
+    else div.append(info, plus, ban, det);
     box.appendChild(div);
   });
   if (!(r.users || []).length)
@@ -1661,6 +1665,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 156</p>
+<p class="hint" id="buildTag" style="text-align:center">build 157</p>
 </body>
 </html>

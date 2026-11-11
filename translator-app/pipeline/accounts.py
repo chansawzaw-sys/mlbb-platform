@@ -197,13 +197,37 @@ def revoke(token):
         conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
 
 
-def claim_admin(username):
+def admin_counts():
+    """(total admin accounts, enabled admin accounts)."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT disabled FROM users WHERE role = 'admin'").fetchall()
+    return len(rows), sum(1 for r in rows if not r["disabled"])
+
+
+def claim_admin(username, recovery_tg_id=None):
     """One-shot: promote `username` to admin ONLY while no admin
-    exists yet. Returns True if it happened."""
+    exists yet. Returns True if it happened.
+
+    Recovery (build 157): if admin accounts exist but EVERY one is
+    disabled — the owner locked themselves out before the
+    self-disable guard existed — the one account linked to the
+    owner's fixed Telegram chat may claim instead. Nobody else can:
+    a working admin existing always closes the claim."""
     with _LOCK, _db() as conn:
-        if conn.execute("SELECT 1 FROM users WHERE role = 'admin'"
-                        ).fetchone():
-            return False
+        admins = conn.execute(
+            "SELECT disabled FROM users WHERE role = 'admin'").fetchall()
+        if admins:
+            if any(not r["disabled"] for r in admins):
+                return False
+            if not recovery_tg_id:
+                return False
+            me = conn.execute(
+                "SELECT tg_chat_id FROM users WHERE username = ?",
+                (username,)).fetchone()
+            if (me is None or me["tg_chat_id"] is None
+                    or str(me["tg_chat_id"]) != str(recovery_tg_id)):
+                return False
         cur = conn.execute(
             "UPDATE users SET role = 'admin' WHERE username = ?",
             (username,))
@@ -233,12 +257,24 @@ def get_user(user_id):
 
 
 def set_disabled(user_id, disabled):
+    """Enable/disable an account (disabling kills its sessions).
+
+    An ADMIN account can never be disabled (build 157): only an
+    admin could re-enable it, so disabling one is a one-way lockout
+    of the whole shop. Returns False when refused."""
     with _LOCK, _db() as conn:
+        row = conn.execute("SELECT role FROM users WHERE id = ?",
+                           (int(user_id),)).fetchone()
+        if row is None:
+            return False
+        if disabled and row["role"] == "admin":
+            return False
         conn.execute("UPDATE users SET disabled = ? WHERE id = ?",
                      (1 if disabled else 0, int(user_id)))
         if disabled:
             conn.execute("DELETE FROM sessions WHERE user_id = ?",
                          (int(user_id),))
+    return True
 
 
 def adjust_credits(user_id, delta):

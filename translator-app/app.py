@@ -1975,13 +1975,24 @@ def _translate_probe_maybe():
 
 @app.get("/api/auth/me")
 def auth_me():
-    import sqlite3
     claim_open = False
     try:
-        with accounts._db() as conn:
-            claim_open = not conn.execute(
-                "SELECT 1 FROM users WHERE role = 'admin'").fetchone()
-    except sqlite3.Error:
+        total_admins, enabled_admins = accounts.admin_counts()
+        if total_admins == 0:
+            claim_open = True
+        elif enabled_admins == 0:
+            # Lockout recovery (build 157): every admin is disabled —
+            # the claim button shows ONLY for the account linked to
+            # the owner's fixed Telegram chat.
+            me = _current_user()
+            try:
+                from pipeline import telegram_send as _tgmod
+                fixed = _tgmod.FIXED_ADMIN_CHAT_ID
+            except Exception:
+                fixed = None
+            claim_open = bool(me and fixed and
+                              str(me.get("tg_chat_id")) == str(fixed))
+    except Exception:
         claim_open = True
     fonts = {}
     try:
@@ -2053,7 +2064,13 @@ def admin_claim():
     user = _current_user()
     if not user:
         return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
-    if not accounts.claim_admin(user["username"]):
+    fixed = None
+    try:
+        from pipeline import telegram_send as _tg
+        fixed = _tg.FIXED_ADMIN_CHAT_ID
+    except Exception:
+        pass
+    if not accounts.claim_admin(user["username"], recovery_tg_id=fixed):
         return jsonify({"error": "admin ရှိပြီးသား ဖြစ်နေပါတယ်"}), 409
     return jsonify({"user": _current_user()})
 
@@ -2317,7 +2334,9 @@ def admin_user_update(uid):
     if not user:
         return jsonify({"error": "user မတွေ့ပါ"}), 404
     if "disabled" in data:
-        accounts.set_disabled(uid, bool(data["disabled"]))
+        if not accounts.set_disabled(uid, bool(data["disabled"])):
+            return jsonify({"error": "admin account ကို ပိတ်လို့ မရပါ — "
+                                     "admin ပျောက်သွားနိုင်ပါတယ်"}), 400
     if data.get("credits_delta"):
         if accounts.adjust_credits(uid, int(data["credits_delta"])) is None:
             return jsonify({"error": "credit မလုံလောက်ပါ — အဲဒီလောက် လျှော့လို့ မရပါ"}), 400
