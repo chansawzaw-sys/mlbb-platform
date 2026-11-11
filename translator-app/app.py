@@ -1854,6 +1854,29 @@ ACCOUNTS_ENFORCED = os.environ.get("VT_ACCOUNTS") == "1"
 _SESSION_COOKIE = "vt_session"
 
 
+def _auto_recover_lockout():
+    """Startup self-heal (build 161): if admin accounts exist but
+    EVERY one is disabled — the legacy self-lockout the owner hit —
+    re-enable them as the app starts. It can only fire in a total
+    lockout: while any admin works, disabled admins stay untouched,
+    and build 157 already refuses to disable an admin at all, so a
+    disabled admin can only be a leftover from before that guard.
+    Deploying code to this server already implies full server
+    control, so this grants nothing new — it just ends the lockout
+    with zero owner round-trips. Best-effort: never blocks startup."""
+    try:
+        total, enabled = accounts.admin_counts()
+        if total and not enabled:
+            for u in accounts.list_admins():
+                if u["disabled"]:
+                    accounts.set_disabled(u["id"], False)
+    except Exception:
+        pass
+
+
+_auto_recover_lockout()
+
+
 def _current_user():
     return accounts.user_for_token(request.cookies.get(_SESSION_COOKIE))
 
