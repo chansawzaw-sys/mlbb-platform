@@ -4,8 +4,11 @@ Provider chain:
   0. Gemini Flash (only when GEMINI_API_KEY is configured server-side —
      see pipeline/gemini_translate.py): ONE request for ALL segments,
      natural spoken Burmese. Any failure -> OpenAI (build 134 module,
-     when configured), then the free chain below. (Order set by the
-     owner 2026-11-11, build 136: Gemini -> OpenAI -> free.)
+     when configured) -> Apps Script (build 137 module, the owner's
+     own Google account via LanguageApp, when configured), then the
+     free chain below. (Order set by the owner 2026-11-11, build 136:
+     Gemini -> OpenAI -> free; Apps Script added after OpenAI by the
+     same order — reliable before throttled, style after Gemini/OpenAI.)
   1. deep-translator GoogleTranslator (unofficial Google Translate endpoint)
   2. `translators` library -> Microsoft Bing Translator web endpoint
   3. keep the source text (never drop a cue)
@@ -421,6 +424,27 @@ def translate_segments(workdir, style="subs"):
                 return out
         except Exception as e:
             report["openai_err"] = str(e)[:120]
+    # 0c. Apps Script batch — third engine (build 137, owner request
+    # 2026-11-10): the owner's own Google account translates via
+    # LanguageApp, so the throttled VPS IP never touches Google.
+    # Reliable fallback before the free chain; literal Google quality,
+    # no narration style. Any failure falls through to the free chain.
+    if segs:
+        try:
+            from . import apps_script_translate
+            if apps_script_translate.configured():
+                by_idx = apps_script_translate.translate_all(
+                    segs, style=style)
+                out = [{**seg, "text_my": by_idx[i],
+                        "provider": "apps-script"}
+                       for i, seg in enumerate(segs)]
+                out = _fill_missing(out, report)
+                _write_report(workdir, report)
+                save_segments(out, workdir / "segments_my.json")
+                write_srt(out, workdir / "subs_my.srt")
+                return out
+        except Exception as e:
+            report["apps_script_err"] = str(e)[:120]
     texts = [(seg.get("text") or "").strip() for seg in segs]
     results = [None] * len(segs)
     # 1. Batched free endpoints — one request per chunk, Google first,

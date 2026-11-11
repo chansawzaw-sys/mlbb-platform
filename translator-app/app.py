@@ -1604,6 +1604,44 @@ def telegram_delete():
     return jsonify({"ok": True, "configured": False})
 
 
+# ---------- Apps Script bridge (server-side only, build 137) ----------
+# The owner's AutoTranslate.gs Web App URL + WEB_SECRET. Same rules as
+# the Gemini/OpenAI keys: admin-only (see _accounts_guard — every
+# /api/settings/* route needs the admin role), stored in the project
+# .env (chmod 600, never in git), and no endpoint ever returns the
+# secret — only whether a URL + secret are configured. The URL alone
+# is also never returned: knowing it without the secret is useless,
+# and returning it would leak the owner's script deployment.
+
+@app.get("/api/settings/apps-script")
+def apps_script_status():
+    from pipeline import apps_script_translate
+    return jsonify({"configured": apps_script_translate.configured()})
+
+
+@app.post("/api/settings/apps-script")
+def apps_script_save():
+    data = request.get_json(force=True) or {}
+    url = (data.get("url") or "").strip()
+    secret = (data.get("secret") or "").strip()
+    ok_url = url.startswith("https://script.google.com/macros/s/") \
+        and url.endswith("/exec") and 40 <= len(url) <= 300
+    if not ok_url:
+        return jsonify({"error": "URL မမှန်ပါ — Apps Script Web App URL (script.google.com/macros/s/…/exec) ဖြစ်ရပါမယ်"}), 400
+    if not (8 <= len(secret) <= 200) or any(ch.isspace() for ch in secret):
+        return jsonify({"error": "secret မမှန်ပါ — စာလုံး ၈ လုံး အထက်, space မပါရပါ"}), 400
+    _env_write("APPS_SCRIPT_URL", url)
+    _env_write("APPS_SCRIPT_SECRET", secret)
+    return jsonify({"ok": True, "configured": True})
+
+
+@app.delete("/api/settings/apps-script")
+def apps_script_delete():
+    _env_remove("APPS_SCRIPT_URL")
+    _env_remove("APPS_SCRIPT_SECRET")
+    return jsonify({"ok": True, "configured": False})
+
+
 @app.get("/api/telegram/recipients")
 def telegram_recipients():
     from pipeline import telegram_send as tg
@@ -1776,6 +1814,19 @@ def _run_translate_probe():
         except Exception as e:
             res["openai_ok"] = False
             res["openai_err"] = str(e)[:200]
+        try:
+            from pipeline import apps_script_translate
+            if apps_script_translate.configured():
+                by = apps_script_translate.translate_all(
+                    [{"start": 0.0, "end": 1.0, "text": sample}])
+                out = by.get(0) or ""
+                res["apps_script_ok"] = bool(out) and \
+                    any("\u1000" <= c <= "\u109f" for c in out)
+            else:
+                res["apps_script_ok"] = False
+        except Exception as e:
+            res["apps_script_ok"] = False
+            res["apps_script_err"] = str(e)[:200]
         (ROOT / ".translate_probe.json").write_text(
             json.dumps(res), encoding="utf-8")
     except Exception:
@@ -1834,6 +1885,11 @@ def auth_me():
         i18n["openai_configured"] = bool(_oa.key_configured())
     except Exception:
         i18n["openai_configured"] = None
+    try:
+        from pipeline import apps_script_translate as _as
+        i18n["apps_script_configured"] = bool(_as.configured())
+    except Exception:
+        i18n["apps_script_configured"] = None
     try:
         i18n["last_provider"] = (
             (ROOT / ".translate_good").read_text(
