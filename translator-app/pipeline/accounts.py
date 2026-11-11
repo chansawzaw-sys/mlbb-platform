@@ -375,6 +375,17 @@ def pending_topups():
     return [dict(r) for r in rows]
 
 
+def topups_for(user_id, limit=10):
+    """One customer's own recent top-up requests (web app status
+    list, build 156) — never exposes other users' rows."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT id, credits, status, created_at, decided_at "
+            "FROM topups WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (int(user_id), int(limit))).fetchall()
+    return [dict(r) for r in rows]
+
+
 def delete_user(user_id, why="manual"):
     """Hard-delete an account (sessions die with it) and leave an
     archive row. Admin accounts can never be deleted this way.

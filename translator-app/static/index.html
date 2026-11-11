@@ -140,7 +140,14 @@
           <div class="an">📷 ငွေလွှဲ QR</div>
           <img id="payQr" alt="" style="display:none">
         </div>
-        <p class="hint">လွှဲပြီးရင် Telegram bot မှာ 💰 Credit ဖြည့် ကို နှိပ်ပြီး screenshot ပို့ပါ — admin စစ်ပြီး credit ထည့်ပေးမယ်</p>
+        <input id="topupAmount" type="number" min="1" max="100000" inputmode="numeric" placeholder="ဖြည့်မယ့် credit အရေအတွက် (ဥပမာ 100)" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-top:8px">
+        <input id="topupProof" type="file" accept="image/*" style="width:100%;margin-top:8px">
+        <div class="row">
+          <button class="ghost" id="topupSend">📸 screenshot ပို့ပြီး ဖြည့်တောင်းမယ်</button>
+        </div>
+        <p class="hint" id="topupMsg"></p>
+        <div id="myTopups"></div>
+        <p class="hint">Telegram bot ကနေလည်း 💰 Credit ဖြည့် နဲ့ ပို့နိုင်ပါတယ် — admin စစ်ပြီး credit ထည့်ပေးမယ်</p>
       </div>
       <p class="err" id="authErr2"></p>
     </div>
@@ -1416,6 +1423,7 @@ async function loadMe() {
       $("tgCard").classList.remove("show");
     }
     if (ME) loadPayQr();
+    if (ME) loadMyTopups();
     if (ME) {
       $("authInfo").textContent = "👤 " + ME.username +
         (ME.role === "admin" ? " (admin)" : "") +
@@ -1424,6 +1432,38 @@ async function loadMe() {
     }
   } catch (e) {}
 }
+async function loadMyTopups() {
+  const box = $("myTopups");
+  if (!box) return;
+  try {
+    const r = await (await fetch("/api/topup")).json();
+    const ts = r.topups || [];
+    if (!ts.length) { box.innerHTML = ""; return; }
+    const label = {pending: "⏳ စစ်ဆေးနေဆဲ", approved: "✅ credit ဝင်ပြီး", rejected: "❌ လက်မခံပါ"};
+    box.innerHTML = ts.map(t =>
+      '<p class="hint">#' + t.id + " · " + t.credits + " credits · " +
+      (label[t.status] || "—") + "</p>").join("");
+  } catch (e) {}
+}
+$("topupSend").addEventListener("click", async () => {
+  const amt = parseInt($("topupAmount").value, 10);
+  const file = $("topupProof").files[0];
+  const msg = $("topupMsg");
+  if (!amt || amt < 1 || amt > 100000) { msg.textContent = "credit အရေအတွက် မှန်အောင် ထည့်ပါ (ဥပမာ 100)"; return; }
+  if (!file) { msg.textContent = "ငွေလွှဲ screenshot အရင် ရွေးပါ"; return; }
+  const fd = new FormData();
+  fd.append("amount", String(amt));
+  fd.append("proof", file);
+  msg.textContent = "ပို့နေပါတယ်…";
+  try {
+    const r = await (await fetch("/api/topup", {method: "POST", body: fd})).json();
+    if (r.error) { msg.textContent = "⚠️ " + r.error; return; }
+    msg.textContent = "✅ တောင်းဆိုချက် #" + r.topup_id + " ပို့ပြီးပါပြီ — admin စစ်ပြီးတာနဲ့ credit ဝင်လာပါမယ် 🙏";
+    $("topupAmount").value = "";
+    $("topupProof").value = "";
+    loadMyTopups();
+  } catch (e) { msg.textContent = "⚠️ ပို့လို့ မရပါ — နောက်တစ်ခါ ပြန်ကြိုးစားပါ"; }
+});
 async function authPost(path) {
   const res = await fetch(path, {method: "POST",
     headers: {"Content-Type": "application/json"},
@@ -1621,6 +1661,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 155</p>
+<p class="hint" id="buildTag" style="text-align:center">build 156</p>
 </body>
 </html>

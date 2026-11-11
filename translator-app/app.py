@@ -2088,6 +2088,70 @@ def admin_api_stats():
     return jsonify(api_stats.read())
 
 
+@app.post("/api/topup")
+def topup_create():
+    """Customer submits a credit top-up from the WEB app (build 156):
+    amount + transfer screenshot. Mirrors the Telegram bot flow — a
+    pending topups row + proof file under topups/<id>.jpg; the admin
+    decides from the web panel or the Telegram approval card, and
+    decide_topup stays exactly-once across both surfaces."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    try:
+        amount = int(request.form.get("amount") or "")
+        assert 1 <= amount <= 100000
+    except Exception:
+        return jsonify({"error": "credit အရေအတွက် မှန်အောင် ထည့်ပါ "
+                                 "(ဥပမာ 100)"}), 400
+    f = request.files.get("proof")
+    if not f or not f.filename:
+        return jsonify({"error": "ငွေလွှဲ screenshot ထည့်ပါ"}), 400
+    tdir = ROOT / "topups"
+    tdir.mkdir(exist_ok=True)
+    tag = uuid.uuid4().hex[:12]
+    raw = tdir / f".tmp-{tag}.bin"
+    tmp = tdir / f".tmp-{tag}.jpg"
+    f.save(raw)
+    try:
+        if raw.stat().st_size > 10 * 1024 * 1024:
+            raise ValueError("too big")
+        from PIL import Image
+        with Image.open(raw) as im:
+            im.verify()
+        with Image.open(raw) as im:
+            im.convert("RGB").save(tmp, "JPEG", quality=88)
+    except Exception:
+        raw.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
+        return jsonify({"error": "ပုံ မဟုတ်ပါ (သို့) 10MB ထက် ကြီးနေပါတယ် — "
+                                 "screenshot အစစ် ထည့်ပါ"}), 400
+    raw.unlink(missing_ok=True)
+    tid = accounts.create_topup(user["id"], amount, None)
+    proof = tdir / f"{tid}.jpg"
+    tmp.replace(proof)
+    accounts.set_topup_proof(tid, proof.name)
+    try:
+        from pipeline import telegram_send as tg
+        cap = (f"💰 Credit ဖြည့် တောင်းဆိုချက် #{tid}\n"
+               f"👤 {user['username']} · {amount} credits (web app)")
+        tg.send_photo(tg.FIXED_ADMIN_CHAT_ID, proof, caption=cap,
+                      buttons=[[("✅ Approve", f"t:{tid}:ok"),
+                                ("❌ ငြင်း", f"t:{tid}:no")]])
+    except Exception:
+        pass
+    return jsonify({"ok": True, "topup_id": tid, "status": "pending"})
+
+
+@app.get("/api/topup")
+def topup_mine():
+    """The logged-in customer's own recent top-up requests."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    return jsonify({"topups": accounts.topups_for(user["id"])})
+
+
 @app.get("/api/admin/topups")
 def admin_topups():
     if not _require_admin():
