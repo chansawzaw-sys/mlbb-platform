@@ -1877,6 +1877,24 @@ def _auto_recover_lockout():
 _auto_recover_lockout()
 
 
+def _stats_reset_once_162():
+    """One-time (build 162, owner order): the produced-video counts
+    restart from 0 when this build first starts. A marker file in
+    the app dir (server-side, survives deploys) makes it one-time;
+    the board's own reset button covers future resets."""
+    try:
+        marker = ROOT / ".stats_reset_162"
+        if not marker.exists():
+            from pipeline import api_stats
+            api_stats.reset()
+            marker.write_text("build162", encoding="utf-8")
+    except Exception:
+        pass
+
+
+_stats_reset_once_162()
+
+
 def _current_user():
     return accounts.user_for_token(request.cookies.get(_SESSION_COOKIE))
 
@@ -2240,6 +2258,15 @@ def admin_api_stats():
         return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import api_stats
     return jsonify(api_stats.read())
+
+
+@app.post("/api/admin/api-stats/reset")
+def admin_api_stats_reset():
+    """Zero the usage board (build 162). Admin-only, like the read."""
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    from pipeline import api_stats
+    return jsonify(api_stats.reset())
 
 
 @app.post("/api/topup")

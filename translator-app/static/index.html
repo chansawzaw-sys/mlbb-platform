@@ -46,6 +46,10 @@
   .jobitem .jbtns button { flex: 1; }
   /* ---------- API usage board boxes (build 141) ---------- */
   .apiGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+  .keyPill { font-weight: 700; padding: 7px 10px; border-radius: 8px;
+    margin: 2px 0 8px; background: #39415e; color: #dbe4ff; }
+  .keyPill.ok { background: #14532d; color: #bbf7d0; }
+  .keyPill.no { background: #4a3436; color: #fecaca; }
   .apiBox { background: #101325; border: 1px solid #2b3050; border-radius: 10px;
     padding: 12px; text-align: center; }
   .apiBox .an { color: #99a; font-size: 12.5px; }
@@ -170,6 +174,7 @@
       <div id="apiStats"><p class="hint">…</p></div>
       <div class="row">
         <button class="ghost" id="apiStatsBtn">🔄 ပြန်စစ်မယ်</button>
+        <button class="ghost" id="apiResetBtn">🗑 အရေအတွက် 0 ပြန်စ</button>
       </div>
     </div>
     <div class="row">
@@ -202,6 +207,7 @@
     </div>
   <div class="card" id="keyCard">
     <h3 style="margin-top:0">🔑 Gemini key (ဘာသာပြန် အတွက်)</h3>
+    <div class="keyPill" id="keyPill">…</div>
     <p class="hint">Key ရှိရင် ဘာသာပြန် <b>မြန်ပြီး အရည်အသွေး ကောင်း</b>တယ်။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="keyState">…</span></p>
     <input type="password" id="keyInput" placeholder="Gemini key (AQ. / AIza နဲ့ စတယ်) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <div class="row">
@@ -212,6 +218,7 @@
 
   <div class="card" id="oaCard">
     <h3 style="margin-top:0">🧠 OpenAI key (ဘာသာပြန် engine — အဓိက)</h3>
+    <div class="keyPill" id="oaPill">…</div>
     <p class="hint">OpenAI credit နဲ့ ဘာသာပြန်ရင် <b>စိတ်ချရပြီး ဈေး အလွန် သက်သာ</b>တယ် (video တစ်ခု ~$0.002)။ Key ရှိရင် ဒီ engine ကို အရင် သုံးတယ်။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="oaState">…</span></p>
     <input type="password" id="oaInput" placeholder="OpenAI key (sk- နဲ့ စတယ်) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <div class="row">
@@ -222,6 +229,7 @@
 
   <div class="card" id="orCard">
     <h3 style="margin-top:0">🌐 OpenRouter key (ဘာသာပြန် engine)</h3>
+    <div class="keyPill" id="orPill">…</div>
     <p class="hint">OpenAI တိုက်ရိုက်က ဒီ server region ကို ပိတ်ထားလို့, OpenRouter ကနေ <b>Gemini/GPT model</b> တွေ သုံးတဲ့ လမ်းပါ။ Wallet ကို Stripe နဲ့ ဖြည့်ရတယ်, credit က သက်တမ်း မကုန်ပါ (video တစ်ခု ~$0.002)။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="orState">…</span></p>
     <input type="password" id="orInput" placeholder="OpenRouter key (sk-or- နဲ့ စတယ်) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <div class="row">
@@ -232,6 +240,7 @@
 
   <div class="card" id="xkCard">
     <h3 style="margin-top:0">🚀 xKiro key (ဘာသာပြန် engine)</h3>
+    <div class="keyPill" id="xkPill">…</div>
     <p class="hint">xKiro gateway ကနေ <b>DeepSeek V4 Flash</b> ကို ဈေးသက်သက်သာသာ (Telegram verify လုပ်ရင် $5 credit အခမဲ့) နဲ့ free model တွေ သုံးတဲ့ လမ်းပါ။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="xkState">…</span></p>
     <input type="password" id="xkInput" placeholder="xKiro key ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <div class="row">
@@ -242,6 +251,7 @@
 
   <div class="card" id="asCard">
     <h3 style="margin-top:0">📜 Apps Script (အခမဲ့ ဘာသာပြန် လမ်း)</h3>
+    <div class="keyPill" id="asPill">…</div>
     <p class="hint">ရှင့် Google account ပေါ်က Apps Script (LanguageApp) ကနေ ဘာသာပြန်တယ် — VPS IP ငြိတာ မရှိလို့ job အပြည့် မပြိုဘူး။ အရည်အသွေးက Google Translate ပုံမှန် (ဇာတ်လမ်း ဟန် မဟုတ်ပါ) — Gemini/OpenAI ရရင် သူတို့ အရင် သုံးပြီး, မရမှ ဒီ လမ်း ယူပါတယ်။ Web App URL + secret ကို ဒီမှာပဲ ထည့်ပါ — <b>chat ထဲ လုံးဝ မပို့ပါနဲ့</b>။ အခြေအနေ: <span id="asState">…</span></p>
     <input type="url" id="asUrl" placeholder="Web App URL (https://script.google.com/macros/s/…/exec)" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <input type="password" id="asSecret" placeholder="WEB_SECRET ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-top:6px">
@@ -253,6 +263,7 @@
 
   <div class="card" id="tgCard">
     <h3 style="margin-top:0">🤖 Telegram bot (ပြီးရင် တန်းပို့ရန်)</h3>
+    <div class="keyPill" id="tgPill">…</div>
     <p class="hint">BotFather မှာ bot တစ်ခု လုပ်ပြီး token ကို ဒီမှာ ထည့်ပါ (<b>chat ထဲ မပို့ပါနဲ့</b>)။ ပို့ချင်တဲ့သူက အဲဒီ bot ကို Telegram မှာ <b>Start တစ်ခါ နှိပ်ထား</b>ရမယ် — ပြီးရင် အလုပ်များ စာရင်းကနေ 📨 TG ခလုတ်နဲ့ တန်းပို့နိုင်ပြီ။ အခြေအနေ: <span id="tgState">…</span></p>
     <input type="password" id="tgInput" placeholder="Bot token (123456789:AA…) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <div class="row">
@@ -1054,6 +1065,16 @@ setInterval(loadJobs, 15000);
 })();
 
 /* ---------------- Gemini key settings ---------------- */
+/* Saved-state pill (build 162): every key card shows one
+   unmissable line — saved in the system, or not entered yet. */
+function setPill(id, configured) {
+  const el = $(id);
+  if (!el) return;
+  el.textContent = configured ? "✅ ထည့်ပြီးပါပြီ — system ထဲ သိမ်းထားပြီး"
+                              : "⚪ မထည့်ရသေး";
+  el.className = "keyPill " + (configured ? "ok" : "no");
+}
+
 async function loadKeyState() {
   try {
     const r = await fetch("/api/settings/gemini-key");
@@ -1067,6 +1088,7 @@ async function loadKeyState() {
       return;
     }
     $("keyState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
+    setPill("keyPill", d.configured);
     // Build 146: the card always shows for the admin inside the
     // ⚙️ Settings panel (the panel itself governs visibility), so a
     // saved key can be replaced any time. Non-admins never get here:
@@ -1088,6 +1110,7 @@ $("keySave").onclick = async () => {
 $("keyDel").onclick = async () => {
   await fetch("/api/settings/gemini-key", {method: "DELETE"});
   loadKeyState();
+  alert("ဖျက်ပြီးပါပြီ");
 };
 loadKeyState();
 
@@ -1103,6 +1126,7 @@ async function loadOaState() {
       return;
     }
     $("oaState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
+    setPill("oaPill", d.configured);
     $("oaCard").classList.add("show");
   } catch (e) { $("oaState").textContent = "?"; }
 }
@@ -1120,6 +1144,7 @@ $("oaSave").onclick = async () => {
 $("oaDel").onclick = async () => {
   await fetch("/api/settings/openai-key", {method: "DELETE"});
   loadOaState();
+  alert("ဖျက်ပြီးပါပြီ");
 };
 loadOaState();
 
@@ -1135,6 +1160,7 @@ async function loadOrState() {
       return;
     }
     $("orState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
+    setPill("orPill", d.configured);
     $("orCard").classList.add("show");
   } catch (e) { $("orState").textContent = "?"; }
 }
@@ -1152,6 +1178,7 @@ $("orSave").onclick = async () => {
 $("orDel").onclick = async () => {
   await fetch("/api/settings/openrouter-key", {method: "DELETE"});
   loadOrState();
+  alert("ဖျက်ပြီးပါပြီ");
 };
 loadOrState();
 
@@ -1167,6 +1194,7 @@ async function loadXkState() {
       return;
     }
     $("xkState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
+    setPill("xkPill", d.configured);
     $("xkCard").classList.add("show");
   } catch (e) { $("xkState").textContent = "?"; }
 }
@@ -1184,6 +1212,7 @@ $("xkSave").onclick = async () => {
 $("xkDel").onclick = async () => {
   await fetch("/api/settings/xkiro-key", {method: "DELETE"});
   loadXkState();
+  alert("ဖျက်ပြီးပါပြီ");
 };
 loadXkState();
 
@@ -1199,6 +1228,7 @@ async function loadAsState() {
       return;
     }
     $("asState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
+    setPill("asPill", d.configured);
     $("asCard").classList.add("show");
   } catch (e) { $("asState").textContent = "?"; }
 }
@@ -1217,6 +1247,7 @@ $("asSave").onclick = async () => {
 $("asDel").onclick = async () => {
   await fetch("/api/settings/apps-script", {method: "DELETE"});
   loadAsState();
+  alert("ဖျက်ပြီးပါပြီ");
 };
 loadAsState();
 
@@ -1233,6 +1264,7 @@ async function loadTgState() {
     $("tgState").textContent = d.configured
       ? `✅ ချိတ်ပြီး (@${d.bot || "?"}) — Start နှိပ်ထားသူ ${d.recipients} ယောက်`
       : "❌ မချိတ်ရသေး";
+    setPill("tgPill", d.configured);
     if (d.configured && d.poller) {
       $("tgState").textContent += d.poller.alive
         ? ` · စစ်ပြီး: ${d.poller.last_poll_ago ?? "?"}s က`
@@ -1325,6 +1357,7 @@ loadMe();
 $("tgDel").onclick = async () => {
   await fetch("/api/settings/telegram", {method: "DELETE"});
   loadTgState();
+  alert("ဖျက်ပြီးပါပြီ");
 };
 loadTgState();
 
@@ -1361,10 +1394,17 @@ async function loadApiStats() {
       "<div class='apiTotal'><div class='an'>📹 စုစုပေါင်း ထုတ်ပြီး ဗီဒီယို</div>" +
       "<div class='ac'>" + total + " <small>ပုဒ်</small></div></div>" +
       "<div class='apiGrid'>" + names.map(box).join("") + "</div>" +
-      "<p class='hint'>မှတ်တမ်း က build 138 နောက်ပိုင်း job တွေက စတာပါ</p>";
+      "<p class='hint'>build 162 မှာ အရေအတွက် အကုန် 0 က ပြန်စထားပါတယ် — နောက် job တွေက ဒီမှာ ပြန် တက်လာပါမယ်</p>";
   } catch (e) {}
 }
 $("apiStatsBtn").onclick = loadApiStats;
+$("apiResetBtn").onclick = async () => {
+  if (!confirm("ထုတ်ပြီး အရေအတွက် မှတ်တမ်း အကုန်လုံး 0 ပြန်စမလား?")) return;
+  const r = await fetch("/api/admin/api-stats/reset", {method: "POST"});
+  if (!r.ok) { alert("ပြန်စလို့ မရပါ"); return; }
+  loadApiStats();
+  alert("0 က ပြန်စပြီးပါပြီ");
+};
 /* Engine health board (build 148): the server already probes every
    translation engine, but the result was never shown anywhere — the
    owner had to ask which path works. Rendered from /api/auth/me's
@@ -1379,7 +1419,7 @@ function renderEngineStats() {
   const row = (name, conf, ok) => {
     const st = !conf ? "⚪ မထည့်ရသေး"
       : !hasP ? "⏳ စစ်နေဆဲ"
-      : ok ? "✅ အလုပ်လုပ်တယ်" : "❌ မရသေး";
+      : ok ? "✅ အလုပ်လုပ်တယ်" : "❌ အလုပ်မလုပ်သေး (key ရှိပြီး)";
     return "<div class='apiBox'><div class='an'>" + name +
       "</div><div class='ad'>" + st + "</div></div>";
   };
@@ -1712,6 +1752,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 161</p>
+<p class="hint" id="buildTag" style="text-align:center">build 162</p>
 </body>
 </html>

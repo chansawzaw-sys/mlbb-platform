@@ -60,3 +60,13 @@ def read():
     d = _load()
     return {"counts": d.get("counts", {}), "segs": d.get("segs", {}),
             "last": d.get("last", {}), "total": d.get("total", 0)}
+
+
+def reset():
+    """Zero every counter (build 162, owner order: the produced-
+    video numbers restart from 0). Atomic write, like record()."""
+    with _LOCK:
+        tmp = _FILE.parent / (_FILE.name + ".tmp")
+        tmp.write_text("{}", encoding="utf-8")
+        tmp.replace(_FILE)
+    return read()
