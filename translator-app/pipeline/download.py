@@ -14,6 +14,129 @@ import yt_dlp
 
 from .common import ensure_system_ca
 
+_URL_RE = re.compile(r"https?://[^\s\"'<>]+")
+_SHORT_HOSTS = ("vt.tiktok.com", "vm.tiktok.com", "xhslink.com")
+
+
+def clean_url(raw: str) -> str:
+    """Best URL out of whatever was pasted (build 166). Share
+    blurbs carry text around the link; TikTok tracking parameters
+    (?_r=, &_t=...) make resolver APIs choke, so TikTok URLs are
+    reduced to their bare path. Other hosts keep their query —
+    YouTube needs ?v=, XHS needs its token."""
+    text = (raw or "").strip()
+    m = _URL_RE.search(text)
+    url = (m.group(0) if m else text).strip().rstrip(").,]'\"")
+    try:
+        p = urlparse(url)
+    except Exception:
+        return url
+    if "tiktok" in p.netloc and p.query:
+        url = p._replace(query="", fragment="").geturl()
+    return url
+
+
+def _resolve_short(url: str) -> str:
+    """Follow a share short link (vt.tiktok.com, xhslink...) to the
+    canonical page URL — resolvers and yt-dlp both do better with
+    the real address. Best-effort: any failure keeps the original,
+    and an IP-literal/localhost destination is never adopted."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return url
+    if host not in _SHORT_HOSTS:
+        return url
+    try:
+        import requests
+        r = requests.get(
+            url, headers={"User-Agent":
+                          "Mozilla/5.0 (Linux; Android 13) "
+                          "AppleWebKit/537.36"},
+            timeout=15, allow_redirects=True)
+        final = r.url or url
+        fp = urlparse(final)
+        if fp.scheme not in ("http", "https") or not fp.netloc:
+            return url
+        hn = (fp.hostname or "").lower()
+        if not hn or hn == "localhost" \
+                or re.match(r"^[\d.]+$", hn) \
+                or re.match(r"^[0-9a-f:]+$", hn):
+            return url
+        return clean_url(final)
+    except Exception:
+        return url
+
+
+class DownloadFailed(Exception):
+    """Every download route failed (build 166, fix F1). str() is a
+    polite Burmese customer message; .raw keeps the technical
+    detail for the server log only — customers never see it."""
+
+    def __init__(self, polite, raw=""):
+        super().__init__(polite)
+        self.polite = polite
+        self.raw = raw
+
+
+_POLITE = {
+    "parse": "ဒီ link ကနေ video ကို ဆွဲလို့ မရသေးပါ။ "
+             "Link အပြည့် ဖြစ်ရပါမယ် — Share → Copy link နဲ့ "
+             "ပြန်ကူး (သို့) ခဏနေ ပြန်စမ်းပေးပါ။",
+    "login": "ဒီ video က login ဝင်မှ ရတဲ့ video ဖြစ်နေပါတယ်။ "
+             "Public video link နဲ့ ပြန်စမ်းပေးပါ။",
+    "gone": "Video ကို မတွေ့တော့ပါ — ဖျက်ထားတာ (သို့) "
+            "private လုပ်ထားတာ ဖြစ်နိုင်ပါတယ်။",
+    "throttle": "တောင်းဆိုမှု များနေလို့ site က ခဏ "
+                "ပိတ်ထားပါတယ်။ မိနစ် အနည်းငယ် စောင့်ပြီး "
+                "ပြန်စမ်းပေးပါ။",
+    "blocked": "ဒီ site က server ကနေ ဆွဲတာကို ပိတ်ထားပါတယ်။ "
+               "ခဏနေ ပြန်စမ်းပေးပါ။",
+    "network": "Network ပြဿနာ ဖြစ်နေပါတယ်။ "
+               "ခဏနေ ပြန်စမ်းပေးပါ။",
+    "default": "Download ဆွဲလို့ မရပါ။ Link ကို ပြန်စစ်ပြီး "
+               "ပြန်စမ်းပေးပါ။",
+}
+
+
+def polite_error(err, url=""):
+    """Map any download failure to its polite Burmese category
+    (build 166, fix F1). The raw exception text stays server-side."""
+    if isinstance(err, DownloadFailed):
+        return err.polite
+    s = (str(err) or "").lower()
+    try:
+        host = (urlparse(url).hostname or "").lower() if url else ""
+    except Exception:
+        host = ""
+    if any(k in s for k in ("url parsing", "returned no video url",
+                            "unsupported url", "not a valid url",
+                            "no downloadable video",
+                            "resolver returned")):
+        cat = "parse"
+    elif any(k in s for k in ("login", "sign in", "log in",
+                              "cookies", "confirm you")) \
+            or "facebook" in host or "instagram" in host:
+        cat = "login"
+    elif any(k in s for k in ("unavailable", "not found", "404",
+                              "removed", "deleted", "private video",
+                              "no longer available")):
+        cat = "gone"
+    elif "429" in s or "too many requests" in s \
+            or "rate limit" in s or "rate-limit" in s:
+        cat = "throttle"
+    elif "403" in s or "blocked" in s or "forbidden" in s \
+            or "unexpected response" in s:
+        cat = "blocked"
+    elif any(k in s for k in ("timed out", "timeout", "connection",
+                              "network", "ssl", "certificate",
+                              "getaddrinfo", "unreachable",
+                              "eof occurred")):
+        cat = "network"
+    else:
+        cat = "default"
+    return _POLITE[cat]
+
 
 def _tiktok_fallback(url: str, workdir: Path) -> dict:
     """Last-resort TikTok download via the public tikwm resolver API.
@@ -202,6 +325,11 @@ def download(url: str, workdir: Path) -> Path:
     ensure_system_ca()
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
+    # Build 166: normalise whatever was pasted (share text, short
+    # link, tracking params) before any host check, so the
+    # resolver, the ladder and the caption path all see the best
+    # form of the URL.
+    url = _resolve_short(clean_url(url))
     out = workdir / "source.mp4"
     opts = {
         # Light renditions first: at the same resolution, platforms
@@ -264,7 +392,12 @@ def download(url: str, workdir: Path) -> Path:
                 if first_err is None:
                     first_err = e
     if info is None:
-        raise first_err
+        # Build 166 (fix F1): the customer gets a polite Burmese
+        # category; the raw technical error goes to the server log
+        # only, never to the phone screen or the Telegram chat.
+        raw = str(first_err) if first_err else "unknown failure"
+        print(f"[download] FAILED {url}: {raw[:400]}", flush=True)
+        raise DownloadFailed(polite_error(first_err, url), raw)
     # Caption fast-path is BEST-EFFORT only: a subtitle 429/failure must
     # never kill the video download (observed on rate-limited IPs).
     # Skipped for TikTok: from this server's IP the caption request just

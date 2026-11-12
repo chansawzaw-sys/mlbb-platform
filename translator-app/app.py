@@ -1220,7 +1220,17 @@ def _refund_charge(job):
 def _fail(job, e):
     _refund_charge(job)
     job["status"] = "error"
-    job["error"] = str(e)[-1500:]
+    if job.get("current") == "download":
+        # Build 166 (fix F1): download failures reach the customer
+        # (web card + Telegram) as a polite Burmese category; the
+        # raw error stays in the server log. Other steps keep their
+        # own composed messages (translation failures already carry
+        # a polite Burmese explanation + provider breakdown).
+        print(f"[job {job['id']}] download FAILED raw: "
+              f"{str(e)[:400]}", flush=True)
+        job["error"] = dl_mod.polite_error(e, job.get("url") or "")
+    else:
+        job["error"] = str(e)[-1500:]
     for s in job["steps"]:
         if s["key"] == job.get("current") and s["state"] == "running":
             s["state"] = "error"
@@ -1430,7 +1440,7 @@ def _preview_dir(url):
 def make_preview():
     """Download (once, cached by URL) and report size/duration for the editor."""
     data = request.get_json(force=True)
-    url = (data.get("url") or "").strip()
+    url = dl_mod.clean_url(data.get("url") or "")
     if not url.startswith(("http://", "https://")):
         return jsonify({"error": "လင့်ခ် မမှန်ပါ"}), 400
     if not _public_url_ok(url):
@@ -1447,7 +1457,10 @@ def make_preview():
         dur = probe_duration(src)
         w, h = fx_mod.video_size(src)
     except Exception as e:
-        return jsonify({"error": str(e)[-500:]}), 502
+        # Build 166 (fix F1): polite Burmese category to the
+        # customer; the raw error is logged server-side only.
+        print(f"[preview] FAILED {url}: {str(e)[:400]}", flush=True)
+        return jsonify({"error": dl_mod.polite_error(e, url)}), 502
     title = None
     info_p = pdir / "source_info.json"
     if info_p.exists():
