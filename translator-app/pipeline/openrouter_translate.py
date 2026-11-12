@@ -11,7 +11,9 @@ segments, the same mode-aware style prompts (imported, one source),
 strict validation; ANY failure raises and the caller falls back
 (xKiro since build 165, then Apps Script, then the free chain).
 Since build 165 (owner order) OpenRouter is the FIRST gateway in
-the chain, ahead of xKiro.
+the chain, ahead of xKiro. Build 168 (owner order 2026-11-13):
+FREE-FIRST — the credit purchase is deferred, so the free models
+lead the walk below and paid DeepSeek goes last.
 
 Key handling (security): read ONLY from env OPENROUTER_API_KEY or
 the git-ignored `.env` in the project root; saved via the app's
@@ -31,25 +33,28 @@ _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def _models():
-    """Configured model first, then paid DeepSeek (the quality
-    anchor once the wallet is funded), then the FREE tail: Baidu
-    ERNIE first (the proven winner on this server), then Google's
-    Gemma 4 pair (open-weight, third-party hosted, so the Google
-    region wall does not apply). A 404/403/402/429 moves to the
-    NEXT model; only 401 (bad key) stops the walk.
+    """Configured model first, then the FREE models, paid
+    DeepSeek LAST. The free order: Baidu ERNIE first (the proven
+    winner on this server), then Google's Gemma 4 pair
+    (open-weight, third-party hosted, so the Google region wall
+    does not apply). A 404/403/402/429 moves to the NEXT model;
+    only 401 (bad key) stops the walk.
 
-    Build 165 (owner order 2026-11-12): the Gemini/GPT name
-    brands were REMOVED from this walk — live probes prove they
-    answer 403 (region) from this server every single time, so
-    each attempt only burned seconds before DeepSeek. The
-    DeepSeek/Qwen/Llama :free endpoints guessed in build 150 are
-    RETIRED (404); the live catalog lists only 13 free models."""
+    Build 168 (owner order 2026-11-13): FREE-FIRST reorder. The
+    owner deferred the OpenRouter credit purchase, so the free
+    models lead and paid DeepSeek sits at the back — while the
+    wallet is empty its 402 is simply walked past, and if the
+    wallet is funded later it spends only after every free
+    model has failed. (Build 165 history: the Gemini/GPT name
+    brands were removed from this walk — 403 region refusals
+    from this server every time; the DeepSeek/Qwen/Llama :free
+    endpoints guessed in build 150 are retired, 404.)"""
     env = (os.environ.get("OPENROUTER_MODEL") or "").strip()
     out = []
-    for m in [env, "deepseek/deepseek-chat-v3-0324",
-              "baidu/ernie-5.5-flash-preview:free",
+    for m in [env, "baidu/ernie-5.5-flash-preview:free",
               "google/gemma-4-31b-it:free",
-              "google/gemma-4-26b-a4b-it:free"]:
+              "google/gemma-4-26b-a4b-it:free",
+              "deepseek/deepseek-chat-v3-0324"]:
         if m and m not in out:
             out.append(m)
     return out
@@ -146,8 +151,7 @@ def translate_all(segments, style="subs"):
             break  # bad key — no model will help
         # 402 (this model needs credit), 403 (provider region
         # refusal), 404 (model missing), 429 (rate limit) or
-        # anything else: try the next model — the free endpoints
-        # at the end of the list answer when the paid ones cannot.
+        # anything else: try the next model in the walk.
     msg = ("OpenRouter failed: " + "; ".join(attempts)
            + f" | last: {last_body}")
     _note_error(msg)

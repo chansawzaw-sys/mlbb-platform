@@ -1,14 +1,21 @@
 """Step 3: translate each segment to Myanmar (Burmese).
 
 Provider chain:
-  0. Gemini Flash (only when GEMINI_API_KEY is configured server-side —
-     see pipeline/gemini_translate.py): ONE request for ALL segments,
-     natural spoken Burmese. Any failure -> OpenAI (build 134 module,
-     when configured) -> OpenRouter (build 147 module; FIRST gateway
-     since build 165, owner order 2026-11-12) -> xKiro (build 155
-     module) -> Apps Script (build 137 module, the owner's own
-     Google account via LanguageApp, when configured), then the
-     free chain below.
+  0. OpenRouter (build 147 module, when configured): ONE request
+     for ALL segments, natural spoken Burmese. Any failure ->
+     xKiro (build 155 module) -> Gemini Flash (only when
+     GEMINI_API_KEY is configured server-side — see
+     pipeline/gemini_translate.py) -> OpenAI (build 134 module,
+     when configured) -> Apps Script (build 137 module, the
+     owner's own Google account via LanguageApp, when
+     configured), then the free chain below.
+     Build 168 (owner order 2026-11-13): FREE-FIRST — no paid
+     credit purchase for now, so the best free models lead each
+     gateway walk (ERNIE/Gemma on OpenRouter, Aya/Command A+/
+     Mistral on xKiro), paid models sit at the back of their
+     walks, and the region-blocked direct engines (Gemini is
+     location-blocked, OpenAI territory-blocked from the VPS)
+     stop burning time ahead of the working gateways.
   1. deep-translator GoogleTranslator (unofficial Google Translate endpoint)
   2. `translators` library -> Microsoft Bing Translator web endpoint
   3. keep the source text (never drop a cue)
@@ -391,45 +398,16 @@ def translate_segments(workdir, style="subs"):
     workdir = Path(workdir)
     segs = load_segments(workdir / "segments_en.json")
     report = {"batch": {}, "chain": {}, "fill": {}}
-    # 0. Gemini batch — the PRIMARY engine since build 136 (owner's
-    # order 2026-11-11: fresh Gemini key first, OpenAI second, the
-    # free chain last). Any failure falls through to OpenAI, with the
-    # error kept in the report for diagnosis.
-    if segs:
-        try:
-            from . import gemini_translate
-            if gemini_translate.key_configured():
-                by_idx = gemini_translate.translate_all(segs, style=style)
-                out = [{**seg, "text_my": by_idx[i], "provider": "gemini"}
-                       for i, seg in enumerate(segs)]
-                out = _fill_missing(out, report)
-                _write_report(workdir, report)
-                save_segments(out, workdir / "segments_my.json")
-                write_srt(out, workdir / "subs_my.srt")
-                return out
-        except Exception as e:
-            report["gemini_err"] = str(e)[:120]
-    # 0b. OpenAI batch — second engine, when a key is configured.
-    if segs:
-        try:
-            from . import openai_translate
-            if openai_translate.key_configured():
-                by_idx = openai_translate.translate_all(segs, style=style)
-                out = [{**seg, "text_my": by_idx[i], "provider": "openai"}
-                       for i, seg in enumerate(segs)]
-                out = _fill_missing(out, report)
-                _write_report(workdir, report)
-                save_segments(out, workdir / "segments_my.json")
-                write_srt(out, workdir / "subs_my.srt")
-                return out
-        except Exception as e:
-            report["openai_err"] = str(e)[:120]
-    # 0c. OpenRouter batch — third engine and the FIRST gateway
-    # (build 147; moved ahead of xKiro by owner order 2026-11-12,
-    # build 165): direct OpenAI is region-blocked from the VPS, so
-    # the wallet runs through OpenRouter (US aggregator; DeepSeek
-    # paid first in its walk, ERNIE free behind it; story-style
-    # prompts apply). Any failure falls through to xKiro.
+    # 0. OpenRouter batch — the FIRST gateway (build 147; build
+    # 168 free-first reorder, owner order 2026-11-13): the owner
+    # deferred the paid credit purchase, so the best FREE models
+    # lead every walk and paid models sit at the back; the
+    # region-blocked direct engines (Gemini/OpenAI) moved behind
+    # the working gateways so they stop failing first on every
+    # job. OpenRouter is a US aggregator (not region-blocked from
+    # the VPS); its walk is ERNIE free -> Gemma 4 free pair ->
+    # DeepSeek paid last; story-style prompts apply. Any failure
+    # falls through to xKiro.
     if segs:
         try:
             from . import openrouter_translate
@@ -447,13 +425,13 @@ def translate_segments(workdir, style="subs"):
                 return out
         except Exception as e:
             report["openrouter_err"] = str(e)[:120]
-    # 0d. xKiro batch — fourth engine (build 155, owner chose it
-    # 2026-11-11; moved behind OpenRouter by owner order
-    # 2026-11-12, build 165): a young OpenAI-compatible gateway
-    # whose free tier plus $5 Telegram-verification credit reach
-    # DeepSeek V4 Flash cheaper than OpenRouter, with free
-    # Mistral/Cohere models behind it. Any failure falls through
-    # to Apps Script, then the free chain.
+    # 0b. xKiro batch — second gateway (build 155, owner chose
+    # it 2026-11-11): a young OpenAI-compatible gateway whose
+    # free tier (Aya / Command A+ / Mistral — leading its walk
+    # since the build-168 free-first reorder) plus $5
+    # Telegram-verification credit reach DeepSeek V4 Flash
+    # cheaper than OpenRouter, DeepSeek pair last in the walk.
+    # Any failure falls through to Gemini.
     if segs:
         try:
             from . import xkiro_translate
@@ -471,6 +449,45 @@ def translate_segments(workdir, style="subs"):
                 return out
         except Exception as e:
             report["xkiro_err"] = str(e)[:120]
+    # 0c. Gemini batch — third (build 136 engine). Direct Gemini
+    # is LOCATION-blocked from this VPS (proven build 164), so
+    # since build 168 it sits behind the working gateways instead
+    # of failing first on every job; the block stays for the day
+    # the server region changes. Any failure falls through to
+    # OpenAI, with the error kept in the report for diagnosis.
+    if segs:
+        try:
+            from . import gemini_translate
+            if gemini_translate.key_configured():
+                by_idx = gemini_translate.translate_all(segs, style=style)
+                out = [{**seg, "text_my": by_idx[i], "provider": "gemini"}
+                       for i, seg in enumerate(segs)]
+                out = _fill_missing(out, report)
+                _write_report(workdir, report)
+                save_segments(out, workdir / "segments_my.json")
+                write_srt(out, workdir / "subs_my.srt")
+                return out
+        except Exception as e:
+            report["gemini_err"] = str(e)[:120]
+    # 0d. OpenAI batch — fourth engine, when a key is configured.
+    # Direct OpenAI is region-blocked from the VPS (403
+    # unsupported territory), so since build 168 it sits behind
+    # the working gateways like Gemini. Any failure falls through
+    # to Apps Script.
+    if segs:
+        try:
+            from . import openai_translate
+            if openai_translate.key_configured():
+                by_idx = openai_translate.translate_all(segs, style=style)
+                out = [{**seg, "text_my": by_idx[i], "provider": "openai"}
+                       for i, seg in enumerate(segs)]
+                out = _fill_missing(out, report)
+                _write_report(workdir, report)
+                save_segments(out, workdir / "segments_my.json")
+                write_srt(out, workdir / "subs_my.srt")
+                return out
+        except Exception as e:
+            report["openai_err"] = str(e)[:120]
     # 0e. Apps Script batch — fifth engine (build 137, owner request
     # 2026-11-10): the owner's own Google account translates via
     # LanguageApp, so the throttled VPS IP never touches Google.

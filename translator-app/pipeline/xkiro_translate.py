@@ -17,7 +17,9 @@ Same contract as pipeline/gemini_translate.py: ONE request for ALL
 segments, the same mode-aware style prompts (imported, one source),
 strict validation; ANY failure raises and the caller falls back
 (Apps Script, then the free chain). Since build 165 (owner order)
-xKiro sits AFTER OpenRouter in the chain.
+xKiro sits AFTER OpenRouter in the chain. Build 168 (owner order
+2026-11-13): FREE-FIRST — the free models lead the walk below
+and the paid DeepSeek pair goes last.
 
 Key handling (security): read ONLY from env XKIRO_API_KEY or the
 git-ignored `.env` in the project root; saved via the app's
@@ -43,23 +45,26 @@ _FREE_MODELS = {"mistralai/mistral-large-2512",
 
 
 def _models():
-    """Configured model first, then the cheapest strong DeepSeek
-    pair, ending with the free tier: Cohere's multilingual Aya
-    Expanse first (best format discipline), then Mistral Large,
-    then Command A+. A 404/403/402/429 moves to the NEXT model;
+    """Configured model first, then the FREE tier, the paid
+    DeepSeek pair LAST. The free order (build 168): Cohere's
+    multilingual Aya Expanse first (the proven winner on this
+    server, best format discipline), then Command A+, then
+    Mistral Large. A 404/403/402/429 moves to the NEXT model;
     only 401 (bad key) stops the walk.
 
-    Build 165: Gemini 2.5 Flash was REMOVED from this walk — it
-    never answered successfully from this server (the region wall
-    applies through this gateway too), so the attempt only cost
-    time on every job."""
+    Build 168 (owner order 2026-11-13): FREE-FIRST reorder —
+    no paid purchase for now, so the free models lead; the
+    DeepSeek pair (V4.1 Flash, then V4 Flash 0731) sits at the
+    back and is reached only when every free model failed.
+    (Build 165 history: Gemini 2.5 Flash was removed from this
+    walk — the region wall applies through this gateway too.)"""
     env = (os.environ.get("XKIRO_MODEL") or "").strip()
     out = []
-    for m in [env, "deepseek/deepseek-v4.1-flash",
-              "deepseek/deepseek-v4-flash-0731",
-              "cohere/aya-expanse-32b",
+    for m in [env, "cohere/aya-expanse-32b",
+              "cohere/command-a-plus",
               "mistralai/mistral-large-2512",
-              "cohere/command-a-plus"]:
+              "deepseek/deepseek-v4.1-flash",
+              "deepseek/deepseek-v4-flash-0731"]:
         if m and m not in out:
             out.append(m)
     return out
@@ -156,9 +161,8 @@ def translate_all(segments, style="subs"):
         last_body = resp.text[:200]
         if resp.status_code == 401:
             break  # bad key — no model will help
-        # 402/403/404/429 or anything else: try the next model —
-        # the free-tier models at the end of the list answer when
-        # the paid ones cannot.
+        # 402/403/404/429 or anything else: try the next model
+        # in the walk.
     msg = ("xKiro failed: " + "; ".join(attempts)
            + f" | last: {last_body}")
     _note_error(msg)

@@ -256,6 +256,129 @@ def _tiktok_fallback(url: str, workdir: Path, quality: str = "hd") -> dict:
     }
 
 
+_DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+               "AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/126.0 Safari/537.36")
+_TIKTOK_ID_RE = re.compile(r"/video/(\d+)")
+
+
+def _embed_candidates(html):
+    """Playable-source candidates in a TikTok embed page (build
+    168): [(url, bitrate_or_None)], best first.
+
+    The payload shape has moved over the years — a hydration JSON
+    blob carrying video.bitrateInfo (entries with a "Bitrate" and
+    a PlayAddr "UrlList"), loose "playAddr"/"downloadAddr"
+    strings, or an og:video meta. Pure text archaeology,
+    best-effort: bitrate-tagged entries sort by bitrate
+    descending ahead of the untagged ones; duplicates removed."""
+    txt = (html or "").replace("\\u002F", "/").replace("\\u002f", "/") \
+        .replace("\\/", "/").replace("&amp;", "&")
+    tagged, plain = [], []
+
+    def _push(lst, u, br=None):
+        if u and u.startswith("http") and all(u != x for x, _ in lst):
+            lst.append((u, br))
+
+    brs = [(m.start(), int(m.group(1)))
+           for m in re.finditer(r'"Bitrate"\s*:\s*(\d+)', txt)]
+    for m in re.finditer(r'"UrlList"\s*:\s*\[([^\]]*)\]', txt):
+        u = re.search(r'"(https?://[^"]+)"', m.group(1))
+        if not u:
+            continue
+        # The bitrateInfo entry a UrlList belongs to is a compact
+        # object, so the NEAREST "Bitrate" is its own — a plain
+        # window search could steal the previous entry's value.
+        near = [b for b in brs if abs(b[0] - m.start()) <= 900]
+        br = min(near, key=lambda b: abs(b[0] - m.start()))[1] \
+            if near else None
+        _push(tagged, u.group(1), br)
+    tagged.sort(key=lambda t: -(t[1] or 0))
+    for key in ("playAddr", "downloadAddr"):
+        for m in re.finditer(r'"%s"\s*:\s*"(https?://[^"]+)"' % key,
+                             txt):
+            _push(plain, m.group(1))
+    m = re.search(r'og:video(?:"|\')\s+content=(?:"|\')([^"\']+)', txt)
+    if m:
+        _push(plain, m.group(1))
+    seen = {u for u, _ in tagged}
+    return tagged + [(u, b) for u, b in plain if u not in seen]
+
+
+def _stream_to_source(play, workdir, headers):
+    """Stream a direct file URL to <workdir>/source.mp4 via a
+    .part file + rename — the same discipline as the tikwm route,
+    so a truncated file can never pose as a finished download."""
+    import requests
+    out = workdir / "source.mp4"
+    tmp = workdir / "source.mp4.part"
+    with requests.get(play, headers=headers, timeout=180,
+                      stream=True) as resp:
+        resp.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in resp.iter_content(1 << 20):
+                if chunk:
+                    f.write(chunk)
+    if tmp.stat().st_size < 10_000:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError("download came back empty/truncated")
+    tmp.replace(out)
+    return out
+
+
+def _tiktok_embed_fallback(url: str, workdir: Path,
+                           quality: str = "hd") -> dict:
+    """TikTok route 2 (build 168): TikTok's own embed page.
+
+    Some valid public videos are unparseable by the tikwm
+    resolver — it answers code -1 for them on every URL shape
+    (the owner's own link, @xstvscenestories 7706396575643340052,
+    is one; verified again on build night). After the resolver
+    route this asks TikTok's embed surface for the same video
+    id: https://www.tiktok.com/embed/v2/<id> is the player third
+    -party sites embed, and its payload can carry the playable
+    source directly. Best-effort with a short timeout: ANY
+    failure raises and download() moves on to the yt-dlp ladder.
+
+    (A douyin.wtf hybrid-API route was evaluated for this slot
+    in build 168 and rejected: verified live 2026-11-13, the
+    public API is dead/changed — every known path answers
+    NOT_FOUND and the host now serves an unrelated console app.)"""
+    import requests
+    m = _TIKTOK_ID_RE.search(url or "")
+    if not m:
+        raise RuntimeError("embed route: no video id in the URL")
+    headers = {"User-Agent": _DESKTOP_UA,
+               "Referer": "https://www.tiktok.com/"}
+    r = requests.get(f"https://www.tiktok.com/embed/v2/{m.group(1)}",
+                     headers=headers, timeout=15)
+    r.raise_for_status()
+    html = r.text or ""
+    cands = _embed_candidates(html)
+    if not cands:
+        raise RuntimeError("embed page carried no playable video URL")
+    if quality == "hd":
+        play = cands[0][0]
+    else:
+        # 720/480: the lightest bitrate-tagged rendition when the
+        # payload tags any; the embed usually exposes just one.
+        tagged = [(u, b) for u, b in cands if b]
+        play = min(tagged, key=lambda t: t[1])[0] if tagged \
+            else cands[0][0]
+    _stream_to_source(play, workdir, headers)
+    title = None
+    mt = re.search(r'og:title(?:"|\')\s+content=(?:"|\')([^"\']+)',
+                   html)
+    if mt:
+        title = mt.group(1)
+    dur = None
+    md = re.search(r'"duration"\s*:\s*(\d+)', html)
+    if md:
+        dur = int(md.group(1)) or None
+    return {"title": title, "duration": dur, "webpage_url": url,
+            "uploader": None, "rendition": "embed"}
+
+
 _XHS_HOSTS = ("xhslink.com", "xiaohongshu.com", "rednote.com")
 _XHS_ID_RE = re.compile(r"/(?:explore|discovery/item)/([0-9a-f]{20,32})")
 
@@ -437,6 +560,15 @@ def download(url: str, workdir: Path, quality: str = "hd") -> Path:
             info = _tiktok_fallback(url, workdir, quality)
         except Exception as e:
             first_err = e
+    if info is None and "tiktok" in urlparse(url).netloc:
+        # Build 168, TikTok route 2: the embed page (see
+        # _tiktok_embed_fallback) catches videos the resolver
+        # cannot parse at all; the ladder below stays as backup.
+        try:
+            info = _tiktok_embed_fallback(url, workdir, quality)
+        except Exception as e:
+            if first_err is None:
+                first_err = e
     if info is None:
         # Attempt ladder: plain first, then browser impersonation. Social
         # sites fingerprint plain datacenter clients and answer with an
