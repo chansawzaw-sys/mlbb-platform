@@ -137,7 +137,10 @@
         <button class="ghost" id="logoutBtn">ထွက်မယ်</button>
       </div>
       <p class="hint" id="linkCodeOut" style="display:none"></p>
-      <div id="payBlock" style="margin-top:10px">
+      <div class="row">
+        <button class="ghost" id="payToggle">💰 ငွေဖြည့်ရန်</button>
+      </div>
+      <div id="payBlock" style="display:none;margin-top:10px">
         <h4 style="margin:6px 0">💰 Credit ဖြည့်ရန်</h4>
         <p class="hint" id="payText"></p>
         <div class="qrBox" id="payQrBox" style="display:none">
@@ -347,10 +350,12 @@
       </div>
       <p class="hint" id="placeNote"></p>
       <label>စာအရွယ်အစား</label>
+      <input type="range" id="wizSubSize" min="60" max="160" step="5" value="100">
+      <p style="text-align:center"><b id="wizSubSizeVal">100%</b></p>
       <div class="chips" id="sizeChips">
-        <button class="chip" data-size="80">သေး</button>
-        <button class="chip on" data-size="100">လတ်</button>
-        <button class="chip" data-size="130">ကြီး</button>
+        <button class="chip" data-size="80">80%</button>
+        <button class="chip on" data-size="100">100%</button>
+        <button class="chip" data-size="130">130%</button>
       </div>
       <label>စာတန်း အရောင်</label>
       <div class="chips" id="colorChips">
@@ -719,7 +724,16 @@ chipWire("qualityChips", "quality", v => W.quality = v);
 chipWire("aspectChips", "aspect", v => W.aspect = v);
 chipWire("aspectStyleChips", "astyle", v => W.aspectStyle = v);
 chipWire("placeChips", "place", v => W.place = v);
-chipWire("sizeChips", "size", v => W.subSize = Number(v));
+chipWire("sizeChips", "size", v => {
+  W.subSize = Number(v); $("wizSubSize").value = v; subSizeLabel();
+});
+function subSizeLabel() {
+  $("wizSubSizeVal").textContent = W.subSize + "%";
+}
+$("wizSubSize").oninput = () => {
+  W.subSize = Number($("wizSubSize").value); subSizeLabel();
+  syncChips("sizeChips", "size", W.subSize); layoutSubs();
+};
 chipWire("colorChips", "color", v => W.color = v);
 chipWire("speedChips", "speed", v => {
   W.speed = Number(v); $("wizSpeed").value = v; speedLabel();
@@ -1465,6 +1479,12 @@ $("setToggle").onclick = () => {
   const p = $("settingsPanel");
   p.style.display = p.style.display === "none" ? "" : "none";
 };
+$("payToggle").onclick = () => {
+  const p = $("payBlock");
+  const open = p.style.display === "none";
+  p.style.display = open ? "" : "none";
+  if (open) { loadPayQr(); loadMyTopups(); }
+};
 async function loadMe() {
   try {
     const r = await (await fetch("/api/auth/me")).json();
@@ -1761,6 +1781,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 169</p>
+<p class="hint" id="buildTag" style="text-align:center">build 170</p>
 </body>
 </html>
