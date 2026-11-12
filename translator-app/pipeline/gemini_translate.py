@@ -112,6 +112,47 @@ def key_configured():
     return bool(get_api_key())
 
 
+def list_models():
+    """Which models can this key's project actually see? (build 164)
+
+    The 404 wall: generateContent 404s for every walk model while
+    the Cloud console shows the Gemini API Enabled on the key's
+    project and the project's own metrics record our 404s — the
+    requests DO reach the project, so its model catalogue may
+    simply differ from our hardcoded names. ListModels is the
+    ground truth. Returns (names, error): bare model ids (no
+    "models/" prefix) that support generateContent; error "" on
+    success."""
+    import requests
+
+    key = get_api_key()
+    if not key:
+        return [], "no GEMINI_API_KEY configured"
+    url = "https://generativelanguage.googleapis.com/v1beta/models"
+    last = ""
+    for use_query in (False, True):
+        try:
+            resp = requests.get(
+                url + (f"?key={key}" if use_query else ""),
+                timeout=30,
+                headers={} if use_query else {"x-goog-api-key": key})
+        except Exception as e:
+            last = f"net:{e}"[:120]
+            continue
+        if resp.status_code == 200:
+            names = []
+            for m in resp.json().get("models") or []:
+                methods = m.get("supportedGenerationMethods") or []
+                if methods and "generateContent" not in methods:
+                    continue
+                name = str(m.get("name") or "").replace("models/", "")
+                if name:
+                    names.append(name)
+            return names, ""
+        last = f"{resp.status_code}: {resp.text[:150]}"
+    return [], last
+
+
 def _models():
     """Model fallback order: the configured model first, then the
     current Flash names. (A key created in late 2026 may not accept

@@ -2035,7 +2035,18 @@ def _run_translate_probe():
                 res["gemini_ok"] = False
         except Exception as e:
             res["gemini_ok"] = False
-            res["gemini_err"] = str(e)[:200]
+            res["gemini_err"] = str(e)[:500]
+        if not res.get("gemini_ok"):
+            # Build 164: when generateContent 404s everywhere, ask
+            # the project what it CAN see — the model catalogue is
+            # the ground truth for the next fix.
+            try:
+                names, lerr = gemini_translate.list_models()
+                res["gemini_models"] = names[:25]
+                if lerr:
+                    res["gemini_models_err"] = lerr[:200]
+            except Exception as e:
+                res["gemini_models_err"] = str(e)[:200]
         try:
             from pipeline import openai_translate
             if openai_translate.key_configured():
