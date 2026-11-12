@@ -19,7 +19,12 @@ strict validation; ANY failure raises and the caller falls back
 (Apps Script, then the free chain). Since build 165 (owner order)
 xKiro sits AFTER OpenRouter in the chain. Build 168 (owner order
 2026-11-13): FREE-FIRST — the free models lead the walk below
-and the paid DeepSeek pair goes last.
+and the paid DeepSeek pair goes last. Build 169 (owner order
+2026-11-13): BEST-FREE-FIRST — the catalog was re-scanned
+(69 models, 26 free) and this walk is UNCHANGED: Aya Expanse
+keeps the lead because it is the only model with production
+proof on the owner's own account (23/23 successful requests,
+2026-11-13), ahead of Command A+ and Mistral Large.
 
 Key handling (security): read ONLY from env XKIRO_API_KEY or the
 git-ignored `.env` in the project root; saved via the app's
