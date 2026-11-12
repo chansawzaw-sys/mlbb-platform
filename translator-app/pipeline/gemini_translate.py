@@ -145,6 +145,32 @@ def _extract_json_array(text):
     return json.loads(text[start:end + 1])
 
 
+def _validated_result(text_out, segments, name):
+    """Parse one model's reply into {index: burmese} or raise.
+
+    Build 163: every engine calls this INSIDE its model walk, so a
+    reply in the wrong shape (prose instead of the JSON array, an
+    id missing, an empty string) costs that one attempt and the
+    walk moves on to the next model — before 163 the first HTTP 200
+    ended the walk and a bad-format reply killed the whole engine
+    (live case: xKiro's free Mistral answered 200 with prose while
+    Aya Expanse, later in the same list, was never tried)."""
+    arr = _extract_json_array(text_out)
+    result = {}
+    for item in arr:
+        if not isinstance(item, dict) or "id" not in item or "my" not in item:
+            raise ValueError(f"{name} item missing id/my")
+        idx, my = int(item["id"]), str(item["my"]).strip()
+        if not my:
+            raise ValueError(f"{name} returned an empty translation")
+        result[idx] = my
+    if set(result) != set(range(len(segments))):
+        raise ValueError(
+            f"{name} id set mismatch: got {sorted(result)}, "
+            f"want 0..{len(segments) - 1}")
+    return result
+
+
 def translate_all(segments, style="subs"):
     """segments: list of dicts with 'text'. Returns {index: burmese_text}.
 
@@ -168,10 +194,11 @@ def translate_all(segments, style="subs"):
         "generationConfig": {"responseMimeType": "application/json",
                              "temperature": 0.3},
     }
-    data = None
+    result = None
     attempts = []
     last_body = ""
     for mdl in _models():
+        badfmt = False
         for ver in ("v1beta", "v1"):
             url = _API_TMPL.format(ver=ver, model=mdl)
             for use_query in (False, True):
@@ -186,7 +213,19 @@ def translate_all(segments, style="subs"):
                     attempts.append(f"{mdl}@{ver}=net:{e}"[:60])
                     continue
                 if resp.status_code == 200:
-                    data = resp.json()
+                    # Build 163: validate NOW, inside the walk —
+                    # a bad-shape reply moves to the next MODEL
+                    # (retrying this model under another version
+                    # or auth shape would return the same text).
+                    try:
+                        text_out = resp.json()["candidates"][0][
+                            "content"]["parts"][0]["text"]
+                        result = _validated_result(
+                            text_out, segments, "Gemini")
+                    except Exception as e:
+                        attempts.append(
+                            f"{mdl}@{ver}=badformat:{e}"[:70])
+                        badfmt = True
                     break
                 # NOTE: body may hold an error message, never the key.
                 attempts.append(f"{mdl}@{ver}={resp.status_code}")
@@ -196,28 +235,15 @@ def translate_all(segments, style="subs"):
                 if resp.status_code in (401, 403) and not use_query:
                     continue  # try query-param auth once
                 break
-            if data is not None:
+            if result is not None or badfmt:
                 break
-        if data is not None:
+        if result is not None:
             break
-    if data is None:
+    if result is None:
         msg = ("Gemini failed: " + "; ".join(attempts)
                + f" | last: {last_body}")
         _note_error(msg)
         raise RuntimeError(msg)
-    text_out = data["candidates"][0]["content"]["parts"][0]["text"]
-    arr = _extract_json_array(text_out)
-    result = {}
-    for item in arr:
-        if not isinstance(item, dict) or "id" not in item or "my" not in item:
-            raise ValueError("Gemini item missing id/my")
-        idx, my = int(item["id"]), str(item["my"]).strip()
-        if not my:
-            raise ValueError("Gemini returned an empty translation")
-        result[idx] = my
-    if set(result) != set(range(len(segments))):
-        raise ValueError(
-            f"Gemini id set mismatch: got {sorted(result)}, want 0..{len(segments) - 1}")
     return result
 
 

@@ -18,7 +18,8 @@ import time
 from pathlib import Path
 
 from .common import PROJECT_ROOT
-from .gemini_translate import _extract_json_array, _prompt_for
+from .gemini_translate import (_extract_json_array, _prompt_for,
+                               _validated_result)
 
 _API_URL = "https://api.openai.com/v1/chat/completions"
 
@@ -73,7 +74,6 @@ def translate_all(segments, style="subs"):
     prompt = _prompt_for(style).replace(
         "__SEGMENTS_JSON__", json.dumps(payload_in, ensure_ascii=False))
     body = {"messages": [{"role": "user", "content": prompt}]}
-    data = None
     attempts = []
     last_body = ""
     for mdl in _models():
@@ -86,33 +86,24 @@ def translate_all(segments, style="subs"):
             attempts.append(f"{mdl}=net:{e}"[:60])
             continue
         if resp.status_code == 200:
-            data = resp.json()
-            break
+            # Build 163: validate inside the walk — a bad-shape
+            # reply costs this model only, the next one still runs.
+            try:
+                text_out = resp.json()["choices"][0][
+                    "message"]["content"]
+                return _validated_result(text_out, segments, "OpenAI")
+            except Exception as e:
+                attempts.append(f"{mdl}=badformat:{e}"[:70])
+                continue
         attempts.append(f"{mdl}={resp.status_code}")
         last_body = resp.text[:200]
         if resp.status_code in (401, 403):
             break  # bad key / no access — other models won't help
         # 404 (model missing) or anything else: try the next model.
-    if data is None:
-        msg = ("OpenAI failed: " + "; ".join(attempts)
-               + f" | last: {last_body}")
-        _note_error(msg)
-        raise RuntimeError(msg)
-    text_out = data["choices"][0]["message"]["content"]
-    arr = _extract_json_array(text_out)
-    result = {}
-    for item in arr:
-        if not isinstance(item, dict) or "id" not in item or "my" not in item:
-            raise ValueError("OpenAI item missing id/my")
-        idx, my = int(item["id"]), str(item["my"]).strip()
-        if not my:
-            raise ValueError("OpenAI returned an empty translation")
-        result[idx] = my
-    if set(result) != set(range(len(segments))):
-        raise ValueError(
-            f"OpenAI id set mismatch: got {sorted(result)}, "
-            f"want 0..{len(segments) - 1}")
-    return result
+    msg = ("OpenAI failed: " + "; ".join(attempts)
+           + f" | last: {last_body}")
+    _note_error(msg)
+    raise RuntimeError(msg)
 
 
 if __name__ == "__main__":

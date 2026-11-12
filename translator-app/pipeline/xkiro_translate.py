@@ -29,7 +29,8 @@ import time
 from pathlib import Path
 
 from .common import PROJECT_ROOT
-from .gemini_translate import _extract_json_array, _prompt_for
+from .gemini_translate import (_extract_json_array, _prompt_for,
+                               _validated_result)
 
 _API_URL = "https://api.xkiro.com/v1/chat/completions"
 
@@ -44,16 +45,17 @@ def _models():
     """Configured model first, then the cheapest strong DeepSeek,
     then Gemini 2.5 Flash (its price here undercuts OpenRouter's,
     and this gateway may route around the region wall), ending
-    with the free tier: Mistral Large and Cohere's multilingual
-    Aya Expanse / Command A+. A 404/403/402/429 moves to the NEXT
+    with the free tier: Cohere's multilingual Aya Expanse first
+    (best format discipline), then Mistral Large, then Command
+    A+. A 404/403/402/429 moves to the NEXT
     model; only 401 (bad key) stops the walk."""
     env = (os.environ.get("XKIRO_MODEL") or "").strip()
     out = []
     for m in [env, "deepseek/deepseek-v4.1-flash",
               "deepseek/deepseek-v4-flash-0731",
               "google/gemini-2.5-flash",
-              "mistralai/mistral-large-2512",
               "cohere/aya-expanse-32b",
+              "mistralai/mistral-large-2512",
               "cohere/command-a-plus"]:
         if m and m not in out:
             out.append(m)
@@ -119,7 +121,6 @@ def translate_all(segments, style="subs"):
     prompt = _prompt_for(style).replace(
         "__SEGMENTS_JSON__", json.dumps(payload_in, ensure_ascii=False))
     body = {"messages": [{"role": "user", "content": prompt}]}
-    data = None
     attempts = []
     last_body = ""
     for mdl in _models():
@@ -132,10 +133,22 @@ def translate_all(segments, style="subs"):
             attempts.append(f"{mdl}=net:{e}"[:60])
             continue
         if resp.status_code == 200:
-            data = resp.json()
+            # Build 163: validate inside the walk — the live
+            # failure that motivated this build was a 200 reply
+            # in prose (no JSON array) ending the engine while
+            # later models were never tried. The winner is noted
+            # only once its reply actually parses.
+            try:
+                text_out = resp.json()["choices"][0][
+                    "message"]["content"]
+                result = _validated_result(
+                    text_out, segments, "xKiro")
+            except Exception as e:
+                attempts.append(f"{mdl}=badformat:{e}"[:70])
+                continue
             _note_model(mdl)
             globals()["LAST_MODEL"] = mdl
-            break
+            return result
         attempts.append(f"{mdl}={resp.status_code}")
         last_body = resp.text[:200]
         if resp.status_code == 401:
@@ -143,26 +156,10 @@ def translate_all(segments, style="subs"):
         # 402/403/404/429 or anything else: try the next model —
         # the free-tier models at the end of the list answer when
         # the paid ones cannot.
-    if data is None:
-        msg = ("xKiro failed: " + "; ".join(attempts)
-               + f" | last: {last_body}")
-        _note_error(msg)
-        raise RuntimeError(msg)
-    text_out = data["choices"][0]["message"]["content"]
-    arr = _extract_json_array(text_out)
-    result = {}
-    for item in arr:
-        if not isinstance(item, dict) or "id" not in item or "my" not in item:
-            raise ValueError("xKiro item missing id/my")
-        idx, my = int(item["id"]), str(item["my"]).strip()
-        if not my:
-            raise ValueError("xKiro returned an empty translation")
-        result[idx] = my
-    if set(result) != set(range(len(segments))):
-        raise ValueError(
-            f"xKiro id set mismatch: got {sorted(result)}, "
-            f"want 0..{len(segments) - 1}")
-    return result
+    msg = ("xKiro failed: " + "; ".join(attempts)
+           + f" | last: {last_body}")
+    _note_error(msg)
+    raise RuntimeError(msg)
 
 
 if __name__ == "__main__":

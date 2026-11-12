@@ -22,7 +22,8 @@ import time
 from pathlib import Path
 
 from .common import PROJECT_ROOT
-from .gemini_translate import _extract_json_array, _prompt_for
+from .gemini_translate import (_extract_json_array, _prompt_for,
+                               _validated_result)
 
 _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -111,7 +112,6 @@ def translate_all(segments, style="subs"):
     prompt = _prompt_for(style).replace(
         "__SEGMENTS_JSON__", json.dumps(payload_in, ensure_ascii=False))
     body = {"messages": [{"role": "user", "content": prompt}]}
-    data = None
     attempts = []
     last_body = ""
     for mdl in _models():
@@ -124,10 +124,20 @@ def translate_all(segments, style="subs"):
             attempts.append(f"{mdl}=net:{e}"[:60])
             continue
         if resp.status_code == 200:
-            data = resp.json()
+            # Build 163: validate inside the walk — a bad-shape
+            # reply costs this model only; the winner is noted
+            # once its reply actually parses.
+            try:
+                text_out = resp.json()["choices"][0][
+                    "message"]["content"]
+                result = _validated_result(
+                    text_out, segments, "OpenRouter")
+            except Exception as e:
+                attempts.append(f"{mdl}=badformat:{e}"[:70])
+                continue
             _note_model(mdl)
             globals()["LAST_MODEL"] = mdl
-            break
+            return result
         attempts.append(f"{mdl}={resp.status_code}")
         last_body = resp.text[:200]
         if resp.status_code == 401:
@@ -136,26 +146,10 @@ def translate_all(segments, style="subs"):
         # refusal), 404 (model missing), 429 (rate limit) or
         # anything else: try the next model — the free endpoints
         # at the end of the list answer when the paid ones cannot.
-    if data is None:
-        msg = ("OpenRouter failed: " + "; ".join(attempts)
-               + f" | last: {last_body}")
-        _note_error(msg)
-        raise RuntimeError(msg)
-    text_out = data["choices"][0]["message"]["content"]
-    arr = _extract_json_array(text_out)
-    result = {}
-    for item in arr:
-        if not isinstance(item, dict) or "id" not in item or "my" not in item:
-            raise ValueError("OpenRouter item missing id/my")
-        idx, my = int(item["id"]), str(item["my"]).strip()
-        if not my:
-            raise ValueError("OpenRouter returned an empty translation")
-        result[idx] = my
-    if set(result) != set(range(len(segments))):
-        raise ValueError(
-            f"OpenRouter id set mismatch: got {sorted(result)}, "
-            f"want 0..{len(segments) - 1}")
-    return result
+    msg = ("OpenRouter failed: " + "; ".join(attempts)
+           + f" | last: {last_body}")
+    _note_error(msg)
+    raise RuntimeError(msg)
 
 
 if __name__ == "__main__":
