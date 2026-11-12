@@ -17,6 +17,29 @@ from .common import ensure_system_ca
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 _SHORT_HOSTS = ("vt.tiktok.com", "vm.tiktok.com", "xhslink.com")
 
+# Download quality (build 167, owner order 2026-11-13): the customer
+# picks the source rendition — "hd" = the original/best available
+# (the owner's explicit wish), "720"/"480" cap the height for a
+# lighter file. Anything unrecognised means "hd".
+QUALITIES = ("hd", "720", "480")
+
+
+def norm_quality(q):
+    return q if q in QUALITIES else "hd"
+
+
+# yt-dlp format selectors per quality. "720" keeps the build-80
+# light-rendition selectors exactly (bitrate-capped first so a
+# same-height heavy rendition is not picked by accident); "hd"
+# takes the best available, period; "480" mirrors 720's shape.
+_FORMAT_SELECTORS = {
+    "hd": "bv*+ba/b",
+    "720": ("bv*[height<=720][tbr<=1800]+ba/b[height<=720][tbr<=1800]/"
+            "bv*[height<=720]+ba/b[height<=720]/b"),
+    "480": ("bv*[height<=480][tbr<=1200]+ba/b[height<=480][tbr<=1200]/"
+            "bv*[height<=480]+ba/b[height<=480]/b"),
+}
+
 
 def clean_url(raw: str) -> str:
     """Best URL out of whatever was pasted (build 166). Share
@@ -138,7 +161,30 @@ def polite_error(err, url=""):
     return _POLITE[cat]
 
 
-def _tiktok_fallback(url: str, workdir: Path) -> dict:
+def _pick_rendition(data, quality):
+    """Choose which tikwm rendition URL to download (build 167).
+
+    Returns (url, field_name) or (None, None). tikwm only includes
+    the HD rendition (`hdplay`) when the request carries hd=1, and
+    the pre-167 picker took `play` first even when hdplay existed —
+    two stacked reasons TikTok jobs started from the standard
+    rendition and came out blurry.
+      hd  -> hdplay, then play, then wmplay (watermarked last)
+      720 -> play (the standard no-watermark rendition), hdplay,
+             then wmplay
+      480 -> same order as 720: tikwm offers no 480 rendition, so
+             the lightest no-watermark file wins."""
+    if quality == "hd":
+        order = ("hdplay", "play", "wmplay")
+    else:
+        order = ("play", "hdplay", "wmplay")
+    for name in order:
+        if data.get(name):
+            return data[name], name
+    return None, None
+
+
+def _tiktok_fallback(url: str, workdir: Path, quality: str = "hd") -> dict:
     """Last-resort TikTok download via the public tikwm resolver API.
 
     TikTok increasingly serves datacenter IPs a stripped/blocker page, so
@@ -146,29 +192,45 @@ def _tiktok_fallback(url: str, workdir: Path) -> dict:
     the video from its own (residential-grade) vantage point and returns
     a direct, watermark-free mp4 URL. No login/cookies involved.
     """
+    import time as _t
+
     import requests
 
     headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"}
-    # One retry: a transient resolver failure silently drops the job
-    # to the yt-dlp ladder, whose TikTok rendition can be 4x larger.
-    r = None
+    # hd=1 is load-bearing (build 167 diagnosis): without it tikwm
+    # does not return the hdplay field AT ALL, so no picker could
+    # ever choose the HD rendition. The payload is then a superset
+    # and _pick_rendition decides per the job's quality.
+    # Retry policy: one retry on a transport failure, and one retry
+    # after a short pause when the resolver answers code -1 / no
+    # rendition (its parse failures are sometimes transient). A
+    # video it still cannot parse after that falls through to the
+    # yt-dlp ladder in download().
+    payload = None
+    play = which = None
+    last_exc = None
     for attempt in range(2):
         try:
             r = requests.get("https://www.tikwm.com/api/",
-                             params={"url": url}, headers=headers,
-                             timeout=30)
+                             params={"url": url, "hd": 1},
+                             headers=headers, timeout=30)
             r.raise_for_status()
-            break
-        except Exception:
-            if attempt == 1:
-                raise
-            import time as _t
-            _t.sleep(2)
-    payload = r.json()
-    data = payload.get("data") or {}
-    play = data.get("play") or data.get("hdplay") or data.get("wmplay")
+            payload = r.json()
+        except Exception as e:
+            last_exc = e
+            payload = None
+        if payload:
+            play, which = _pick_rendition(payload.get("data") or {},
+                                          quality)
+            if play:
+                break
+        if attempt == 0:
+            _t.sleep(3)
     if not play:
+        if payload is None and last_exc is not None:
+            raise last_exc
         raise RuntimeError(f"tikwm resolver returned no video URL: {payload!r:.200}")
+    data = payload.get("data") or {}
     out = workdir / "source.mp4"
     # Stream to a .part file and rename only when complete: an
     # interrupted download must never leave a truncated source.mp4
@@ -190,6 +252,7 @@ def _tiktok_fallback(url: str, workdir: Path) -> dict:
         "duration": data.get("duration"),
         "webpage_url": url,
         "uploader": author.get("nickname") or author.get("unique_id"),
+        "rendition": which,
     }
 
 
@@ -254,7 +317,7 @@ def _xhs_page_video_urls(html: str):
     return urls
 
 
-def _xhs_fallback(url: str, workdir: Path) -> dict:
+def _xhs_fallback(url: str, workdir: Path, quality: str = "hd") -> dict:
     """RedNote/Xiaohongshu download. The plain ladder dies on the
     login wall the share link redirects into; instead: harvest item
     URLs from the redirect chain, try yt-dlp on each, then parse the
@@ -269,8 +332,7 @@ def _xhs_fallback(url: str, workdir: Path) -> dict:
     if not cands:
         raise RuntimeError("XHS: no note id found in the share link chain")
     dl_opts = {
-        "format": ("bv*[height<=720][tbr<=1800]+ba/b[height<=720][tbr<=1800]/"
-                   "bv*[height<=720]+ba/b[height<=720]/b"),
+        "format": _FORMAT_SELECTORS[quality],
         "merge_output_format": "mp4",
         "outtmpl": str(workdir / "source.%(ext)s"),
         "noplaylist": True, "quiet": True, "no_warnings": True,
@@ -321,7 +383,7 @@ def _xhs_fallback(url: str, workdir: Path) -> dict:
     raise RuntimeError(f"XHS resolver found no downloadable video: {last_err}")
 
 
-def download(url: str, workdir: Path) -> Path:
+def download(url: str, workdir: Path, quality: str = "hd") -> Path:
     ensure_system_ca()
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -330,15 +392,19 @@ def download(url: str, workdir: Path) -> Path:
     # resolver, the ladder and the caption path all see the best
     # form of the URL.
     url = _resolve_short(clean_url(url))
+    # Build 167: the job's quality choice picks the rendition class
+    # on every route (resolver + ladder). Recorded in source_info
+    # .json so the app can tell whether a cached preview matches
+    # the quality a job asked for.
+    quality = norm_quality(quality)
     out = workdir / "source.mp4"
     opts = {
-        # Light renditions first: at the same resolution, platforms
-        # offer several bitrates (TikTok's "download" rendition of a
-        # 63 s clip is 39 MB where the standard one is 9 MB). A bitrate
-        # cap picks the light one; the uncapped selectors remain as
-        # fallbacks so an unusual format list can never fail the job.
-        "format": ("bv*[height<=720][tbr<=1800]+ba/b[height<=720][tbr<=1800]/"
-                   "bv*[height<=720]+ba/b[height<=720]/b"),
+        # Per-quality selectors (_FORMAT_SELECTORS): "720" keeps the
+        # build-80 light renditions first — at the same resolution,
+        # platforms offer several bitrates (TikTok's "download"
+        # rendition of a 63 s clip is 39 MB where the standard one
+        # is 9 MB); "hd" takes the best available, period.
+        "format": _FORMAT_SELECTORS[quality],
         "merge_output_format": "mp4",
         "outtmpl": str(workdir / "source.%(ext)s"),
         "noplaylist": True,
@@ -359,7 +425,7 @@ def download(url: str, workdir: Path) -> Path:
         # resolver harvests the note URL from the chain first. The
         # generic ladder stays as the backup.
         try:
-            info = _xhs_fallback(url, workdir)
+            info = _xhs_fallback(url, workdir, quality)
         except Exception as e:
             first_err = e
     if info is None and "tiktok" in urlparse(url).netloc:
@@ -368,7 +434,7 @@ def download(url: str, workdir: Path) -> Path:
         # public resolver sees the video from a different vantage point
         # and is fast — try it FIRST; the ladder stays as the backup.
         try:
-            info = _tiktok_fallback(url, workdir)
+            info = _tiktok_fallback(url, workdir, quality)
         except Exception as e:
             first_err = e
     if info is None:
@@ -429,6 +495,8 @@ def download(url: str, workdir: Path) -> Path:
         "duration": info.get("duration"),
         "webpage_url": info.get("webpage_url") or url,
         "uploader": info.get("uploader"),
+        "quality": quality,
+        "rendition": info.get("rendition"),
     }
     (workdir / "source_info.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")

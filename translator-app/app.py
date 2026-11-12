@@ -827,6 +827,26 @@ def _tg_voice_step(chat_id, flow):
                               ("🎙 Thiha (ကျား)", "v:thiha")]])
 
 
+def _tg_quality_step(chat_id, flow):
+    """Download-quality step (build 167), right after the frame
+    step: «အကြည် HD» fetches the original rendition (the owner's
+    standing wish); 720p/480p fetch a lighter file."""
+    from pipeline import telegram_send as tg
+    flow["step"] = "quality"
+    tg.send_message(chat_id, "Video အရည် ရွေးပေးပါ",
+                    buttons=[[("📺 အကြည် HD", "q:hd"),
+                              ("720p", "q:720"),
+                              ("480p", "q:480")]])
+
+
+def _tg_logo_step(chat_id, flow):
+    from pipeline import telegram_send as tg
+    flow["step"] = "logo"
+    tg.send_message(chat_id, "Logo ထည့်ဦးမလား",
+                    buttons=[[("🚫 မထည့်", "l:skip"),
+                              ("🖼 ထည့်မယ်", "l:yes")]])
+
+
 def _tg_after_logo(chat_id, flow):
     """Logo settled (placed or skipped): modes that burn subtitles
     (both/subs) pick a subtitle colour next; dub-only has no
@@ -847,8 +867,8 @@ def _tg_after_logo(chat_id, flow):
 
 def _tg_start_flow_job(chat_id, flow):
     """Final bot-flow step: credit/cap checks, then create the job
-    from everything the flow collected (blur, mode, frame, logo,
-    colour, voice, speed)."""
+    from everything the flow collected (blur, mode, frame, quality,
+    logo, colour, voice, speed)."""
     from pipeline import telegram_send as tg
     ratio = flow.get("ratio") or "orig"
     acct = accounts.user_for_tg(chat_id)
@@ -880,7 +900,8 @@ def _tg_start_flow_job(chat_id, flow):
                          "voice": flow.get("voice"),
                          "subs": ({"color": flow["sub_color"]}
                                   if flow.get("sub_color") else None),
-                         "speed_cap": flow.get("speed_cap") or 1.3})
+                         "speed_cap": flow.get("speed_cap") or 1.3,
+                         "quality": flow.get("quality") or "hd"})
     if err:
         tg.send_message(chat_id, "🙏 တောင်းပန်ပါတယ် — " + err)
         return
@@ -889,7 +910,16 @@ def _tg_start_flow_job(chat_id, flow):
     if acct and not tg.is_admin(chat_id):
         job["user_id"] = acct["id"]
         accounts.mark_has_job(acct["id"])
-    job["source_path"] = flow.get("src")
+    if flow.get("file_id"):
+        # An uploaded file IS the source — no download quality
+        # applies, always reuse it.
+        job["source_path"] = flow.get("src")
+    elif flow.get("src") and _preview_quality(
+            Path(flow["src"]).parent) == job["quality"]:
+        # Build 167: the prepare download doubles as the job's
+        # source only when it was fetched at the picked quality;
+        # otherwise phase 1 downloads fresh at that quality.
+        job["source_path"] = flow.get("src")
     fx = {}
     if flow.get("blur"):
         fx["blur"] = {**flow["blur"], "strength": 25}
@@ -918,8 +948,8 @@ def _tg_start_flow_job(chat_id, flow):
 
 
 def _on_tg_callback(cq):
-    """Inline-button taps for the bot flow: blur, mode, frame, logo,
-    colour, voice, speed."""
+    """Inline-button taps for the bot flow: blur, mode, frame,
+    quality, logo, colour, voice, speed."""
     from pipeline import telegram_send as tg
     tg.answer_callback(cq.get("id"))
     chat = (cq.get("message") or {}).get("chat") or {}
@@ -1039,10 +1069,14 @@ def _on_tg_callback(cq):
         if ratio != "orig" and ratio not in fx_mod.ASPECT_DIMS:
             return
         flow["ratio"] = ratio
-        flow["step"] = "logo"
-        tg.send_message(chat_id, "Logo ထည့်ဦးမလား",
-                        buttons=[[("🚫 မထည့်", "l:skip"),
-                                  ("🖼 ထည့်မယ်", "l:yes")]])
+        _tg_quality_step(chat_id, flow)
+        return
+    if data.startswith("q:") and flow.get("step") == "quality":
+        q = data[2:]
+        if q not in ("hd", "720", "480"):
+            return
+        flow["quality"] = q
+        _tg_logo_step(chat_id, flow)
         return
     if data.startswith("l:") and flow.get("step") == "logo":
         if data == "l:yes":
@@ -1248,7 +1282,8 @@ def _run_phase2(job):
                        voice_rate=job.get("voice_rate", 0),
                        voice_pitch=job.get("voice_pitch", 0),
                        subs=job.get("subs"),
-                       max_speed=job.get("speed_cap") or 1.3)
+                       max_speed=job.get("speed_cap") or 1.3,
+                       quality=job.get("quality") or "hd")
 
 
 _KEEP_DONE_PER_USER = 2
@@ -1313,7 +1348,8 @@ def _worker(job):
         _save(job)
         run_job.run_phase1(workdir, job["url"], source_path=job.get("source_path"),
                            progress=_progress_fn(job),
-                           style="subs" if job["mode"] == "subs" else "dub")
+                           style="subs" if job["mode"] == "subs" else "dub",
+                           quality=job.get("quality") or "hd")
         _quote_for_job(job)
         _run_phase2(job)
         _finish(job)
@@ -1434,6 +1470,25 @@ def _preview_allowed():
 def _preview_dir(url):
     pid = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
     return pid, PREVIEWS_DIR / pid
+
+
+def _preview_quality(pdir):
+    """Which download quality a cached preview was fetched at
+    (build 167). download() records it in source_info.json; a
+    preview cached before build 167 has no record and was fetched
+    with the old light (<=720p) selectors, so it counts as "720".
+    A job may reuse the cached file ONLY when this matches the
+    quality the customer picked — otherwise phase 1 downloads
+    fresh at the picked quality."""
+    try:
+        meta = json.loads((Path(pdir) / "source_info.json")
+                          .read_text(encoding="utf-8"))
+        q = meta.get("quality")
+        if q in ("hd", "720", "480"):
+            return q
+    except Exception:
+        pass
+    return "720"
 
 
 @app.post("/api/preview")
@@ -2638,6 +2693,11 @@ def _new_job(data):
         speed_cap = max(1.0, min(4.0, float(data.get("speed_cap") or 1.3)))
     except (TypeError, ValueError):
         speed_cap = 1.3
+    # Download quality (build 167): "hd" = original/best rendition
+    # (the default — the owner's standing wish), "720"/"480" cap the
+    # source height. Anything else falls back to "hd".
+    quality = data.get("quality") if data.get("quality") in \
+        ("hd", "720", "480") else "hd"
     if font not in FONT_LABELS:
         return None, "font မမှန်ပါ"
     if not url.startswith(("http://", "https://")):
@@ -2650,7 +2710,7 @@ def _new_job(data):
         "id": uuid.uuid4().hex[:12], "url": url, "mode": mode,
         "voice": voice, "font": font, "subs": subs,
         "voice_rate": voice_rate, "voice_pitch": voice_pitch,
-        "speed_cap": speed_cap,
+        "speed_cap": speed_cap, "quality": quality,
         "fx": _build_fx(data), "source_path": None,
         "status": "queued", "current": None, "error": None,
         "created_at": time.time(), "updated_at": time.time(),
@@ -2682,7 +2742,10 @@ def create_job():
             preview_id = None
     if preview_id:
         cand = PREVIEWS_DIR / str(preview_id) / "source.mp4"
-        if cand.exists():
+        # Build 167: reuse the cached preview only when it was
+        # fetched at the quality this job picked — a 720p preview
+        # must not silently cap an "hd" job (the blur complaint).
+        if cand.exists() and _preview_quality(cand.parent) == job["quality"]:
             job["source_path"] = str(cand)
     if ACCOUNTS_ENFORCED and me and me["role"] != "admin" \
             and job.get("source_path"):

@@ -133,7 +133,7 @@ def filter_chain(fx, vw, vh):
     return filters, cur, logo_path
 
 
-def apply_effects(input_mp4, output_mp4, fx):
+def apply_effects(input_mp4, output_mp4, fx, cap_k=2500):
     """Apply blur (first) and logo (on top) in ONE ffmpeg pass. Returns output."""
     if not has_fx(fx):
         raise ValueError("apply_effects called with empty fx")
@@ -142,7 +142,7 @@ def apply_effects(input_mp4, output_mp4, fx):
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4)]
     if logo_path:
         cmd += ["-i", str(logo_path)]
-    mr = target_maxrate_k(input_mp4)
+    mr = target_maxrate_k(input_mp4, cap_k)
     cmd += ["-filter_complex", ";".join(filters), "-map", cur, "-map", "0:a?",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
             "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",

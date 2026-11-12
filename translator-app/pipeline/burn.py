@@ -388,7 +388,7 @@ def _fonts_dir():
 
 
 def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
-         blur_box=None, fx=None):
+         blur_box=None, fx=None, cap_k=2500):
     fonts_dir = _fonts_dir()
     family = FONT_CHOICES.get(font, FONT_CHOICES[DEFAULT_FONT])
     # Never deliver silent tofu again: if the chosen family's font
@@ -429,7 +429,7 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
             cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4)]
             if logo_path:
                 cmd += ["-i", str(logo_path)]
-            mr = target_maxrate_k(input_mp4)
+            mr = target_maxrate_k(input_mp4, cap_k)
             cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]",
                     "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
                     "-crf", "24", "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
@@ -437,7 +437,7 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
             run(cmd)
             return output_mp4
     vf = f"ass='{ass}':fontsdir='{fontsdir}'"
-    mr = target_maxrate_k(input_mp4)
+    mr = target_maxrate_k(input_mp4, cap_k)
     run(["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4), "-vf", vf,
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
          "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",

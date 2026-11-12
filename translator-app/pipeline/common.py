@@ -54,7 +54,17 @@ def ensure_system_ca():
             pass
 
 
-def target_maxrate_k(input_mp4):
+def maxrate_cap_k(quality):
+    """Encode maxrate ceiling (kbps) for a job's download quality
+    (build 167). "hd" jobs fetched the original rendition on the
+    owner's explicit order — the build-102 ceiling of 2500k would
+    strangle it straight back to blurry, so hd gets 6000k. The
+    source anchor in target_maxrate_k still keeps a low-bitrate
+    source from ballooning; the cap only stops being the limit."""
+    return 6000 if quality == "hd" else 2500
+
+
+def target_maxrate_k(input_mp4, cap_k=2500):
     """Video maxrate (kbps) that keeps a re-encode in the SOURCE's size
     class. CRF alone is quality-based: re-encoding a low-bitrate phone
     or TikTok source at crf 23/24 ballooned one 12 MB job to 110 MB.
@@ -70,7 +80,7 @@ def target_maxrate_k(input_mp4):
         if dur <= 0:
             return 1800
         kbps = src.stat().st_size * 8 / dur / 1000.0
-        return int(max(450, min(2500, kbps * 1.1)))
+        return int(max(450, min(cap_k, kbps * 1.1)))
     except Exception:
         return 1800
 

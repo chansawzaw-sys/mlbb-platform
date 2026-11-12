@@ -135,7 +135,7 @@ def _piece_vf(c, dur):
     return vf
 
 
-def _video_single_pass(src, chunks, out):
+def _video_single_pass(src, chunks, out, cap_k=2500):
     """All chunks in ONE ffmpeg decode+encode (a trim/concat filter
     graph). ONLY safe for a FEW chunks: with many trim branches on one
     input, ffmpeg buffers frames for the latest branch while earlier
@@ -153,7 +153,7 @@ def _video_single_pass(src, chunks, out):
         filters.append(f + f"[v{n}]")
         labels.append(f"[v{n}]")
     filters.append("".join(labels) + f"concat=n={len(chunks)}:v=1:a=0[outv]")
-    mr = target_maxrate_k(src)
+    mr = target_maxrate_k(src, cap_k)
     run(["ffmpeg", "-y", "-v", "error", "-i", str(src),
          "-filter_complex", ";".join(filters), "-map", "[outv]",
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
@@ -161,11 +161,11 @@ def _video_single_pass(src, chunks, out):
         timeout=1800)
 
 
-def _video_chunked(src, chunks, cdir, out):
+def _video_chunked(src, chunks, cdir, out, cap_k=2500):
     """Original path: one encode per chunk + concat-copy. Kept as the
     fallback for very many chunks, or if the single pass ever fails."""
     vlist = []
-    mr = target_maxrate_k(src)
+    mr = target_maxrate_k(src, cap_k)
     for n, c in enumerate(chunks):
         dur = c["end"] - c["start"]
         vout = cdir / f"v{n:03d}.mp4"
@@ -213,7 +213,7 @@ def _bed_chain(c, dur, stereo):
     return chain
 
 
-def retime(workdir, max_speed=MAX_SPEED):
+def retime(workdir, max_speed=MAX_SPEED, cap_k=2500):
     workdir = Path(workdir)
     src = workdir / "source.mp4"
     segs = load_segments(workdir / "segments_my.json")
@@ -315,11 +315,11 @@ def retime(workdir, max_speed=MAX_SPEED):
         # in the chunk count and bounded in memory.
         if len(chunks) <= 12:
             try:
-                _video_single_pass(src, chunks, retimed_video)
+                _video_single_pass(src, chunks, retimed_video, cap_k)
             except Exception:
-                _video_chunked(src, chunks, cdir, retimed_video)
+                _video_chunked(src, chunks, cdir, retimed_video, cap_k)
         else:
-            _video_chunked(src, chunks, cdir, retimed_video)
+            _video_chunked(src, chunks, cdir, retimed_video, cap_k)
         run(["ffmpeg", "-y", "-v", "error", "-i", str(retimed_video), "-i", str(dub_wav),
              "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k", "-shortest",
              str(workdir / "retimed.mp4")], timeout=1200)

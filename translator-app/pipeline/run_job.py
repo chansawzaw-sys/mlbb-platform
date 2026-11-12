@@ -9,6 +9,7 @@ import shutil
 from pathlib import Path
 
 from . import burn, download, fx as fx_mod, retime, transcribe, translate_segments, tts
+from .common import maxrate_cap_k
 
 ALL_STEPS = ["download", "transcribe", "translate", "tts", "retime", "finalize"]
 
@@ -26,9 +27,14 @@ def _marks(progress):
     return mark
 
 
-def run_phase1(workdir, url, source_path=None, progress=None, style="subs"):
+def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
+               quality="hd"):
     """Phase 1: download -> transcribe -> translate. Then the job waits for
-    human review/edit of the Myanmar segments before phase 2."""
+    human review/edit of the Myanmar segments before phase 2.
+    `quality` (build 167) is the download rendition choice; the
+    caller passes source_path only when the cached preview was
+    fetched at this same quality, so a fresh download here honours
+    the choice."""
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     mark = _marks(progress)
@@ -39,7 +45,7 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs"):
         src = workdir / "source.mp4"
         shutil.copyfile(source_path, src)
     else:
-        src = download.download(url, workdir)
+        src = download.download(url, workdir, quality=quality)
     mark("download", "done")
 
     mark("transcribe", "running")
@@ -95,13 +101,17 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs"):
 
 def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
                fx=None, font=burn.DEFAULT_FONT, voice_rate=0, voice_pitch=0,
-               subs=None, max_speed=None):
+               subs=None, max_speed=None, quality="hd"):
     """Phase 2: from the FINAL (possibly user-edited) segments_my.json —
     TTS -> retime -> logo/blur -> subtitle burn -> output.mp4.
     `subs` is the subtitle-layout dict (size_pct/width_pct/bottom_pct/align);
-    None = burn.py defaults (the previous cinematic look)."""
+    None = burn.py defaults (the previous cinematic look).
+    `quality` (build 167) only sets the encode maxrate ceiling via
+    maxrate_cap_k — an "hd" job's original rendition is not
+    strangled back down by the build-102 cap."""
     workdir = Path(workdir)
     mark = _marks(progress)
+    cap_k = maxrate_cap_k(quality)
     src = workdir / "source.mp4"
     final = workdir / "output.mp4"
     if mode == "subs":
@@ -109,7 +119,7 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
         # fx (if any) rides INSIDE the burn encode — no separate fx pass.
         burn.burn(src, workdir / "subs_my.srt", final, font=font, subs=subs,
                   blur_box=(fx or {}).get("blur"),
-                  fx=fx if fx_mod.has_fx(fx) else None)
+                  fx=fx if fx_mod.has_fx(fx) else None, cap_k=cap_k)
         mark("finalize", "done")
         return final
 
@@ -118,7 +128,8 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
     mark("tts", "done")
 
     mark("retime", "running")
-    plan = retime.retime(workdir, max_speed=max_speed or retime.MAX_SPEED)
+    plan = retime.retime(workdir, max_speed=max_speed or retime.MAX_SPEED,
+                         cap_k=cap_k)
     mark("retime", "done")
     if fx and fx.get("blur_pieces"):
         # Blur pieces were timed on the ORIGINAL video; the retime
@@ -134,11 +145,11 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
         # fx (if any) rides INSIDE the burn encode — no separate fx pass.
         burn.burn(base, workdir / "subs_retimed.srt", final, font=font,
                   subs=subs, blur_box=(fx or {}).get("blur"),
-                  fx=fx if fx_mod.has_fx(fx) else None)
+                  fx=fx if fx_mod.has_fx(fx) else None, cap_k=cap_k)
     else:  # dub only — no burn, so fx gets its own (single) pass
         if fx_mod.has_fx(fx):
             fxed = workdir / "fx.mp4"
-            fx_mod.apply_effects(base, fxed, fx)
+            fx_mod.apply_effects(base, fxed, fx, cap_k=cap_k)
             base = fxed
         shutil.copyfile(base, final)
     mark("finalize", "done")
@@ -147,10 +158,10 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
 
 def run_job(workdir, url, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
             fx=None, source_path=None, font=burn.DEFAULT_FONT,
-            voice_rate=0, voice_pitch=0, subs=None):
+            voice_rate=0, voice_pitch=0, subs=None, quality="hd"):
     """Uninterrupted run (CLI/back-compat): phase 1 + phase 2, no review."""
     run_phase1(workdir, url, source_path=source_path, progress=progress,
-               style="subs" if mode == "subs" else "dub")
+               style="subs" if mode == "subs" else "dub", quality=quality)
     return run_phase2(workdir, mode=mode, voice=voice, progress=progress,
                       fx=fx, font=font, voice_rate=voice_rate,
-                      voice_pitch=voice_pitch, subs=subs)
+                      voice_pitch=voice_pitch, subs=subs, quality=quality)

@@ -318,6 +318,13 @@
         <button class="chip" data-astyle="black">ဘေးအနက်</button>
         <button class="chip" data-astyle="crop">ဖြည့်ဖြတ်</button>
       </div>
+      <label>Video အရည် (Download)</label>
+      <div class="chips" id="qualityChips">
+        <button class="chip on" data-quality="hd">📺 အကြည် HD</button>
+        <button class="chip" data-quality="720">720p</button>
+        <button class="chip" data-quality="480">480p</button>
+      </div>
+      <p class="hint">«အကြည် HD» = မူရင်း အရည် အတိုင်း ရယူပါတယ် — ဖိုင် ပိုကြီးပြီး download ပိုကြာနိုင်ပါတယ်</p>
     </div>
 
     <div class="wstep" data-step="3" style="display:none">
@@ -653,7 +660,7 @@ stage.addEventListener("pointercancel", onUp);
 const W = { step: 1, mode: "both", aspect: "", aspectStyle: "blur",
             blurChoice: null, place: "box", subSize: 100, color: "white",
             logoChoice: null, voice: "my-MM-ThihaNeural", speed: 1.3,
-            pvFailed: false };
+            quality: "hd", pvFailed: false };
 const WIZ_NAMES = {1: "လင့်ခ်", 2: "Preview", 3: "ဝါး", 4: "စာတန်း",
                    5: "Logo", 6: "အသံ", 7: "အရှိန်", 8: "အကျဉ်းချုပ်"};
 function wizSteps() {
@@ -708,6 +715,7 @@ function syncChips(id, attr, val) {
     x.classList.toggle("on", x.dataset[attr] === String(val)));
 }
 chipWire("modeChips", "mode", v => W.mode = v);
+chipWire("qualityChips", "quality", v => W.quality = v);
 chipWire("aspectChips", "aspect", v => W.aspect = v);
 chipWire("aspectStyleChips", "astyle", v => W.aspectStyle = v);
 chipWire("placeChips", "place", v => W.place = v);
@@ -741,6 +749,7 @@ function wizSummaryRender() {
     "🔗 " + $("url").value.trim(),
     "🎞 ပုံစံ: " + ({subs: "စာတန်းထိုး", dub: "အသံထွက်", both: "နှစ်မျိုးလုံး"})[W.mode]
       + (W.aspect ? " · Frame " + W.aspect + " (" + W.aspectStyle + ")" : " · Frame မူရင်း"),
+    "📺 အရည်: " + ({hd: "အကြည် HD (မူရင်း)", 720: "720p", 480: "480p"})[W.quality],
     "🌫 ဝါး: " + (blur && W.blurChoice === "yes" ? "ဝါးမယ်" : "မဝါးဘူး"),
   ];
   if (W.mode !== "dub")
@@ -816,7 +825,7 @@ $("go").onclick = async () => {
     body: JSON.stringify({url, mode: W.mode,
                           voice: W.voice, font: $("font").value,
                           voice_rate: 0, voice_pitch: 0,
-                          speed_cap: W.speed,
+                          speed_cap: W.speed, quality: W.quality,
                           subs: {size_pct: W.subSize,
                                  width_pct: W.place === "box" ? 100 : 95,
                                  bottom_pct: 10,
@@ -1752,6 +1761,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 166</p>
+<p class="hint" id="buildTag" style="text-align:center">build 167</p>
 </body>
 </html>
