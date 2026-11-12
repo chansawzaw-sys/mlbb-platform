@@ -9,7 +9,9 @@ prepaid via Stripe and purchased credits do not expire.
 Same contract as pipeline/gemini_translate.py: ONE request for ALL
 segments, the same mode-aware style prompts (imported, one source),
 strict validation; ANY failure raises and the caller falls back
-(Apps Script, then the free chain).
+(xKiro since build 165, then Apps Script, then the free chain).
+Since build 165 (owner order) OpenRouter is the FIRST gateway in
+the chain, ahead of xKiro.
 
 Key handling (security): read ONLY from env OPENROUTER_API_KEY or
 the git-ignored `.env` in the project root; saved via the app's
@@ -29,25 +31,25 @@ _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def _models():
-    """Configured model first, then the name brands, then the
-    providers that do not region-block this server, ending with
-    FREE variants. Live probe 2026-11-11 (build 150): Google AND
-    OpenAI models both answer 403 (region) even via OpenRouter;
-    paid DeepSeek answers 402 (wallet empty); the DeepSeek/Qwen/
-    Llama :free endpoints I guessed in build 150 are RETIRED
-    (404). The live OpenRouter catalog that day lists only 13
-    free models; the multilingual chat ones are Google's Gemma 4
-    (open-weight, served by third-party hosts, so the Google
-    region wall does not apply) and Baidu ERNIE — those are the
-    free tail now. A 404/403/402/429 moves to the NEXT model;
-    only 401 (bad key) stops the walk."""
+    """Configured model first, then paid DeepSeek (the quality
+    anchor once the wallet is funded), then the FREE tail: Baidu
+    ERNIE first (the proven winner on this server), then Google's
+    Gemma 4 pair (open-weight, third-party hosted, so the Google
+    region wall does not apply). A 404/403/402/429 moves to the
+    NEXT model; only 401 (bad key) stops the walk.
+
+    Build 165 (owner order 2026-11-12): the Gemini/GPT name
+    brands were REMOVED from this walk — live probes prove they
+    answer 403 (region) from this server every single time, so
+    each attempt only burned seconds before DeepSeek. The
+    DeepSeek/Qwen/Llama :free endpoints guessed in build 150 are
+    RETIRED (404); the live catalog lists only 13 free models."""
     env = (os.environ.get("OPENROUTER_MODEL") or "").strip()
     out = []
-    for m in [env, "google/gemini-2.5-flash", "openai/gpt-4o-mini",
-              "deepseek/deepseek-chat-v3-0324",
+    for m in [env, "deepseek/deepseek-chat-v3-0324",
+              "baidu/ernie-5.5-flash-preview:free",
               "google/gemma-4-31b-it:free",
-              "google/gemma-4-26b-a4b-it:free",
-              "baidu/ernie-5.5-flash-preview:free"]:
+              "google/gemma-4-26b-a4b-it:free"]:
         if m and m not in out:
             out.append(m)
     return out

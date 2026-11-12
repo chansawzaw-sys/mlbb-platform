@@ -4,11 +4,11 @@ Provider chain:
   0. Gemini Flash (only when GEMINI_API_KEY is configured server-side —
      see pipeline/gemini_translate.py): ONE request for ALL segments,
      natural spoken Burmese. Any failure -> OpenAI (build 134 module,
-     when configured) -> Apps Script (build 137 module, the owner's
-     own Google account via LanguageApp, when configured), then the
-     free chain below. (Order set by the owner 2026-11-11, build 136:
-     Gemini -> OpenAI -> free; Apps Script added after OpenAI by the
-     same order — reliable before throttled, style after Gemini/OpenAI.)
+     when configured) -> OpenRouter (build 147 module; FIRST gateway
+     since build 165, owner order 2026-11-12) -> xKiro (build 155
+     module) -> Apps Script (build 137 module, the owner's own
+     Google account via LanguageApp, when configured), then the
+     free chain below.
   1. deep-translator GoogleTranslator (unofficial Google Translate endpoint)
   2. `translators` library -> Microsoft Bing Translator web endpoint
   3. keep the source text (never drop a cue)
@@ -424,33 +424,12 @@ def translate_segments(workdir, style="subs"):
                 return out
         except Exception as e:
             report["openai_err"] = str(e)[:120]
-    # 0c. xKiro batch — third engine (build 155, owner chose it
-    # 2026-11-11): a young OpenAI-compatible gateway whose free
-    # tier plus $5 Telegram-verification credit reach DeepSeek V4
-    # Flash cheaper than OpenRouter, with free Mistral/Cohere
-    # models behind it. Any failure falls through to OpenRouter.
-    if segs:
-        try:
-            from . import xkiro_translate
-            if xkiro_translate.key_configured():
-                by_idx = xkiro_translate.translate_all(
-                    segs, style=style)
-                label = xkiro_translate.last_label()
-                out = [{**seg, "text_my": by_idx[i],
-                        "provider": label}
-                       for i, seg in enumerate(segs)]
-                out = _fill_missing(out, report)
-                _write_report(workdir, report)
-                save_segments(out, workdir / "segments_my.json")
-                write_srt(out, workdir / "subs_my.srt")
-                return out
-        except Exception as e:
-            report["xkiro_err"] = str(e)[:120]
-    # 0d. OpenRouter batch — fourth engine (build 147, owner chose it
-    # 2026-11-11): direct OpenAI is region-blocked from the VPS, so
-    # the same wallet idea runs through OpenRouter (US aggregator,
-    # Gemini models first, story-style prompts apply). Any failure
-    # falls through to Apps Script, then the free chain.
+    # 0c. OpenRouter batch — third engine and the FIRST gateway
+    # (build 147; moved ahead of xKiro by owner order 2026-11-12,
+    # build 165): direct OpenAI is region-blocked from the VPS, so
+    # the wallet runs through OpenRouter (US aggregator; DeepSeek
+    # paid first in its walk, ERNIE free behind it; story-style
+    # prompts apply). Any failure falls through to xKiro.
     if segs:
         try:
             from . import openrouter_translate
@@ -468,6 +447,30 @@ def translate_segments(workdir, style="subs"):
                 return out
         except Exception as e:
             report["openrouter_err"] = str(e)[:120]
+    # 0d. xKiro batch — fourth engine (build 155, owner chose it
+    # 2026-11-11; moved behind OpenRouter by owner order
+    # 2026-11-12, build 165): a young OpenAI-compatible gateway
+    # whose free tier plus $5 Telegram-verification credit reach
+    # DeepSeek V4 Flash cheaper than OpenRouter, with free
+    # Mistral/Cohere models behind it. Any failure falls through
+    # to Apps Script, then the free chain.
+    if segs:
+        try:
+            from . import xkiro_translate
+            if xkiro_translate.key_configured():
+                by_idx = xkiro_translate.translate_all(
+                    segs, style=style)
+                label = xkiro_translate.last_label()
+                out = [{**seg, "text_my": by_idx[i],
+                        "provider": label}
+                       for i, seg in enumerate(segs)]
+                out = _fill_missing(out, report)
+                _write_report(workdir, report)
+                save_segments(out, workdir / "segments_my.json")
+                write_srt(out, workdir / "subs_my.srt")
+                return out
+        except Exception as e:
+            report["xkiro_err"] = str(e)[:120]
     # 0e. Apps Script batch — fifth engine (build 137, owner request
     # 2026-11-10): the owner's own Google account translates via
     # LanguageApp, so the throttled VPS IP never touches Google.

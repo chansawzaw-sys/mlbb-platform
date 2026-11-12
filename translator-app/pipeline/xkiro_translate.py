@@ -10,13 +10,14 @@ at $0.075/$0.30 per 1M tokens — cheaper than OpenRouter's DeepSeek.
 The LIVE catalog (fetched keyless from /v1/models on build night,
 69 models) shows: DeepSeek/Gemini are premium tier; the 26 free
 models are Mistral + Cohere (incl. multilingual Aya Expanse) +
-SenseNova. Whether their Gemini route dodges this server's region
-wall is decided by the live probe, like every engine before it.
+SenseNova. (The Gemini route did NOT dodge this server's region
+wall — removed from the walk in build 165.)
 
 Same contract as pipeline/gemini_translate.py: ONE request for ALL
 segments, the same mode-aware style prompts (imported, one source),
 strict validation; ANY failure raises and the caller falls back
-(OpenRouter, Apps Script, then the free chain).
+(Apps Script, then the free chain). Since build 165 (owner order)
+xKiro sits AFTER OpenRouter in the chain.
 
 Key handling (security): read ONLY from env XKIRO_API_KEY or the
 git-ignored `.env` in the project root; saved via the app's
@@ -42,18 +43,20 @@ _FREE_MODELS = {"mistralai/mistral-large-2512",
 
 
 def _models():
-    """Configured model first, then the cheapest strong DeepSeek,
-    then Gemini 2.5 Flash (its price here undercuts OpenRouter's,
-    and this gateway may route around the region wall), ending
-    with the free tier: Cohere's multilingual Aya Expanse first
-    (best format discipline), then Mistral Large, then Command
-    A+. A 404/403/402/429 moves to the NEXT
-    model; only 401 (bad key) stops the walk."""
+    """Configured model first, then the cheapest strong DeepSeek
+    pair, ending with the free tier: Cohere's multilingual Aya
+    Expanse first (best format discipline), then Mistral Large,
+    then Command A+. A 404/403/402/429 moves to the NEXT model;
+    only 401 (bad key) stops the walk.
+
+    Build 165: Gemini 2.5 Flash was REMOVED from this walk — it
+    never answered successfully from this server (the region wall
+    applies through this gateway too), so the attempt only cost
+    time on every job."""
     env = (os.environ.get("XKIRO_MODEL") or "").strip()
     out = []
     for m in [env, "deepseek/deepseek-v4.1-flash",
               "deepseek/deepseek-v4-flash-0731",
-              "google/gemini-2.5-flash",
               "cohere/aya-expanse-32b",
               "mistralai/mistral-large-2512",
               "cohere/command-a-plus"]:
