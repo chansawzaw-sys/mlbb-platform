@@ -10295,13 +10295,13 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const p = await getPlayer(db, args.player_id);
       if (!p) return { ok: false, error: "Player မတွေ့ပါ" };
-      // Role split (Batch 16): coin adjustment + role changes stay
-      // Owner(fixed Gmail)-only; perm_ban is Owner/Admin; moderation
+      // Role split (Batch 16): role changes stay Owner(fixed Gmail)-only;
+      // coin adjustment + perm_ban are Owner/Admin; moderation
       // actions need owner/admin/moderator — all from DB session.
-      const ownerOnly = ["adjust_coins", "set_role"].includes(args.action);
+      const ownerOnly = args.action === "set_role";
       const auth = ownerOnly
         ? await requireOwner(db, args.actor_player_id, args.session_token)
-        : args.action === "perm_ban"
+        : args.action === "perm_ban" || args.action === "adjust_coins"
           ? await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token)
           : await requireRole(db, args.actor_player_id, args.session_token, ["owner", "admin", "moderator"]);
       if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
