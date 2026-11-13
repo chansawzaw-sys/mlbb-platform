@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://mlbbking.com/sitemap.xml
+Sitemap: https://fightforlegendary.com/sitemap.xml

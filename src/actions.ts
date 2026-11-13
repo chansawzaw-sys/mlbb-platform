@@ -1309,7 +1309,7 @@ async function notify(
   // allowed to fail the notification write above.
   if (args.playerId !== null) {
     void sendPushToPlayer(db, args.playerId, {
-      title: "MLBB KING",
+      title: "Fight for Legendary",
       body: [args.title, args.body ?? ""].filter((x) => x !== "").join(" — "),
       tag: args.matchId ? `match-${args.matchId}` : undefined,
       url: args.matchId
@@ -1461,7 +1461,7 @@ async function getVapidPublicKey(db: Db): Promise<string> {
   }
 }
 
-const VAPID_SUBJECT = "https://mlbb-platform-production-df84.up.railway.app";
+const VAPID_SUBJECT = "https://fightforlegendary.com";
 
 async function buildVapidJwt(cfg: VapidConfig, endpoint: string): Promise<string> {
   const enc = new TextEncoder();
@@ -9041,7 +9041,7 @@ export const Actions = {
       // forget). No in-app notification row is created for DMs — the
       // conversation unread badge remains the in-app signal.
       void sendPushToPlayer(db, partner.id, {
-        title: "MLBB KING",
+        title: "Fight for Legendary",
         body: `${me.name}: ${text.slice(0, 80)}`,
         tag: `dm-${me.id}`,
         url: `/?push_dm=${me.id}`,
@@ -10270,7 +10270,7 @@ export const Actions = {
           body,
         });
         const after = await getSettingsMap(db);
-        if (body) await telegramSend(after, `📢 MLBB KING ကြေညာချက်\n${body}`);
+        if (body) await telegramSend(after, `📢 Fight for Legendary ကြေညာချက်\n${body}`);
       }
       ctx.invalidateQueries();
       return { ok: true, error: "" };
@@ -10390,7 +10390,7 @@ export const Actions = {
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
       if (err2fa) return { ok: false, error: err2fa, telegram_sent: false };
       const s = await getSettingsMap(db);
-      const tg = await telegramSend(s, `📢 MLBB KING\n${args.text}`);
+      const tg = await telegramSend(s, `📢 Fight for Legendary\n${args.text}`);
       await notify(db, {
         playerId: null,
         type: "announcement",
@@ -10429,7 +10429,7 @@ export const Actions = {
         (s["telegram_bot_token"] ?? "").trim() !== "" && (s["telegram_chat_id"] ?? "").trim() !== "";
       if (!configured)
         return { ok: false, error: "မချိတ်ရသေး — Bot Token နဲ့ Chat ID အရင် ထည့်ပြီး သိမ်းပါ", configured: false };
-      let text = "✅ MLBB KING — Telegram bot test message အောင်မြင်ပါတယ်။";
+      let text = "✅ Fight for Legendary — Telegram bot test message အောင်မြင်ပါတယ်။";
       if (args.mode === "stats") {
         const all = await db.select().from(schema.players);
         const matchRows = await db.select().from(schema.matches);
@@ -10438,7 +10438,7 @@ export const Actions = {
           .from(schema.reports)
           .where(eq(schema.reports.status, "open"));
         text = [
-          "📊 MLBB KING Stats",
+          "📊 Fight for Legendary Stats",
           `Online: ${all.filter((p) => isOnline(p)).length} / Players: ${all.length}`,
           `Active matches: ${matchRows.filter((m) => ["ready_check", "live", "result_pending", "disputed"].includes(m.status)).length}`,
           `Pending reports: ${reportRows.length} • Disputes: ${matchRows.filter((m) => m.status === "disputed").length}`,
@@ -11091,7 +11091,7 @@ export const Actions = {
         let parsed: BackupFile | null = null;
         try { parsed = JSON.parse(raw) as BackupFile; } catch { return fail("JSON ဖိုင် မမှန်ပါ"); }
         if (!parsed || parsed.app !== "mlbb-platform" || !parsed.tables)
-          return fail("ဒါက MLBB KING backup ဖိုင် မဟုတ်ပါ");
+          return fail("ဒါက Fight for Legendary backup ဖိုင် မဟုတ်ပါ");
         const tablesIn = parsed.tables;
         let restored = 0;
         // Settings (secrets redacted as "***" in exports are never restored).
@@ -11219,7 +11219,7 @@ export const Actions = {
         actor: actorName,
       });
       await logAct(db, actorName, `Backup snapshot ${code} created (${size} bytes)`);
-      const tgText = `💾 MLBB KING backup ${code} ဆောက်ပြီးပါပြီ (${size} bytes)`;
+      const tgText = `💾 Fight for Legendary backup ${code} ဆောက်ပြီးပါပြီ (${size} bytes)`;
       const s = await getSettingsMap(db);
       await telegramSend(s, tgText);
       ctx.invalidateQueries();
