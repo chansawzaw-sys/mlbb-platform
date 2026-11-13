@@ -6,6 +6,7 @@ Modes:
   both  = timing-synced dub AND burned subtitles (re-timed cues)
 """
 import shutil
+import time
 from pathlib import Path
 
 from . import burn, download, fx as fx_mod, retime, transcribe, translate_segments, tts
@@ -21,9 +22,33 @@ def steps_for_mode(mode):
 
 
 def _marks(progress):
+    """Progress marks + per-phase wall-clock timing (build 171).
+
+    Each step's elapsed seconds (its "running" mark to its
+    "done" mark) are offered to the progress callback as
+    phase_s={step: secs}; app.py stores them on the job dict,
+    which is persisted to job.json, so a slow job can be
+    diagnosed phase by phase (download / transcribe /
+    translate / tts / retime / finalize-encode). Callbacks
+    that do not accept the phase_s keyword get the plain call
+    instead — timing must never break a job."""
+    starts = {}
+
     def mark(step, state, note=""):
-        if progress:
+        if not progress:
+            return
+        if state == "running":
+            starts[step] = time.time()
             progress(step, state, note)
+            return
+        if state == "done" and step in starts:
+            secs = round(time.time() - starts.pop(step), 1)
+            try:
+                progress(step, state, note, phase_s={step: secs})
+                return
+            except TypeError:
+                pass
+        progress(step, state, note)
     return mark
 
 

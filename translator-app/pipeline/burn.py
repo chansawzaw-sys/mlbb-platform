@@ -37,7 +37,10 @@ DEFAULT_FONT = "noto"
 # (384-2*10)/384 of the frame width.
 SUBS_DEFAULTS = {"size_pct": 100, "width_pct": 95, "bottom_pct": 10,
                  "align": "bottom"}
-_SUBS_RANGES = {"size_pct": (60.0, 160.0), "width_pct": (50.0, 100.0),
+# size_pct range is 10–120 since build 172 (owner order 2026-11-13);
+# it was 60–160 before. The clamped value also caps the in-box fit
+# candidate in srt_to_ass, so this one range governs every placement.
+_SUBS_RANGES = {"size_pct": (10.0, 120.0), "width_pct": (50.0, 100.0),
                 "bottom_pct": (2.0, 25.0)}
 _BASE_FS_FRAC = 26 / 288      # font size as a fraction of frame height
 _BASE_OUTLINE = 3 / 288       # outline thickness, same scaling

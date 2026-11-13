@@ -35,42 +35,55 @@ from .gemini_translate import (_extract_json_array, _prompt_for,
 _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
-def _models():
-    """Configured model first, then the FREE models, paid
-    DeepSeek LAST. The free order (build 169): Google's Gemma 4
-    31B first — the strongest free model on the platform
-    (frontier-class open weight, explicitly multilingual, and it
-    supports response_format/structured outputs like our strict
-    JSON contract needs) — then Baidu ERNIE, the proven winner
-    on this server, as the safety net at #2, then Gemma 4 26B.
-    The Gemma pair is open-weight and third-party hosted, so the
-    Google region wall does not apply. A 404/403/402/429 moves
-    to the NEXT model; only 401 (bad key) stops the walk.
+def _last_winner():
+    """The model that produced the most recent successful
+    translation on this server (recorded by _note_model), or ""
+    when none is recorded / the note cannot be read."""
+    try:
+        return (PROJECT_ROOT / ".openrouter_last_model").read_text(
+            encoding="utf-8").strip()
+    except Exception:
+        return ""
 
-    Build 169 (owner order 2026-11-13): BEST-FREE-FIRST — the
-    walk leads with the strongest free model instead of the
-    merely-proven one; ERNIE drops to #2, it does not leave the
-    front. (The build-night catalog re-scan also weighed
-    nvidia/nemotron-3-ultra-550b:free, a new 550B free entry:
-    frontier-sized but a reasoning/orchestration model with NO
-    response_format support in its catalog parameters and no
-    established multilingual strength — not clearly stronger
-    for zh→my translation, so it was NOT promoted.) Build 168
-    (owner order 2026-11-13): FREE-FIRST reorder — the owner
-    deferred the OpenRouter credit purchase, so the free models
-    lead and paid DeepSeek sits at the back; while the wallet
-    is empty its 402 is simply walked past, and if the wallet
-    is funded later it spends only after every free model has
-    failed. (Build 165 history: the Gemini/GPT name brands were
-    removed from this walk — 403 region refusals from this
-    server every time; the DeepSeek/Qwen/Llama :free endpoints
-    guessed in build 150 are retired, 404.)"""
+
+def _models():
+    """Env override first, then the RECORDED LAST WINNER, then
+    the fixed free-first order; paid DeepSeek always LAST.
+
+    Build 171 (speed fix, diagnosed 2026-11-13): two changes.
+    (1) WINNER-FIRST — the model that won the last real
+    translation on this server now leads the fixed order: the
+    build-169 fixed order led with Gemma 4 31B, but the live
+    probe winner here is ERNIE, and every timeout/refusal on
+    the way down the walk is paid for in wall-clock minutes
+    before the working model is even tried. Only a FREE
+    winner is promoted — a paid winner never jumps the queue,
+    so paid still spends last. (2) ERNIE LEADS THE FIXED
+    ORDER — with no winner recorded yet,
+    baidu/ernie-5.5-flash-preview:free goes first (the
+    probe-proven winner on this server), then Google's Gemma 4
+    31B, then Gemma 4 26B. A 404/403/402/429 moves to the NEXT
+    model; only 401 (bad key) stops the walk.
+
+    History: build 169 led with Gemma 4 31B (strongest free
+    model in the catalog scan) with ERNIE as the #2 safety
+    net; build 168 set the FREE-FIRST policy (the owner
+    deferred the credit purchase — free models lead, paid
+    DeepSeek at the back, its 402 simply walked past while
+    the wallet is empty); build 165 removed the Gemini/GPT
+    name brands (403 region refusals from this server)."""
     env = (os.environ.get("OPENROUTER_MODEL") or "").strip()
+    fixed = ["baidu/ernie-5.5-flash-preview:free",
+             "google/gemma-4-31b-it:free",
+             "google/gemma-4-26b-a4b-it:free",
+             "deepseek/deepseek-chat-v3-0324"]
+    candidates = [env]
+    winner = _last_winner()
+    if winner in fixed and winner.endswith(":free"):
+        candidates.append(winner)
+    candidates += fixed
     out = []
-    for m in [env, "google/gemma-4-31b-it:free",
-              "baidu/ernie-5.5-flash-preview:free",
-              "google/gemma-4-26b-a4b-it:free",
-              "deepseek/deepseek-chat-v3-0324"]:
+    for m in candidates:
         if m and m not in out:
             out.append(m)
     return out
@@ -137,10 +150,12 @@ def translate_all(segments, style="subs"):
     body = {"messages": [{"role": "user", "content": prompt}]}
     attempts = []
     last_body = ""
+    # Build 171: per-attempt timeout 120s -> 60s — a hung model
+    # must cost a minute, not two, before the walk moves on.
     for mdl in _models():
         try:
             resp = requests.post(
-                _API_URL, json={**body, "model": mdl}, timeout=120,
+                _API_URL, json={**body, "model": mdl}, timeout=60,
                 headers={"Authorization": f"Bearer {key}",
                          "Content-Type": "application/json"})
         except Exception as e:  # network-level: next model shape

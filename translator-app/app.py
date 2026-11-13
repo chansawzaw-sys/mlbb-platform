@@ -65,7 +65,7 @@ class JobCancelled(Exception):
 
 
 def _progress_fn(job):
-    def progress(step, state, note=""):
+    def progress(step, state, note="", phase_s=None):
         if job.get("cancel_requested"):
             raise JobCancelled()
         job["updated_at"] = time.time()
@@ -75,6 +75,14 @@ def _progress_fn(job):
                 if note:
                     s["note"] = note
         job["current"] = step
+        if phase_s:
+            # Build 171: per-phase wall-clock seconds measured
+            # in run_job — kept on the job (and in job.json) so
+            # a slow job can be diagnosed phase by phase.
+            try:
+                job.setdefault("phase_s", {}).update(phase_s)
+            except Exception:
+                pass
         _save(job)
     return progress
 
@@ -2194,11 +2202,16 @@ def _translate_probe_maybe():
         data = json.loads(pf.read_text(encoding="utf-8"))
     except Exception:
         data = None
-    # Stale when older than 30 min OR older than this process: a
+    # Stale when older than 6 h OR older than this process: a
     # fresh deploy must re-probe at once, not serve the previous
     # build's verdict (build 126's first check hit exactly that).
+    # Build 171: the TTL was 30 min — every re-probe burns real
+    # translation calls from the SAME free-tier quota that real
+    # jobs need (the OpenRouter free endpoints allow only ~50
+    # requests a day), so the health board now refreshes at most
+    # every 6 h instead of starving jobs for a fresher hint.
     if not data or float(data.get("ts") or 0) < _BOOT_TS \
-            or time.time() - float(data.get("ts") or 0) > 1800:
+            or time.time() - float(data.get("ts") or 0) > 21600:
         with _PROBE_LOCK:
             if not _PROBE["running"]:
                 _PROBE["running"] = True
@@ -2651,10 +2664,12 @@ def _clamp_num(v, lo, hi, default):
 
 def _build_subs(data):
     """Subtitle layout params, clamped server-side; absent = previous look
-    (burn.SUBS_DEFAULTS: size 100, width 95, bottom 10, bottom-aligned)."""
+    (burn.SUBS_DEFAULTS: size 100, width 95, bottom 10, bottom-aligned).
+    size_pct clamps to 10–120 since build 172 (owner order 2026-11-13),
+    matching the wizard slider and burn._SUBS_RANGES."""
     s = data.get("subs") or {}
     return {
-        "size_pct": _clamp_num(s.get("size_pct"), 60, 160, 100),
+        "size_pct": _clamp_num(s.get("size_pct"), 10, 120, 100),
         "width_pct": _clamp_num(s.get("width_pct"), 50, 100, 95),
         "bottom_pct": _clamp_num(s.get("bottom_pct"), 2, 25, 10),
         "align": "top" if s.get("align") == "top" else "bottom",

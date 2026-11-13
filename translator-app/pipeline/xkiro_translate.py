@@ -49,27 +49,53 @@ _FREE_MODELS = {"mistralai/mistral-large-2512",
                 "cohere/command-a-plus"}
 
 
+def _last_winner():
+    """The model that produced the most recent successful
+    translation on this server (recorded by _note_model), or ""
+    when none is recorded / the note cannot be read."""
+    try:
+        return (PROJECT_ROOT / ".xkiro_last_model").read_text(
+            encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
 def _models():
-    """Configured model first, then the FREE tier, the paid
-    DeepSeek pair LAST. The free order (build 168): Cohere's
+    """Env override first, then the RECORDED LAST WINNER, then
+    the fixed free-first order; the paid DeepSeek pair LAST.
+
+    Build 171 (speed fix, diagnosed 2026-11-13): WINNER-FIRST,
+    the same treatment as the OpenRouter walk — the model that
+    won the last real translation on this server now leads the
+    fixed order, so the walk reaches the proven model at once
+    instead of paying timeouts/refusals on the way down. Only
+    a FREE winner is promoted — a paid DeepSeek winner never
+    jumps the queue, so the paid pair still spends last. With
+    no winner recorded, the fixed order is unchanged: Cohere's
     multilingual Aya Expanse first (the proven winner on this
     server, best format discipline), then Command A+, then
-    Mistral Large. A 404/403/402/429 moves to the NEXT model;
+    Mistral Large, then the paid pair (V4.1 Flash, then V4
+    Flash 0731). A 404/403/402/429 moves to the NEXT model;
     only 401 (bad key) stops the walk.
 
-    Build 168 (owner order 2026-11-13): FREE-FIRST reorder —
-    no paid purchase for now, so the free models lead; the
-    DeepSeek pair (V4.1 Flash, then V4 Flash 0731) sits at the
-    back and is reached only when every free model failed.
-    (Build 165 history: Gemini 2.5 Flash was removed from this
-    walk — the region wall applies through this gateway too.)"""
+    History: build 168 set the FREE-FIRST policy (no paid
+    purchase for now — free models lead, the DeepSeek pair at
+    the back, reached only when every free model failed);
+    build 165 removed Gemini 2.5 Flash (the region wall
+    applies through this gateway too)."""
     env = (os.environ.get("XKIRO_MODEL") or "").strip()
+    fixed = ["cohere/aya-expanse-32b",
+             "cohere/command-a-plus",
+             "mistralai/mistral-large-2512",
+             "deepseek/deepseek-v4.1-flash",
+             "deepseek/deepseek-v4-flash-0731"]
+    candidates = [env]
+    winner = _last_winner()
+    if winner in fixed and winner in _FREE_MODELS:
+        candidates.append(winner)
+    candidates += fixed
     out = []
-    for m in [env, "cohere/aya-expanse-32b",
-              "cohere/command-a-plus",
-              "mistralai/mistral-large-2512",
-              "deepseek/deepseek-v4.1-flash",
-              "deepseek/deepseek-v4-flash-0731"]:
+    for m in candidates:
         if m and m not in out:
             out.append(m)
     return out
@@ -136,10 +162,12 @@ def translate_all(segments, style="subs"):
     body = {"messages": [{"role": "user", "content": prompt}]}
     attempts = []
     last_body = ""
+    # Build 171: per-attempt timeout 120s -> 60s — a hung model
+    # must cost a minute, not two, before the walk moves on.
     for mdl in _models():
         try:
             resp = requests.post(
-                _API_URL, json={**body, "model": mdl}, timeout=120,
+                _API_URL, json={**body, "model": mdl}, timeout=60,
                 headers={"Authorization": f"Bearer {key}",
                          "Content-Type": "application/json"})
         except Exception as e:  # network-level: next model shape
