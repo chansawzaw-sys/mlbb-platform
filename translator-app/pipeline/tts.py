@@ -205,12 +205,11 @@ def synthesize(workdir, voice=DEFAULT_VOICE, rate=0, pitch=0):
                 provider = None
         if provider is None:
             # Last resort for THIS segment only: silence of the
-            # segment's own window length. The timeline stays exact,
-            # the subtitle still carries the line, the music bed
-            # still plays under it — and the failure is RECORDED on
-            # the segment, never silent. If most segments land here
-            # the job fails loudly below instead of shipping a
-            # mostly-silent dub.
+            # segment's own window length. The timeline stays exact
+            # and the subtitle still carries the line — and the
+            # failure is RECORDED on the segment, never silent. If
+            # most segments land here the job fails loudly below
+            # instead of shipping a mostly-silent dub.
             dur = max(0.5, float(seg.get("end") or 0)
                       - float(seg.get("start") or 0))
             run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",

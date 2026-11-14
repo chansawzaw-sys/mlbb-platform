@@ -11,16 +11,20 @@ Rules (owner's spec, revised 2026-11-09: the picture must NEVER stop):
   * Video speed-up is capped at MAX_VFAST so a very short dub cannot
     turn the picture into a fast-forward joke; the small remainder
     pads with silence at the chunk tail (picture still moving).
-  * Under the narration, the ORIGINAL track plays as a quiet bed:
-    centre-cut when stereo (the original dialogue sits in the
-    centre and largely cancels; wide music/effects survive) at
-    BED_VOL — the owner wants the music kept as background only and
-    the original voices gone. Mono sources get a whisper-level bed.
-  * Non-speech gaps keep the original audio at low volume (ambience).
+  * AUDIO IS NARRATION ONLY (build 177, owner order 2026-11-14):
+    the original track NEVER enters a dub. Builds <=176 mixed a
+    centre-cut source "bed" under the narration and played the
+    original at low volume in the gaps — the owner heard the two
+    voices layered ("အသံတွေ ထပ်နေတယ်") and ordered the source audio
+    deleted outright ("မူရင်း အသံတွေ ဖျောက်ပစ်လိုက်"). Segment chunks
+    render the TTS file alone; gap chunks render pure silence.
+    (Subtitle-only jobs are a different path — burn.py straight on
+    source.mp4 — and keep the original audio untouched.)
 
 Implementation: split the source into chunks (gaps + segments), render each
-chunk's video (rate-adjusted) and audio (atempo dub + quiet bed, or quiet
-original for gaps), concat both, and emit re-timed subtitle timings.
+chunk's video (rate-adjusted) and audio (atempo'd narration for speech
+segments, silence for gaps), concat both, and emit re-timed subtitle
+timings.
 
 CLI: python -m pipeline.retime <workdir>
 Reads source.mp4 + segments_my.json (with tts_file/tts_duration).
@@ -35,9 +39,6 @@ from .common import (load_segments, probe_duration, run, save_segments,
 MAX_SPEED = 1.30
 MIN_VSLOW = 0.80   # legacy stat only; the plan no longer floors at it
 MAX_VFAST = 1.6    # fastest the picture may play for a short dub
-GAP_VOL = 0.25
-BED_VOL = 0.22         # music bed under narration (stereo, centre-cut)
-BED_VOL_MONO = 0.06    # mono: no centre-cut possible, keep it a whisper
 
 
 def _plan(segs, total_dur, max_speed=MAX_SPEED):
@@ -182,37 +183,6 @@ def _video_chunked(src, chunks, cdir, out, cap_k=2500):
          "-i", str(lst), "-c:v", "copy", str(out)], timeout=1200)
 
 
-def _atempo_chain(factor):
-    """atempo only accepts 0.5..100 per instance — chain for less."""
-    parts = []
-    f = float(factor)
-    while f < 0.5:
-        parts.append("atempo=0.5")
-        f /= 0.5
-    parts.append(f"atempo={f:.4f}")
-    return ",".join(parts)
-
-
-def _bed_chain(c, dur, stereo):
-    """Filter chain turning the source window into the quiet bed:
-    re-time it to the chunk's new duration exactly like the picture,
-    suppress the centre (dialogue) on stereo, drop to bed level."""
-    f = dur / max(0.05, c["new_dur"])      # audio tempo to fit window
-    chain = _atempo_chain(f)
-    if stereo:
-        # Side signal (L-R) in BOTH channels with the SAME sign:
-        # centre dialogue cancels in the subtraction, wide music
-        # survives — and unlike anti-phase stereo (c1=-(c0-c1)) it
-        # does not annihilate itself on mono fold-down (phone
-        # speakers, amix layout folds).
-        chain += (",pan=stereo|c0=c0-c1|c1=c0-c1"
-                  f",volume={BED_VOL}")
-    else:
-        chain += f",volume={BED_VOL_MONO}"
-    chain += f",apad,atrim=0:{c['new_dur']:.3f}"
-    return chain
-
-
 def retime(workdir, max_speed=MAX_SPEED, cap_k=2500):
     workdir = Path(workdir)
     src = workdir / "source.mp4"
@@ -226,13 +196,6 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500):
             break
     max_speed = max(1.0, min(4.0, float(max_speed or MAX_SPEED)))
     chunks = _plan(segs, total, max_speed)
-    src_stereo = False
-    src_has_audio = False
-    for s in probe_streams(src):
-        if s.get("codec_type") == "audio":
-            src_has_audio = True
-            src_stereo = int(s.get("channels") or 0) >= 2
-            break
 
     cdir = workdir / "chunks"
     cdir.mkdir(exist_ok=True)
@@ -246,30 +209,14 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500):
         if c["kind"] == "seg":
             seg = segs[c["seg_idx"]]
             tts_file = seg["tts_file"]
+            # Narration ONLY (build 177): the TTS file alone, fitted
+            # to the chunk window exactly as before (atempo first,
+            # silence pad at the tail) — the source track is never
+            # opened here any more.
             af = f"atempo={c['speed']:.4f},apad,atrim=0:{c['new_dur']:.3f}"
-            made = False
-            if src_has_audio:
-                # Narration on top of the quiet original bed (music
-                # kept as background, original voices centre-cut).
-                fc = (f"[0:a]{af}[n];"
-                      f"[1:a]{_bed_chain(c, dur, src_stereo)}[b];"
-                      "[n][b]amix=inputs=2:duration=first:"
-                      "normalize=0[a]")
-                try:
-                    run(["ffmpeg", "-y", "-v", "error",
-                         "-i", tts_file,
-                         "-ss", f"{c['start']:.3f}", "-t", f"{dur:.3f}",
-                         "-i", str(src),
-                         "-filter_complex", fc, "-map", "[a]",
-                         "-ac", "2", "-ar", "44100", str(aout)],
-                        timeout=300)
-                    made = True
-                except Exception:
-                    made = False   # fall through to narration-only
-            if not made:
-                run(["ffmpeg", "-y", "-v", "error", "-i", tts_file,
-                     "-af", af, "-ac", "2", "-ar", "44100", str(aout)],
-                    timeout=300)
+            run(["ffmpeg", "-y", "-v", "error", "-i", tts_file,
+                 "-af", af, "-ac", "2", "-ar", "44100", str(aout)],
+                timeout=300)
             new_segs.append({**seg,
                              "start_new": round(t_cursor, 3),
                              "end_new": round(t_cursor + c["new_dur"], 3),
@@ -277,10 +224,13 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500):
                              "video_rate": c.get("vrate", 1.0),
                              "freeze_extra": 0.0})
         else:
-            # gap: original audio, lowered, padded/trimmed to chunk length
-            run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['start']:.3f}", "-i", str(src),
-                 "-t", f"{dur:.3f}", "-vn", "-af",
-                 f"volume={GAP_VOL},aresample=44100,apad,atrim=0:{c['new_dur']:.3f}",
+            # gap: SILENCE (build 177) — gaps used to carry the
+            # original audio at GAP_VOL; now generated silence of
+            # exactly the chunk length, same format as the narration
+            # chunks so the concat stays seamless.
+            run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                 "anullsrc=channel_layout=stereo:sample_rate=44100",
+                 "-t", f"{c['new_dur']:.3f}",
                  "-ac", "2", "-ar", "44100", str(aout)], timeout=300)
         alist.append(aout)
         t_cursor += c["new_dur"]
