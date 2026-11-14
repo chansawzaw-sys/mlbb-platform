@@ -102,6 +102,16 @@ export const HERO_CATALOG: Record<string, string> = {
 };
 export const HERO_NAMES = Object.keys(HERO_CATALOG);
 export const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
+export const MAX_AUDIO_BYTES = 12 * 1024 * 1024;
+export const ALLOWED_AUDIO_MIMES: Record<string, string> = {
+  "audio/mpeg": "mp3",
+  "audio/ogg": "ogg",
+  "audio/mp4": "m4a",
+  "audio/x-m4a": "m4a",
+  "audio/wav": "wav",
+  "audio/x-wav": "wav",
+  "audio/wave": "wav",
+};
 export const ALLOWED_IMAGE_MIMES: Record<string, string> = {
   "image/jpeg": "jpg",
   "image/jpg": "jpg",
@@ -129,6 +139,26 @@ function validateImage(base64: string, mimeRaw: string): { error: string; bytes:
   if (mime==="image/jpeg" && !isJpeg) return { error: "ပုံ file အစစ် မဟုတ်ပါ — JPG ပုံ အစစ်ပဲ တင်ပါ", bytes: null, mime, ext };
   if (mime==="image/png" && !isPng) return { error: "ပုံ file အစစ် မဟုတ်ပါ — PNG ပုံ အစစ်ပဲ တင်ပါ", bytes: null, mime, ext };
   if (mime==="image/webp" && !isWebp) return { error: "ပုံ file အစစ် မဟုတ်ပါ — WebP ပုံ အစစ်ပဲ တင်ပါ", bytes: null, mime, ext };
+  return { error: "", bytes, mime, ext };
+}
+function validateAudio(base64: string, mimeRaw: string): { error: string; bytes: Buffer | null; mime: string; ext: string } {
+  const mime = (mimeRaw ?? "").trim().toLowerCase();
+  const ext = ALLOWED_AUDIO_MIMES[mime];
+  if (!ext) return { error: "သီချင်း အမျိုးအစား မမှန်ပါ — MP3, OGG, M4A, WAV သီချင်းပဲ တင်လို့ရပါတယ်", bytes: null, mime, ext: "" };
+  if (!base64 || base64.length < 20) return { error: "သီချင်း file မတွေ့ပါ — သီချင်း တစ်ခုရွေးပြီး ပြန်ကြိုးစားပါ", bytes: null, mime, ext };
+  let bytes: Buffer;
+  try { bytes = Buffer.from(base64, "base64"); } catch { return { error: "သီချင်း file ကို ဖတ်လို့ မရပါ — တခြား သီချင်းနဲ့ ပြန်ကြိုးစားပါ", bytes: null, mime, ext }; }
+  if (bytes.length === 0) return { error: "သီချင်း file အလွတ် ဖြစ်နေပါတယ်", bytes: null, mime, ext };
+  if (bytes.length > MAX_AUDIO_BYTES) return { error: "သီချင်း size ကြီးလွန်းပါတယ် — အများဆုံး 12MB အောက် သီချင်းပဲ တင်လို့ရပါတယ်", bytes: null, mime, ext };
+  // magic bytes check so a renamed non-audio file is rejected even if mime is spoofed
+  const isMp3 = bytes.length >= 3 && (bytes.toString("ascii", 0, 3) === "ID3" || (bytes[0] === 0xff && ((bytes[1] ?? 0) & 0xe0) === 0xe0));
+  const isOgg = bytes.length >= 4 && bytes.toString("ascii", 0, 4) === "OggS";
+  const isWav = bytes.length >= 12 && bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WAVE";
+  const isM4a = bytes.length >= 8 && bytes.toString("ascii", 4, 8) === "ftyp";
+  if (ext === "mp3" && !isMp3) return { error: "သီချင်း file အစစ် မဟုတ်ပါ — MP3 သီချင်း အစစ်ပဲ တင်ပါ", bytes: null, mime, ext };
+  if (ext === "ogg" && !isOgg) return { error: "သီချင်း file အစစ် မဟုတ်ပါ — OGG သီချင်း အစစ်ပဲ တင်ပါ", bytes: null, mime, ext };
+  if (ext === "wav" && !isWav) return { error: "သီချင်း file အစစ် မဟုတ်ပါ — WAV သီချင်း အစစ်ပဲ တင်ပါ", bytes: null, mime, ext };
+  if (ext === "m4a" && !isM4a) return { error: "သီချင်း file အစစ် မဟုတ်ပါ — M4A သီချင်း အစစ်ပဲ တင်ပါ", bytes: null, mime, ext };
   return { error: "", bytes, mime, ext };
 }
 async function blobUrlSafe(ctx: Ctx, key: string): Promise<string> {
@@ -248,6 +278,12 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   wizard_art_role_mage_key: "",
   wizard_art_role_marksman: "",
   wizard_art_role_marksman_key: "",
+  // Background music (BGM): admin-managed playlist that loops quietly
+  // in the player app. bgm_tracks is a JSON array of {key, url, name};
+  // the blob key stays server-side (settingsOut ships only {name, url},
+  // like slide_image_N_key).
+  bgm_enabled: "1",
+  bgm_tracks: "[]",
   preset_rules: JSON.stringify([
     "ပထမ tower ရသူ နိုင်",
     "Lord မသတ်ရ",
@@ -399,6 +435,11 @@ const SETTINGS_KEYS_OWNER_ONLY: string[] = [
   "wizard_art_role_mage_key",
   "wizard_art_role_marksman",
   "wizard_art_role_marksman_key",
+  // bgm_enabled / bgm_tracks change only through the dedicated BGM
+  // actions below (which accept Owner/Admin) — same treatment as the
+  // slide_image keys.
+  "bgm_enabled",
+  "bgm_tracks",
 ];
 const SETTINGS_KEYS_ADMIN_OK = new Set<string>([
   ...SETTINGS_KEYS_CONTENT,
@@ -448,6 +489,33 @@ export const DEFAULT_FIXED_RULES: Record<"mode_1v1" | "brawl" | "classic_1" | "c
   classic_2_3: ["Mid only", "ကြိုက်သလိုဆော့", "Item အကုန် ဆက်လို့ရ", "Hero အကုန် ကိုင်ခွင့်ရှိ"],
   classic_4_5: ["Hero အကုန် ကိုင်ခွင့်ရှိ", "ကြိုက်သလိုဆော့"],
 };
+
+/** BGM playlist rows as stored in the bgm_tracks setting (JSON array of
+ *  {key, url, name}). Entries without a usable url are dropped; the key
+ *  is kept here for server-side blob cleanup only — settingsOut strips
+ *  it before anything ships to the client. */
+type BgmTrackRow = { key: string; url: string; name: string };
+function parseBgmTracks(raw: string | undefined): BgmTrackRow[] {
+  try {
+    const parsed = JSON.parse(raw ?? "[]") as unknown;
+    if (!Array.isArray(parsed)) return [];
+    const out: BgmTrackRow[] = [];
+    for (const e of parsed) {
+      if (!e || typeof e !== "object") continue;
+      const rec = e as Record<string, unknown>;
+      const url = typeof rec["url"] === "string" ? rec["url"] : "";
+      if (!url) continue;
+      out.push({
+        key: typeof rec["key"] === "string" ? rec["key"] : "",
+        url,
+        name: typeof rec["name"] === "string" ? rec["name"] : "",
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
 
 function parseRuleList(raw: string | undefined, defaults: string[]): string[] {
   try {
@@ -1830,20 +1898,12 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
     .join("");
 }
 
-/** Public display mask for payout names: first word, first 3 chars + "***"
- *  (single initial + "***" for very short names). Never a full name. */
 /** Batch 27 (Job 1): a Telegram username is 5–32 chars of [A-Za-z0-9_].
  *  One validator shared by updateSettings and getBootstrap so the Recovery
  *  page renders exactly when the stored username is dialable. */
 const RECOVERY_USERNAME_RE = /^[A-Za-z0-9_]{5,32}$/;
 function validRecoveryUsername(u: string): boolean {
   return RECOVERY_USERNAME_RE.test((u ?? "").trim());
-}
-
-function maskName(name: string): string {
-  const first = (name ?? "").trim().split(/\s+/)[0] ?? "";
-  if (first.length <= 2) return `${first.slice(0, 1)}***`;
-  return `${first.slice(0, 3)}***`;
 }
 
 function telegramConfigured(s: Record<string, string>): boolean {
@@ -3626,6 +3686,10 @@ const settingsShape = z.object({
   wizard_art_role_assassin: z.string(),
   wizard_art_role_mage: z.string(),
   wizard_art_role_marksman: z.string(),
+  // Background music: enabled flag + playlist ({name, url} only — the
+  // blob key never ships, like slide_image_N_key).
+  bgm_enabled: z.boolean(),
+  bgm_tracks: z.array(z.object({ name: z.string(), url: z.string() })),
   preset_rules: z.array(z.string()),
   fixed_rules: z.object({
     classic_1: z.array(z.string()),
@@ -3749,6 +3813,11 @@ function settingsOut(s: Record<string, string>, adminView = false) {
     wizard_art_role_assassin: s["wizard_art_role_assassin"] ?? "",
     wizard_art_role_mage: s["wizard_art_role_mage"] ?? "",
     wizard_art_role_marksman: s["wizard_art_role_marksman"] ?? "",
+    // Background music: players need the track urls to play the
+    // playlist, so {name, url} ships in every view — the blob key
+    // stays server-side.
+    bgm_enabled: s["bgm_enabled"] !== "0",
+    bgm_tracks: parseBgmTracks(s["bgm_tracks"]).map((t) => ({ name: t.name, url: t.url })),
     // Back-compat alias: preset_rules mirrors the Classic 4–5 fixed list
     // (the tournament pick-list; challenges use fixed_rules via the server).
     // NOTE (2026-10-28): this flat tournament pick-list intentionally stays
@@ -4353,6 +4422,38 @@ const dmConversationShape = z.object({
   last_mine: z.boolean(),
   unread: z.number(),
 });
+
+/** Part D (D2): the decision-summary block listReports attaches to a
+ *  match-linked report — the match's own frozen facts (stamped rule
+ *  snapshot, rosters, results, evidence) plus the pair's Batch 28 hold
+ *  figures, so staff decide from ONE view. Staff payload only. */
+const reportSideShape = z.object({
+  leader_name: z.string(),
+  leader_game_name: z.string(),
+  members: z.array(z.object({ name: z.string(), game_name: z.string() })),
+});
+const reportMatchSummaryShape = z.object({
+  match_id: z.number(),
+  code: z.string(),
+  arena: z.string(),
+  team_size: z.number(),
+  status: z.string(),
+  stake_coins: z.number(),
+  pot_coins: z.number(),
+  fee_coins: z.number(),
+  held_amount: z.number(),
+  hold_received: z.number(),
+  hold_status: z.string(),
+  winner_name: z.string(),
+  side_a: reportSideShape,
+  side_b: reportSideShape,
+  rules: z.array(z.string()),
+  a_result: z.string(),
+  b_result: z.string(),
+  a_evidence_url: z.string(),
+  b_evidence_url: z.string(),
+});
+type ReportMatchSummary = z.infer<typeof reportMatchSummaryShape>;
 
 export const Actions = {
   getBootstrap: defineAction({
@@ -7839,6 +7940,108 @@ export const Actions = {
     },
   }),
 
+  /* Background music (BGM): an admin-managed playlist (max 10 tracks)
+   * that loops quietly in the player app. Tracks are blobs; the
+   * playlist itself is the bgm_tracks setting (JSON {key, url, name}).
+   * Same gate as the slideshow / wizard-art actions: Owner/Admin +
+   * security confirmation + TOTP. */
+  uploadBgmTrack: defineAction({
+    description: "Staff action: upload a background-music track (MP3/OGG/M4A/WAV, max 12MB, up to 10 tracks).",
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string(),
+      name: z.string().max(120).default(""),
+      audio_base64: z.string().max(17_500_000).default(""),
+      audio_mime: z.string().max(60).default(""),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string(), track_url: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const fail = (error: string) => ({ ok: false, error, track_url: "" });
+      const auth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor) return fail(auth.error ?? AUTH_ERR);
+      if (!args.confirmed) return fail("သီချင်း တင်ရန် security confirmation လိုပါတယ်");
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return fail(err2fa);
+      const v = validateAudio(args.audio_base64, args.audio_mime);
+      if (v.error || !v.bytes) return fail(v.error || "သီချင်း file မမှန်ပါ");
+      const s = await getSettingsMap(db);
+      const tracks = parseBgmTracks(s["bgm_tracks"]);
+      if (tracks.length >= 10) return fail("သီချင်း ၁၀ ပုဒ် ပြည့်နေပါပြီ — အသစ် တင်ချင်ရင် အရင် တစ်ပုဒ် ဖျက်ပါ");
+      const key = `bgm/track-${Date.now()}.${v.ext}`;
+      try {
+        await ctx.blobs.put(key, v.bytes, { contentType: v.mime });
+      } catch {
+        return fail("သီချင်း သိမ်းလို့ မရပါ — ပြန်ကြိုးစားပါ");
+      }
+      const url = await blobUrlSafe(ctx, key);
+      const name = args.name.trim() || `Track ${tracks.length + 1}`;
+      tracks.push({ key, url, name });
+      await setSetting(db, "bgm_tracks", JSON.stringify(tracks));
+      await logAct(db, auth.actor.name, `BGM track uploaded (${name})`);
+      ctx.invalidateQueries();
+      return { ok: true, error: "", track_url: url };
+    },
+  }),
+
+  deleteBgmTrack: defineAction({
+    description: "Staff action: remove a background-music track from the playlist.",
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string(),
+      index: z.number().int().min(0).max(9),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const auth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
+      if (!args.confirmed) return { ok: false, error: "သီချင်း ဖျက်ရန် security confirmation လိုပါတယ်" };
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return { ok: false, error: err2fa };
+      const s = await getSettingsMap(db);
+      const tracks = parseBgmTracks(s["bgm_tracks"]);
+      const removed = tracks[args.index];
+      if (!removed) return { ok: false, error: "သီချင်း မတွေ့ပါ" };
+      tracks.splice(args.index, 1);
+      await setSetting(db, "bgm_tracks", JSON.stringify(tracks));
+      if (removed.key) {
+        try { await ctx.blobs.delete(removed.key); } catch { /* best-effort */ }
+      }
+      await logAct(db, auth.actor.name, `BGM track removed (${removed.name || `index ${args.index}`})`);
+      ctx.invalidateQueries();
+      return { ok: true, error: "" };
+    },
+  }),
+
+  setBgmEnabled: defineAction({
+    description: "Staff action: turn background music on or off for all players.",
+    request: z.object({
+      actor_player_id: z.number().default(0),
+      session_token: z.string(),
+      enabled: z.boolean(),
+      confirmed: z.boolean().default(false),
+      totp_code: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean(), error: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const auth = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
+      if (auth.error || !auth.actor) return { ok: false, error: auth.error ?? AUTH_ERR };
+      if (!args.confirmed) return { ok: false, error: "BGM ပြောင်းရန် security confirmation လိုပါတယ်" };
+      const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
+      if (err2fa) return { ok: false, error: err2fa };
+      await setSetting(db, "bgm_enabled", args.enabled ? "1" : "0");
+      await logAct(db, auth.actor.name, `BGM ${args.enabled ? "enabled" : "disabled"}`);
+      ctx.invalidateQueries();
+      return { ok: true, error: "" };
+    },
+  }),
+
   telegramCallback: defineAction({
     description: "Handle signed Telegram bot button callbacks (top-up, withdrawal, and dispute decisions).",
     request: z.object({
@@ -9361,6 +9564,10 @@ export const Actions = {
       // match id links the case to that match (same reports queue; no new
       // money logic — resolution stays with the existing admin tools).
       match_id: z.number().default(0),
+      // Part D (D1): optional screenshot attached to the report —
+      // validated exactly like match-result evidence (submitResult).
+      screenshot_base64: z.string().max(8_000_000).default(""),
+      screenshot_mime: z.string().default("image/png"),
     }),
     response: z.object({
       ok: z.boolean(),
@@ -9434,12 +9641,29 @@ export const Actions = {
       const rl = await rateLimit(db, `report:${reporterId ?? "anon"}`, 10, 60 * 60 * 1000);
       if (rl) return { ok: false, case_code: "", error: rl, ...noHold };
       const caseCode = uid("CASE");
+      // Part D (D1): an attached screenshot goes through the SAME image
+      // validation as match evidence; an invalid image rejects the
+      // WHOLE report (submitResult precedent). The blob is stored
+      // before the insert so the row is born with its screenshot_key.
+      let screenshotKey: string | null = null;
+      if (args.screenshot_base64) {
+        const v = validateImage(args.screenshot_base64, args.screenshot_mime);
+        if (v.error || !v.bytes)
+          return { ok: false, case_code: "", error: v.error || "ပုံ မမှန်ပါ", ...noHold };
+        screenshotKey = `report-evidence/${caseCode}-${Date.now()}.${v.ext}`;
+        try {
+          await ctx.blobs.put(screenshotKey, v.bytes, { contentType: v.mime });
+        } catch {
+          return { ok: false, case_code: "", error: "Screenshot သိမ်းလို့ မရပါ — ပြန်ကြိုးစားပါ", ...noHold };
+        }
+      }
       await db.insert(schema.reports).values({
         caseCode,
         matchId: linkMatchId,
         // Batch 28: the reported player's id, derived server-side above
         // for match-linked cases (NULL for ordinary name-only reports).
         targetId: linkTarget?.id ?? null,
+        screenshotKey,
         reporterId,
         reporterName,
         targetName,
@@ -9497,6 +9721,12 @@ export const Actions = {
           hold_amount: z.number(),
           hold_received: z.number(),
           hold_status: z.string(),
+          // Part D: staff-only — the reporter's attached screenshot URL
+          // (D1; the blob key itself never ships) and the decision
+          // summary for match-linked cases (D2; null for ordinary
+          // reports).
+          screenshot_url: z.string(),
+          match_summary: reportMatchSummaryShape.nullable(),
         }),
       ),
     }),
@@ -9509,10 +9739,10 @@ export const Actions = {
         .from(schema.reports)
         .orderBy(desc(schema.reports.id))
         .limit(100);
-      const matchCodeOf = new Map<number, string>();
+      const matchRowOf = new Map<number, MatchRow>();
       for (const mid of new Set(rows.map((r) => r.matchId).filter((x): x is number => x != null))) {
         const mr = (await db.select().from(schema.matches).where(eq(schema.matches.id, mid)).limit(1))[0];
-        if (mr) matchCodeOf.set(mid, mr.code);
+        if (mr) matchRowOf.set(mid, mr);
       }
       const holdOf = new Map<string, ReportHoldRow>();
       for (const r of rows) {
@@ -9522,12 +9752,74 @@ export const Actions = {
         const h = await holdForPair(db, r.matchId, r.targetId);
         if (h) holdOf.set(key, h);
       }
+      // Part D (D2): one decision summary per linked match. The rules
+      // come from the match's OWN stamped snapshot (matches.customRules
+      // — the per-combination fixed-rule set frozen onto the challenge
+      // at creation and copied onto the match at accept), never from
+      // the live settings lists, which admins may have edited since.
+      // Evidence URLs get the same privileged treatment as matchOut's
+      // evUrl (this whole payload is staff-gated). Hold figures are
+      // pair-specific, so they merge per report row below.
+      const evUrlRep = async (key: string) => {
+        if (!key) return "";
+        if (key.startsWith("evidence/")) {
+          try { return await ctx.blobs.getUrl(key); } catch { return ""; }
+        }
+        return key;
+      };
+      const summaryByMatch = new Map<number, ReportMatchSummary>();
+      for (const [mid, m] of matchRowOf) {
+        const parts = await participantsFor(db, mid);
+        const nameOf = async (id: number) => {
+          const p = await getPlayer(db, id);
+          return { name: p?.name ?? "Unknown", game_name: p?.gameName ?? "" };
+        };
+        const sideOf = async (side: "A" | "B", leaderId: number): Promise<ReportMatchSummary["side_a"]> => {
+          const leader = await nameOf(leaderId);
+          const rowsOnSide = parts.filter((pt) => pt.side === side);
+          // 1v1 matches carry no snapshot rows — the roster is just
+          // the leader.
+          const members: { name: string; game_name: string }[] = [];
+          if (rowsOnSide.length === 0) members.push(leader);
+          else for (const pt of rowsOnSide) members.push(await nameOf(pt.playerId));
+          return { leader_name: leader.name, leader_game_name: leader.game_name, members };
+        };
+        const winner = m.winnerId ? await getPlayer(db, m.winnerId) : null;
+        summaryByMatch.set(mid, {
+          match_id: m.id,
+          code: m.code,
+          arena: m.arena,
+          team_size: m.teamSize,
+          status: m.status,
+          stake_coins: m.stake,
+          pot_coins: m.stake * 2 * m.teamSize,
+          fee_coins: m.feeAmount,
+          held_amount: 0,
+          hold_received: 0,
+          hold_status: "",
+          winner_name: winner?.name ?? "",
+          side_a: await sideOf("A", m.playerAId),
+          side_b: await sideOf("B", m.playerBId),
+          rules: (m.customRules ?? "").split("\n").map((x) => x.trim()).filter(Boolean),
+          a_result: m.aResult ?? "",
+          b_result: m.bResult ?? "",
+          a_evidence_url: await evUrlRep(m.aEvidence),
+          b_evidence_url: await evUrlRep(m.bEvidence),
+        });
+      }
+      // Part D (D1): resolve each report's screenshot blob key to a URL
+      // for staff only — the key itself never leaves the server.
+      const shotUrlOf = new Map<number, string>();
+      for (const r of rows) {
+        if (r.screenshotKey) shotUrlOf.set(r.id, await blobUrlSafe(ctx, r.screenshotKey));
+      }
       return {
         reports: rows.map((r) => {
           const h =
             r.matchId != null && r.targetId != null
               ? holdOf.get(`${r.matchId}:${r.targetId}`)
               : undefined;
+          const baseSummary = r.matchId != null ? summaryByMatch.get(r.matchId) : undefined;
           return {
             id: r.id,
             case_code: r.caseCode,
@@ -9539,10 +9831,19 @@ export const Actions = {
             action_taken: r.actionTaken,
             created_at: iso(r.createdAt) ?? "",
             match_id: r.matchId ?? null,
-            match_code: r.matchId != null ? (matchCodeOf.get(r.matchId) ?? "") : "",
+            match_code: r.matchId != null ? (matchRowOf.get(r.matchId)?.code ?? "") : "",
             hold_amount: h?.heldAmount ?? 0,
             hold_received: h?.receivedAmount ?? 0,
             hold_status: h?.status ?? "",
+            screenshot_url: shotUrlOf.get(r.id) ?? "",
+            match_summary: baseSummary
+              ? {
+                  ...baseSummary,
+                  held_amount: h?.heldAmount ?? 0,
+                  hold_received: h?.receivedAmount ?? 0,
+                  hold_status: h?.status ?? "",
+                }
+              : null,
           };
         }),
       };

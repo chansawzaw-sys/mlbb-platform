@@ -316,6 +316,11 @@ export const reports = sqliteTable("reports", {
    *  derived server-side at createReport (opposing side's leader).
    *  NULL for ordinary reports, which only carry a target NAME. */
   targetId: integer("target_id"),
+  /** Part D (D1): blob key of the optional screenshot the reporter
+   *  attached at creation time (validated like match evidence).
+   *  Staff-only — resolved to a URL only inside listReports; never
+   *  exposed in any player-facing response. NULL when none attached. */
+  screenshotKey: text("screenshot_key"),
   reporterId: integer("reporter_id"),
   reporterName: text("reporter_name").notNull().default(""),
   targetName: text("target_name").notNull(),

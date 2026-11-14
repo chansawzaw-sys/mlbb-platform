@@ -527,6 +527,19 @@ const STATIC_PAGES: Record<string, string> = {
   "/contact": "contact.html",
 };
 
+// Cache policy (BGM/caching build): hashed bundle files and icons under
+// /assets/ never change at a given URL, and blob URLs embed a unique
+// per-upload token, so both are immutable-cacheable for a long time.
+// HTML, the service worker and the manifest must revalidate on every
+// load so a new deploy lands immediately.
+function cacheControlFor(pathname: string, servedExt: string): string | null {
+  if (pathname.startsWith("/assets/"))
+    return "public, max-age=31536000, immutable";
+  if (servedExt === ".html" || pathname === "/sw.js" || pathname === "/manifest.json")
+    return "no-cache";
+  return null;
+}
+
 async function serveStatic(pathname: string): Promise<Response> {
   const rel =
     pathname === "/"
@@ -537,14 +550,19 @@ async function serveStatic(pathname: string): Promise<Response> {
     const file = Bun.file(filePath);
     if (file.size > 0 || (await file.exists())) {
       const ext = filePath.slice(filePath.lastIndexOf("."));
-      return new Response(file, {
-        headers: { "content-type": MIME[ext] ?? file.type ?? "application/octet-stream" },
-      });
+      const headers: Record<string, string> = {
+        "content-type": MIME[ext] ?? file.type ?? "application/octet-stream",
+      };
+      const cc = cacheControlFor(pathname, ext);
+      if (cc) headers["cache-control"] = cc;
+      return new Response(file, { headers });
     }
   }
   // SPA fallback
   const index = Bun.file(join(CLIENT_DIR, "index.html"));
-  return new Response(index, { headers: { "content-type": MIME[".html"] } });
+  return new Response(index, {
+    headers: { "content-type": MIME[".html"], "cache-control": "no-cache" },
+  });
 }
 
 // --- server ---------------------------------------------------------------
@@ -567,7 +585,14 @@ const server = Bun.serve({
     if (req.method === "GET" && path.startsWith("/blobs/")) {
       const found = await blobs.fileForToken(decodeURIComponent(path.slice("/blobs/".length)));
       if (!found) return new Response("not found", { status: 404 });
-      return new Response(found.file, { headers: { "content-type": found.contentType } });
+      // Blob tokens are unique per upload (a replacement gets a NEW
+      // URL), so blobs are immutable at a given URL — cache for 30 days.
+      return new Response(found.file, {
+        headers: {
+          "content-type": found.contentType,
+          "cache-control": "public, max-age=2592000, immutable",
+        },
+      });
     }
     if (req.method === "GET") {
       return serveStatic(path);
