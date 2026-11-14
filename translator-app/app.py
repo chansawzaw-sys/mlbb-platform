@@ -102,16 +102,16 @@ def _heartbeat(job):
 
 
 # ---------- auto-cleanup: no job data stays on the server ----------
-# 15 minutes after a job finishes (done or error), its whole folder —
+# 12 hours after a web job finishes (done or error), its whole folder —
 # source, intermediates and output — plus the cached preview copy of
 # the same URL is deleted, so nothing accumulates on the disk.
-CLEANUP_DELAY = 900
+CLEANUP_DELAY = 12 * 3600
 CLEANUP_TIMERS = {}
 
 
 def _job_retention(job):
     """Bot-submitted jobs stay 24h — customers come back for their
-    video; web jobs keep the 15-minute hygiene rule."""
+    video; web jobs stay 12h (owner order 2026-11-14, was 15 min)."""
     return 24 * 3600 if job.get("tg_chat_id") else CLEANUP_DELAY
 
 
@@ -2971,7 +2971,7 @@ def stream_job(jid):
 @app.delete("/api/jobs/<jid>")
 def delete_job(jid):
     """Delete a job and all its files right now (the user asked for no
-    leftovers; otherwise the 15-minute auto-cleanup does it)."""
+    leftovers; otherwise the 12-hour auto-cleanup does it)."""
     job = _load_job(jid)
     if not job or not _owns(_current_user(), job):
         return jsonify({"error": "job မတွေ့ပါ"}), 404

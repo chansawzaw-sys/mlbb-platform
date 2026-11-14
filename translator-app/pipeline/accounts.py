@@ -299,7 +299,7 @@ def adjust_credits(user_id, delta):
 def mark_has_job(user_id):
     """Sticky flag: this account has submitted at least one job.
     The dormant sweep trusts this (plus the caller's live job list),
-    not just job folders still on disk — those are deleted 15 min /
+    not just job folders still on disk — those are deleted 12 h /
     24 h after finishing, long before the 60-day sweep runs."""
     if not user_id:
         return
