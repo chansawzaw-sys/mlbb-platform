@@ -75,19 +75,22 @@
         position: relative;
         width: 168px;
         height: 168px;
-        animation: ffs-flyin 0.95s cubic-bezier(0.22, 1.4, 0.36, 1) both;
+        /* Beat map: the logo holds small/dim through the 0–0.5s charge
+           phase (the 0% keyframe, held by the backwards fill), then the
+           3D fly-in spans 0.5s → 1.2s and LANDS at exactly 1.2s. */
+        animation: ffs-flyin 0.7s cubic-bezier(0.22, 1.4, 0.36, 1) 0.5s both;
         will-change: transform, opacity;
       }
       @keyframes ffs-flyin {
         0% {
-          opacity: 0;
-          transform: translateY(56px) scale(0.25) rotateY(-160deg);
+          opacity: 0.45;
+          transform: translateY(30px) scale(0.45) rotateY(-140deg);
         }
-        60% {
+        55% {
           opacity: 1;
-          transform: translateY(-8px) scale(1.08) rotateY(14deg);
+          transform: translateY(-8px) scale(1.09) rotateY(14deg);
         }
-        80% {
+        78% {
           transform: translateY(2px) scale(0.97) rotateY(-5deg);
         }
         100% {
@@ -101,20 +104,26 @@
         border-radius: 50%;
         background: radial-gradient(circle, rgba(243, 210, 122, 0.55) 0%, rgba(243, 210, 122, 0.12) 45%, transparent 70%);
         opacity: 0;
-        animation: ffs-glowpulse 1.1s ease-out 0.85s both;
+        /* Beat map: the glow gathers from t=0, brightens at the 1.2s
+           landing (46% of 2.6s), and PEAKS at exactly 2.0s (77%). */
+        animation: ffs-glowpulse 2.6s ease-out both;
         pointer-events: none;
       }
       @keyframes ffs-glowpulse {
         0% {
           opacity: 0;
-          transform: scale(0.6);
+          transform: scale(0.5);
         }
-        35% {
+        46% {
+          opacity: 0.5;
+          transform: scale(0.95);
+        }
+        77% {
           opacity: 1;
-          transform: scale(1.05);
+          transform: scale(1.15);
         }
         100% {
-          opacity: 0.25;
+          opacity: 0.3;
           transform: scale(1);
         }
       }
@@ -125,6 +134,17 @@
         height: 168px;
         border-radius: 36px;
         box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
+        /* Charge phase: the crown starts dim/desaturated and reaches
+           full brightness as the fly-in begins at 0.5s. */
+        animation: ffs-chargebright 0.5s ease-out both;
+      }
+      @keyframes ffs-chargebright {
+        from {
+          filter: brightness(0.5) saturate(0.65);
+        }
+        to {
+          filter: brightness(1) saturate(1);
+        }
       }
       .ffs-shine {
         position: absolute;
@@ -142,7 +162,8 @@
         width: 45%;
         background: linear-gradient(100deg, transparent 0%, rgba(255, 255, 255, 0.55) 50%, transparent 100%);
         transform: skewX(-18deg);
-        animation: ffs-shinesweep 0.9s ease-in-out 1.05s both;
+        /* Retimed to the 1.2s landing / BOOM beat. */
+        animation: ffs-shinesweep 0.9s ease-in-out 1.2s both;
       }
       @keyframes ffs-shinesweep {
         from {
@@ -171,7 +192,7 @@
         background: #f3d27a;
         box-shadow: 0 0 10px 2px rgba(243, 210, 122, 0.65);
         opacity: 0;
-        animation: ffs-sparkrise 1.7s ease-out both;
+        animation: ffs-sparkrise 1.4s ease-out both;
       }
       @keyframes ffs-sparkrise {
         0% {
@@ -184,6 +205,60 @@
         100% {
           opacity: 0;
           transform: translateY(-130px) scale(1.1);
+        }
+      }
+      /* Charge-phase sparks: positioned around the logo (inline
+         left/top in px within the 188px sparks box) and pulled INWARD
+         to the centre via the per-spark --dx/--dy custom properties,
+         arriving as the logo lands at 1.2s. */
+      .ffs-spark.ffs-conv {
+        bottom: auto;
+        animation: ffs-sparkconv 0.95s ease-in both;
+      }
+      @keyframes ffs-sparkconv {
+        0% {
+          opacity: 0;
+          transform: translate(0, 0) scale(0.5);
+        }
+        25% {
+          opacity: 1;
+        }
+        100% {
+          opacity: 0;
+          transform: translate(var(--dx, 0px), var(--dy, 0px)) scale(0.35);
+        }
+      }
+      /* Name + tagline wrapper: clips the 2.8s CHIME shine sweep. */
+      .ffs-namewrap {
+        position: relative;
+        overflow: hidden;
+        padding: 0 12px 4px;
+      }
+      .ffs-namewrap::after {
+        content: "";
+        position: absolute;
+        top: -10%;
+        bottom: -10%;
+        left: -60%;
+        width: 40%;
+        background: linear-gradient(100deg, transparent 0%, rgba(255, 255, 255, 0.5) 50%, transparent 100%);
+        transform: skewX(-18deg);
+        opacity: 0;
+        /* Beat map: the name shine sweeps at exactly 2.8s. */
+        animation: ffs-namesweep 0.85s ease-in-out 2.8s both;
+        pointer-events: none;
+      }
+      @keyframes ffs-namesweep {
+        0% {
+          transform: translateX(0) skewX(-18deg);
+          opacity: 0;
+        }
+        20% {
+          opacity: 1;
+        }
+        100% {
+          transform: translateX(460%) skewX(-18deg);
+          opacity: 0;
         }
       }
       .ffs-name {
@@ -246,7 +321,9 @@
         }
         .ffs-logowrap,
         .ffs-glow,
+        .ffs-logo,
         .ffs-shine::after,
+        .ffs-namewrap::after,
         .ffs-spark,
         .ffs-name,
         .ffs-tag {
@@ -256,7 +333,7 @@
       }
     </style>
     
-  <link rel="stylesheet" crossorigin href="./assets/index-ax5sy5xv.css"><script type="module" crossorigin src="./assets/index-kfesx1xd.js"></script></head>
+  <link rel="stylesheet" crossorigin href="./assets/index-y5shj7gw.css"><script type="module" crossorigin src="./assets/index-sp1zrxpb.js"></script></head>
   <body>
     <div
       data-generated-space-root=""
@@ -287,8 +364,36 @@
         root.setAttribute("role", "presentation");
         root.setAttribute("aria-hidden", "true");
         var sparks = "";
+        // Charge phase (0–1.2s): sparks start around the logo inside
+        // the 188px sparks box and CONVERGE to its centre (94, 94),
+        // arriving as the logo lands.
+        var convPos = [
+          [8, 20],
+          [168, 6],
+          [180, 96],
+          [150, 172],
+          [18, 170],
+          [2, 92],
+        ];
+        for (var c = 0; c < convPos.length; c++) {
+          var cx = convPos[c][0] || 0;
+          var cy = convPos[c][1] || 0;
+          sparks +=
+            '<span class="ffs-spark ffs-conv" style="left:' +
+            cx +
+            "px;top:" +
+            cy +
+            "px;--dx:" +
+            (94 - cx) +
+            "px;--dy:" +
+            (94 - cy) +
+            "px;animation-delay:" +
+            (c * 0.06).toFixed(2) +
+            's"></span>';
+        }
+        // After the landing: the classic rising sparks.
         var sparkLeft = [18, 34, 50, 63, 78];
-        var sparkDelay = [1.15, 1.35, 1.05, 1.5, 1.25];
+        var sparkDelay = [1.3, 1.5, 1.35, 1.65, 1.45];
         for (var i = 0; i < sparkLeft.length; i++) {
           sparks +=
             '<span class="ffs-spark" style="left:' +
@@ -307,8 +412,10 @@
           sparks +
           "</div>" +
           "</div>" +
+          '<div class="ffs-namewrap">' +
           '<p class="ffs-name">Fight for Legendary</p>' +
           '<p class="ffs-tag">PLAY • COMPETE • WIN</p>' +
+          "</div>" +
           "</div>" +
           '<button type="button" class="ffs-mute" aria-label="Toggle splash sound"></button>';
         document.body.appendChild(root);
@@ -403,7 +510,106 @@
           } catch (e) {}
         }
 
-        function playSting(tailOnly) {
+        // ---- Beat sounds (each takes its absolute audio start time) ----
+
+        // 0.0s ENERGY CHARGE: rising synth sweep, pitch + brightness
+        // building under the whole charge/fly-in window (~1.15s).
+        function sndCharge(t0) {
+          try {
+            var dur = 1.15;
+            var osc = actx.createOscillator();
+            var osc2 = actx.createOscillator();
+            var filter = actx.createBiquadFilter();
+            var g = actx.createGain();
+            osc.type = "sawtooth";
+            osc2.type = "square";
+            osc.frequency.setValueAtTime(70, t0);
+            osc.frequency.exponentialRampToValueAtTime(660, t0 + dur);
+            osc2.frequency.setValueAtTime(35, t0);
+            osc2.frequency.exponentialRampToValueAtTime(330, t0 + dur);
+            filter.type = "lowpass";
+            filter.Q.value = 2;
+            filter.frequency.setValueAtTime(240, t0);
+            filter.frequency.exponentialRampToValueAtTime(4200, t0 + dur);
+            g.gain.setValueAtTime(0.0001, t0);
+            g.gain.exponentialRampToValueAtTime(0.11, t0 + dur * 0.85);
+            g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur + 0.05);
+            osc.connect(filter);
+            osc2.connect(filter);
+            filter.connect(g);
+            g.connect(master);
+            osc.start(t0);
+            osc2.start(t0);
+            osc.stop(t0 + dur + 0.1);
+            osc2.stop(t0 + dur + 0.1);
+          } catch (e) {}
+        }
+
+        // 0.5s WHOOSH: band-swept noise under the 0.7s fly-in.
+        function sndWhoosh(t0) {
+          whoosh(t0, 0.7);
+        }
+
+        // 1.2s BOOM: deep bass impact + shimmer chord at the landing.
+        function sndBoom(t0) {
+          tone(110, t0, 0.7, "sine", 0.55, 42);
+          tone(55, t0, 0.85, "triangle", 0.4, 36);
+          tone(523.25, t0 + 0.02, 1.1, "triangle", 0.16);
+          tone(659.25, t0 + 0.02, 1.1, "triangle", 0.14);
+          tone(783.99, t0 + 0.04, 1.15, "triangle", 0.14);
+          tone(1046.5, t0 + 0.06, 1.2, "sine", 0.12);
+        }
+
+        // 2.0s GLOW: warm pad swell whose gain PEAKS at t0 (the glow
+        // pulse peak), so the swell starts 0.4s early.
+        function sndGlow(t0) {
+          try {
+            var start = Math.max(actx.currentTime + 0.01, t0 - 0.4);
+            var freqs = [261.63, 329.63, 392.0, 493.88];
+            var filter = actx.createBiquadFilter();
+            filter.type = "lowpass";
+            filter.frequency.value = 1400;
+            var g = actx.createGain();
+            g.gain.setValueAtTime(0.0001, start);
+            g.gain.exponentialRampToValueAtTime(0.13, t0);
+            g.gain.exponentialRampToValueAtTime(0.0001, t0 + 1.1);
+            filter.connect(g);
+            g.connect(master);
+            for (var k = 0; k < freqs.length; k++) {
+              var o = actx.createOscillator();
+              o.type = k % 2 ? "sine" : "triangle";
+              o.frequency.value = freqs[k] || 261.63;
+              o.connect(filter);
+              o.start(start);
+              o.stop(t0 + 1.2);
+            }
+          } catch (e) {}
+        }
+
+        // 2.8s CHIME: bright sparkle arpeggio with the name shine.
+        function sndChime(t0) {
+          var notes = [1046.5, 1318.5, 1567.98, 2093.0];
+          for (var n = 0; n < notes.length; n++) {
+            tone(notes[n] || 1046.5, t0 + n * 0.09, 0.6, "sine", 0.11);
+          }
+          tone(2637.02, t0 + 0.38, 0.7, "sine", 0.08);
+        }
+
+        // Beat map — absolute offsets in seconds from splash start.
+        var BEATS = [
+          { at: 0.0, play: sndCharge },
+          { at: 0.5, play: sndWhoosh },
+          { at: 1.2, play: sndBoom },
+          { at: 2.0, play: sndGlow },
+          { at: 2.8, play: sndChime },
+        ];
+
+        // Starts audio (once) and schedules ONLY the beats still ahead
+        // of the current elapsed time, at their absolute offsets from
+        // splash start. A beat whose time has already passed (>50ms
+        // grace for the t=0 charge at first paint) is skipped entirely
+        // — never restarted, never replaced by a generic tail.
+        function startAudio() {
           try {
             if (audioStarted || audioFailed || muted || lifted) return;
             var ctx = ensureCtx();
@@ -414,30 +620,14 @@
               if (ctx.state === "suspended") return; // still blocked; a tap may retry
             }
             audioStarted = true;
-            var t = ctx.currentTime + 0.02;
-            if (!tailOnly) {
-              // Rising whoosh under the fly-in (0 -> ~0.9s).
-              whoosh(t, 0.9);
-              // Deep bass impact as the logo lands (~0.9s).
-              tone(110, t + 0.88, 0.7, "sine", 0.55, 42);
-              tone(55, t + 0.88, 0.85, "triangle", 0.4, 36);
-              // Bright shimmer chord on landing (C major add9 sparkle).
-              tone(523.25, t + 0.9, 1.1, "triangle", 0.16);
-              tone(659.25, t + 0.9, 1.1, "triangle", 0.14);
-              tone(783.99, t + 0.92, 1.15, "triangle", 0.14);
-              tone(1046.5, t + 0.94, 1.2, "sine", 0.12);
-              // Sparkle arpeggio as the particles rise.
-              var notes = [1318.5, 1567.98, 2093.0, 1760.0];
-              for (var n = 0; n < notes.length; n++) {
-                tone(notes[n], t + 1.2 + n * 0.14, 0.5, "sine", 0.1);
-              }
-            } else {
-              // Late tap: short tail — shimmer + a couple of sparkles.
-              tone(523.25, t, 0.8, "triangle", 0.15);
-              tone(783.99, t + 0.02, 0.85, "triangle", 0.13);
-              tone(1046.5, t + 0.04, 0.9, "sine", 0.11);
-              tone(1567.98, t + 0.22, 0.5, "sine", 0.09);
-              tone(2093.0, t + 0.4, 0.55, "sine", 0.08);
+            var elapsed = (Date.now() - startedAt) / 1000;
+            var now = ctx.currentTime;
+            for (var b = 0; b < BEATS.length; b++) {
+              var beat = BEATS[b];
+              if (!beat) continue;
+              var off = beat.at - elapsed;
+              if (off < -0.05) continue; // already past: skip entirely
+              beat.play(now + Math.max(off, 0.02));
             }
           } catch (e) {
             audioFailed = true;
@@ -462,9 +652,9 @@
           } catch (e) {}
         }
 
-        // Attempt the sting at splash start (may stay silent if the
-        // browser blocks autoplay — the animation still plays).
-        if (!muted && !reduced) playSting(false);
+        // Attempt the beat sting at splash start (may stay silent if
+        // the browser blocks autoplay — the animation still plays).
+        if (!muted && !reduced) startAudio();
 
         // Any tap while the splash is up can unlock audio; a tap on
         // the background skips to the end of the splash.
@@ -472,9 +662,10 @@
           if (lifted) return;
           if (ev.target === muteBtn) return;
           if (!audioStarted && !muted && !reduced) {
-            var elapsed = Date.now() - startedAt;
-            playSting(elapsed > 1800);
-            return; // first tap unlocks audio; it does not also skip
+            // First tap unlocks audio: startAudio schedules only the
+            // beats still ahead; it does not also skip.
+            startAudio();
+            return;
           }
           lift();
         });
@@ -499,8 +690,8 @@
                   master.gain.setTargetAtTime(0.9, actx.currentTime, 0.03);
                 } catch (e) {}
               } else if (!audioStarted) {
-                var elapsed = Date.now() - startedAt;
-                playSting(elapsed > 1800);
+                // Unmuted mid-splash: pick up only the beats ahead.
+                startAudio();
               }
             }
           });

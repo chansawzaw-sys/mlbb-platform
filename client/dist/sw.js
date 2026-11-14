@@ -1,13 +1,13 @@
-// Fight for Legendary service worker — Batch 20 (cache v14; Batch 17/18 fetch
-// policy unchanged, plus Web Push display + click routing). v14: new
-// splash-screen shell in index.html.
+// Fight for Legendary service worker — Batch 20 (cache v15; Batch 17/18 fetch
+// policy unchanged, plus Web Push display + click routing). v15: splash
+// intro retimed to the 0.0/0.5/1.2/2.0/2.8/3.5s beat map in index.html.
 // Safety-first policy for a live-money app:
 //  - /actions is NEVER intercepted or cached (always fresh, always network).
 //  - Navigations are NETWORK-FIRST (online users always get the freshest
 //    HTML/bundle); the cached shell is only an offline fallback.
 //  - Same-origin static assets are CACHE-FIRST (they are content-hashed).
 //  - Non-GET requests and everything else are left completely untouched.
-const CACHE_NAME = "mlbb-shell-v14";
+const CACHE_NAME = "mlbb-shell-v15";
 
 const SHELL_URLS = [
   "./",
