@@ -23,6 +23,8 @@ seg["tts_file"], seg["tts_duration"], seg["tts_provider"] in segments_my.json.
 import asyncio
 import os
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import edge_tts
@@ -147,6 +149,85 @@ async def _edge_all(jobs, voice, rate, pitch):
     return ok
 
 
+# Build 186 (audit fix #5): the classic/gTTS fallback used to run
+# SEQUENTIALLY per segment — on an edge-down day every missing
+# segment paid the full provider ladder one after another
+# (measured mild case: ~1.14 s/seg; a hanging provider cost its
+# whole retry ladder, ~2.5-3 min, PER SEGMENT). The fallback now
+# runs across segments in parallel (same semaphore width as the
+# edge path) and every segment carries a wall-clock budget.
+SEG_BUDGET_S = 45.0    # per-segment ceiling for the whole fallback ladder
+ATTEMPT_CAP_S = 30.0   # per-provider-attempt ceiling inside it (the
+                       # classic endpoint's own request timeout is
+                       # 30 s, so a healthy attempt is never cut)
+
+
+def _run_capped(fn, cap_s):
+    """Run fn() in a worker thread under a hard ceiling; True only
+    if it finished without raising inside the cap. A timed-out
+    attempt is abandoned (the thread is a daemon to the pool's
+    shutdown(wait=False) — the same pattern translate_segments
+    uses for its hung-provider guard) and counts as a failure."""
+    ex = ThreadPoolExecutor(max_workers=1)
+    try:
+        ex.submit(fn).result(timeout=max(1.0, cap_s))
+        return True
+    except Exception:
+        return False
+    finally:
+        ex.shutdown(wait=False)
+
+
+def _fallback_for_segment(text, out):
+    """The pre-186 fallback ladder for ONE segment — classic ->
+    gTTS -> one breath -> classic -> gTTS — same providers, same
+    order, same retry, now under SEG_BUDGET_S with each attempt
+    capped at ATTEMPT_CAP_S of the remaining budget. Returns the
+    provider label, or None when the ladder produced nothing
+    (the caller then applies the recorded FAILED-silent last
+    resort, exactly as before — a segment is never dropped and
+    never silently voiceless: it is either spoken, or recorded
+    FAILED-silent with the majority-failure job gate behind it).
+
+    An abandoned (timed-out) attempt can leave a partial file —
+    gTTS streams into its target — so the target is unlinked
+    after every failed attempt; an abandoned writer holds an fd
+    to the unlinked inode and cannot pollute the next attempt's
+    file at the same path."""
+    t0 = time.monotonic()
+
+    def left():
+        return SEG_BUDGET_S - (time.monotonic() - t0)
+
+    def attempt(fn):
+        if left() <= 1:
+            return False
+        ok = _run_capped(lambda: fn(text, out),
+                         min(ATTEMPT_CAP_S, left()))
+        good = ok and out.exists() and out.stat().st_size > 0
+        if not good:
+            try:
+                out.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return good
+
+    if attempt(_classic_synth):
+        return "google-classic:my"
+    if attempt(_gtts_synth):
+        return "gtts:my"
+    # One full-chain retry after a breath (transient network
+    # failures are the usual cause) — kept from the pre-186
+    # ladder, shortened to what the budget still affords.
+    if left() > 3:
+        time.sleep(min(2.0, left() - 1))
+    if attempt(_classic_synth):
+        return "google-classic:my (retry)"
+    if attempt(_gtts_synth):
+        return "gtts:my (retry)"
+    return None
+
+
 def synthesize(workdir, voice=DEFAULT_VOICE, rate=0, pitch=0):
     """rate: speech-speed adjustment in percent (-50..+100, 0 = default).
     pitch: pitch adjustment in Hz (-50..+50, 0 = default). Both reach
@@ -168,41 +249,31 @@ def synthesize(workdir, voice=DEFAULT_VOICE, rate=0, pitch=0):
             edge_ok = asyncio.run(_edge_all(jobs, voice, rate, pitch))
         except Exception:
             edge_ok = set()
+    # Build 186 (audit fix #5): segments edge missed run the
+    # classic/gTTS fallback ladder CONCURRENTLY (6 workers, the
+    # edge path's width) instead of one segment at a time; each
+    # segment's own ladder order and budget live in
+    # _fallback_for_segment. Finalization below stays in segment
+    # order in this thread, so the recorded outcome per segment
+    # (provider, FAILED-silent, the majority-failure gate) is
+    # exactly the pre-186 contract.
+    providers = {}
+    missing = [(i, t, o) for i, t, o in jobs if i not in edge_ok]
+    if missing:
+        def _fb(job_args):
+            _i, _t, _o = job_args
+            return _fallback_for_segment(_t, _o)
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for (i, _t, _o), prov in zip(missing, ex.map(_fb, missing)):
+                if prov:
+                    providers[i] = prov
     for i, text, out in jobs:
         seg = segs[i]
         provider = None
         if i in edge_ok:
             provider = f"edge-tts:{voice}"
         if provider is None:
-            try:
-                _classic_synth(text, out)
-                if out.exists() and out.stat().st_size > 0:
-                    provider = "google-classic:my"
-            except Exception:
-                provider = None
-        if provider is None:
-            try:
-                _gtts_synth(text, out)
-                provider = "gtts:my"
-            except Exception:
-                provider = None
-        if provider is None:
-            # One full-chain retry after a breath (transient network
-            # failures are the usual cause) — a single segment must
-            # not kill the whole job (audit A6).
-            time.sleep(2)
-            try:
-                _classic_synth(text, out)
-                if out.exists() and out.stat().st_size > 0:
-                    provider = "google-classic:my (retry)"
-            except Exception:
-                provider = None
-        if provider is None:
-            try:
-                _gtts_synth(text, out)
-                provider = "gtts:my (retry)"
-            except Exception:
-                provider = None
+            provider = providers.get(i)
         if provider is None:
             # Last resort for THIS segment only: silence of the
             # segment's own window length. The timeline stays exact

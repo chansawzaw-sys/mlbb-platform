@@ -51,6 +51,12 @@ MAX_VFAST = 1.6    # fastest the picture may play for a short dub
 MERGE_MAX_CHUNKS = 12
 CANARY_MAX_CHUNKS = 40
 
+# Build 186 grouped merging (audit fix #3): past the canary
+# ceiling the video stage encodes in groups of this many chunks
+# (the canary's proven graph size) instead of one encode per
+# chunk — see _video_grouped.
+GROUP_MAX_CHUNKS = CANARY_MAX_CHUNKS
+
 
 def _canary_timeout(total_dur):
     """Wall-clock budget (seconds) for a canary single-pass encode:
@@ -223,6 +229,48 @@ def _video_merged(src, chunks, dub_wav, spec, cap_k=2500, timeout=1800):
     run(cmd, timeout=timeout)
 
 
+def _video_grouped(src, chunks, cdir, out, cap_k=2500):
+    """Build 186 (audit fix #3): grouped single-pass for jobs past
+    the canary ceiling. The chunk list is encoded in groups of at
+    most GROUP_MAX_CHUNKS chunks — each group is the ordinary
+    single-pass trim/concat graph at crf 23, exactly the chunked
+    path's settings — and the group files are concat-copied into
+    `out`. This replaces N per-chunk encodes with
+    ceil(N/GROUP_MAX_CHUNKS) graph encodes: the classic path's
+    per-chunk process + encode overhead was ~45% of the phase on
+    >40-chunk jobs (audit: 29 chunks classic retime 26.2 s vs
+    ~17-21 s merged-family). No group ever exceeds the build-183
+    canary's proven graph size, so there is no new stall surface —
+    and the canary's own remedy applies anyway: each group runs
+    under _canary_timeout, and any group failure raises so the
+    caller falls back to the classic chunked path for the whole
+    stage. The build-182 finalize merge is NOT attempted here
+    (the subtitle burn is timestamp-global and cannot be split
+    per group); the output feeds run_job's classic finalize
+    exactly like the chunked path's did. Returns the group count."""
+    groups = [chunks[i:i + GROUP_MAX_CHUNKS]
+              for i in range(0, len(chunks), GROUP_MAX_CHUNKS)]
+    gfiles = []
+    for gi, group in enumerate(groups):
+        gout = cdir / f"g{gi:03d}.mp4"
+        _video_single_pass(
+            src, group, gout, cap_k,
+            timeout=_canary_timeout(
+                sum(c["end"] - c["start"] for c in group)))
+        gfiles.append(gout)
+    lst = cdir / "glist.txt"
+    lst.write_text("".join(f"file '{f.resolve()}'\n" for f in gfiles),
+                   encoding="utf-8")
+    run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+         "-i", str(lst), "-c:v", "copy", str(out)], timeout=1200)
+    for f in gfiles:
+        try:
+            f.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return len(groups)
+
+
 def _video_chunked(src, chunks, cdir, out, cap_k=2500):
     """Original path: one encode per chunk + concat-copy. Kept as the
     fallback for very many chunks, or if the single pass ever fails."""
@@ -242,6 +290,67 @@ def _video_chunked(src, chunks, cdir, out, cap_k=2500):
                    encoding="utf-8")
     run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
          "-i", str(lst), "-c:v", "copy", str(out)], timeout=1200)
+
+
+def _render_chunk_audio_loop(chunks, segs, cdir):
+    """The original per-chunk rendering: one ffmpeg process per
+    chunk. Narration ONLY (build 177): a segment chunk is its TTS
+    file alone, fitted to the chunk window (atempo first, silence
+    pad at the tail) — the source track is never opened here; a
+    gap chunk is generated silence of exactly the chunk length,
+    same format as the narration chunks so the concat stays
+    seamless. Kept unchanged as the fallback for the one-shot
+    renderer below."""
+    for n, c in enumerate(chunks):
+        aout = cdir / f"a{n:03d}.wav"
+        if c["kind"] == "seg":
+            seg = segs[c["seg_idx"]]
+            af = f"atempo={c['speed']:.4f},apad,atrim=0:{c['new_dur']:.3f}"
+            run(["ffmpeg", "-y", "-v", "error", "-i", seg["tts_file"],
+                 "-af", af, "-ac", "2", "-ar", "44100", str(aout)],
+                timeout=300)
+        else:
+            run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                 "anullsrc=channel_layout=stereo:sample_rate=44100",
+                 "-t", f"{c['new_dur']:.3f}",
+                 "-ac", "2", "-ar", "44100", str(aout)], timeout=300)
+
+
+def _render_chunk_audio_oneshot(chunks, segs, cdir):
+    """Build 186 (audit fix #6): render ALL chunk WAVs in ONE
+    ffmpeg invocation — one input per chunk, one filter branch
+    per chunk, one output per chunk file, with the same filters
+    and the same -ac 2 / -ar 44100 output options as the loop.
+    Proven sample-identical to the loop before shipping
+    (bench186b item6 experiment: 31/31 chunks, PCM bytes and
+    format params equal), so the dub.wav concat downstream is
+    bit-for-bit the same render with N-1 process spawns and
+    per-call decode setups removed."""
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    branches = []
+    for n, c in enumerate(chunks):
+        if c["kind"] == "seg":
+            seg = segs[c["seg_idx"]]
+            cmd += ["-i", str(seg["tts_file"])]
+            branches.append(
+                f"[{n}:a]atempo={c['speed']:.4f},apad,"
+                f"atrim=0:{c['new_dur']:.3f}[a{n}]")
+        else:
+            cmd += ["-f", "lavfi", "-t", f"{c['new_dur']:.3f}", "-i",
+                    "anullsrc=channel_layout=stereo:sample_rate=44100"]
+            branches.append(f"[{n}:a]anull[a{n}]")
+    cmd += ["-filter_complex", ";".join(branches)]
+    for n in range(len(chunks)):
+        cmd += ["-map", f"[a{n}]", "-ac", "2", "-ar", "44100",
+                str(cdir / f"a{n:03d}.wav")]
+    run(cmd, timeout=1200)
+
+
+def _render_chunk_audio(chunks, segs, cdir):
+    try:
+        _render_chunk_audio_oneshot(chunks, segs, cdir)
+    except Exception:
+        _render_chunk_audio_loop(chunks, segs, cdir)
 
 
 def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None):
@@ -264,8 +373,11 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None):
     runs under _canary_timeout and any failure lands on the classic
     chunked path. Which path produced the video is recorded in
     plan["video_path"] (passthrough / merged / merged_canary /
-    single_pass / single_pass_canary / chunked), persisted to
-    retime_plan.json with the rest of the plan."""
+    single_pass / single_pass_canary / grouped / chunked),
+    persisted to retime_plan.json with the rest of the plan.
+    Build 186: past the canary ceiling the video stage uses
+    grouped single-pass (_video_grouped) before the chunked
+    fallback."""
     workdir = Path(workdir)
     src = workdir / "source.mp4"
     segs = load_segments(workdir / "segments_my.json")
@@ -286,36 +398,20 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None):
     t_cursor = 0.0
 
     for n, c in enumerate(chunks):
-        dur = c["end"] - c["start"]
         aout = cdir / f"a{n:03d}.wav"
         if c["kind"] == "seg":
             seg = segs[c["seg_idx"]]
-            tts_file = seg["tts_file"]
-            # Narration ONLY (build 177): the TTS file alone, fitted
-            # to the chunk window exactly as before (atempo first,
-            # silence pad at the tail) — the source track is never
-            # opened here any more.
-            af = f"atempo={c['speed']:.4f},apad,atrim=0:{c['new_dur']:.3f}"
-            run(["ffmpeg", "-y", "-v", "error", "-i", tts_file,
-                 "-af", af, "-ac", "2", "-ar", "44100", str(aout)],
-                timeout=300)
             new_segs.append({**seg,
                              "start_new": round(t_cursor, 3),
                              "end_new": round(t_cursor + c["new_dur"], 3),
                              "speed": c["speed"], "video_slow": c.get("vrate", 1.0),
                              "video_rate": c.get("vrate", 1.0),
                              "freeze_extra": 0.0})
-        else:
-            # gap: SILENCE (build 177) — gaps used to carry the
-            # original audio at GAP_VOL; now generated silence of
-            # exactly the chunk length, same format as the narration
-            # chunks so the concat stays seamless.
-            run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
-                 "anullsrc=channel_layout=stereo:sample_rate=44100",
-                 "-t", f"{c['new_dur']:.3f}",
-                 "-ac", "2", "-ar", "44100", str(aout)], timeout=300)
         alist.append(aout)
         t_cursor += c["new_dur"]
+    # Render every chunk's WAV (build 186 one-shot, audit fix #6;
+    # falls back to the per-chunk loop on any failure).
+    _render_chunk_audio(chunks, segs, cdir)
 
     def _concat(files, out, is_video):
         lst = workdir / ("vlist.txt" if is_video else "alist.txt")
@@ -414,6 +510,19 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None):
                     _video_single_pass(src, chunks, retimed_video, cap_k,
                                        timeout=budget)
                     plan["video_path"] = "single_pass_canary"
+                except Exception:
+                    _video_chunked(src, chunks, cdir, retimed_video, cap_k)
+                    plan["video_path"] = "chunked"
+            elif n_chunks > CANARY_MAX_CHUNKS:
+                # Build 186 grouped single-pass (audit fix #3):
+                # past the canary ceiling the stage encodes in
+                # canary-sized groups instead of one encode per
+                # chunk; any failure lands on the classic chunked
+                # path for the whole stage, unchanged.
+                try:
+                    plan["merge_groups"] = _video_grouped(
+                        src, chunks, cdir, retimed_video, cap_k)
+                    plan["video_path"] = "grouped"
                 except Exception:
                     _video_chunked(src, chunks, cdir, retimed_video, cap_k)
                     plan["video_path"] = "chunked"

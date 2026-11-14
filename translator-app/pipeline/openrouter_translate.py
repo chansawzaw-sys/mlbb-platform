@@ -34,6 +34,16 @@ from .gemini_translate import (_extract_json_array, _prompt_for,
 
 _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# Build 186 (audit fix #4): ONE global budget for the whole model
+# walk. Build 171 cut the per-attempt timeout to 60 s, but four
+# hanging models still stacked 4x60 = 240 s before the chain
+# reached xKiro. Now the walk as a whole gets WALK_BUDGET_S: each
+# attempt's timeout is min(60, what is left of the budget), and
+# when the budget is spent the walk stops and raises, exactly as
+# if every model had failed fast. A healthy first attempt is
+# untouched (full 60 s available, as before).
+WALK_BUDGET_S = 90
+
 
 def _last_winner():
     """The model that produced the most recent successful
@@ -152,10 +162,19 @@ def translate_all(segments, style="subs"):
     last_body = ""
     # Build 171: per-attempt timeout 120s -> 60s — a hung model
     # must cost a minute, not two, before the walk moves on.
+    # Build 186: the whole walk shares WALK_BUDGET_S (see the
+    # constant) — the per-attempt timeout shrinks as the budget
+    # drains, and an exhausted budget ends the walk.
+    deadline = time.monotonic() + WALK_BUDGET_S
     for mdl in _models():
+        left = deadline - time.monotonic()
+        if left <= 2:
+            attempts.append("walk-budget-exhausted")
+            break
         try:
             resp = requests.post(
-                _API_URL, json={**body, "model": mdl}, timeout=60,
+                _API_URL, json={**body, "model": mdl},
+                timeout=max(3, min(60, left)),
                 headers={"Authorization": f"Bearer {key}",
                          "Content-Type": "application/json"})
         except Exception as e:  # network-level: next model shape

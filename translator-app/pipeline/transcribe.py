@@ -59,13 +59,23 @@ def _get_model(model_ref):
     m = _MODEL_CACHE.get(model_ref)
     if m is None:
         from faster_whisper import WhisperModel
+        # Build 186 (speed audit fix #2): num_workers=2 —
+        # ctranslate2's inter_threads follows num_workers, and at
+        # the default 1 the ONE shared model instance executed
+        # essentially one inference at a time, so concurrent jobs'
+        # transcribe() calls queued inside the model (measured:
+        # 2 concurrent jobs stretched ~2x each for ~1.3x total
+        # throughput). Two workers let two transcriptions truly
+        # overlap; model, compute type and every decode setting
+        # are unchanged, so a lone job's segments are identical.
         try:
             # Cache-only first: zero network, no hub metadata round-trip.
             m = WhisperModel(model_ref, device="cpu", compute_type="int8",
-                             local_files_only=True)
+                             num_workers=2, local_files_only=True)
         except Exception:
             # Fresh server: download once, later loads hit the branch above.
-            m = WhisperModel(model_ref, device="cpu", compute_type="int8")
+            m = WhisperModel(model_ref, device="cpu", compute_type="int8",
+                             num_workers=2)
         _MODEL_CACHE[model_ref] = m
     return m
 

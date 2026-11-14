@@ -234,7 +234,10 @@ def _active_worker_count():
 def _enqueue_job(job, kind="main"):
     """Park a job for the dispatcher (build 180). Submissions are
     never refused for concurrency: they wait here, in order, until
-    one of the MAX_CONCURRENT_JOBS worker slots frees up."""
+    one of the MAX_CONCURRENT_JOBS worker slots frees up.
+    Build 186 (audit fix #7): the enqueue instant is stamped so
+    the dispatcher can record how long the job actually waited."""
+    job["enqueued_at"] = time.time()
     _JOB_QUEUE.append((job["id"], kind))
 
 
@@ -1361,6 +1364,19 @@ def _job_dispatcher():
                     _cancelled(job)
                     continue
                 job["worker_started"] = True
+                # Build 186 (audit fix #7): record the queue wait
+                # in the job's timings — phase_s used to start at
+                # the download step, so a job that waited minutes
+                # for a slot looked "fast" in every report.
+                try:
+                    waited = round(
+                        time.time() - float(job.get("enqueued_at")
+                                            or job.get("created_at")
+                                            or time.time()), 1)
+                    job["queue_wait_s"] = waited
+                    job.setdefault("phase_s", {})["queue_wait"] = waited
+                except Exception:
+                    pass
                 if jid in _TG_PENDING:
                     _TG_PENDING.remove(jid)
                 target = _worker2 if kind == "rerun" else _worker
@@ -1517,8 +1533,61 @@ def _enforce_done_cap(job):
             _cleanup_job(old["id"])
 
 
+def _small_copy_async(job):
+    """Build 186 (audit fix #1): the compact download copy is made
+    AFTER the job has flipped to done, in this background thread.
+    Build 179 ran the whole extra 480p encode synchronously inside
+    _finish, so every customer waited out a second full encode
+    before the done state (and its download button) appeared. The
+    encode itself (_ensure_small_copy) is unchanged; when it
+    lands, the job gains job["small"] and the done state's
+    fast-download button appears on the page's normal refresh
+    (the page also keeps polling briefly while small_pending is
+    set). Telegram delivery is unaffected — it never read the
+    small copy: it shrinks its own output_tg.mp4, or sends the
+    full file over the local Bot API (build 184). The encode's
+    seconds are recorded in the job's timings (audit fix #7), and
+    small_pending always clears — even on failure — so neither
+    the UI nor a timing report waits on a copy that never comes."""
+    t0 = time.time()
+    try:
+        _ensure_small_copy(job)
+    except Exception:
+        pass
+    try:
+        secs = round(time.time() - t0, 1)
+        job["small_copy_s"] = secs
+        job.setdefault("phase_s", {})["small_copy"] = secs
+    except Exception:
+        pass
+    job["small_pending"] = False
+    # Guarded save: the job dir may have been reaped meanwhile
+    # (retention / newest-2 cap) — never resurrect a deleted job
+    # by recreating its folder around a lone job.json.
+    try:
+        if (JOBS_DIR / job["id"]).exists() \
+                and JOBS.get(job["id"]) is job:
+            _save(job)
+    except Exception:
+        pass
+
+
 def _finish(job):
-    _ensure_small_copy(job)
+    # Build 186 (audit fix #1): the small copy moved OFF this
+    # path (see _small_copy_async) — _finish now only settles the
+    # charge and flips the job to done. Any small copy left from
+    # a previous render of this job is stale for the new output,
+    # so its metadata is dropped here, synchronously; the fresh
+    # copy replaces the file itself when the background encode
+    # lands.
+    job.pop("small", None)
+    _out = JOBS_DIR / job["id"] / "output.mp4"
+    try:
+        if _out.exists():
+            job["output_size"] = _out.stat().st_size
+    except Exception:
+        pass
+    job["small_pending"] = True
     _charge_for_job(job)
     job["charge_settled"] = True
     job["status"] = "done"
@@ -1528,6 +1597,8 @@ def _finish(job):
     _save(job)
     _enforce_done_cap(job)
     _tg_deliver_async(job)
+    threading.Thread(target=_small_copy_async, args=(job,),
+                     daemon=True).start()
 
 
 def _cancelled(job):

@@ -28,13 +28,15 @@ returned correct Burmese. On a normal residential IP, provider 1 usually works.
 CLI: python -m pipeline.translate_segments <workdir>
 Reads segments_en.json, writes segments_my.json + subs_my.srt (original timings).
 """
+import json
 import random
 import re
 import sys
 import time
 from pathlib import Path
 
-from .common import ensure_system_ca, load_segments, save_segments, write_srt
+from .common import (PROJECT_ROOT, ensure_system_ca, load_segments,
+                     save_segments, write_srt)
 
 
 def _with_timeout(fn, text, timeout=45):
@@ -302,6 +304,52 @@ def translate_one(text):
     return _Chain().one(text)
 
 
+# How long a translate probe verdict stays trustworthy (seconds) —
+# the same 6 h the app itself uses before re-probing
+# (app.py _translate_probe_maybe).
+_PROBE_FRESH_S = 21600
+
+
+def _probe_blocked(engine):
+    """Build 186 (audit fix #4): True when the app's most recent
+    translate probe (.translate_probe.json, refreshed by app.py
+    at most every 6 h) found this engine REGION-BLOCKED from this
+    server and the verdict is still fresh.
+
+    Direct Gemini is location-blocked and direct OpenAI is
+    territory-blocked from the VPS (builds 164/168). Their
+    failures are fast today, but on a hanging day the Gemini walk
+    alone could stack 6 model/version shapes x 120 s ahead of
+    the working gateways. While the probe's region-block verdict
+    is fresh, jobs skip the attempt entirely; the probe itself
+    calls the engines directly (not through here), so the day
+    the region changes the probe notices and the skip lifts on
+    its own. Only a region-block SIGNATURE skips — a plain
+    failure (quota, catalog, network) never does, and a stale or
+    missing probe never does."""
+    try:
+        data = json.loads((PROJECT_ROOT / ".translate_probe.json")
+                          .read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    ts = float(data.get("ts") or 0)
+    if not ts or time.time() - ts > _PROBE_FRESH_S:
+        return False
+    if engine == "gemini":
+        if data.get("gemini_ok"):
+            return False
+        blob = ((data.get("gemini_err") or "") + " "
+                + (data.get("gemini_models_err") or ""))
+        return "not supported" in blob or "FAILED_PRECONDITION" in blob
+    if engine == "openai":
+        if data.get("openai_ok"):
+            return False
+        blob = data.get("openai_err") or ""
+        return ("unsupported_country_region_territory" in blob
+                or "territory not supported" in blob)
+    return False
+
+
 def _fill_missing(out, report=None):
     """No silent gaps (owner complaint 2026-11-09: subtitle lines
     missing from the finished video). Batch endpoints — Gemini
@@ -455,10 +503,15 @@ def translate_segments(workdir, style="subs"):
     # of failing first on every job; the block stays for the day
     # the server region changes. Any failure falls through to
     # OpenAI, with the error kept in the report for diagnosis.
+    # Build 186: while the app probe's region-block verdict is
+    # fresh, the attempt is skipped outright (see _probe_blocked).
+    if segs and _probe_blocked("gemini"):
+        report["gemini_skipped"] = "region-blocked (fresh probe)"
     if segs:
         try:
             from . import gemini_translate
-            if gemini_translate.key_configured():
+            if gemini_translate.key_configured() \
+                    and not _probe_blocked("gemini"):
                 by_idx = gemini_translate.translate_all(segs, style=style)
                 out = [{**seg, "text_my": by_idx[i], "provider": "gemini"}
                        for i, seg in enumerate(segs)]
@@ -473,11 +526,15 @@ def translate_segments(workdir, style="subs"):
     # Direct OpenAI is region-blocked from the VPS (403
     # unsupported territory), so since build 168 it sits behind
     # the working gateways like Gemini. Any failure falls through
-    # to Apps Script.
+    # to Apps Script. Build 186: skipped while the probe's
+    # region-block verdict is fresh, like Gemini above.
+    if segs and _probe_blocked("openai"):
+        report["openai_skipped"] = "region-blocked (fresh probe)"
     if segs:
         try:
             from . import openai_translate
-            if openai_translate.key_configured():
+            if openai_translate.key_configured() \
+                    and not _probe_blocked("openai"):
                 by_idx = openai_translate.translate_all(segs, style=style)
                 out = [{**seg, "text_my": by_idx[i], "provider": "openai"}
                        for i, seg in enumerate(segs)]

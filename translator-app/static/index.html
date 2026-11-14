@@ -981,6 +981,12 @@ $("bulkGo").onclick = async () => {
 
 function mbOf(n) { return n ? (n / 1e6).toFixed(1) + " MB" : ""; }
 
+// Build 186: while a done job's compact copy is still encoding
+// server-side, poll() keeps the interval alive (bounded) so the
+// fast-download button can appear without reopening the job.
+let doneKey = "";
+let smallPolls = 0;
+
 async function poll(id) {
   const job = await (await fetch("/api/jobs/" + id)).json();
   if (!job.steps) {  // deleted/unknown — forget it and stop
@@ -1004,7 +1010,18 @@ async function poll(id) {
       `<div class="step ${s.state}">${ICON[s.state] || "⏳"} ${s.label}</div>`).join("");
   if (job.status === "waiting_review" && reviewShownFor !== id) loadReview(id);
   if (job.status === "done") {
-    clearInterval(timer); $("go").disabled = false;
+    // Build 186: the compact copy is encoded AFTER the done flip
+    // now — while the server reports small_pending, keep polling
+    // (at most ~90 s) so its button swaps in by itself when the
+    // copy lands; otherwise stop exactly as before. The preview
+    // load + scroll are one-shot per finished job, so the extra
+    // polls never reload the player or yank the page.
+    const dkey = id + "@" + (job.finished_at || 0);
+    const firstDone = doneKey !== dkey;
+    if (firstDone) { doneKey = dkey; smallPolls = 0; }
+    if (job.small_pending && smallPolls < 45) smallPolls++;
+    else clearInterval(timer);
+    $("go").disabled = false;
     currentJobId = id;
     // Build 179: the main button serves the compact copy (several
     // times smaller → downloads fast); the full master is the
@@ -1029,8 +1046,11 @@ async function poll(id) {
     $("dl").style.display = "block";
     $("dlHint").style.display = "block";
     fillDl("jobDl", id); $("jobDl").style.display = "flex";
-    $("preview").src = "/api/jobs/" + id + "/stream"; $("preview").style.display = "block";
-    try { $("preview").scrollIntoView({behavior: "smooth", block: "center"}); } catch (e) {}
+    if (firstDone) {
+      $("preview").src = "/api/jobs/" + id + "/stream";
+      try { $("preview").scrollIntoView({behavior: "smooth", block: "center"}); } catch (e) {}
+    }
+    $("preview").style.display = "block";
     $("cleanupNote").style.display = "block"; $("doneBtns").style.display = "flex";
   } else if (job.status === "error" || job.status === "cancelled") {
     clearInterval(timer); $("go").disabled = false;
@@ -2036,6 +2056,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 185</p>
+<p class="hint" id="buildTag" style="text-align:center">build 186</p>
 </body>
 </html>
