@@ -648,6 +648,25 @@ def _daily_limit_message(user):
     return None
 
 
+def _setup_gate_message(user):
+    """Build 187: None when this account may start jobs, else the
+    polite Burmese refusal. A Google-born account must finish the
+    one-time username+password setup first. The check lives at JOB
+    START — web create and the bot flow's final step both call it,
+    next to the daily-limit check — so every submission route
+    inherits it and a refusal always lands before any charge.
+    Admins are never gated (ensure_admin also clears the flag at
+    promotion, so the owner cannot be locked out either way)."""
+    if not user or user.get("role") == "admin":
+        return None
+    if user.get("needs_setup"):
+        return ("📝 account ပြင်ဆင်ရန် လိုပါသေးတယ် — Google နဲ့ "
+                "ဝင်ထားတာမို့ username နဲ့ password တစ်ခါ "
+                "သတ်မှတ်ပေးပါ (ခဏလေးပဲ ကြာပါတယ်)၊ ပြီးမှ video "
+                "ထုတ်လို့ရပါမယ် 🙏")
+    return None
+
+
 def _may_submit(chat_id):
     from pipeline import telegram_send as tg
     if tg.is_admin(chat_id):
@@ -1057,6 +1076,16 @@ def _tg_start_flow_job(chat_id, flow):
             tg.send_message(chat_id, "🙏 video ထုတ်ဖို့ အရင် 👤 Username ချိတ်ပေးပါ "
                                      "(အောက်က Menu ထဲက) — account "
                                      "ချိတ်ပြီးမှ ထုတ်လို့ရပါမယ်" + _LINK_HINT)
+            return
+        # Build 187: one-time setup gate — linking a chat is fine
+        # before setup, but a Google-born account that never
+        # finished setup on the web cannot start bot jobs either
+        # (the same central job-start rule as the web route).
+        setup_msg = _setup_gate_message(acct)
+        if setup_msg:
+            _TG_FLOW.pop(chat_id, None)
+            tg.send_message(chat_id, setup_msg +
+                            " web page ထဲမှာ ဝင်ပြီး ပြင်ပေးပါ 🙏")
             return
         need = flow.get("minutes") or 1
         if (acct["credits"] or 0) < need:
@@ -2692,6 +2721,27 @@ def auth_change_password():
     return _set_session(resp, accounts.new_session(user["id"]))
 
 
+@app.post("/api/auth/setup")
+def auth_setup():
+    """Build 187: complete the one-time username+password setup
+    for a Google-born account. Idempotent by design — an account
+    that never needed setup, or already finished it, gets a clean
+    already-response and can NOT be renamed through here. The
+    session is deliberately untouched: completing setup must not
+    log the user out of the device they are setting up on."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    res = accounts.complete_setup(user["id"], data.get("username"),
+                                  data.get("password"))
+    if res["error"]:
+        return jsonify({"error": res["error"]}), 400
+    if res["already"]:
+        return jsonify({"user": res["user"], "already": True})
+    return jsonify({"user": res["user"]})
+
+
 @app.post("/api/admin/claim")
 def admin_claim():
     """One-shot bootstrap: the signed-in account becomes admin, but
@@ -3186,6 +3236,12 @@ def create_job():
         return jsonify({"error": err}), 400
     me = _current_user()
     if me:
+        # Build 187: one-time setup gate — refused before the job
+        # exists (and before has_job is marked), like the daily
+        # limit below.
+        setup_msg = _setup_gate_message(me)
+        if setup_msg:
+            return jsonify({"error": setup_msg}), 400
         job["user_id"] = me["id"]
         accounts.mark_has_job(me["id"])
         # Daily limit (build 180): refused HERE, before the job —

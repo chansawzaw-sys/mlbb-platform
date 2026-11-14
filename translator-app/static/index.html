@@ -166,6 +166,17 @@
     </div>
   </div>
 
+  <div class="card" id="setupCard">
+    <h3 style="margin-top:0">📝 အကောင့် ပြင်ဆင်ပေးပါ</h3>
+    <p class="hint">Google နဲ့ ဝင်ထားတဲ့ အကောင့် အသစ် မို့လို့ username နဲ့ password တစ်ခါ သတ်မှတ်ပေးပါ — နောက်ပိုင်း ဒီ username / password နဲ့လည်း ဝင်နိုင်ပြီး၊ Telegram ချိတ်ရာမှာလည်း ဒီ username ကို သုံးပါမယ်။ ပြီးမှ video ထုတ်လို့ရပါမယ်။</p>
+    <input id="setupUser" placeholder="username (အင်္ဂလိပ်/ဂဏန်း/./_ · ၃–၂၄ လုံး)" autocomplete="username" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-bottom:8px">
+    <input type="password" id="setupPass" placeholder="password အသစ် (အနည်းဆုံး ၆ လုံး)" autocomplete="new-password" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+    <div class="row">
+      <button class="ghost" id="setupBtn">✅ သတ်မှတ်မယ်</button>
+    </div>
+    <p class="err" id="setupErr"></p>
+  </div>
+
   <div class="card" id="adminCard">
     <h3 style="margin-top:0">🛠 Admin — လူ ရှာရန်</h3>
     <input id="adminQ" placeholder="username ရိုက်ရှာပါ (အနည်းဆုံး ၂ လုံး)" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
@@ -1760,6 +1771,20 @@ async function loadMe() {
     GOOGLE_CID = r.google_client_id || null;
     $("authOut").style.display = ME ? "none" : "";
     $("authIn").style.display = ME ? "" : "none";
+    // Build 187: a Google-born account that still owes its
+    // one-time setup gets the setup card and the wizard + job
+    // list tuck away until it is done (job start is refused
+    // server-side too — this just keeps the page honest). The
+    // flag is server-side, so a reload mid-setup lands right
+    // back here.
+    const needSetup = !!(ME && ME.needs_setup && ME.role !== "admin");
+    $("setupCard").classList.toggle("show", needSetup);
+    if (ME) {
+      $("wizCard").classList.toggle("show", !needSetup);
+      $("jobsCard").classList.toggle("show", !needSetup);
+      if (needSetup && !$("setupUser").value)
+        $("setupUser").value = ME.username || "";
+    }
     $("adminCard").classList.toggle("show", !!(ME && ME.role === "admin"));
     if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); loadWall(); loadDailyLimit(); renderEngineStats(); loadAllSettings(); }
     if (ME && ME.role !== "admin") {
@@ -1826,6 +1851,17 @@ async function authPost(path) {
   $("authErr").textContent = "";
   loadMe();
 }
+$("setupBtn").addEventListener("click", async () => {
+  const res = await fetch("/api/auth/setup", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({username: $("setupUser").value,
+                          password: $("setupPass").value})});
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok) { $("setupErr").textContent = d.error || "အမှား"; return; }
+  $("setupErr").textContent = "";
+  $("setupPass").value = "";
+  loadMe();
+});
 $("linkCodeBtn").addEventListener("click", async () => {
   const r = await (await fetch("/api/auth/link-code", {method: "POST"})).json();
   const out = $("linkCodeOut");
@@ -2056,6 +2092,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 186</p>
+<p class="hint" id="buildTag" style="text-align:center">build 187</p>
 </body>
 </html>

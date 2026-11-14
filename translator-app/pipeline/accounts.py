@@ -91,6 +91,13 @@ def _db():
         conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
     if "email" not in cols:
         conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+    # Build 187: Google-born accounts owe a one-time username +
+    # password setup before they may start jobs. Only rows created
+    # by create_google_user ever carry 1; password registrations
+    # and linked accounts keep the default 0 forever.
+    if "needs_setup" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN needs_setup "
+                     "INTEGER DEFAULT 0")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub "
         "ON users(google_sub) WHERE google_sub IS NOT NULL")
@@ -108,6 +115,8 @@ def _public(row):
             "email": row["email"] if "email" in keys else None,
             "google_linked": bool("google_sub" in keys
                                   and row["google_sub"]),
+            "needs_setup": bool("needs_setup" in keys
+                                and row["needs_setup"]),
             "created_at": row["created_at"]}
 
 
@@ -254,7 +263,8 @@ def claim_admin(username, recovery_tg_id=None):
                     or str(me["tg_chat_id"]) != str(recovery_tg_id)):
                 return False
         cur = conn.execute(
-            "UPDATE users SET role = 'admin' WHERE username = ?",
+            "UPDATE users SET role = 'admin', needs_setup = 0 "
+            "WHERE username = ?",
             (username,))
         return cur.rowcount == 1
 
@@ -389,14 +399,18 @@ def _google_username(email):
 
 def create_google_user(sub, email):
     """First Google sign-in for an unseen sub: a new account whose
-    password is a random secret nobody knows (Google-only until the
-    user sets one via change-password while signed in). Credits and
-    ledger start empty, exactly like a fresh registration."""
+    password is a random secret nobody knows and whose username is
+    auto-derived from the email — BOTH are temporary (build 187):
+    the row is stamped needs_setup=1 and the user picks their real
+    username + password on the one-time setup screen before they
+    can start any job. Credits and ledger start empty, exactly
+    like a fresh registration."""
     username = _google_username(email)
     with _LOCK, _db() as conn:
         cur = conn.execute(
             "INSERT INTO users (username, pass_hash, created_at, "
-            "google_sub, email, last_login) VALUES (?, ?, ?, ?, ?, ?)",
+            "google_sub, email, last_login, needs_setup) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1)",
             (username, generate_password_hash(secrets.token_urlsafe(48)),
              time.time(), str(sub), email, time.time()))
         row = conn.execute("SELECT * FROM users WHERE id = ?",
@@ -424,10 +438,71 @@ def link_google(user_id, sub, email):
 def ensure_admin(user_id):
     """Promote an account to admin. Called ONLY from the Google
     sign-in path after a verified token for the fixed owner email
-    (build 180 amendment) — no other caller may exist."""
+    (build 180 amendment) — no other caller may exist.
+
+    Build 187: promotion also CLEARS needs_setup. The owner's
+    Google-born row is created with the flag like any other; if
+    the job-start gate ever looked at it before this promotion,
+    the owner could be held at a customer setup screen. Clearing
+    it here (plus the gate's admin exemption) makes that
+    impossible."""
     with _LOCK, _db() as conn:
-        conn.execute("UPDATE users SET role = 'admin' WHERE id = ?",
-                     (int(user_id),))
+        conn.execute("UPDATE users SET role = 'admin', needs_setup = 0 "
+                     "WHERE id = ?", (int(user_id),))
+
+
+def complete_setup(user_id, username, password):
+    """One-time username+password setup for a Google-born account
+    (build 187). Returns {"user", "already", "error"} — exactly
+    one outcome: success (user), a clean no-op when the account
+    never needed or already finished setup (already — a rename
+    after setup is NOT possible through here), or a Burmese
+    validation error the user can fix and retry.
+
+    Username rules are registration's: same regex, unique
+    case-insensitively. Keeping the account's OWN auto-derived
+    name is allowed — the uniqueness check excludes this row, and
+    picking a new name simply replaces the temporary one in the
+    same UPDATE, releasing it. The password hash is written
+    directly, NOT via set_password: setup must not revoke the
+    session the user is completing it from."""
+    username = (username or "").strip()
+    if not _USERNAME_RE.match(username):
+        return {"user": None, "already": False,
+                "error": "username ၃–၂၄ လုံး, အင်္ဂလိပ်/ဂဏန်း/./_ ပဲ ရပါတယ်"}
+    if not password or len(password) < 6:
+        return {"user": None, "already": False,
+                "error": "password အနည်းဆုံး ၆ လုံး ထားပါ"}
+    with _LOCK, _db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?",
+                           (int(user_id),)).fetchone()
+        if row is None:
+            return {"user": None, "already": False,
+                    "error": "account မတွေ့ပါ"}
+        if not row["needs_setup"]:
+            return {"user": _public(row), "already": True,
+                    "error": None}
+        taken = conn.execute(
+            "SELECT 1 FROM users WHERE username = ? AND id != ?",
+            (username, int(user_id))).fetchone()
+        if taken:
+            return {"user": None, "already": False,
+                    "error": "ဒီ username ယူပြီးသား ဖြစ်နေပါတယ်"}
+        cur = conn.execute(
+            "UPDATE users SET username = ?, pass_hash = ?, "
+            "needs_setup = 0 WHERE id = ? AND needs_setup = 1",
+            (username, generate_password_hash(password),
+             int(user_id)))
+        if cur.rowcount != 1:
+            # A parallel setup submit won the race; this call is
+            # now the no-op second call.
+            row = conn.execute("SELECT * FROM users WHERE id = ?",
+                               (int(user_id),)).fetchone()
+            return {"user": _public(row), "already": True,
+                    "error": None}
+        row = conn.execute("SELECT * FROM users WHERE id = ?",
+                           (int(user_id),)).fetchone()
+    return {"user": _public(row), "already": False, "error": None}
 
 
 def touch_login(user_id):
