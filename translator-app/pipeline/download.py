@@ -326,9 +326,165 @@ def _stream_to_source(play, workdir, headers):
     return out
 
 
+_GEAR_H_RE = re.compile(r"_(\d{3,4})(?:_|$)")
+
+
+def _page_video_candidates(html):
+    """Playable renditions in a TikTok video page's hydration
+    payload (build 173): [(url, bitrate_or_None, height_or_None)],
+    best first, plus a meta dict (title/duration/uploader).
+
+    Primary source is the structured JSON in
+    __UNIVERSAL_DATA_FOR_REHYDRATION__ -> webapp.video-detail ->
+    itemStruct.video: bitrateInfo entries (their PlayAddr
+    UrlLists, tagged with Bitrate and a height from PlayAddr or
+    the GearName), then the plain playAddr, and downloadAddr
+    LAST — it is the watermarked official download rendition.
+    When the JSON is absent or scrubbed (some videos answer with
+    metadata but empty playAddr/bitrateInfo), the _embed_candidates
+    text scan gets a turn at the same HTML, restricted to
+    video-shaped URLs so a cover/music UrlList on the fat page
+    can never pose as the video."""
+    txt = html or ""
+    cands, meta = [], {}
+    m = re.search(
+        r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>'
+        r'(.*?)</script>', txt, re.S)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            det = (data.get("__DEFAULT_SCOPE__") or {}).get(
+                "webapp.video-detail") or {}
+            vs = (det.get("itemInfo") or {}).get("itemStruct") or {}
+            v = vs.get("video") or {}
+            seen = set()
+
+            def _add(u, br=None, h=None):
+                if u and u.startswith("http") and u not in seen:
+                    seen.add(u)
+                    cands.append((u, br, h))
+
+            for e in v.get("bitrateInfo") or []:
+                pa = e.get("PlayAddr") or {}
+                h = pa.get("Height")
+                if not h:
+                    gm = _GEAR_H_RE.search(e.get("GearName") or "")
+                    h = int(gm.group(1)) if gm else None
+                for u in pa.get("UrlList") or []:
+                    _add(str(u).replace("\\u002F", "/"),
+                         e.get("Bitrate"), h)
+            _add((v.get("playAddr") or "").replace("\\u002F", "/"))
+            author = vs.get("author") or {}
+            meta = {"title": vs.get("desc"),
+                    "duration": v.get("duration"),
+                    "uploader": author.get("nickname")
+                    or author.get("uniqueId")}
+            dl = (v.get("downloadAddr") or "").replace("\\u002F", "/")
+            if dl and all(dl != u for u, _, _ in cands):
+                cands.append((dl, None, None))
+        except Exception:
+            cands, meta = [], {}
+    if not cands:
+        for u, br in _embed_candidates(txt):
+            if "/video/" in u or "mime_type=video" in u:
+                cands.append((u, br, None))
+    return cands, meta
+
+
+def _rank_page_renditions(cands, quality):
+    """Order _page_video_candidates for trying (build 173),
+    best first, mirroring _pick_rendition's contract: hd takes
+    the highest bitrate on offer; 720/480 take the best
+    rendition at or under the target height when heights are
+    known (the next height up when none fit), else the lightest
+    bitrate. The full order matters: bitrateInfo UrlList entries
+    are mirrors of each other and a given edge can refuse a
+    signed URL (403) while its sibling serves it, so the route
+    walks this list until one streams."""
+    if not cands:
+        return []
+    if quality == "hd":
+        tagged = sorted(((u, b) for u, b, _ in cands if b),
+                        key=lambda t: -t[1])
+        untagged = [u for u, b, _ in cands if not b]
+        return [u for u, _ in tagged] + untagged
+    target = 720 if quality == "720" else 480
+    with_h = [(u, b, h) for u, b, h in cands if h]
+    if with_h:
+        under = sorted((t for t in with_h if t[2] <= target),
+                       key=lambda t: -(t[1] or 0))
+        over = sorted((t for t in with_h if t[2] > target),
+                      key=lambda t: (t[2], -(t[1] or 0)))
+        rest = [u for u, _, h in cands if not h]
+        return [u for u, _, _ in under + over] + rest
+    tagged = sorted(((u, b) for u, b, _ in cands if b),
+                    key=lambda t: t[1])
+    untagged = [u for u, b, _ in cands if not b]
+    return [u for u, _ in tagged] + untagged
+
+
+def _tiktok_page_fallback(url: str, workdir: Path,
+                          quality: str = "hd") -> dict:
+    """TikTok route 2 (build 173): TikTok's own video page,
+    fetched with a browser-impersonating client (curl-cffi) and
+    parsed for its hydration payload.
+
+    The resolver (route 1) is a third party: when it rate-limits,
+    changes shape or cannot parse, every TikTok job used to die
+    even though the video page itself still carries the playable
+    addresses — verified in the sandbox 2026-11-14, where a
+    control video's page yielded 4 bitrateInfo renditions and a
+    full, ffprobe-clean download. The fetch MUST be impersonated:
+    the same page via plain requests is a ~9 KB shell with the
+    payload stripped (that is all route 3's embed surface ever
+    sees from a datacenter IP). Some videos answer the page with
+    metadata but EMPTY playAddr/bitrateInfo (the owner's
+    @xstvscenestories link does from the test egress) — those
+    still raise here and fall through, exactly like route 1.
+    One retry under a second impersonation profile; timeouts
+    stay tight so a gated page costs seconds, not minutes."""
+    from curl_cffi import requests as creq
+    headers = {"Referer": "https://www.tiktok.com/"}
+    html = None
+    last_exc = None
+    for imp in ("chrome", "safari"):
+        try:
+            r = creq.get(url, impersonate=imp, headers=headers,
+                         timeout=20)
+            r.raise_for_status()
+            html = r.text or ""
+            break
+        except Exception as e:
+            last_exc = e
+    if html is None:
+        raise last_exc if last_exc is not None else RuntimeError(
+            "page route: fetch failed")
+    cands, meta = _page_video_candidates(html)
+    if not cands:
+        raise RuntimeError("video page carried no playable video URL")
+    ranked = _rank_page_renditions(cands, quality)
+    dl_headers = {"User-Agent": _DESKTOP_UA,
+                  "Referer": "https://www.tiktok.com/"}
+    last_exc = None
+    for play in ranked[:6]:
+        try:
+            _stream_to_source(play, workdir, dl_headers)
+            break
+        except Exception as e:
+            last_exc = e
+    else:
+        raise last_exc if last_exc is not None else RuntimeError(
+            "page route: every rendition refused the download")
+    return {"title": meta.get("title"),
+            "duration": meta.get("duration"),
+            "webpage_url": url,
+            "uploader": meta.get("uploader"),
+            "rendition": "page"}
+
+
 def _tiktok_embed_fallback(url: str, workdir: Path,
                            quality: str = "hd") -> dict:
-    """TikTok route 2 (build 168): TikTok's own embed page.
+    """TikTok route 3 (build 168): TikTok's own embed page.
 
     Some valid public videos are unparseable by the tikwm
     resolver — it answers code -1 for them on every URL shape
@@ -561,7 +717,17 @@ def download(url: str, workdir: Path, quality: str = "hd") -> Path:
         except Exception as e:
             first_err = e
     if info is None and "tiktok" in urlparse(url).netloc:
-        # Build 168, TikTok route 2: the embed page (see
+        # Build 173, TikTok route 2: the video page itself,
+        # impersonated + parsed (see _tiktok_page_fallback). It
+        # does not depend on the third-party resolver at all, so
+        # a resolver outage no longer kills every TikTok job.
+        try:
+            info = _tiktok_page_fallback(url, workdir, quality)
+        except Exception as e:
+            if first_err is None:
+                first_err = e
+    if info is None and "tiktok" in urlparse(url).netloc:
+        # Build 168, TikTok route 3: the embed page (see
         # _tiktok_embed_fallback) catches videos the resolver
         # cannot parse at all; the ladder below stays as backup.
         try:
