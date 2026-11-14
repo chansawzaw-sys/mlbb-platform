@@ -40,6 +40,27 @@ MAX_SPEED = 1.30
 MIN_VSLOW = 0.80   # legacy stat only; the plan no longer floors at it
 MAX_VFAST = 1.6    # fastest the picture may play for a short dub
 
+# Single-pass graph thresholds (build 183 canary). Up to
+# MERGE_MAX_CHUNKS chunks the single-pass trim/concat graph is the
+# long-standing default (build 182 merged encode included). Between
+# there and CANARY_MAX_CHUNKS the same graph runs as a CANARY: a
+# bounded timeout (see _canary_timeout) cuts a graph stall short
+# and the classic chunked path — linear, bounded-memory — takes
+# over, so the worst case costs the timeout, never the open-ended
+# 19+ minute stall a ~40-chunk graph once caused in production.
+MERGE_MAX_CHUNKS = 12
+CANARY_MAX_CHUNKS = 40
+
+
+def _canary_timeout(total_dur):
+    """Wall-clock budget (seconds) for a canary single-pass encode:
+    4x the source duration, floored at 240 s (a short clip on a
+    busy 4-job server still gets room) and capped at 1200 s (a
+    genuine stall is rescued in minutes, not tens of minutes).
+    The classic <=MERGE_MAX_CHUNKS paths keep their historical
+    1800 s budget untouched."""
+    return int(max(240, min(1200, 4 * float(total_dur or 0))))
+
 
 def _plan(segs, total_dur, max_speed=MAX_SPEED):
     """Build chunk list covering [0, total_dur]: gaps and speech segments."""
@@ -156,23 +177,27 @@ def _video_graph(chunks):
     return filters, "[outv]"
 
 
-def _video_single_pass(src, chunks, out, cap_k=2500):
+def _video_single_pass(src, chunks, out, cap_k=2500, timeout=1800):
     """All chunks in ONE ffmpeg decode+encode (a trim/concat filter
     graph). ONLY safe for a FEW chunks: with many trim branches on one
     input, ffmpeg buffers frames for the latest branch while earlier
     ones process, which balloons memory and time (a ~40-chunk graph
     stalled a production job in this step for 19+ minutes). The
-    chunked path below is linear and is the default for real jobs."""
+    chunked path below is linear and is the default for real jobs.
+    Build 183: 13..CANARY_MAX_CHUNKS chunks may attempt this graph
+    as a canary when the caller passes a bounded `timeout` — a
+    subprocess timeout raises here and the caller falls back to
+    the chunked path, exactly like any other encode failure."""
     filters, _label = _video_graph(chunks)
     mr = target_maxrate_k(src, cap_k)
     run(["ffmpeg", "-y", "-v", "error", "-i", str(src),
          "-filter_complex", ";".join(filters), "-map", "[outv]",
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
          "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k", str(out)],
-        timeout=1800)
+        timeout=timeout)
 
 
-def _video_merged(src, chunks, dub_wav, spec, cap_k=2500):
+def _video_merged(src, chunks, dub_wav, spec, cap_k=2500, timeout=1800):
     """Build 182 merged encode: the retime graph and the finalize
     graph (fx chain and/or subtitle burn, built by the caller in
     `spec`) run in ONE ffmpeg invocation, and the dub audio is muxed
@@ -195,7 +220,7 @@ def _video_merged(src, chunks, dub_wav, spec, cap_k=2500):
             "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
             "-c:a", "aac", "-b:a", "96k", "-shortest",
             str(spec["output"])]
-    run(cmd, timeout=1800)
+    run(cmd, timeout=timeout)
 
 
 def _video_chunked(src, chunks, cdir, out, cap_k=2500):
@@ -226,12 +251,21 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None):
     that supplies the finalize graph (fx/subtitle burn) so it can be
     appended to the single-pass retime graph and encoded ONCE into
     the final output. Consulted only when the video path is the
-    single-pass one (few chunks, not passthrough); the plan then
+    single-pass one (not passthrough); the plan then
     carries final_merged=True + final_output, and retimed.mp4 is not
     written (nothing outside run_job's classic finalize reads it).
     Spec-BUILDING errors propagate (the classic burn fails loudly the
     same way, e.g. a missing Myanmar font); a failed merged ENCODE
-    falls back to the classic two-encode flow below."""
+    falls back to the classic two-encode flow below.
+
+    Build 183 canary: the single-pass family (merged encode, or the
+    plain single-pass graph for dub-without-fx) is attempted up to
+    CANARY_MAX_CHUNKS chunks; beyond MERGE_MAX_CHUNKS the attempt
+    runs under _canary_timeout and any failure lands on the classic
+    chunked path. Which path produced the video is recorded in
+    plan["video_path"] (passthrough / merged / merged_canary /
+    single_pass / single_pass_canary / chunked), persisted to
+    retime_plan.json with the rest of the plan."""
     workdir = Path(workdir)
     src = workdir / "source.mp4"
     segs = load_segments(workdir / "segments_my.json")
@@ -313,23 +347,46 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None):
             "video_passthrough": passthrough, "max_speed": max_speed}
 
     merged = False
+    canary_failed = False
+    n_chunks = len(chunks)
     if passthrough:
+        plan["video_path"] = "passthrough"
         run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-i", str(dub_wav),
              "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
              "-shortest", str(workdir / "retimed.mp4")], timeout=1200)
     else:
         spec = None
-        if make_finalize is not None and len(chunks) <= 12:
+        if make_finalize is not None and n_chunks <= CANARY_MAX_CHUNKS:
             # Built OUTSIDE the try: a spec error (missing font, bad
             # fx) must fail the job loudly, exactly as the classic
             # finalize would — only an encode failure falls back.
+            # Build 183: the spec is now also built in the canary
+            # range (13..CANARY_MAX_CHUNKS chunks); the merged
+            # encode there runs under _canary_timeout instead of
+            # the classic 1800 s budget.
             spec = make_finalize(plan)
         if spec is not None:
+            canary = n_chunks > MERGE_MAX_CHUNKS
+            budget = _canary_timeout(total) if canary else 1800
+            if canary:
+                plan["merge_timeout_s"] = budget
             try:
-                _video_merged(src, chunks, dub_wav, spec, cap_k)
+                _video_merged(src, chunks, dub_wav, spec, cap_k,
+                              timeout=budget)
                 merged = True
+                plan["video_path"] = "merged_canary" if canary \
+                    else "merged"
             except Exception:
                 merged = False
+                canary_failed = canary
+                # A timed-out/failed merged encode may leave a
+                # partial file at the final path — remove it so it
+                # can never pose as the finished video; the classic
+                # flow below rewrites that path from scratch anyway.
+                try:
+                    Path(spec["output"]).unlink(missing_ok=True)
+                except Exception:
+                    pass
         if merged:
             plan["final_merged"] = True
             plan["final_output"] = str(spec["output"])
@@ -337,14 +394,32 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None):
             retimed_video = workdir / "retimed_video.mp4"
             # Single-pass only for a handful of chunks (see its docstring:
             # many-branch trim graphs stall); the chunked path is linear
-            # in the chunk count and bounded in memory.
-            if len(chunks) <= 12:
+            # in the chunk count and bounded in memory. Build 183
+            # canary: in the 13..CANARY_MAX_CHUNKS range the graph
+            # gets ONE bounded attempt when no merged encode was
+            # tried (dub without fx) — a canary MERGED failure goes
+            # straight to chunked, since the same graph just failed.
+            if n_chunks <= MERGE_MAX_CHUNKS:
                 try:
                     _video_single_pass(src, chunks, retimed_video, cap_k)
+                    plan["video_path"] = "single_pass"
                 except Exception:
                     _video_chunked(src, chunks, cdir, retimed_video, cap_k)
+                    plan["video_path"] = "chunked"
+            elif spec is None and not canary_failed \
+                    and n_chunks <= CANARY_MAX_CHUNKS:
+                budget = _canary_timeout(total)
+                plan["merge_timeout_s"] = budget
+                try:
+                    _video_single_pass(src, chunks, retimed_video, cap_k,
+                                       timeout=budget)
+                    plan["video_path"] = "single_pass_canary"
+                except Exception:
+                    _video_chunked(src, chunks, cdir, retimed_video, cap_k)
+                    plan["video_path"] = "chunked"
             else:
                 _video_chunked(src, chunks, cdir, retimed_video, cap_k)
+                plan["video_path"] = "chunked"
             run(["ffmpeg", "-y", "-v", "error", "-i", str(retimed_video), "-i", str(dub_wav),
                  "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k", "-shortest",
                  str(workdir / "retimed.mp4")], timeout=1200)

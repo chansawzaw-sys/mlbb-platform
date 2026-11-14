@@ -65,8 +65,14 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
     mark = _marks(progress)
 
     mark("download", "running")
-    if source_path and Path(source_path).exists():
-        # preview was already downloaded by /api/preview — reuse that file
+    if source_path and Path(source_path).exists() \
+            and Path(source_path).stat().st_size > 50_000:
+        # preview was already downloaded by /api/preview — reuse that file.
+        # The size gate (build 183) mirrors app.py's _src_valid floor:
+        # if the cached preview vanished or was truncated after the
+        # job was created (audit A5 — another job's cleanup can remove
+        # the shared preview dir), fall back to a normal download
+        # instead of copying a stub into the job.
         src = workdir / "source.mp4"
         shutil.copyfile(source_path, src)
     else:

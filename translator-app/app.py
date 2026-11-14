@@ -1075,11 +1075,15 @@ def _tg_start_flow_job(chat_id, flow):
         # An uploaded file IS the source — no download quality
         # applies, always reuse it.
         job["source_path"] = flow.get("src")
-    elif flow.get("src") and _preview_quality(
-            Path(flow["src"]).parent) == job["quality"]:
+    elif flow.get("src") and _src_valid(Path(flow["src"])) \
+            and _preview_quality(
+                Path(flow["src"]).parent) == job["quality"]:
         # Build 167: the prepare download doubles as the job's
         # source only when it was fetched at the picked quality;
         # otherwise phase 1 downloads fresh at that quality.
+        # Build 183: _src_valid (not just the flow's say-so) — the
+        # cached file may have been cleaned up or truncated since
+        # prepare; a bad cache falls back to a fresh download.
         job["source_path"] = flow.get("src")
     fx = {}
     if flow.get("blur"):
@@ -1681,13 +1685,23 @@ def make_preview():
         return jsonify({"error": "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"}), 400
     if not _preview_allowed():
         return jsonify({"error": "ခဏ ခဏ မစမ်းပါနဲ့ — ခဏ စောင့်ပြီး ပြန် စမ်းပါ"}), 429
+    # Build 183: the wizard already knows the quality the customer
+    # picked on this step — fetch the preview AT that quality so
+    # the cached file is exactly the rendition the eventual job
+    # will reuse (before, the preview always pulled the hd master
+    # and a 720/480 job then downloaded a second time). A cached
+    # preview fetched at a DIFFERENT quality is re-fetched at the
+    # requested one; the job-side quality check in create_job
+    # stays as the guarantee when the two still differ.
+    quality = dl_mod.norm_quality(data.get("quality"))
     pid, pdir = _preview_dir(url)
     pdir.mkdir(parents=True, exist_ok=True)
     src = pdir / "source.mp4"
     try:
-        if not _src_valid(src):
+        if not (_src_valid(src)
+                and _preview_quality(pdir) == quality):
             src.unlink(missing_ok=True)
-            dl_mod.download(url, pdir)
+            dl_mod.download(url, pdir, quality=quality)
         dur = probe_duration(src)
         w, h = fx_mod.video_size(src)
     except Exception as e:
@@ -1703,7 +1717,8 @@ def make_preview():
         except Exception:
             pass
     return jsonify({"preview_id": pid, "duration": round(dur, 2),
-                    "width": w, "height": h, "title": title})
+                    "width": w, "height": h, "title": title,
+                    "quality": quality})
 
 
 @app.get("/api/preview/<pid>/frame")
@@ -3041,7 +3056,12 @@ def create_job():
         # Build 167: reuse the cached preview only when it was
         # fetched at the quality this job picked — a 720p preview
         # must not silently cap an "hd" job (the blur complaint).
-        if cand.exists() and _preview_quality(cand.parent) == job["quality"]:
+        # Build 183: also require the file to be a COMPLETE,
+        # probeable video (_src_valid, not mere existence) — a
+        # truncated cache file must fall back to a fresh download
+        # in phase 1, never poison the job.
+        if _src_valid(cand) \
+                and _preview_quality(cand.parent) == job["quality"]:
             job["source_path"] = str(cand)
     if ACCOUNTS_ENFORCED and me and me["role"] != "admin" \
             and job.get("source_path"):

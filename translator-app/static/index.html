@@ -529,7 +529,8 @@ $("previewBtn").onclick = async () => {
   $("previewBtn").textContent = "🔄 Preview ဒေါင်းနေပြီ… ခဏစောင့်ပါ";
   try {
     const res = await fetch("/api/preview", {method: "POST",
-      headers: {"Content-Type": "application/json"}, body: JSON.stringify({url})});
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({url, quality: W.quality})});
     const pv = await res.json();
     if (!res.ok) throw new Error(pv.error || "preview မရပါ");
     previewId = pv.preview_id; previewDur = pv.duration; previewUrl = url;
@@ -1953,6 +1954,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 182</p>
+<p class="hint" id="buildTag" style="text-align:center">build 183</p>
 </body>
 </html>
