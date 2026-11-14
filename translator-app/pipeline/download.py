@@ -59,36 +59,124 @@ def clean_url(raw: str) -> str:
     return url
 
 
+_CANONICAL_TIKTOK_RE = re.compile(
+    r"https?://(?:www\.|m\.)?tiktok\.com/@[A-Za-z0-9_.\-]+/video/\d+")
+_TIKTOK_SHORT_HOSTS = ("vt.tiktok.com", "vm.tiktok.com")
+
+
+def _guarded_final(final, original):
+    """The build-166 SSRF guard, shared by every resolution
+    method (build 174): http(s) only, a real hostname, never
+    localhost or an IP literal. Returns the cleaned URL, or
+    None when there is nothing safe to adopt."""
+    if not final or final == original:
+        return None
+    try:
+        fp = urlparse(final)
+    except Exception:
+        return None
+    if fp.scheme not in ("http", "https") or not fp.netloc:
+        return None
+    hn = (fp.hostname or "").lower()
+    if not hn or hn == "localhost" \
+            or re.match(r"^[\d.]+$", hn) \
+            or re.match(r"^[0-9a-f:]+$", hn):
+        return None
+    return clean_url(final)
+
+
+def _mine_canonical(text):
+    """A canonical TikTok video URL hidden in a bounce page's
+    HTML/JS (build 174): a share short link can answer 200 with
+    a script/meta bounce instead of an HTTP redirect, and the
+    target address sits in the body. Strict shape — only a real
+    tiktok.com/@user/video/<id> URL is ever adopted."""
+    if not text:
+        return None
+    txt = text.replace("\\u002F", "/").replace("\\u002f", "/") \
+        .replace("\\/", "/").replace("&amp;", "&")
+    m = _CANONICAL_TIKTOK_RE.search(txt)
+    return m.group(0) if m else None
+
+
+def _judge_resolution(final, body, original, want_video):
+    """Judge one resolution attempt (build 174): a redirect
+    that landed on the canonical video URL wins outright; a
+    canonical URL mined from the body is next (the JS-bounce
+    case); any other guarded redirect target is accepted for
+    non-TikTok shorts (the XHS note page), while a TikTok short
+    must land on a /video/ address — a bounce to the TikTok
+    home page would leave the resolvers worse off than the
+    short link itself."""
+    g = _guarded_final(final, original)
+    if g and _CANONICAL_TIKTOK_RE.match(g):
+        return g
+    mined = _mine_canonical(body)
+    if mined:
+        return mined
+    if g and (not want_video or "/video/" in g):
+        return g
+    return None
+
+
 def _resolve_short(url: str) -> str:
     """Follow a share short link (vt.tiktok.com, xhslink...) to the
     canonical page URL — resolvers and yt-dlp both do better with
     the real address. Best-effort: any failure keeps the original,
-    and an IP-literal/localhost destination is never adopted."""
+    and an IP-literal/localhost destination is never adopted.
+
+    Build 174: customers paste TikTok's Share → Copy link short
+    URLs, and the build-166 single plain-requests follow is not
+    enough everywhere — live proof 2026-11-14: on the VPS the
+    short link failed preview while the same video's full URL
+    succeeded in under a minute, and the sandbox resolved the
+    short link fine, so the failure is vantage-dependent (a
+    plain datacenter request gets challenged where an
+    impersonated one gets through). Resolution now walks
+    independent methods — browser-impersonated fetches
+    (curl-cffi chrome, then safari), a plain-requests fetch,
+    and body mining for a canonical URL when a response does
+    not redirect at HTTP level — then repeats the round once
+    before giving up. Per-attempt timeouts stay at 10 s, so the
+    worst case adds about a minute, and only when every method
+    fails; a success is one fetch."""
     try:
         host = (urlparse(url).hostname or "").lower()
     except Exception:
         return url
     if host not in _SHORT_HOSTS:
         return url
-    try:
-        import requests
-        r = requests.get(
-            url, headers={"User-Agent":
-                          "Mozilla/5.0 (Linux; Android 13) "
-                          "AppleWebKit/537.36"},
-            timeout=15, allow_redirects=True)
-        final = r.url or url
-        fp = urlparse(final)
-        if fp.scheme not in ("http", "https") or not fp.netloc:
-            return url
-        hn = (fp.hostname or "").lower()
-        if not hn or hn == "localhost" \
-                or re.match(r"^[\d.]+$", hn) \
-                or re.match(r"^[0-9a-f:]+$", hn):
-            return url
-        return clean_url(final)
-    except Exception:
-        return url
+    want_video = host in _TIKTOK_SHORT_HOSTS
+
+    def _attempts():
+        try:
+            from curl_cffi import requests as creq
+            for imp in ("chrome", "safari"):
+                yield ("cffi", creq, imp)
+        except Exception:
+            pass
+        yield ("plain", None, None)
+
+    for _round in range(2):
+        for kind, creq, imp in _attempts():
+            try:
+                if kind == "cffi":
+                    r = creq.get(url, impersonate=imp, timeout=10)
+                else:
+                    import requests
+                    r = requests.get(
+                        url,
+                        headers={"User-Agent":
+                                 "Mozilla/5.0 (Linux; Android 13) "
+                                 "AppleWebKit/537.36"},
+                        timeout=10, allow_redirects=True)
+                got = _judge_resolution(r.url or "", r.text or "",
+                                        url, want_video)
+                if got:
+                    return got
+            except Exception:
+                continue
+    return url
 
 
 class DownloadFailed(Exception):
@@ -442,10 +530,15 @@ def _tiktok_page_fallback(url: str, workdir: Path,
     @xstvscenestories link does from the test egress) — those
     still raise here and fall through, exactly like route 1.
     One retry under a second impersonation profile; timeouts
-    stay tight so a gated page costs seconds, not minutes."""
+    stay tight so a gated page costs seconds, not minutes.
+    The impersonated fetch follows redirects, so a short link
+    that still reaches this route unresolved lands on the
+    canonical page anyway (build 174, sandbox-verified) — and
+    the landed address is what gets recorded as webpage_url."""
     from curl_cffi import requests as creq
     headers = {"Referer": "https://www.tiktok.com/"}
     html = None
+    landed = None
     last_exc = None
     for imp in ("chrome", "safari"):
         try:
@@ -453,6 +546,7 @@ def _tiktok_page_fallback(url: str, workdir: Path,
                          timeout=20)
             r.raise_for_status()
             html = r.text or ""
+            landed = r.url or None
             break
         except Exception as e:
             last_exc = e
@@ -477,7 +571,8 @@ def _tiktok_page_fallback(url: str, workdir: Path,
             "page route: every rendition refused the download")
     return {"title": meta.get("title"),
             "duration": meta.get("duration"),
-            "webpage_url": url,
+            "webpage_url": landed if landed
+            and _TIKTOK_ID_RE.search(landed) else url,
             "uploader": meta.get("uploader"),
             "rendition": "page"}
 
