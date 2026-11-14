@@ -504,6 +504,164 @@ systemctl daemon-reload
 systemctl enable --now translator-autoupdate.timer >/dev/null 2>&1 || true
 echo "Auto-update timer installed (checks GitHub every 15 min)."
 
+# --- 13d. local Telegram Bot API server (build 184) ---------------------------
+# The cloud Bot API caps bot sends at 50 MB. When the owner has saved a
+# Telegram api_id + api_hash (my.telegram.org) in the app's Admin card
+# (TG_API_ID / TG_API_HASH in the app .env), this section installs a
+# self-hosted telegram-bot-api server on THIS box and points the bot at
+# it (TG_API_BASE=http://127.0.0.1:8081 in the app .env), which lifts
+# sends to 2 GB so big finished videos land in the chat directly.
+#
+# Binary source: upstream tdlib publishes source only (no release
+# binaries), so the pinned build is the community prebuilt of the
+# UNMODIFIED upstream source (SwissCore92/telegram-bot-api-bin, built
+# by GitHub Actions from tdlib/telegram-bot-api; the tarball carries
+# the upstream source-commit). The download is pinned by version AND
+# sha256 below, and is verified before anything is installed.
+#
+# FAIL-SAFE BY CONSTRUCTION: the whole section is one subshell with
+# set +e, called behind `|| true` — no failure in here (offline,
+# bad download, server won't start) can fail or even slow the
+# translator deploy; the bot simply stays on the cloud API. When
+# the credentials are ABSENT the section only clears TG_API_BASE
+# (cloud default); a previously installed tg-bot-api unit is left
+# installed and running but unused — removing it is a manual call.
+TGBA_VERSION='10.3'
+TGBA_HOME="${TGBA_HOME:-/opt/tg-bot-api}"
+TGBA_UNIT="${TGBA_UNIT:-/etc/systemd/system/tg-bot-api.service}"
+TGBA_DL_BASE="${TGBA_DL_BASE:-https://github.com/SwissCore92/telegram-bot-api-bin/releases/download/v${TGBA_VERSION}}"
+TGBA_PORT='8081'
+
+tgba_env_get() {  # $1 = key -> last value in the app .env ("" if absent)
+  [ -f "$APP_DIR/.env" ] || return 0
+  grep -E "^$1=" "$APP_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d ' \r' || true
+}
+
+tgba_env_set_base() {  # $1 = base URL, or "" to remove TG_API_BASE
+  local env_file="$APP_DIR/.env" tmp
+  [ -f "$env_file" ] || return 0
+  tmp="$(mktemp)" || return 0
+  grep -v '^TG_API_BASE=' "$env_file" > "$tmp" 2>/dev/null || true
+  if [ -n "$1" ]; then
+    echo "TG_API_BASE=$1" >> "$tmp"
+  fi
+  cat "$tmp" > "$env_file"
+  rm -f "$tmp"
+  chmod 600 "$env_file" 2>/dev/null || true
+  chown "$APP_USER:$APP_USER" "$env_file" 2>/dev/null || true
+}
+
+tgba_setup() (
+  set +e  # contained to this subshell: nothing here may fail the deploy
+  api_id="$(tgba_env_get TG_API_ID)"
+  api_hash="$(tgba_env_get TG_API_HASH)"
+  if [ -z "$api_id" ] || [ -z "$api_hash" ]; then
+    if grep -q '^TG_API_BASE=' "$APP_DIR/.env" 2>/dev/null; then
+      tgba_env_set_base ""
+      echo "Local Telegram API: no credentials — TG_API_BASE cleared (bot on the cloud API, 50 MB)."
+    else
+      echo "Local Telegram API: not configured (cloud API, 50 MB sends)."
+    fi
+    exit 0
+  fi
+
+  case "$(uname -m)" in
+    x86_64|amd64)   tgba_arch='amd64'; tgba_sha='e4235392510fef9244225cf7d4da09dbf5ffa059ca497b9f711d20cac9a9bf35' ;;
+    aarch64|arm64)  tgba_arch='arm64'; tgba_sha='984a36745fda466bd8e3c7cfd40207a7e34f44f80250a36de014bd8a84a865b7' ;;
+    *) echo "Local Telegram API: unsupported arch $(uname -m) — skipped."; exit 0 ;;
+  esac
+  tgba_asset="telegram-bot-api-v${TGBA_VERSION}-linux-${tgba_arch}.tar.gz"
+  tgba_bin="$TGBA_HOME/bin/telegram-bot-api"
+
+  # (a) binary: download once per pinned version, sha256-verified.
+  if [ ! -x "$tgba_bin" ] || [ "$(cat "$TGBA_HOME/VERSION" 2>/dev/null)" != "$TGBA_VERSION" ]; then
+    tgba_dl="$(mktemp -d)"
+    echo "Local Telegram API: downloading telegram-bot-api v${TGBA_VERSION} (${tgba_arch})..."
+    if curl -fsSL --max-time 300 -o "$tgba_dl/$tgba_asset" "$TGBA_DL_BASE/$tgba_asset" \
+       && echo "${tgba_sha}  $tgba_dl/$tgba_asset" | sha256sum -c - >/dev/null 2>&1 \
+       && tar -xzf "$tgba_dl/$tgba_asset" -C "$tgba_dl"; then
+      mkdir -p "$TGBA_HOME/bin"
+      install -m 755 "$tgba_dl/telegram-bot-api-v${TGBA_VERSION}-linux-${tgba_arch}/telegram-bot-api" "$tgba_bin"
+      echo "$TGBA_VERSION" > "$TGBA_HOME/VERSION"
+      echo "Local Telegram API: binary v${TGBA_VERSION} installed at $tgba_bin."
+    else
+      echo "WARN: Local Telegram API binary download/verify failed — skipping (bot stays on the cloud API)."
+      rm -rf "$tgba_dl"
+      exit 0
+    fi
+    rm -rf "$tgba_dl"
+  fi
+  if [ ! -x "$tgba_bin" ]; then
+    echo "WARN: Local Telegram API binary missing — skipping."
+    exit 0
+  fi
+
+  mkdir -p "$TGBA_HOME/data"
+  chown -R "$APP_USER:$APP_USER" "$TGBA_HOME/data" 2>/dev/null || true
+
+  # One-time cloud -> local migration (Telegram's rule): the bot must
+  # log OUT of the cloud Bot API server once before a local server may
+  # receive its updates. Guarded by a marker file so it runs exactly
+  # once, and failure-tolerant — an unconfirmed logOut is retried on
+  # the next bootstrap run, never blocking this one. NOTE: after a
+  # successful logOut, Telegram can take up to ~10 minutes before the
+  # token authorizes on the local server; the app poller retries on
+  # its own, so delivery self-heals with no further action.
+  tgba_marker="$TGBA_HOME/.cloud-logout-done"
+  if [ ! -f "$tgba_marker" ]; then
+    tgba_tok="$(tgba_env_get TELEGRAM_BOT_TOKEN)"
+    if [ -n "$tgba_tok" ]; then
+      tgba_resp="$(curl -fsS --max-time 30 "https://api.telegram.org/bot${tgba_tok}/logOut" 2>/dev/null)"
+      if echo "$tgba_resp" | grep -q '"ok":true' || echo "$tgba_resp" | grep -qi 'not logged in'; then
+        touch "$tgba_marker"
+        echo "Local Telegram API: one-time cloud logOut done."
+      else
+        echo "WARN: cloud logOut not confirmed (retried next run): $tgba_resp"
+      fi
+    else
+      echo "Local Telegram API: no bot token yet — cloud logOut deferred."
+    fi
+  fi
+
+  # (b) systemd unit. It embeds the api_hash, so it is mode 600.
+  cat > "$TGBA_UNIT" <<EOF
+[Unit]
+Description=Local Telegram Bot API server (video translator bot, build 184)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$APP_USER
+Group=$APP_USER
+WorkingDirectory=$TGBA_HOME
+ExecStart=$tgba_bin --api-id=$api_id --api-hash=$api_hash --http-ip-address=127.0.0.1 --http-port=$TGBA_PORT --dir=$TGBA_HOME/data --local
+Restart=on-failure
+RestartSec=5
+MemoryMax=1G
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 600 "$TGBA_UNIT"
+  systemctl daemon-reload
+  systemctl enable tg-bot-api.service >/dev/null 2>&1 || true
+  systemctl restart tg-bot-api.service || echo "WARN: tg-bot-api failed to start."
+
+  # (c)+(d) point the app at the local server only when it is really
+  # up; the translator restart at step 14 then picks the base up.
+  if systemctl is-active --quiet tg-bot-api.service; then
+    tgba_env_set_base "http://127.0.0.1:${TGBA_PORT}"
+    echo "Local Telegram API: live on 127.0.0.1:${TGBA_PORT} — TG_API_BASE set for the app."
+  else
+    echo "WARN: tg-bot-api is not active; TG_API_BASE left unchanged (bot stays on the cloud API)."
+  fi
+  exit 0
+)
+tgba_setup || echo "WARN: local Telegram API setup hit an error — continuing the translator deploy."
+
 # --- 13b. Myanmar fonts -------------------------------------------------------------------------
 # The repo ships the fonts as .ttf.b64 (the push channel is text
 # only). The app service runs as an unprivileged system user and

@@ -287,6 +287,18 @@
     </div>
   </div>
 
+  <div class="card" id="tgApiCard">
+    <h3 style="margin-top:0">📡 Telegram Local API (ဖိုင် အကြီး တိုက်ရိုက် ပို့ရန်)</h3>
+    <div class="keyPill" id="tgApiPill">…</div>
+    <p class="hint">Cloud Telegram API က bot ပို့တာ <b>50MB</b> ပဲ ခွင့်ပြုတယ် — ဖိုင် ကြီးရင် ချုံ့ ထားတဲ့ မူပွား ပဲ chat ထဲ ရောက်တယ်။ <b>my.telegram.org</b> က ရတဲ့ <b>api_id + api_hash</b> ကို ဒီမှာ ထည့်ရင် နောက် update မှာ ဒီ server ပေါ်မှာပဲ Local Bot API server တက်လာပြီး bot က <b>2GB အထိ</b> ဖိုင်တွေကို chat ထဲ တိုက်ရိုက် ပို့နိုင်မယ်။ ဒီ ၂ ခုကို <b>chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ။ အခြေအနေ: <span id="tgApiState">…</span></p>
+    <input type="text" id="tgApiIdInput" inputmode="numeric" placeholder="api_id (ဂဏန်း သက်သက်)" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+    <input type="password" id="tgApiHashInput" placeholder="api_hash ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-top:6px">
+    <div class="row">
+      <button class="ghost" id="tgApiSave">သိမ်းမယ်</button>
+      <button class="ghost" id="tgApiDel">ဖျက်မယ်</button>
+    </div>
+  </div>
+
   <div class="card" id="googleCard">
     <h3 style="margin-top:0">🔐 Google login (တစ်ချက် နှိပ် ဝင်ရန်)</h3>
     <div class="keyPill" id="googlePill">…</div>
@@ -1496,6 +1508,48 @@ $("tgDel").onclick = async () => {
 };
 loadTgState();
 
+/* ---------------- Telegram Local API settings (build 184) ---------------- */
+async function loadTgApiState() {
+  try {
+    const r = await fetch("/api/settings/telegram-api");
+    const d = await r.json();
+    // Owner-only card: a non-admin's 403 has no "mode" field and
+    // the card stays hidden, exactly like the token card above.
+    if (!r.ok || !("mode" in d)) {
+      $("tgApiCard").classList.remove("show");
+      return;
+    }
+    const configured = d.api_id_set && d.api_hash_set;
+    setPill("tgApiPill", configured);
+    $("tgApiState").textContent = !configured
+      ? "❌ မထည့်ရသေး (Cloud API · 50MB)"
+      : (d.mode === "local"
+          ? "✅ Local API နဲ့ ပို့နေတယ် (2GB အထိ)"
+          : "⏳ ထည့်ပြီးသား — Local API က နောက် update မှာ တက်လာမယ်");
+    $("tgApiCard").classList.add("show");
+  } catch (e) { $("tgApiState").textContent = "?"; }
+}
+$("tgApiSave").onclick = async () => {
+  const api_id = $("tgApiIdInput").value.trim();
+  const api_hash = $("tgApiHashInput").value.trim();
+  if (!api_id || !api_hash) { alert("api_id နဲ့ api_hash ၂ ခုလုံး ထည့်ပါ"); return; }
+  const res = await fetch("/api/settings/telegram-api", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({api_id: api_id, api_hash: api_hash})});
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok) { alert(d.error || "သိမ်းလို့ မရပါ"); return; }
+  $("tgApiIdInput").value = "";
+  $("tgApiHashInput").value = "";
+  loadTgApiState();
+  alert("သိမ်းပြီးပြီ — နောက် update (၁၅ မိနစ် အတွင်း) မှာ Local API server တက်လာပြီး bot က 2GB အထိ တိုက်ရိုက် ပို့နိုင်မယ်");
+};
+$("tgApiDel").onclick = async () => {
+  await fetch("/api/settings/telegram-api", {method: "DELETE"});
+  loadTgApiState();
+  alert("ဖျက်ပြီးပါပြီ — bot က Cloud API (50MB) ကို ပြန်သုံးမယ်");
+};
+loadTgApiState();
+
 /* ---------------- Google client ID settings (build 180) ---------------- */
 async function loadGoogleState() {
   try {
@@ -1669,6 +1723,7 @@ async function loadMe() {
       $("xkCard").classList.remove("show");
       $("asCard").classList.remove("show");
       $("tgCard").classList.remove("show");
+      $("tgApiCard").classList.remove("show");
       $("googleCard").classList.remove("show");
     }
     if (ME) loadPayQr();
@@ -1954,6 +2009,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 183</p>
+<p class="hint" id="buildTag" style="text-align:center">build 184</p>
 </body>
 </html>

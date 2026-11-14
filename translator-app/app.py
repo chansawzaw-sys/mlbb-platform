@@ -339,7 +339,13 @@ def _tg_deliver_async(job):
     """A bot-submitted job finished: send the video back to its chat.
     Over the bot API's 50 MB cap the user still gets the video: a
     480p-class compressed copy goes to the chat and the full-quality
-    file stays in their web jobs list (bot jobs are kept 24h)."""
+    file stays in their web jobs list (bot jobs are kept 24h).
+
+    Build 184: when the bot runs through a LOCAL Bot API server
+    (tg.is_local()), the full file itself goes to the chat — the
+    local cap is 2 GB, so there is nothing to shrink. If that send
+    fails for any reason, the cloud behaviour below takes over, so
+    a broken local server can never strand a finished video."""
     chat_id = job.get("tg_chat_id")
     if not chat_id:
         return
@@ -350,7 +356,23 @@ def _tg_deliver_async(job):
         try:
             if not out.exists():
                 return
-            if out.stat().st_size > tg.MAX_BYTES:
+            size = out.stat().st_size
+            if tg.is_local() and tg.MAX_BYTES < size <= tg.LOCAL_MAX_BYTES:
+                try:
+                    job["tg"] = {"state": "sending", "to": job.get("tg_from")}
+                    _save(job)
+                    tg.send_video(
+                        chat_id, out,
+                        caption="🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို\n"
+                                + (job.get("url") or "")
+                                + "\n🙏 ကျေးဇူးတင်ပါတယ်")
+                    job["tg"] = {"state": "sent", "to": job.get("tg_from"),
+                                 "direct": True}
+                    _save(job)
+                    return
+                except Exception:
+                    pass  # compact copy + web link below, as on cloud
+            if size > tg.MAX_BYTES:
                 small = _tg_shrink_for_send(
                     out, out.with_name("output_tg.mp4"))
                 if small:
@@ -447,8 +469,9 @@ def _on_tg_message(msg):
             tg.send_message(chat_id, "⏳ ရှင့် အရင် video လုပ်နေဆဲ ဖြစ်ပါတယ် — "
                                      "ပြီးသွားမှ နောက်တစ်ခု ပို့ပေးပါ 🙏")
             return
-        if (vid.get("file_size") or 0) > 20 * 1000 * 1000:
-            tg.send_message(chat_id, "⚠️ တောင်းပန်ပါတယ် — ဒီ file က 20MB ထက် ကြီးနေလို့ bot က လက်ခံလို့ မရပါ။ "
+        if (vid.get("file_size") or 0) > tg.download_cap():
+            cap_mb = tg.download_cap() // 1_000_000
+            tg.send_message(chat_id, f"⚠️ တောင်းပန်ပါတယ် — ဒီ file က {cap_mb}MB ထက် ကြီးနေလို့ bot က လက်ခံလို့ မရပါ။ "
                                      "video ရဲ့ link ကို ပို့ပေးပါ 🙏")
             return
         frm = msg.get("from") or {}
@@ -2031,6 +2054,62 @@ def telegram_delete():
     return jsonify({"ok": True, "configured": False})
 
 
+# ---------- Local Telegram Bot API server (build 184) ----------
+# The cloud Bot API caps bot sends at 50 MB. When the owner saves
+# a Telegram api_id + api_hash (from my.telegram.org) here, the
+# deploy bootstrap installs a self-hosted telegram-bot-api server
+# on this VPS and points the bot at it (TG_API_BASE in .env —
+# written by the bootstrap, never from this UI), lifting sends to
+# 2 GB so big finished videos land in the chat directly. The hash
+# is a credential: it is stored in .env (chmod 600) exactly like
+# the bot token, and no endpoint ever returns either value — only
+# whether each one is set, plus which API the bot is using now.
+
+def _tg_api_id():
+    return _env_value("TG_API_ID")
+
+
+def _tg_api_hash():
+    return _env_value("TG_API_HASH")
+
+
+@app.get("/api/settings/telegram-api")
+def telegram_api_status():
+    from pipeline import telegram_send as tg
+    return jsonify({"api_id_set": bool(_tg_api_id()),
+                    "api_hash_set": bool(_tg_api_hash()),
+                    "mode": tg.api_mode()})
+
+
+@app.post("/api/settings/telegram-api")
+def telegram_api_save():
+    data = request.get_json(force=True, silent=True) or {}
+    api_id = (data.get("api_id") or "").strip()
+    api_hash = (data.get("api_hash") or "").strip().lower()
+    if not re.fullmatch(r"\d{5,12}", api_id):
+        return jsonify({"error": "api_id မမှန်ပါ — my.telegram.org က ရတဲ့ ဂဏန်း သက်သက် ဖြစ်ရပါမယ်"}), 400
+    if not re.fullmatch(r"[0-9a-f]{32}", api_hash):
+        return jsonify({"error": "api_hash မမှန်ပါ — my.telegram.org က ရတဲ့ စာလုံး ၃၂ လုံး ဖြစ်ရပါမယ်"}), 400
+    _env_write("TG_API_ID", api_id)
+    _env_write("TG_API_HASH", api_hash)
+    from pipeline import telegram_send as tg
+    return jsonify({"ok": True, "api_id_set": True,
+                    "api_hash_set": True, "mode": tg.api_mode()})
+
+
+@app.delete("/api/settings/telegram-api")
+def telegram_api_delete():
+    _env_remove("TG_API_ID")
+    _env_remove("TG_API_HASH")
+    # Revert to the cloud API at once. The local server (if the
+    # bootstrap installed one) is left running but unused; the
+    # bootstrap only re-derives TG_API_BASE while credentials
+    # exist, so deleting them here is the whole off-switch.
+    _env_remove("TG_API_BASE")
+    return jsonify({"ok": True, "api_id_set": False,
+                    "api_hash_set": False, "mode": "cloud"})
+
+
 # ---------- Apps Script bridge (server-side only, build 137) ----------
 # The owner's AutoTranslate.gs Web App URL + WEB_SECRET. Same rules as
 # the Gemini/OpenAI keys: admin-only (see _accounts_guard — every
@@ -2933,8 +3012,9 @@ def send_telegram(jid):
         return jsonify({"error": "ကိုယ့် Telegram ကိုပဲ ပို့လို့ရပါတယ် — "
                                  "သူများ Telegram ကို ပို့ခွင့် မရှိပါ"}), 403
     size = out.stat().st_size
-    if size > tg.MAX_BYTES:
-        return jsonify({"error": f"ဖိုင် {size / 1e6:.0f}MB ရှိနေတယ် — Telegram bot က 50MB အထိပဲ ပို့လို့ရပါတယ်"}), 400
+    if size > tg.send_cap():
+        cap_mb = tg.send_cap() // 1_000_000
+        return jsonify({"error": f"ဖိုင် {size / 1e6:.0f}MB ရှိနေတယ် — Telegram bot က {cap_mb}MB အထိပဲ ပို့လို့ရပါတယ်"}), 400
     user = next((r for r in tg.recipients()
                  if r["chat_id"] == int(chat_id)), {})
     job["tg"] = {"state": "sending",

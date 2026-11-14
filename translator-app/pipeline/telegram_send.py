@@ -10,6 +10,13 @@ How Telegram bots work, and why this module is shaped this way:
     endpoint ever returns it.
   * api.telegram.org caps bot uploads at 50 MB; the caller enforces
     that before sending.
+  * Build 184: every Bot API call goes through api_base(). By default
+    that is the cloud API above, but when the owner saves a Telegram
+    api_id/api_hash (my.telegram.org) the deploy bootstrap installs a
+    self-hosted telegram-bot-api server on this same VPS and points
+    TG_API_BASE at it (127.0.0.1:8081). A local server lifts sends to
+    2 GB and returns absolute filesystem paths from getFile (its
+    --local mode), which download_file() handles below.
 
 Recipients persist in .tg_recipients.json in the app dir (survives
 app updates like .env does; never in git).
@@ -17,11 +24,11 @@ app updates like .env does; never in git).
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from pathlib import Path
 
-_API = "https://api.telegram.org/bot{token}/{method}"
 _LOCK = threading.Lock()
 _ME_CACHE = {}
 _POLLER_STARTED = False
@@ -80,17 +87,61 @@ def _env_path():
     return _root() / ".env"
 
 
-def token():
-    """Bot token from the environment or the app .env, or None."""
-    t = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
-    if t:
-        return t
+def _env_get(key):
+    """One value from the process env, else from the app .env —
+    read live on every call so admin edits apply without a restart
+    (the same rule token() has always followed)."""
+    v = (os.environ.get(key) or "").strip()
+    if v:
+        return v
     p = _env_path()
     if p.exists():
         for ln in p.read_text(encoding="utf-8").splitlines():
-            if ln.startswith("TELEGRAM_BOT_TOKEN="):
-                return ln.split("=", 1)[1].strip() or None
-    return None
+            if ln.startswith(key + "="):
+                return ln.split("=", 1)[1].strip()
+    return ""
+
+
+def token():
+    """Bot token from the environment or the app .env, or None."""
+    return _env_get("TELEGRAM_BOT_TOKEN") or None
+
+
+# ---------------- Bot API base (build 184) ----------------
+# TG_API_BASE is written into .env ONLY by the deploy bootstrap,
+# and only when a local telegram-bot-api server is actually running
+# (credentials present + binary installed + unit active). Unset or
+# blank always means the cloud API.
+
+CLOUD_BASE = "https://api.telegram.org"
+
+
+def api_base():
+    return _env_get("TG_API_BASE").rstrip("/") or CLOUD_BASE
+
+
+def is_local():
+    return api_base() != CLOUD_BASE
+
+
+def api_mode():
+    return "local" if is_local() else "cloud"
+
+
+def send_cap():
+    """Largest file the bot may send in the current mode."""
+    return LOCAL_MAX_BYTES if is_local() else MAX_BYTES
+
+
+def download_cap():
+    """Largest user file the bot may download in the current mode
+    (the cloud getFile endpoint refuses anything over 20 MB; a
+    local server has no such cap)."""
+    return LOCAL_MAX_BYTES if is_local() else MAX_DOWNLOAD_BYTES
+
+
+def _api_url(tok, method):
+    return f"{api_base()}/bot{tok}/{method}"
 
 
 def valid_format(tok):
@@ -100,7 +151,7 @@ def valid_format(tok):
 
 def _call(tok, method, timeout=30, **params):
     import requests
-    r = requests.post(_API.format(token=tok, method=method),
+    r = requests.post(_api_url(tok, method),
                       data=params, timeout=timeout)
     data = r.json()
     if not data.get("ok"):
@@ -164,7 +215,7 @@ def poll_once():
     import requests
     with _LOCK:
         store = _load_store()
-    r = requests.get(_API.format(token=tok, method="getUpdates"),
+    r = requests.get(_api_url(tok, "getUpdates"),
                      params={"offset": store.get("offset", 0),
                              "timeout": 30,
                              "allowed_updates": '["message", "callback_query"]'},
@@ -321,7 +372,7 @@ def send_photo(chat_id, photo_path, caption="", buttons=None):
     if buttons:
         data["reply_markup"] = _markup(buttons)
     with open(photo_path, "rb") as fh:
-        r = requests.post(_API.format(token=tok, method="sendPhoto"),
+        r = requests.post(_api_url(tok, "sendPhoto"),
                           data=data,
                           files={"photo": (Path(photo_path).name, fh,
                                            "image/jpeg")},
@@ -370,8 +421,15 @@ def start_poller():
 
 
 def download_file(file_id, dest_path):
-    """Bot file download (getFile). Telegram refuses bot downloads
-    over 20 MB — the caller checks the size before calling."""
+    """Bot file download (getFile). The cloud endpoint refuses bot
+    downloads over 20 MB — the caller checks tg.download_cap()
+    before calling (a local server lifts that cap entirely).
+
+    With a LOCAL Bot API server in --local mode, getFile answers
+    with an ABSOLUTE filesystem path (the server runs on this same
+    VPS), so the file is copied straight off disk. A relative path
+    (cloud, or a local server not in --local mode) is fetched over
+    HTTP from the configured base instead."""
     tok = token()
     if not tok:
         raise RuntimeError("telegram bot token မရှိပါ")
@@ -379,12 +437,19 @@ def download_file(file_id, dest_path):
     path = info.get("file_path")
     if not path:
         raise RuntimeError("telegram file မရပါ")
-    import requests
-    url = f"https://api.telegram.org/file/bot{tok}/{path}"
     # Via .part + rename: a dropped connection must not leave a
     # truncated file that later steps treat as the whole video.
     dest_path = Path(dest_path)
     tmp = dest_path.with_name(dest_path.name + ".part")
+    if os.path.isabs(path):
+        src = Path(path)
+        if not src.exists():
+            raise RuntimeError("telegram file မရပါ (local path missing)")
+        shutil.copyfile(src, tmp)
+        tmp.replace(dest_path)
+        return dest_path
+    import requests
+    url = f"{api_base()}/file/bot{tok}/{path}"
     with requests.get(url, stream=True, timeout=300) as r:
         r.raise_for_status()
         with open(tmp, "wb") as fh:
@@ -396,7 +461,15 @@ def download_file(file_id, dest_path):
 
 # ---------------- sending ----------------
 
-MAX_BYTES = 50 * 1000 * 1000  # api.telegram.org bot upload cap
+MAX_BYTES = 50 * 1000 * 1000  # cloud api.telegram.org bot upload cap
+
+# A local Bot API server (build 184) raises the protocol send cap
+# to 2000 MB; the app keeps a small safety margin under it.
+LOCAL_MAX_BYTES = 1900 * 1000 * 1000
+
+# Cloud getFile refuses bot downloads over 20 MB (no such cap on a
+# local server — see download_cap()).
+MAX_DOWNLOAD_BYTES = 20 * 1000 * 1000
 
 
 def send_video(chat_id, path, caption=""):
@@ -413,7 +486,7 @@ def send_video(chat_id, path, caption=""):
         try:
             with open(path, "rb") as fh:
                 r = requests.post(
-                    _API.format(token=tok, method=method),
+                    _api_url(tok, method),
                     data={"chat_id": str(chat_id), "caption": caption[:1024],
                           "supports_streaming": "true"},
                     files={field: (path.name, fh, "video/mp4")},
