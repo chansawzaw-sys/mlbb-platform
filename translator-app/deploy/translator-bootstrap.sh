@@ -20,10 +20,10 @@
 #      then smoke-loads it once so the first real job is not slow.
 #   5. Installs a systemd service "translator" running the app UNCHANGED
 #      through a tiny launcher (deploy artifact, not an app file). The
-#      launcher binds the app to 127.0.0.1:8613 and adds a
-#      one-job-at-a-time gate (the app itself starts a thread per job with
-#      no serialization; two concurrent whisper+ffmpeg jobs can OOM a
-#      2 GB box). TRANSLATOR_GATE=off in the unit disables the gate.
+#      launcher binds the app to 127.0.0.1:8613 and adds a queue
+#      sanity cap (the app's own dispatcher runs four heavy jobs
+#      at once and queues the rest — build 180). TRANSLATOR_GATE=off
+#      in the unit disables the cap.
 #   6. Puts Caddy in front on public port 8611 with HTTP basic auth
 #      (user "htetheather"; password generated once, stored root-only in
 #      /root/translator-auth.txt, printed once at the end).
@@ -224,7 +224,7 @@ fi
 echo "Smoke-loading the whisper model once (warms caches, proves it loads)..."
 .venv/bin/python -c "from faster_whisper import WhisperModel; WhisperModel('$MODEL_DIR', device='cpu', compute_type='int8'); print('WHISPER_OK')"
 
-# --- 8. launcher (serves the app unchanged + one-job-at-a-time gate) -----------------
+# --- 8. launcher (serves the app unchanged + queue sanity cap) -----------------
 mkdir -p "$DEPLOY_DIR"
 cat > "$DEPLOY_DIR/serve.py" <<'PYEOF'
 #!/usr/bin/env python3
@@ -235,13 +235,17 @@ same way run.sh does (.venv/bin/python + app), with two deliberate deltas:
 
 1. Binds 127.0.0.1 instead of app.py's hardcoded 0.0.0.0, on the internal
    port (PORT env). Caddy is the only public door.
-2. A one-job-at-a-time gate. app.py starts a background thread per job with
-   no serialization; on a 1 vCPU / 2 GB box, two concurrent whisper+ffmpeg
-   jobs can OOM the service. The gate rejects a new phase start
-   (POST /api/jobs, POST /api/jobs/<id>/review) with HTTP 429 while another
-   job is queued/running. Preview downloads, exports and bulk text input
-   are not gated (they start no heavy work). Disable with
-   TRANSLATOR_GATE=off.
+2. A queue sanity cap. app.py itself serializes the heavy work:
+   its dispatcher runs at most MAX_CONCURRENT_JOBS (4) worker
+   threads at once and parks every other submission in an in-app
+   FIFO queue — submissions are never refused for concurrency.
+   This gate is only a backstop against a runaway queue: it
+   rejects a new phase start (POST /api/jobs,
+   POST /api/jobs/<id>/review) with HTTP 429 only when
+   QUEUE_CAP or more jobs are already queued/running. Preview
+   downloads, exports and bulk text input are not gated (they
+   start no heavy work). Disable with TRANSLATOR_GATE=off, tune
+   with TRANSLATOR_QUEUE_CAP.
 
 Note: JOBS is the app's in-memory dict; entries loaded from disk keep their
 created_at, so a stale "running" entry older than STALE_AFTER seconds is
@@ -260,10 +264,14 @@ from flask import jsonify, request  # noqa: E402
 
 ACTIVE_STATUSES = {"queued", "running"}
 STALE_AFTER = 25 * 60  # seconds since the job's last heartbeat
+QUEUE_CAP = int(os.environ.get("TRANSLATOR_QUEUE_CAP", "20"))
 
 
-def _busy_job(exclude_jid=None):
+def _active_count(exclude_jid=None):
+    """Queued + running jobs with a fresh heartbeat. A stale entry
+    (a leftover of a previous, dead process) never counts."""
     now = time.time()
+    n = 0
     for jid, job in list(appmod.JOBS.items()):
         if jid == exclude_jid:
             continue
@@ -276,27 +284,27 @@ def _busy_job(exclude_jid=None):
         # could block every new job for hours.
         updated = job.get("updated_at") or job.get("created_at") or now
         if now - float(updated) < STALE_AFTER:
-            return job
-    return None
+            n += 1
+    return n
 
 
 if os.environ.get("TRANSLATOR_GATE", "on") != "off":
 
     @appmod.app.before_request
-    def _one_job_at_a_time():
+    def _queue_sanity_cap():
         if request.method != "POST":
             return None
         path = request.path.rstrip("/")
         if path == "/api/jobs":
-            busy = _busy_job()
+            count = _active_count()
         elif path.startswith("/api/jobs/") and path.endswith("/review"):
-            busy = _busy_job(exclude_jid=path.split("/")[3])
+            count = _active_count(exclude_jid=path.split("/")[3])
         else:
             return None
-        if busy is not None:
+        if count >= QUEUE_CAP:
             return jsonify({
-                "error": "နောက်ထပ် job တစ်ခု လုပ်နေဆဲပါ — အဲဒီ job ပြီးမှ နောက်တစ်ခု စပါ။ "
-                         "(one job at a time on this server)"
+                "error": "တန်းစီ ပြည့်နေပါတယ် — ခဏ စောင့်ပြီး ပြန် ကြိုးစားပေးပါ။ "
+                         "(queue is full, please retry shortly)"
             }), 429
         return None
 
@@ -341,12 +349,13 @@ $VT_ENV_LINE
 ExecStart=$APP_DIR/.venv/bin/python $DEPLOY_DIR/serve.py
 Restart=on-failure
 RestartSec=3
-# Sane caps for a 1 vCPU / 2 GB box shared with the MLBB container:
-# whisper base (int8) + one ffmpeg pass; the box has 2 cores:
-# 170% lets a job use nearly the whole machine while MLBB (light,
-# mostly idle) keeps its headroom — this quota was the main speed brake.
-MemoryMax=2600M
-CPUQuota=170%
+# Sane caps for the 4 vCPU / 8 GB YTA 3 box shared with the MLBB
+# container: whisper base (int8) + ffmpeg passes, FOUR jobs at
+# once (build 180 — the owner wants the full 4 cores working);
+# 400% is the whole machine, and 6.5G covers four whisper +
+# ffmpeg working sets while leaving the OS + MLBB their share.
+MemoryMax=6.5G
+CPUQuota=400%
 OOMPolicy=continue
 NoNewPrivileges=true
 PrivateTmp=true

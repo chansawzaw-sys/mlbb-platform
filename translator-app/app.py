@@ -17,6 +17,7 @@ import shutil
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import (Flask, Response, jsonify, request, send_file,
@@ -102,16 +103,17 @@ def _heartbeat(job):
 
 
 # ---------- auto-cleanup: no job data stays on the server ----------
-# 12 hours after a web job finishes (done or error), its whole folder —
+# 24 hours after a job finishes (done or error), its whole folder —
 # source, intermediates and output — plus the cached preview copy of
 # the same URL is deleted, so nothing accumulates on the disk.
-CLEANUP_DELAY = 12 * 3600
+CLEANUP_DELAY = 24 * 3600
 CLEANUP_TIMERS = {}
 
 
 def _job_retention(job):
-    """Bot-submitted jobs stay 24h — customers come back for their
-    video; web jobs stay 12h (owner order 2026-11-14, was 15 min)."""
+    """Every finished job stays 24h — customers come back for their
+    video (owner order 2026-11-14, build 180: web jobs raised from
+    12h to match the bot jobs' long-standing 24h)."""
     return 24 * 3600 if job.get("tg_chat_id") else CLEANUP_DELAY
 
 
@@ -131,6 +133,8 @@ def _schedule_cleanup(job):
 # ---------- Telegram round-trip: bot-submitted jobs ----------
 
 _TG_PENDING = []  # job ids created from Telegram, waiting for a free slot
+_JOB_QUEUE = []   # (jid, kind) FIFO for the dispatcher; kind "main" or "rerun"
+MAX_CONCURRENT_JOBS = 4  # build 180: four heavy jobs at once (YTA 3, 4 cores)
 _TG_FLOW = {}     # chat_id -> bot choice flow state (blur spot, mode)
 _TG_DAILY_CAP = int(os.environ.get("VT_TG_DAILY_CAP", "30"))
 _TG_DAILY_FILE = ROOT / ".tg_daily.json"
@@ -215,9 +219,23 @@ def _backup_loop():
 
 
 def _any_active_worker():
-    return any(j.get("worker_started")
-               and j.get("status") in ("queued", "running")
-               for j in list(JOBS.values()))
+    return _active_worker_count() > 0
+
+
+def _active_worker_count():
+    """Jobs whose worker thread is actually running right now.
+    Queued jobs waiting for a slot do NOT count — worker_started is
+    only set by the dispatcher at the moment a worker launches."""
+    return sum(1 for j in list(JOBS.values())
+               if j.get("worker_started")
+               and j.get("status") in ("queued", "running"))
+
+
+def _enqueue_job(job, kind="main"):
+    """Park a job for the dispatcher (build 180). Submissions are
+    never refused for concurrency: they wait here, in order, until
+    one of the MAX_CONCURRENT_JOBS worker slots frees up."""
+    _JOB_QUEUE.append((job["id"], kind))
 
 
 def _tg_shrink_for_send(out, dest, budget=47_000_000):
@@ -277,7 +295,7 @@ def _ensure_small_copy(job):
     AAC 96k) but budgeted for download speed instead of the bot's
     50 MB cap. The done-state's main download button serves this
     copy; the full master stays one tap away (?v=full). Lives in
-    the job dir, so the 12h/24h retention and the newest-2-per-
+    the job dir, so the 24h retention and the newest-2-per-
     account cap (both whole-dir deletes) cover it — no orphans.
     Failure is non-fatal: the job still finishes with the full
     file only and the UI falls back to a single button."""
@@ -533,6 +551,75 @@ def _bot_open():
             if ln.startswith("BOT_OPEN="):
                 return ln.split("=", 1)[1].strip() == "1"
     return False
+
+
+# ---------- Google sign-in + daily job limit (build 180) ----------
+
+# The owner's fixed Google identity for THIS app (same fixed-owner
+# pattern as the MLBB platform): a Google sign-in presenting this
+# email, verified by Google, lands in an admin account. No other
+# Google account can ever gain admin through Google sign-in.
+FIXED_ADMIN_EMAIL = "nnominalhuman@gmail.com"
+
+
+def _env_value(key):
+    """Read one KEY=value from the project .env, live (admin edits
+    take effect without a restart), env var as fallback."""
+    p = ROOT / ".env"
+    if p.exists():
+        for ln in p.read_text(encoding="utf-8").splitlines():
+            if ln.startswith(key + "="):
+                return ln.split("=", 1)[1].strip()
+    return os.environ.get(key, "")
+
+
+def _google_client_id():
+    return _env_value("GOOGLE_CLIENT_ID")
+
+
+_YANGON_TZ = timezone(timedelta(hours=6, minutes=30))  # no DST, ever
+
+
+def _yangon_day(ts):
+    return datetime.fromtimestamp(float(ts), _YANGON_TZ).date()
+
+
+def _daily_job_limit():
+    """Admin setting DAILY_JOB_LIMIT: max videos per account per
+    day, 0 = unlimited (the default). Read live like BOT_OPEN."""
+    try:
+        return max(0, int(_env_value("DAILY_JOB_LIMIT") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _account_daily_count(user_id):
+    """Videos this account STARTED today (Asia/Yangon), web and
+    Telegram combined — both channels stamp the same user_id on
+    their jobs. Failed/cancelled jobs don't count: the customer
+    never got a video from them."""
+    today = _yangon_day(time.time())
+    return sum(1 for j in _all_jobs()
+               if j.get("user_id") == user_id
+               and j.get("status") in ("queued", "running",
+                                       "waiting_review", "done")
+               and j.get("created_at")
+               and _yangon_day(j["created_at"]) == today)
+
+
+def _daily_limit_message(user):
+    """None when this account may start another video today, else
+    the polite Burmese refusal naming the limit. Admins exempt."""
+    if not user or user.get("role") == "admin":
+        return None
+    limit = _daily_job_limit()
+    if limit <= 0:
+        return None
+    if _account_daily_count(user["id"]) >= limit:
+        return (f"🚫 တောင်းပန်ပါတယ် — တစ်ရက် အများဆုံး video {limit} ပုဒ် "
+                "ပဲ ထုတ်လို့ရပါတယ်၊ ဒီနေ့ အတွက် ပြည့်သွားပါပြီ။ "
+                "မနက်ဖြန် ပြန် ကြိုးစားပေးပါ 🙏")
+    return None
 
 
 def _may_submit(chat_id):
@@ -953,6 +1040,14 @@ def _tg_start_flow_job(chat_id, flow):
                             f"credits လိုပါတယ်, လက်ကျန် "
                             f"{acct['credits']} credits ပဲ ရှိပါတယ်။ Menu ထဲက «💰 Credit ဖြည့်» နဲ့ ဖြည့်နိုင်ပါတယ် 🙏")
             return
+        # Daily limit (build 180): the ACCOUNT's day total counts
+        # web + Telegram jobs together; refused before the job
+        # exists, so nothing is ever charged for it.
+        limit_msg = _daily_limit_message(acct)
+        if limit_msg:
+            _TG_FLOW.pop(chat_id, None)
+            tg.send_message(chat_id, limit_msg)
+            return
     if (not tg.is_admin(chat_id)
             and _tg_daily_count(chat_id) >= _TG_DAILY_CAP):
         _TG_FLOW.pop(chat_id, None)
@@ -1003,9 +1098,11 @@ def _tg_start_flow_job(chat_id, flow):
     _save(job)
     _tg_daily_count(chat_id, add=True)
     _TG_PENDING.append(job["id"])
-    if _any_active_worker() or len(_TG_PENDING) > 1:
+    _enqueue_job(job)
+    ahead = _active_worker_count() + len(_JOB_QUEUE) - 1
+    if ahead >= MAX_CONCURRENT_JOBS:
         tg.send_message(chat_id,
-                        f"✅ လက်ခံရရှိပါပြီ — တန်းစီ {len(_TG_PENDING)} ခုမြောက် ဖြစ်ပါတယ်။ "
+                        f"✅ လက်ခံရရှိပါပြီ — တန်းစီ {ahead - MAX_CONCURRENT_JOBS + 1} ခုမြောက် ဖြစ်ပါတယ်။ "
                         "အရင် job တွေ ပြီးတာနဲ့ စလုပ်ပေးပါမယ် 🙏")
     else:
         tg.send_message(chat_id,
@@ -1216,23 +1313,38 @@ def _tg_progress(job):
         time.sleep(5)
 
 
-def _tg_dispatcher():
-    """Start queued bot jobs one at a time (the server runs a single
-    heavy job safely; the web form is gated the same way)."""
+def _job_dispatcher():
+    """Feed the worker slots (build 180: MAX_CONCURRENT_JOBS = 4
+    — the owner wants the full 4-core YTA 3 working).
+
+    Every submission — web form, Telegram bot, review re-render —
+    lands in _JOB_QUEUE with status "queued" and starts here, in
+    order, as slots free up. Nothing is ever refused for
+    concurrency; it waits. A job cancelled while waiting is settled
+    as cancelled without burning a worker slot."""
     while True:
         try:
-            if _TG_PENDING and not _any_active_worker():
-                jid = _TG_PENDING.pop(0)
+            while _JOB_QUEUE and \
+                    _active_worker_count() < MAX_CONCURRENT_JOBS:
+                jid, kind = _JOB_QUEUE.pop(0)
                 job = JOBS.get(jid)
-                if job and job.get("status") == "queued":
-                    job["worker_started"] = True
-                    threading.Thread(target=_worker, args=(job,),
-                                     daemon=True).start()
+                if not job or job.get("status") != "queued":
+                    continue
+                if job.get("cancel_requested"):
+                    _cancelled(job)
+                    continue
+                job["worker_started"] = True
+                if jid in _TG_PENDING:
+                    _TG_PENDING.remove(jid)
+                target = _worker2 if kind == "rerun" else _worker
+                threading.Thread(target=target, args=(job,),
+                                 daemon=True).start()
+                if job.get("tg_chat_id"):
                     threading.Thread(target=_tg_progress, args=(job,),
                                      daemon=True).start()
         except Exception:
             pass
-        time.sleep(4)
+        time.sleep(2)
 
 
 def _cleanup_job(jid):
@@ -2131,6 +2243,57 @@ def auth_logout():
     return resp
 
 
+@app.post("/api/auth/google")
+def auth_google():
+    """Google one-tap sign-in AND account linking (build 180).
+
+    The browser sends the GSI credential (a Google-signed ID
+    token); pipeline.google_auth verifies it with Google and this
+    route enforces the rest: the email must be Google-verified
+    (an unverified email claim is rejected outright — it is the
+    only thing tying a token to an identity we act on), a disabled
+    account stays out, and the fixed owner email — and ONLY that
+    email — promotes its account to admin.
+
+    With a live session this LINKS Google to the signed-in account
+    (refused when the sub belongs to someone else); without one it
+    signs in the account for the sub, creating it on first use."""
+    from pipeline import google_auth
+    data = request.get_json(force=True, silent=True) or {}
+    token = data.get("credential") or data.get("id_token") or ""
+    cid = _google_client_id()
+    if not cid:
+        return jsonify({"error": "Google login မဖွင့်ရသေးပါ"}), 400
+    info = google_auth.verify_id_token(token, cid)
+    if not info:
+        return jsonify({"error": "Google အတည်ပြုချက် မအောင်မြင်ပါ — ပြန် ကြိုးစားပေးပါ"}), 401
+    if not info["email_verified"]:
+        return jsonify({"error": "ဒီ Google account ရဲ့ email ကို Google က အတည်မပြုရသေးပါ"}), 401
+    me = _current_user()
+    if me:
+        if not accounts.link_google(me["id"], info["sub"], info["email"]):
+            return jsonify({"error": "ဒီ Google account က အခြား account နဲ့ ချိတ်ပြီးသား ဖြစ်နေပါတယ်"}), 409
+        user = accounts.get_user(me["id"])
+    else:
+        user = accounts.user_for_google_sub(info["sub"])
+        if user is None:
+            user = accounts.create_google_user(info["sub"], info["email"])
+        if user["disabled"]:
+            return jsonify({"error": "ဒီ account ပိတ်ထားပါတယ် — admin ကို ဆက်သွယ်ပါ"}), 401
+    # Fixed owner email (amendment): a verified token for exactly
+    # this address makes its account an admin — the ONLY way the
+    # Google path can produce or confirm one. Existing accounts
+    # and flags are otherwise left exactly as they are.
+    if info["email"] == FIXED_ADMIN_EMAIL and user["role"] != "admin":
+        accounts.ensure_admin(user["id"])
+        user = accounts.get_user(user["id"])
+    accounts.touch_login(user["id"])
+    if me:
+        return jsonify({"user": user})
+    return _set_session(jsonify({"user": user}),
+                        accounts.new_session(user["id"]))
+
+
 _PROBE = {"running": False}
 _PROBE_LOCK = threading.Lock()
 _BOOT_TS = time.time()
@@ -2344,6 +2507,7 @@ def auth_me():
     return jsonify({"user": _current_user(),
                     "admin_claim_open": claim_open,
                     "enforced": ACCOUNTS_ENFORCED,
+                    "google_client_id": _google_client_id() or None,
                     "fonts": fonts,
                     "i18n": i18n})
 
@@ -2556,6 +2720,59 @@ def botopen_save():
     data = request.get_json(force=True, silent=True) or {}
     _env_write("BOT_OPEN", "1" if data.get("open") else "0")
     return jsonify({"ok": True, "bot_open": _bot_open()})
+
+
+# ---------- Google sign-in settings (build 180) ----------
+# The client ID is configured by the admin here and stored in .env
+# like the API keys; this settings endpoint only ever reports
+# WHETHER one is set, never the value (same rule as the keys). The
+# browser still needs the id itself to render the Google button —
+# a client ID is a public identifier by design (it ships in every
+# page that offers Google sign-in), so /api/auth/me exposes just
+# the id for the login view. There is no client SECRET in this
+# flow at all, so nothing secret exists to leak.
+
+@app.get("/api/settings/google")
+def google_settings_status():
+    return jsonify({"configured": bool(_google_client_id())})
+
+
+@app.post("/api/settings/google")
+def google_settings_save():
+    data = request.get_json(force=True, silent=True) or {}
+    cid = (data.get("client_id") or "").strip()
+    ok_format = cid.endswith(".apps.googleusercontent.com") \
+        and 20 <= len(cid) <= 120 \
+        and all(ch.isalnum() or ch in "-." for ch in cid)
+    if not ok_format:
+        return jsonify({"error": "Client ID မမှန်ပါ — …apps.googleusercontent.com နဲ့ ဆုံးတဲ့ Google Client ID ဖြစ်ရပါမယ်"}), 400
+    _env_write("GOOGLE_CLIENT_ID", cid)
+    return jsonify({"ok": True, "configured": True})
+
+
+@app.delete("/api/settings/google")
+def google_settings_delete():
+    _env_remove("GOOGLE_CLIENT_ID")
+    return jsonify({"ok": True, "configured": False})
+
+
+# ---------- daily job limit settings (build 180) ----------
+
+@app.get("/api/settings/daily-limit")
+def daily_limit_status():
+    return jsonify({"limit": _daily_job_limit()})
+
+
+@app.post("/api/settings/daily-limit")
+def daily_limit_save():
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        limit = int(data.get("limit"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "ကိန်းဂဏန်း ထည့်ပါ (0 = အကန့်အသတ် မရှိ)"}), 400
+    limit = max(0, min(10000, limit))
+    _env_write("DAILY_JOB_LIMIT", str(limit))
+    return jsonify({"ok": True, "limit": limit})
 
 
 @app.post("/api/settings/payqr")
@@ -2805,6 +3022,11 @@ def create_job():
     if me:
         job["user_id"] = me["id"]
         accounts.mark_has_job(me["id"])
+        # Daily limit (build 180): refused HERE, before the job —
+        # and therefore before any charge — even exists.
+        limit_msg = _daily_limit_message(me)
+        if limit_msg:
+            return jsonify({"error": limit_msg}), 400
     preview_id = data.get("preview_id")
     if preview_id:
         # A preview may be reused ONLY for the very link it was taken
@@ -2839,15 +3061,23 @@ def create_job():
                          "credits ပဲ ရှိပါတယ်"}), 400
     JOBS[job["id"]] = job
     _save(job)
-    job["worker_started"] = True
-    threading.Thread(target=_worker, args=(job,), daemon=True).start()
+    # Build 180: queue for a worker slot instead of starting inline —
+    # two jobs run at once, the rest wait their turn (never refused).
+    _enqueue_job(job)
     return jsonify(job)
 
 
 def _job_view(job):
-    return {k: job.get(k) for k in
+    view = {k: job.get(k) for k in
             ("id", "url", "mode", "status", "current", "error", "tg",
              "created_at", "updated_at", "finished_at", "cleanup_at")}
+    if job.get("status") == "queued":
+        # 1-based place among waiting jobs, so the UI/bot can SAY
+        # "you are in the queue" instead of looking stuck (build 180).
+        waiting = [qid for qid, _kind in _JOB_QUEUE]
+        if job["id"] in waiting:
+            view["queue_pos"] = waiting.index(job["id"]) + 1
+    return view
 
 
 def _all_jobs():
@@ -2925,6 +3155,10 @@ def get_job(jid):
     job = _load_job(jid)
     if not job or not _owns(_current_user(), job):
         return jsonify({"error": "job မတွေ့ပါ"}), 404
+    if job.get("status") == "queued":
+        waiting = [q for q, _kind in _JOB_QUEUE]
+        if jid in waiting:
+            job = dict(job, queue_pos=waiting.index(jid) + 1)
     return jsonify(job)
 
 
@@ -2992,9 +3226,11 @@ def job_review(jid):
     if old_timer:
         old_timer.cancel()
     job.pop("cleanup_at", None)
+    # Build 180: the re-render queues for a worker slot like any
+    # other job (it used to jump the queue with its own thread).
+    job["status"] = "queued"
     _save(job)
-    job["worker_started"] = True
-    threading.Thread(target=_worker2, args=(job,), daemon=True).start()
+    _enqueue_job(job, kind="rerun")
     return jsonify({"ok": True, "edited_count": changed})
 
 
@@ -3045,7 +3281,7 @@ def stream_job(jid):
 @app.delete("/api/jobs/<jid>")
 def delete_job(jid):
     """Delete a job and all its files right now (the user asked for no
-    leftovers; otherwise the 12-hour auto-cleanup does it)."""
+    leftovers; otherwise the 24-hour auto-cleanup does it)."""
     job = _load_job(jid)
     if not job or not _owns(_current_user(), job):
         return jsonify({"error": "job မတွေ့ပါ"}), 404
@@ -3252,7 +3488,7 @@ except Exception:
 
 # Each background loop gets its own guard: one failure must never
 # silently take the others down with it.
-for _target in (_backup_loop, _tg_dispatcher):
+for _target in (_backup_loop, _job_dispatcher):
     try:
         threading.Thread(target=_target, daemon=True).start()
     except Exception:

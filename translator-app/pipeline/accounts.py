@@ -83,16 +83,31 @@ def _db():
         conn.execute("ALTER TABLE users ADD COLUMN last_login REAL")
     if "has_job" not in cols:
         conn.execute("ALTER TABLE users ADD COLUMN has_job INTEGER DEFAULT 0")
+    # Build 180: Google sign-in. google_sub is the stable Google
+    # account id; the partial unique index keeps it unique among
+    # linked accounts while any number of password-only rows keep
+    # NULL. email is the address Google verified for that sub.
+    if "google_sub" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
+    if "email" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub "
+        "ON users(google_sub) WHERE google_sub IS NOT NULL")
     return conn
 
 
 def _public(row):
     if row is None:
         return None
+    keys = row.keys()
     return {"id": row["id"], "username": row["username"],
             "role": row["role"], "credits": row["credits"],
             "disabled": bool(row["disabled"]),
             "tg_chat_id": row["tg_chat_id"],
+            "email": row["email"] if "email" in keys else None,
+            "google_linked": bool("google_sub" in keys
+                                  and row["google_sub"]),
             "created_at": row["created_at"]}
 
 
@@ -299,8 +314,8 @@ def adjust_credits(user_id, delta):
 def mark_has_job(user_id):
     """Sticky flag: this account has submitted at least one job.
     The dormant sweep trusts this (plus the caller's live job list),
-    not just job folders still on disk — those are deleted 12 h /
-    24 h after finishing, long before the 60-day sweep runs."""
+    not just job folders still on disk — those are deleted 24 h
+    after finishing, long before the 60-day sweep runs."""
     if not user_id:
         return
     with _LOCK, _db() as conn:
@@ -341,6 +356,84 @@ def user_for_tg(chat_id):
         row = conn.execute("SELECT * FROM users WHERE tg_chat_id = ?",
                            (int(chat_id),)).fetchone()
     return _public(row)
+
+
+# ---------------- Google sign-in (build 180) ----------------
+
+def user_for_google_sub(sub):
+    if not sub:
+        return None
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE google_sub = ?",
+                           (str(sub),)).fetchone()
+    return _public(row)
+
+
+def _google_username(email):
+    """Derive a valid, unique username from an email prefix:
+    strip characters the username rule rejects, then add a numeric
+    suffix until the name is free."""
+    base = re.sub(r"[^A-Za-z0-9_.]", "", (email or "").split("@")[0])
+    base = base.strip(".")[:24] or "googleuser"
+    if len(base) < 3:
+        base = (base + "guser")[:24]
+    with _db() as conn:
+        cand, n = base, 1
+        while conn.execute("SELECT 1 FROM users WHERE username = ?",
+                           (cand,)).fetchone():
+            n += 1
+            suffix = str(n)
+            cand = base[:24 - len(suffix)] + suffix
+    return cand
+
+
+def create_google_user(sub, email):
+    """First Google sign-in for an unseen sub: a new account whose
+    password is a random secret nobody knows (Google-only until the
+    user sets one via change-password while signed in). Credits and
+    ledger start empty, exactly like a fresh registration."""
+    username = _google_username(email)
+    with _LOCK, _db() as conn:
+        cur = conn.execute(
+            "INSERT INTO users (username, pass_hash, created_at, "
+            "google_sub, email, last_login) VALUES (?, ?, ?, ?, ?, ?)",
+            (username, generate_password_hash(secrets.token_urlsafe(48)),
+             time.time(), str(sub), email, time.time()))
+        row = conn.execute("SELECT * FROM users WHERE id = ?",
+                           (cur.lastrowid,)).fetchone()
+    return _public(row)
+
+
+def link_google(user_id, sub, email):
+    """Attach a Google identity to an EXISTING account. Refuses
+    (False) when the sub already belongs to a different account —
+    the partial unique index is the backstop, never a 500."""
+    existing = user_for_google_sub(sub)
+    if existing and existing["id"] != int(user_id):
+        return False
+    try:
+        with _LOCK, _db() as conn:
+            conn.execute(
+                "UPDATE users SET google_sub = ?, email = ? WHERE id = ?",
+                (str(sub), email, int(user_id)))
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def ensure_admin(user_id):
+    """Promote an account to admin. Called ONLY from the Google
+    sign-in path after a verified token for the fixed owner email
+    (build 180 amendment) — no other caller may exist."""
+    with _LOCK, _db() as conn:
+        conn.execute("UPDATE users SET role = 'admin' WHERE id = ?",
+                     (int(user_id),))
+
+
+def touch_login(user_id):
+    with _LOCK, _db() as conn:
+        conn.execute("UPDATE users SET last_login = ? WHERE id = ?",
+                     (time.time(), int(user_id)))
 
 
 # ---------------- credits: ledger, charges, top-ups ----------------

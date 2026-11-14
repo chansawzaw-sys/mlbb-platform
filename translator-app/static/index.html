@@ -129,6 +129,7 @@
         <button class="ghost" id="loginBtn">ဝင်မယ်</button>
         <button class="ghost" id="registerBtn">အကောင့် အသစ် ဖွင့်မယ်</button>
       </div>
+      <div id="gBtnOut" style="margin-top:10px"></div>
       <p class="err" id="authErr"></p>
     </div>
     <div id="authIn" style="display:none">
@@ -139,6 +140,8 @@
         <button class="ghost" id="logoutBtn">ထွက်မယ်</button>
       </div>
       <p class="hint" id="linkCodeOut" style="display:none"></p>
+      <div id="gBtnIn" style="margin-top:6px"></div>
+      <p class="hint" id="gLinkState" style="display:none"></p>
       <div class="row">
         <button class="ghost" id="payToggle">💰 ငွေဖြည့်ရန်</button>
       </div>
@@ -210,6 +213,12 @@
     <div class="row">
       <button class="ghost" id="botOpenBtn">…</button>
     </div>
+    <h4>📅 တစ်ရက် အများဆုံး video (account တစ်ခုချင်း)</h4>
+    <p class="hint">user တစ်ယောက် တစ်ရက် (မြန်မာ အချိန်) အများ ဆုံး ထုတ်နိုင်တဲ့ video အရေအတွက် — web + Telegram နှစ်ခုပေါင်း ရေတွက်တယ်။ <b>0 = အကန့်အသတ် မရှိ</b>။ Admin မပါဝင်။</p>
+    <input id="dailyLimit" type="number" min="0" max="10000" inputmode="numeric" placeholder="ဥပမာ 10 (0 = အကန့်အသတ် မရှိ)" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+    <div class="row">
+      <button class="ghost" id="dailyLimitSave">သိမ်းမယ်</button>
+    </div>
   <div class="card" id="keyCard">
     <h3 style="margin-top:0">🔑 Gemini key (ဘာသာပြန် အတွက်)</h3>
     <div class="keyPill" id="keyPill">…</div>
@@ -274,6 +283,17 @@
     <div class="row">
       <button class="ghost" id="tgSave">သိမ်းမယ်</button>
       <button class="ghost" id="tgDel">ဖျက်မယ်</button>
+    </div>
+  </div>
+
+  <div class="card" id="googleCard">
+    <h3 style="margin-top:0">🔐 Google login (တစ်ချက် နှိပ် ဝင်ရန်)</h3>
+    <div class="keyPill" id="googlePill">…</div>
+    <p class="hint">Google Client ID ထည့်ရင် customer တွေ <b>Google နဲ့ တစ်ချက် နှိပ်</b> ပြီး ဝင်လို့ရမယ် (username/password လည်း ဒီအတိုင်း ရှိမယ်)။ Client ID ကို <b>chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ။ အခြေအနေ: <span id="googleState">…</span></p>
+    <input type="text" id="googleInput" placeholder="Client ID (…apps.googleusercontent.com)" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+    <div class="row">
+      <button class="ghost" id="googleSave">သိမ်းမယ်</button>
+      <button class="ghost" id="googleDel">ဖျက်မယ်</button>
     </div>
   </div>
     </div>
@@ -444,7 +464,7 @@
       <a class="dlbtn" id="jobDlSrcTxt" download>📄 မူရင်း စာသား (TXT)</a>
       <a class="dlbtn" id="jobDlSrcSrt" download>📄 မူရင်း SRT</a>
     </div>
-    <p class="hint" id="cleanupNote" style="display:none">⏰ ၁၂ နာရီ အတွင်း ဒေါင်းပါ / ပြင်ပါ — ကုန်သွားရင် server ပေါ်က ဖိုင် အကုန် အလိုလို ဖျက်ပါမယ် (memory မကျန်အောင်)။</p>
+    <p class="hint" id="cleanupNote" style="display:none">⏰ ၂၄ နာရီ အတွင်း ဒေါင်းပါ / ပြင်ပါ — ကုန်သွားရင် server ပေါ်က ဖိုင် အကုန် အလိုလို ဖျက်ပါမယ် (memory မကျန်အောင်)။</p>
     <div class="row" id="doneBtns" style="display:none">
       <button class="ghost" id="editBtn">✏️ မြန်မာစာ ပြင်ပြီး ပြန်လုပ်မယ်</button>
       <button class="ghost" id="delBtn">🗑 ခုပဲ ဖျက်မယ်</button>
@@ -476,6 +496,7 @@
   </div>
 
 </div>
+<script src="https://accounts.google.com/gsi/client" async></script>
 <script>
 const $ = id => document.getElementById(id);
 const ICON = {pending:"⏳", running:"🔄", done:"✅", error:"❌"};
@@ -959,8 +980,14 @@ async function poll(id) {
     notifyUser(job);
     loadJobs();
   }
-  $("steps").innerHTML = job.steps.map(s =>
-    `<div class="step ${s.state}">${ICON[s.state] || "⏳"} ${s.label}</div>`).join("");
+  $("steps").innerHTML =
+    (job.status === "queued"
+      ? `<div class="step running">⏳ တန်းစီ စောင့်နေပါတယ်` +
+        (job.queue_pos ? ` (အဆင့် ${job.queue_pos})` : "") +
+        ` — အရင် job တွေ ပြီးတာနဲ့ အလိုအလျောက် စ လုပ်ပါမယ်၊ ဒီ page ကို ဖွင့်ထားရုံပါပဲ</div>`
+      : "") +
+    job.steps.map(s =>
+      `<div class="step ${s.state}">${ICON[s.state] || "⏳"} ${s.label}</div>`).join("");
   if (job.status === "waiting_review" && reviewShownFor !== id) loadReview(id);
   if (job.status === "done") {
     clearInterval(timer); $("go").disabled = false;
@@ -1031,6 +1058,9 @@ async function loadJobs() {
     }
     el.innerHTML = d.jobs.map(j => {
       const parts = [];
+      if (j.status === "queued")
+        parts.push("⏳ တန်းစီ စောင့်နေပါတယ်" +
+          (j.queue_pos ? " (အဆင့် " + j.queue_pos + ")" : ""));
       if ((j.status === "running" || j.status === "queued") && j.current)
         parts.push(j.current);
       if (j.status === "done" && j.cleanup_at)
@@ -1340,6 +1370,61 @@ $("tgSave").onclick = async () => {
 };
 $("loginBtn").addEventListener("click", () => authPost("/api/auth/login"));
 $("registerBtn").addEventListener("click", () => authPost("/api/auth/register"));
+
+/* ---------------- Google sign-in (build 180) ----------------
+   The button exists ONLY when the admin configured a client ID
+   (/api/auth/me carries it — a public identifier, not a secret).
+   One callback serves both jobs: signed out it signs in (or
+   creates the account); signed in it LINKS Google to this
+   account. The server tells the two apart by the session. */
+let GOOGLE_CID = null, GSI_INITED = false;
+async function onGoogleCredential(resp) {
+  const errEl = ME ? $("authErr2") : $("authErr");
+  try {
+    const res = await fetch("/api/auth/google", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({credential: resp.credential})});
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (errEl) errEl.textContent = d.error || "Google login မအောင်မြင်ပါ";
+      return;
+    }
+    if (errEl) errEl.textContent = "";
+    loadMe();
+  } catch (e) {
+    if (errEl) errEl.textContent = "Google login မအောင်မြင်ပါ";
+  }
+}
+function setupGoogleButtons() {
+  const out = $("gBtnOut"), inn = $("gBtnIn"), st = $("gLinkState");
+  if (out) out.innerHTML = "";
+  if (inn) inn.innerHTML = "";
+  if (st) st.style.display = "none";
+  if (!GOOGLE_CID) return;
+  if (ME && ME.google_linked) {
+    if (st) {
+      st.style.display = "";
+      st.textContent = "✅ Google ချိတ်ထားပြီး" +
+        (ME.email ? " (" + ME.email + ")" : "");
+    }
+    return;
+  }
+  let tries = 0;
+  (function render() {
+    if (!(window.google && google.accounts && google.accounts.id)) {
+      if (++tries < 40) setTimeout(render, 250);
+      return;
+    }
+    if (!GSI_INITED) {
+      google.accounts.id.initialize(
+        {client_id: GOOGLE_CID, callback: onGoogleCredential});
+      GSI_INITED = true;
+    }
+    const target = ME ? inn : out;
+    if (target) google.accounts.id.renderButton(
+      target, {theme: "outline", size: "large", width: 280});
+  })();
+}
 $("logoutBtn").addEventListener("click", async () => {
   await fetch("/api/auth/logout", {method: "POST"}); loadMe();
 });
@@ -1408,6 +1493,60 @@ $("tgDel").onclick = async () => {
   alert("ဖျက်ပြီးပါပြီ");
 };
 loadTgState();
+
+/* ---------------- Google client ID settings (build 180) ---------------- */
+async function loadGoogleState() {
+  try {
+    const r = await fetch("/api/settings/google");
+    const d = await r.json();
+    // Same owner-only rule as the key cards: a non-admin's 403 has
+    // no "configured" field and the card stays hidden, full stop.
+    if (!r.ok || !("configured" in d)) {
+      $("googleCard").classList.remove("show");
+      return;
+    }
+    $("googleState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
+    setPill("googlePill", d.configured);
+    $("googleCard").classList.add("show");
+  } catch (e) { $("googleState").textContent = "?"; }
+}
+$("googleSave").onclick = async () => {
+  const cid = $("googleInput").value.trim();
+  if (!cid) { alert("Client ID အရင် ထည့်ပါ"); return; }
+  const res = await fetch("/api/settings/google", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({client_id: cid})});
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok) { alert(d.error || "သိမ်းလို့ မရပါ"); return; }
+  $("googleInput").value = "";
+  loadGoogleState();
+  loadMe();
+  alert("သိမ်းပြီးပြီ — login မှာ Google ခလုတ် ပေါ်လာမယ်");
+};
+$("googleDel").onclick = async () => {
+  await fetch("/api/settings/google", {method: "DELETE"});
+  loadGoogleState();
+  loadMe();
+  alert("ဖျက်ပြီးပါပြီ");
+};
+loadGoogleState();
+
+/* ---------------- daily job limit settings (build 180) ---------------- */
+async function loadDailyLimit() {
+  try {
+    const d = await (await fetch("/api/settings/daily-limit")).json();
+    if ("limit" in d) $("dailyLimit").value = d.limit;
+  } catch (e) {}
+}
+$("dailyLimitSave").onclick = async () => {
+  const v = parseInt($("dailyLimit").value, 10);
+  if (isNaN(v) || v < 0) { alert("ကိန်းဂဏန်း မှန်အောင် ထည့်ပါ (0 = အကန့်အသတ် မရှိ)"); return; }
+  const res = await fetch("/api/settings/daily-limit", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({limit: v})});
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok) { alert(d.error || "သိမ်းလို့ မရပါ"); return; }
+  alert(d.limit === 0 ? "သိမ်းပြီးပြီ — အကန့်အသတ် မရှိ"
+                      : "သိမ်းပြီးပြီ — တစ်ရက် အများဆုံး " + d.limit + " ပုဒ်");
+};
 
 // ---------- accounts ----------
 let ME = null;
@@ -1515,10 +1654,11 @@ async function loadMe() {
     const r = await (await fetch("/api/auth/me")).json();
     ME = r.user;
     I18N = r.i18n || null;
+    GOOGLE_CID = r.google_client_id || null;
     $("authOut").style.display = ME ? "none" : "";
     $("authIn").style.display = ME ? "" : "none";
     $("adminCard").classList.toggle("show", !!(ME && ME.role === "admin"));
-    if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); loadWall(); renderEngineStats(); }
+    if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); loadWall(); loadDailyLimit(); renderEngineStats(); }
     if (ME && ME.role !== "admin") {
       // Customers never see the owner's key / bot settings cards.
       $("keyCard").classList.remove("show");
@@ -1527,6 +1667,7 @@ async function loadMe() {
       $("xkCard").classList.remove("show");
       $("asCard").classList.remove("show");
       $("tgCard").classList.remove("show");
+      $("googleCard").classList.remove("show");
     }
     if (ME) loadPayQr();
     if (ME) loadMyTopups();
@@ -1536,6 +1677,7 @@ async function loadMe() {
         " · 💳 " + ME.credits + " credits";
       $("claimBtn").style.display = r.admin_claim_open ? "" : "none";
     }
+    setupGoogleButtons();
   } catch (e) {}
 }
 async function loadMyTopups() {
@@ -1810,6 +1952,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 179</p>
+<p class="hint" id="buildTag" style="text-align:center">build 180</p>
 </body>
 </html>
