@@ -18,7 +18,7 @@
          background: #f6efdd; color: #33302a; padding: 16px; }
   .wrap { max-width: 560px; margin: 0 auto; }
   h1 { font-size: 20px; margin: 8px 0 4px; }
-  p.sub { color: #aab; font-size: 13px; margin: 0 0 16px; line-height: 1.6; }
+  p.sub { color: #6f6650; font-size: 13px; margin: 0 0 16px; line-height: 1.6; }
   label { display: block; font-size: 14px; margin: 14px 0 6px; }
   input[type=url], select { width: 100%; padding: 12px; border-radius: 10px;
     border: 1px solid #cbbd97; background: #fffdf8; color: #33302a; font-size: 15px; }
@@ -29,19 +29,19 @@
     border: 1px solid #cbbd97; background: #fffdf8; font-size: 14px; cursor: pointer; }
   .modes input:checked + span { background: #2b5cff; border-color: #2b5cff; font-weight: 700; }
   button { width: 100%; margin-top: 18px; padding: 14px; border: 0; border-radius: 12px;
-    background: #e9c767; color: #f6efdd; font-size: 16px; font-weight: 700; cursor: pointer; }
+    background: #e9c767; color: #33302a; font-size: 16px; font-weight: 700; cursor: pointer; }
   button:disabled { opacity: .5; }
   button.ghost { background: #f3ead3; color: #3d382f; border: 1px solid #cbbd97; }
   .card { margin-top: 20px; background: #fffaf1; border: 1px solid #ddd0b2;
     border-radius: 12px; padding: 14px; display: none; }
   .card.show { display: block; }
-  .step { display: flex; gap: 8px; align-items: center; padding: 7px 0; font-size: 14px; color: #99a; }
+  .step { display: flex; gap: 8px; align-items: center; padding: 7px 0; font-size: 14px; color: #655c47; }
   .jobrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid #ffffff14; font-size: 14px; flex-wrap: wrap; }
   .jobrow button, .tgpick button { width: auto; margin-top: 0; padding: 8px 12px; font-size: 13.5px; border-radius: 9px; }
   .jobitem { display: block; }
   .jobitem .jhead { display: flex; gap: 6px; align-items: center; }
   .jobitem .jurl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .jobitem .jmeta { color: #99a; font-size: 12.5px; margin-top: 2px; }
+  .jobitem .jmeta { color: #655c47; font-size: 12.5px; margin-top: 2px; }
   .jobitem .jbtns { display: flex; gap: 6px; margin-top: 8px; }
   .jobitem .jbtns button { flex: 1; }
   /* ---------- API usage board boxes (build 141) ---------- */
@@ -52,20 +52,20 @@
   .keyPill.no { background: #4a3436; color: #fecaca; }
   .apiBox { background: #efe5cb; border: 1px solid #ddd0b2; border-radius: 10px;
     padding: 12px; text-align: center; }
-  .apiBox .an { color: #99a; font-size: 12.5px; }
+  .apiBox .an { color: #655c47; font-size: 12.5px; }
   .apiBox .ac { font-size: 24px; font-weight: 700; color: #33302a; margin-top: 3px; }
-  .apiBox .ac small { font-size: 12.5px; font-weight: 400; color: #99a; }
-  .apiBox .ad { color: #99a; font-size: 11.5px; margin-top: 6px; line-height: 1.6; }
+  .apiBox .ac small { font-size: 12.5px; font-weight: 400; color: #655c47; }
+  .apiBox .ad { color: #655c47; font-size: 11.5px; margin-top: 6px; line-height: 1.6; }
   /* ---------- QR display box (build 143) ---------- */
   .qrBox { background: #efe5cb; border: 1px solid #ddd0b2; border-radius: 10px;
     padding: 12px; text-align: center; margin-top: 8px; }
   .qrBox img { max-width: 200px; border-radius: 8px; }
-  .qrBox .an { color: #99a; font-size: 12.5px; margin-bottom: 8px; }
+  .qrBox .an { color: #655c47; font-size: 12.5px; margin-bottom: 8px; }
   .apiTotal { background: #efe5cb; border: 1px solid #2b5cff; border-radius: 10px;
     padding: 12px; text-align: center; margin-top: 8px; }
-  .apiTotal .an { color: #bbc; font-size: 13px; }
+  .apiTotal .an { color: #655c47; font-size: 13px; }
   .apiTotal .ac { font-size: 26px; font-weight: 700; color: #33302a; margin-top: 3px; }
-  .apiTotal .ac small { font-size: 13px; font-weight: 400; color: #99a; }
+  .apiTotal .ac small { font-size: 13px; font-weight: 400; color: #655c47; }
   .step.running { color: #2b5cff; }
   .step.done { color: #7dd87d; }
   .step.error { color: #ff8080; }
@@ -91,19 +91,20 @@
     text-shadow: -2px 0 0 #000, 2px 0 0 #000, 0 -2px 0 #000, 0 2px 0 #000,
       -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000, 2px 2px 0 #000,
       0 3px 7px rgba(0,0,0,.65); }
-  .hint { font-size: 12px; color: #aab; line-height: 1.7; margin: 8px 0 0; }
+  .hint { font-size: 12px; color: #6f6650; line-height: 1.7; margin: 8px 0 0; }
+  ::placeholder { color: #968a6d; opacity: 1; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; }
   .row button { flex: 1; width: auto; margin-top: 8px; padding: 9px 4px; font-size: 13px; }
   .row a.dlbtn { flex: 1 1 40%; text-align: center; margin-top: 8px; padding: 9px 4px;
     font-size: 13px; border-radius: 10px; background: #f3ead3; color: #3d382f;
     border: 1px solid #cbbd97; text-decoration: none; }
   input[type=range] { width: 100%; accent-color: #e9c767; }
-  .val { color: #e9c767; font-size: 12px; }
+  .val { color: #9a7b1e; font-size: 12px; }
   /* ---------- review step ---------- */
   .revItem { border-top: 1px solid #ddd0b2; padding: 10px 0; }
   .revItem:first-child { border-top: 0; }
-  .revTime { font-size: 12px; color: #8fa; margin-bottom: 3px; }
-  .revEn { font-size: 13px; color: #99a; line-height: 1.5; margin-bottom: 6px; }
+  .revTime { font-size: 12px; color: #3e7d4e; margin-bottom: 3px; }
+  .revEn { font-size: 13px; color: #655c47; line-height: 1.5; margin-bottom: 6px; }
   .revMy { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #cbbd97;
     background: #fffdf8; color: #33302a; font-size: 16px; line-height: 1.6;
     font-family: inherit; resize: vertical; }
@@ -1952,6 +1953,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 180</p>
+<p class="hint" id="buildTag" style="text-align:center">build 181</p>
 </body>
 </html>
