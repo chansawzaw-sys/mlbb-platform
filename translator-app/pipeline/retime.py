@@ -136,13 +136,12 @@ def _piece_vf(c, dur):
     return vf
 
 
-def _video_single_pass(src, chunks, out, cap_k=2500):
-    """All chunks in ONE ffmpeg decode+encode (a trim/concat filter
-    graph). ONLY safe for a FEW chunks: with many trim branches on one
-    input, ffmpeg buffers frames for the latest branch while earlier
-    ones process, which balloons memory and time (a ~40-chunk graph
-    stalled a production job in this step for 19+ minutes). The
-    chunked path below is linear and is the default for real jobs."""
+def _video_graph(chunks):
+    """The single-pass video graph: one trim/setpts branch per chunk,
+    concatenated. Returns (filters, out_label). Shared by
+    _video_single_pass and by the build-182 merged encode, which
+    appends the finalize graph (fx + subtitle burn) to the concat
+    label so the retimed picture is encoded ONCE, not twice."""
     filters, labels = [], []
     for n, c in enumerate(chunks):
         f = (f"[0:v]trim=start={c['start']:.3f}:end={c['end']:.3f},"
@@ -154,12 +153,49 @@ def _video_single_pass(src, chunks, out, cap_k=2500):
         filters.append(f + f"[v{n}]")
         labels.append(f"[v{n}]")
     filters.append("".join(labels) + f"concat=n={len(chunks)}:v=1:a=0[outv]")
+    return filters, "[outv]"
+
+
+def _video_single_pass(src, chunks, out, cap_k=2500):
+    """All chunks in ONE ffmpeg decode+encode (a trim/concat filter
+    graph). ONLY safe for a FEW chunks: with many trim branches on one
+    input, ffmpeg buffers frames for the latest branch while earlier
+    ones process, which balloons memory and time (a ~40-chunk graph
+    stalled a production job in this step for 19+ minutes). The
+    chunked path below is linear and is the default for real jobs."""
+    filters, _label = _video_graph(chunks)
     mr = target_maxrate_k(src, cap_k)
     run(["ffmpeg", "-y", "-v", "error", "-i", str(src),
          "-filter_complex", ";".join(filters), "-map", "[outv]",
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
          "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k", str(out)],
         timeout=1800)
+
+
+def _video_merged(src, chunks, dub_wav, spec, cap_k=2500):
+    """Build 182 merged encode: the retime graph and the finalize
+    graph (fx chain and/or subtitle burn, built by the caller in
+    `spec`) run in ONE ffmpeg invocation, and the dub audio is muxed
+    in the same pass — the picture is encoded exactly once at the
+    finalize stage's own settings (crf 24; the classic flow encoded
+    it at crf 23, decoded it, and encoded it again at crf 24).
+    `spec` = {"filters", "out_label", "logo_path", "output"} with the
+    finalize filters rooted at the concat label [outv]; the logo, if
+    any, is input 2 (0 = source, 1 = dub.wav)."""
+    filters, _label = _video_graph(chunks)
+    filters = filters + list(spec["filters"])
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src),
+           "-i", str(dub_wav)]
+    if spec.get("logo_path"):
+        cmd += ["-i", str(spec["logo_path"])]
+    mr = target_maxrate_k(src, cap_k)
+    cmd += ["-filter_complex", ";".join(filters),
+            "-map", spec["out_label"], "-map", "1:a",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+            "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
+            "-c:a", "aac", "-b:a", "96k", "-shortest",
+            str(spec["output"])]
+    run(cmd, timeout=1800)
 
 
 def _video_chunked(src, chunks, cdir, out, cap_k=2500):
@@ -183,7 +219,19 @@ def _video_chunked(src, chunks, cdir, out, cap_k=2500):
          "-i", str(lst), "-c:v", "copy", str(out)], timeout=1200)
 
 
-def retime(workdir, max_speed=MAX_SPEED, cap_k=2500):
+def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None):
+    """Re-time the picture to the dub and mux the narration.
+
+    `make_finalize` (build 182): optional callable(plan) -> spec|None
+    that supplies the finalize graph (fx/subtitle burn) so it can be
+    appended to the single-pass retime graph and encoded ONCE into
+    the final output. Consulted only when the video path is the
+    single-pass one (few chunks, not passthrough); the plan then
+    carries final_merged=True + final_output, and retimed.mp4 is not
+    written (nothing outside run_job's classic finalize reads it).
+    Spec-BUILDING errors propagate (the classic burn fails loudly the
+    same way, e.g. a missing Myanmar font); a failed merged ENCODE
+    falls back to the classic two-encode flow below."""
     workdir = Path(workdir)
     src = workdir / "source.mp4"
     segs = load_segments(workdir / "segments_my.json")
@@ -254,40 +302,62 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500):
     passthrough = all(c["kind"] == "gap"
                       or abs(c["new_dur"] - c["orig_dur"]) <= 0.01
                       for c in chunks)
-    if passthrough:
-        run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-i", str(dub_wav),
-             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
-             "-shortest", str(workdir / "retimed.mp4")], timeout=1200)
-    else:
-        retimed_video = workdir / "retimed_video.mp4"
-        # Single-pass only for a handful of chunks (see its docstring:
-        # many-branch trim graphs stall); the chunked path is linear
-        # in the chunk count and bounded in memory.
-        if len(chunks) <= 12:
-            try:
-                _video_single_pass(src, chunks, retimed_video, cap_k)
-            except Exception:
-                _video_chunked(src, chunks, cdir, retimed_video, cap_k)
-        else:
-            _video_chunked(src, chunks, cdir, retimed_video, cap_k)
-        run(["ffmpeg", "-y", "-v", "error", "-i", str(retimed_video), "-i", str(dub_wav),
-             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k", "-shortest",
-             str(workdir / "retimed.mp4")], timeout=1200)
-        # Intermediates are dead weight once the mux exists (the chunked
-        # fallback's pieces are a second full copy of the video) — drop
-        # them now instead of letting them sit until job cleanup.
-        try:
-            retimed_video.unlink(missing_ok=True)
-            for piece in cdir.glob("v*.mp4"):
-                piece.unlink(missing_ok=True)
-        except Exception:
-            pass
-
+    # The re-timed subtitle timings depend only on the plan, so they
+    # are written BEFORE the video stage now (build 182): the merged
+    # encode's finalize graph burns subs_retimed.srt in the same
+    # pass that produces the retimed picture.
     save_segments(new_segs, workdir / "segments_retimed.json")
     write_srt(new_segs, workdir / "subs_retimed.srt", start_key="start_new", end_key="end_new")
     plan = {"chunks": chunks, "source_duration": round(total, 3),
             "retimed_duration": round(t_cursor, 3),
             "video_passthrough": passthrough, "max_speed": max_speed}
+
+    merged = False
+    if passthrough:
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-i", str(dub_wav),
+             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
+             "-shortest", str(workdir / "retimed.mp4")], timeout=1200)
+    else:
+        spec = None
+        if make_finalize is not None and len(chunks) <= 12:
+            # Built OUTSIDE the try: a spec error (missing font, bad
+            # fx) must fail the job loudly, exactly as the classic
+            # finalize would — only an encode failure falls back.
+            spec = make_finalize(plan)
+        if spec is not None:
+            try:
+                _video_merged(src, chunks, dub_wav, spec, cap_k)
+                merged = True
+            except Exception:
+                merged = False
+        if merged:
+            plan["final_merged"] = True
+            plan["final_output"] = str(spec["output"])
+        else:
+            retimed_video = workdir / "retimed_video.mp4"
+            # Single-pass only for a handful of chunks (see its docstring:
+            # many-branch trim graphs stall); the chunked path is linear
+            # in the chunk count and bounded in memory.
+            if len(chunks) <= 12:
+                try:
+                    _video_single_pass(src, chunks, retimed_video, cap_k)
+                except Exception:
+                    _video_chunked(src, chunks, cdir, retimed_video, cap_k)
+            else:
+                _video_chunked(src, chunks, cdir, retimed_video, cap_k)
+            run(["ffmpeg", "-y", "-v", "error", "-i", str(retimed_video), "-i", str(dub_wav),
+                 "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k", "-shortest",
+                 str(workdir / "retimed.mp4")], timeout=1200)
+            # Intermediates are dead weight once the mux exists (the chunked
+            # fallback's pieces are a second full copy of the video) — drop
+            # them now instead of letting them sit until job cleanup.
+            try:
+                retimed_video.unlink(missing_ok=True)
+                for piece in cdir.glob("v*.mp4"):
+                    piece.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     (workdir / "retime_plan.json").write_text(
         __import__("json").dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     return plan

@@ -40,17 +40,20 @@ def has_fx(fx):
             or (fx.get("aspect") or {}).get("ratio") in ASPECT_DIMS)
 
 
-def filter_chain(fx, vw, vh):
+def filter_chain(fx, vw, vh, start="[0:v]", logo="[1:v]"):
     """Build the -filter_complex pieces for blur + logo.
 
-    Returns (filters, out_label, logo_path). The input video is [0:v];
-    a logo, if any, must be supplied as input 1. Shared by
-    apply_effects() and by burn.py, which appends the subtitle filter
-    to the same graph so blur/logo + subtitles cost ONE encode."""
-    logo = fx.get("logo") or {}
-    logo_path = logo.get("path")
+    Returns (filters, out_label, logo_path). The input video is
+    `start` ([0:v] standalone; another label when the chain is
+    appended to an earlier graph — build 182's merged retime+finalize
+    encode) and a logo, if any, must be supplied as the input named
+    by `logo`. Shared by apply_effects() and by burn.py, which
+    appends the subtitle filter to the same graph so blur/logo +
+    subtitles cost ONE encode."""
+    logo_cfg = fx.get("logo") or {}
+    logo_path = logo_cfg.get("path")
     filters = []
-    cur = "[0:v]"
+    cur = start
     # Piece-by-piece blur (owner's rule): each piece blurs only its
     # own rows and only inside its time window — the text zone moves,
     # so the blur follows it instead of covering one big fixed area.
@@ -89,15 +92,15 @@ def filter_chain(fx, vw, vh):
         filters.append(f"[fxbase][fxblurred]overlay=x='main_w*{bx}':y='main_h*{by}'[vfx]")
         cur = "[vfx]"
     if logo_path:
-        size_pct = float(logo.get("size_pct") or 18)
-        opacity = min(max(float(logo.get("opacity", 70)) / 100.0, 0.0), 1.0)
-        sat = min(max(float(logo.get("saturation", 100)) / 100.0, 0.0), 2.0)
-        pos_x = min(max(float(logo.get("pos_x", 1.0)), 0.0), 1.0)
-        pos_y = min(max(float(logo.get("pos_y", 0.0)), 0.0), 1.0)
+        size_pct = float(logo_cfg.get("size_pct") or 18)
+        opacity = min(max(float(logo_cfg.get("opacity", 70)) / 100.0, 0.0), 1.0)
+        sat = min(max(float(logo_cfg.get("saturation", 100)) / 100.0, 0.0), 2.0)
+        pos_x = min(max(float(logo_cfg.get("pos_x", 1.0)), 0.0), 1.0)
+        pos_y = min(max(float(logo_cfg.get("pos_y", 0.0)), 0.0), 1.0)
         logo_w = max(16, int(vw * size_pct / 100.0))
         # logo chain: scale, fade colour (hue saturation), set alpha (opacity)
         filters.append(
-            f"[1:v]scale=w={logo_w}:h=-1,format=rgb24,hue=s={sat:.3f},"
+            f"{logo}scale=w={logo_w}:h=-1,format=rgb24,hue=s={sat:.3f},"
             f"format=rgba,colorchannelmixer=aa={opacity:.3f}[fxlogo]")
         filters.append(
             f"{cur}[fxlogo]overlay=x='(main_w-overlay_w)*{pos_x:.4f}'"

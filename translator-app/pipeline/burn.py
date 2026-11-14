@@ -390,8 +390,13 @@ def _fonts_dir():
     return FONTS_DIR
 
 
-def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
-         blur_box=None, fx=None, cap_k=2500):
+def _prepare_ass(input_mp4, srt_path, font=DEFAULT_FONT, subs=None,
+                 blur_box=None, fx=None):
+    """Font check + layout dims + the ASS script for a burn.
+
+    Returns (ass_path, fonts_dir, width, height) where width/height
+    are the FINAL canvas dims the subtitles were laid out on (the fx
+    aspect reframe, when present, remaps them and the blur box)."""
     fonts_dir = _fonts_dir()
     family = FONT_CHOICES.get(font, FONT_CHOICES[DEFAULT_FONT])
     # Never deliver silent tofu again: if the chosen family's font
@@ -419,16 +424,48 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
     ass_path = Path(srt_path).with_name(Path(srt_path).stem + ".layout.ass")
     srt_to_ass(srt_path, ass_path, width, height, family, subs,
                blur_box=blur_box)
-    ass = str(ass_path.resolve()).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    return ass_path, fonts_dir, width, height
+
+
+def _ass_filter(ass_path, fonts_dir):
+    ass = str(Path(ass_path).resolve()).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
     fontsdir = str(fonts_dir).replace("\\", "/").replace(":", "\\:")
+    return f"ass='{ass}':fontsdir='{fontsdir}'"
+
+
+def finalize_filters(input_mp4, srt_path, font=DEFAULT_FONT, subs=None,
+                     blur_box=None, fx=None, start="[0:v]", logo="[1:v]"):
+    """Filter-complex segments turning the video stream at label
+    `start` into the finished picture: the fx chain (blur/logo/
+    aspect) with the subtitle burn appended — the same graph burn()
+    runs standalone. Returns (filters, out_label, logo_path).
+
+    Build 182: retime's merged encode hangs this graph off its
+    concat label so retime + finalize cost ONE encode instead of
+    two; `logo` names the input slot the logo image will occupy in
+    that larger command."""
+    ass_path, fonts_dir, width, height = _prepare_ass(
+        input_mp4, srt_path, font, subs, blur_box, fx)
+    if fx:
+        from . import fx as fx_mod
+        if fx_mod.has_fx(fx):
+            filters, cur, logo_path = fx_mod.filter_chain(
+                fx, width, height, start=start, logo=logo)
+            filters.append(f"{cur}{_ass_filter(ass_path, fonts_dir)}[vout]")
+            return filters, "[vout]", logo_path
+    return [f"{start}{_ass_filter(ass_path, fonts_dir)}[vout]"], "[vout]", None
+
+
+def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
+         blur_box=None, fx=None, cap_k=2500):
     if fx:
         from . import fx as fx_mod
         if fx_mod.has_fx(fx):
             # Blur/logo + subtitles in ONE encode: the fx filter graph
             # runs first, the ass filter is appended to its output.
             # (Was: a full fx encode followed by a full burn encode.)
-            filters, cur, logo_path = fx_mod.filter_chain(fx, width, height)
-            filters.append(f"{cur}ass='{ass}':fontsdir='{fontsdir}'[vout]")
+            filters, _out, logo_path = finalize_filters(
+                input_mp4, srt_path, font, subs, blur_box, fx)
             cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4)]
             if logo_path:
                 cmd += ["-i", str(logo_path)]
@@ -439,7 +476,9 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
                     "-c:a", "copy", str(output_mp4)]
             run(cmd)
             return output_mp4
-    vf = f"ass='{ass}':fontsdir='{fontsdir}'"
+    ass_path, fonts_dir, _w, _h = _prepare_ass(
+        input_mp4, srt_path, font, subs, blur_box, fx)
+    vf = _ass_filter(ass_path, fonts_dir)
     mr = target_maxrate_k(input_mp4, cap_k)
     run(["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4), "-vf", vf,
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",

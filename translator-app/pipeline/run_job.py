@@ -152,10 +152,44 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
     tts.synthesize(workdir, voice, rate=voice_rate, pitch=voice_pitch)
     mark("tts", "done")
 
+    def _make_finalize(plan):
+        """Build 182: the finalize graph (fx + subtitle burn for
+        mode=both; the fx chain alone for dub-with-fx), rooted at the
+        retime concat label so retime can append it to its single-
+        pass graph and encode the picture ONCE. Blur pieces are
+        remapped through THIS plan first (they were timed on the
+        original video). Returns None when there is no finalize
+        encode to merge (dub without fx — finalize is a file copy)."""
+        fxm = fx
+        if fxm and fxm.get("blur_pieces"):
+            fxm = {**fxm, "blur_pieces": retime.remap_pieces(
+                plan, fxm["blur_pieces"])}
+        if mode == "both":
+            filters, out_label, logo_path = burn.finalize_filters(
+                src, workdir / "subs_retimed.srt", font=font, subs=subs,
+                blur_box=(fxm or {}).get("blur"),
+                fx=fxm if fx_mod.has_fx(fxm) else None,
+                start="[outv]", logo="[2:v]")
+            return {"filters": filters, "out_label": out_label,
+                    "logo_path": logo_path, "output": final}
+        if fx_mod.has_fx(fxm):
+            vw, vh = fx_mod.video_size(src)
+            filters, cur, logo_path = fx_mod.filter_chain(
+                fxm, vw, vh, start="[outv]", logo="[2:v]")
+            return {"filters": filters, "out_label": cur,
+                    "logo_path": logo_path, "output": final}
+        return None
+
     mark("retime", "running")
     plan = retime.retime(workdir, max_speed=max_speed or retime.MAX_SPEED,
-                         cap_k=cap_k)
+                         cap_k=cap_k, make_finalize=_make_finalize)
     mark("retime", "done")
+    if plan.get("final_merged"):
+        # The retime encode WAS the finalize encode (build 182) —
+        # output.mp4 is already the finished file.
+        mark("finalize", "running")
+        mark("finalize", "done")
+        return final
     if fx and fx.get("blur_pieces"):
         # Blur pieces were timed on the ORIGINAL video; the retime
         # just stretched/shrank the picture, so re-time the windows
