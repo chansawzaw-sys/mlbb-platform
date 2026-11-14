@@ -259,6 +259,64 @@ def _tg_shrink_for_send(out, dest, budget=47_000_000):
     return None
 
 
+def _small_budget(dur):
+    """Byte budget for a job's compact download copy: ~1 Mbit/s of
+    video (~7.5 MB per minute) — several times smaller than the HD
+    master, so a phone download finishes in a fraction of the time,
+    while staying watchable. Floored so very short clips still get
+    reasonable quality; capped at the Telegram shrink's budget."""
+    if not dur or dur <= 0:
+        return 8_000_000
+    return max(2_500_000, min(47_000_000, int(dur * 125_000)))
+
+
+def _ensure_small_copy(job):
+    """Build 179: every finished job also gets a compact copy,
+    output_small.mp4, made with the Telegram shrink's exact recipe
+    (480p-class box, x264 ultrafast/crf 26, duration-capped bitrate,
+    AAC 96k) but budgeted for download speed instead of the bot's
+    50 MB cap. The done-state's main download button serves this
+    copy; the full master stays one tap away (?v=full). Lives in
+    the job dir, so the 12h/24h retention and the newest-2-per-
+    account cap (both whole-dir deletes) cover it — no orphans.
+    Failure is non-fatal: the job still finishes with the full
+    file only and the UI falls back to a single button."""
+    jdir = JOBS_DIR / job["id"]
+    out = jdir / "output.mp4"
+    small = jdir / "output_small.mp4"
+    try:
+        job.pop("small", None)
+        if not out.exists():
+            return
+        full_size = out.stat().st_size
+        job["output_size"] = full_size
+        if small.exists():
+            small.unlink()
+        got = _tg_shrink_for_send(
+            out, small, budget=_small_budget(probe_duration(out)))
+        if not got or not small.exists():
+            return
+        ssize = small.stat().st_size
+        # A "compact" copy that barely shrinks the master (short or
+        # low-res sources) is pointless weight: drop it; the UI
+        # shows just the full download, labelled with its size.
+        if ssize >= full_size * 0.9:
+            small.unlink(missing_ok=True)
+            return
+        w = h = None
+        from pipeline.common import probe_streams
+        for s in probe_streams(small):
+            if s.get("codec_type") == "video":
+                w, h = int(s["width"]), int(s["height"])
+                break
+        job["small"] = {"size": ssize, "w": w, "h": h}
+    except Exception:
+        try:
+            small.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _tg_deliver_async(job):
     """A bot-submitted job finished: send the video back to its chat.
     Over the bot API's 50 MB cap the user still gets the video: a
@@ -1321,6 +1379,7 @@ def _enforce_done_cap(job):
 
 
 def _finish(job):
+    _ensure_small_copy(job)
     _charge_for_job(job)
     job["charge_settled"] = True
     job["status"] = "done"
@@ -2939,30 +2998,45 @@ def job_review(jid):
     return jsonify({"ok": True, "edited_count": changed})
 
 
+def _job_output_path(jid):
+    """Which file a download/stream serves (build 179): ?v=small
+    serves the compact copy when the job has one; anything else —
+    including no parameter, which is what older clients and the
+    Telegram 'full quality on the web' pointer rely on — serves
+    the full master."""
+    jdir = JOBS_DIR / jid
+    if request.args.get("v") == "small":
+        small = jdir / "output_small.mp4"
+        if small.exists():
+            return small, f"myanmar-{jid}-small.mp4"
+    return jdir / "output.mp4", f"myanmar-{jid}.mp4"
+
+
 @app.get("/api/jobs/<jid>/download")
 def download_job(jid):
     job = _load_job(jid)
     if not job or not _owns(_current_user(), job):
         return jsonify({"error": "မပြီးသေးပါ"}), 404
-    out = JOBS_DIR / jid / "output.mp4"
+    out, name = _job_output_path(jid)
     if not out.exists():
         return jsonify({"error": "မပြီးသေးပါ"}), 404
     # conditional=True (build 159): Range requests get 206 partial
     # content — downloads can resume instead of restarting, and
     # download managers / the phone browser can pull in parallel.
     return send_file(out, as_attachment=True,
-                     download_name=f"myanmar-{jid}.mp4",
+                     download_name=name,
                      conditional=True)
 
 
 @app.get("/api/jobs/<jid>/stream")
 def stream_job(jid):
     """Inline playback for the result preview (the download route's
-    attachment header prevents some phone browsers from playing it)."""
+    attachment header prevents some phone browsers from playing it).
+    Defaults to the full master; ?v=small previews the compact copy."""
     job = _load_job(jid)
     if not job or not _owns(_current_user(), job):
         return jsonify({"error": "မပြီးသေးပါ"}), 404
-    out = JOBS_DIR / jid / "output.mp4"
+    out, _name = _job_output_path(jid)
     if not out.exists():
         return jsonify({"error": "မပြီးသေးပါ"}), 404
     return send_file(out, as_attachment=False, conditional=True)

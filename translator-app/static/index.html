@@ -72,6 +72,8 @@
   .err { color: #ff9a9a; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
   a.dl { display: block; text-align: center; margin-top: 12px; padding: 13px; border-radius: 10px;
     background: #2fbf71; color: #fff; font-weight: 700; text-decoration: none; }
+  a.dlFull { background: #f3ead3; color: #3d382f; border: 1px solid #cbbd97;
+    font-weight: 600; }
   video { width: 100%; border-radius: 10px; margin-top: 12px; background: #000; }
   /* ---------- editor ---------- */
   #stage { position: relative; width: 100%; margin-top: 10px; border-radius: 10px;
@@ -428,6 +430,7 @@
     <p class="err" id="err"></p>
     <video id="preview" controls playsinline preload="metadata" style="display:none"></video>
     <a class="dl" id="dl" style="display:none">⬇️ ရလာတဲ့ ဗီဒီယို ဒေါင်းလုပ် (.mp4)</a>
+    <a class="dl dlFull" id="dlFull" style="display:none">🎞 မူရင်း အရည်အပြည့် ဒေါင်းလုပ်</a>
     <p class="hint" id="dlHint" style="display:none">ဒေါင်းနှိပ်ရင် တိုးတက်မှု % ပြပြီး ဖုန်း Downloads folder ထဲ တန်းဝင်ပါတယ်</p>
     <div id="dlProg" style="display:none;margin:8px 0">
       <div style="background:#eee1c2;border-radius:6px;height:10px;overflow:hidden">
@@ -799,7 +802,7 @@ function resetForNewLink() {
   $("card").style.display = "none";
   $("steps").innerHTML = ""; $("err").textContent = "";
   $("preview").style.display = "none"; $("preview").removeAttribute("src");
-  $("dl").style.display = "none"; $("jobDl").style.display = "none";
+  $("dl").style.display = "none"; $("dlFull").style.display = "none"; $("jobDl").style.display = "none";
   $("cleanupNote").style.display = "none"; $("doneBtns").style.display = "none";
   $("go").disabled = false;
   W.step = 1; W.blurChoice = null; W.logoChoice = null; W.pvFailed = false;
@@ -825,7 +828,7 @@ $("go").onclick = async () => {
   }
   $("go").disabled = true; $("err").textContent = "";
   $("reviewCard").classList.remove("show"); reviewShownFor = null;
-  $("dl").style.display = "none"; $("preview").style.display = "none";
+  $("dl").style.display = "none"; $("dlFull").style.display = "none"; $("preview").style.display = "none";
   $("jobDl").style.display = "none";
   $("cleanupNote").style.display = "none"; $("doneBtns").style.display = "none";
   $("card").style.display = "block"; $("steps").innerHTML = "စတင်နေပြီ…";
@@ -941,6 +944,8 @@ $("bulkGo").onclick = async () => {
   $("bulkGo").disabled = false;
 };
 
+function mbOf(n) { return n ? (n / 1e6).toFixed(1) + " MB" : ""; }
+
 async function poll(id) {
   const job = await (await fetch("/api/jobs/" + id)).json();
   if (!job.steps) {  // deleted/unknown — forget it and stop
@@ -960,7 +965,27 @@ async function poll(id) {
   if (job.status === "done") {
     clearInterval(timer); $("go").disabled = false;
     currentJobId = id;
-    $("dl").href = "/api/jobs/" + id + "/download"; $("dl").style.display = "block";
+    // Build 179: the main button serves the compact copy (several
+    // times smaller → downloads fast); the full master is the
+    // separate second button. No compact copy → single button,
+    // still labelled with the full size so the wait is no surprise.
+    if (job.small && job.small.size) {
+      const p = (job.small.w && job.small.h)
+        ? Math.min(job.small.w, job.small.h) : 0;
+      $("dl").href = "/api/jobs/" + id + "/download?v=small";
+      $("dl").textContent = "⬇️ ဒေါင်းလုပ် (အမြန်" +
+        (p ? " · " + p + "p" : "") + " · " + mbOf(job.small.size) + ")";
+      $("dlFull").href = "/api/jobs/" + id + "/download?v=full";
+      $("dlFull").textContent = "🎞 မူရင်း အရည်အပြည့် ဒေါင်းလုပ်" +
+        (job.output_size ? " (" + mbOf(job.output_size) + ")" : "");
+      $("dlFull").style.display = "block";
+    } else {
+      $("dl").href = "/api/jobs/" + id + "/download";
+      $("dl").textContent = "⬇️ ရလာတဲ့ ဗီဒီယို ဒေါင်းလုပ် (.mp4)" +
+        (job.output_size ? " (" + mbOf(job.output_size) + ")" : "");
+      $("dlFull").style.display = "none";
+    }
+    $("dl").style.display = "block";
     $("dlHint").style.display = "block";
     fillDl("jobDl", id); $("jobDl").style.display = "flex";
     $("preview").src = "/api/jobs/" + id + "/stream"; $("preview").style.display = "block";
@@ -1711,9 +1736,10 @@ $("paySave").addEventListener("click", async () => {
 /* Download with live % progress, saved straight into the phone's
    Downloads folder (build 159). Falls back to the browser's own
    downloader if streaming fetch is unavailable or fails. */
-$("dl").addEventListener("click", async (e) => {
+function bindProgressDownload(el) {
+el.addEventListener("click", async (e) => {
   e.preventDefault();
-  const url = $("dl").getAttribute("href");
+  const url = el.getAttribute("href");
   if (!url) return;
   const prog = $("dlProg"), bar = $("dlBar"), pct = $("dlPct");
   try {
@@ -1746,6 +1772,9 @@ $("dl").addEventListener("click", async (e) => {
     window.location.href = url;
   }
 });
+}
+bindProgressDownload($("dl"));
+bindProgressDownload($("dlFull"));
 window.tgPick = async function (id) {
   const box = $("tgpick-" + id);
   if (box.style.display !== "none") { box.style.display = "none"; return; }
@@ -1781,6 +1810,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 178</p>
+<p class="hint" id="buildTag" style="text-align:center">build 179</p>
 </body>
 </html>
