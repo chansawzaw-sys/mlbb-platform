@@ -338,81 +338,77 @@ def _ensure_small_copy(job):
             pass
 
 
-def _tg_deliver_async(job):
-    """A bot-submitted job finished: send the video back to its chat.
-    Over the bot API's 50 MB cap the user still gets the video: a
-    480p-class compressed copy goes to the chat and the full-quality
-    file stays in their web jobs list (bot jobs are kept 24h).
+def _deliver_video_core(job, chat_id, record, cap_full, cap_shrunk,
+                        notify_failure):
+    """The Telegram delivery itself — one implementation shared by
+    bot jobs (_tg_deliver_async) and web-job auto-send (build 188,
+    _web_tg_autosend), so the rules can never drift apart:
 
-    Build 184: when the bot runs through a LOCAL Bot API server
-    (tg.is_local()), the full file itself goes to the chat — the
-    local cap is 2 GB, so there is nothing to shrink. If that send
-    fails for any reason, the cloud behaviour below takes over, so
-    a broken local server can never strand a finished video."""
-    chat_id = job.get("tg_chat_id")
-    if not chat_id:
-        return
+    * LOCAL Bot API (build 184): the full file goes as-is up to
+      the local 2 GB-class cap; if that send fails for any reason,
+      the cloud behaviour below takes over, so a broken local
+      server can never strand a finished video.
+    * Cloud: a file up to the 50 MB bot cap goes directly; a
+      larger one goes as a 480p-class compact copy made by
+      _tg_shrink_for_send, plus a message pointing at the
+      full-quality file in the web app.
 
-    def go():
-        from pipeline import telegram_send as tg
-        out = JOBS_DIR / job["id"] / "output.mp4"
-        try:
-            if not out.exists():
+    `record(d)` stores each state dict under the caller's own job
+    key (the caller merges in its "to"). With notify_failure (bot
+    jobs) the chat also gets a plain message when the video cannot
+    be sent at all — for a bot customer the chat is the only place
+    they would look. Web auto-send passes False: that customer is
+    already looking at the web app, so a failure is only recorded
+    on the job (and the manual ✉️ button stays available)."""
+    from pipeline import telegram_send as tg
+    out = JOBS_DIR / job["id"] / "output.mp4"
+    try:
+        if not out.exists():
+            return
+        size = out.stat().st_size
+        if tg.is_local() and tg.MAX_BYTES < size <= tg.LOCAL_MAX_BYTES:
+            try:
+                record({"state": "sending"})
+                _save(job)
+                tg.send_video(chat_id, out, caption=cap_full)
+                record({"state": "sent", "direct": True})
+                _save(job)
                 return
-            size = out.stat().st_size
-            if tg.is_local() and tg.MAX_BYTES < size <= tg.LOCAL_MAX_BYTES:
-                try:
-                    job["tg"] = {"state": "sending", "to": job.get("tg_from")}
-                    _save(job)
-                    tg.send_video(
-                        chat_id, out,
-                        caption="🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို\n"
-                                + (job.get("url") or "")
-                                + "\n🙏 ကျေးဇူးတင်ပါတယ်")
-                    job["tg"] = {"state": "sent", "to": job.get("tg_from"),
-                                 "direct": True}
-                    _save(job)
-                    return
-                except Exception:
-                    pass  # compact copy + web link below, as on cloud
-            if size > tg.MAX_BYTES:
-                small = _tg_shrink_for_send(
-                    out, out.with_name("output_tg.mp4"))
-                if small:
-                    job["tg"] = {"state": "sending", "to": job.get("tg_from")}
-                    _save(job)
-                    tg.send_video(
-                        chat_id, small,
-                        caption="🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို\n"
-                                "(ဖိုင် ကြီးလို့ Telegram အတွက် ချုံ့ ထားပါတယ် — "
-                                "quality အပြည့် ကို web app မှာ ယူနိုင်ပါတယ် 🙏)")
-                    tg.send_message(chat_id, "🌐 quality အပြည့် ကို ဒီမှာ ယူနိုင်ပါတယ်: "
-                                             + APP_LINK
-                                             + "\n(Jobs စာရင်းထဲမှာ ၂၄ နာရီ အတွင်း ယူပေးပါ)")
-                    job["tg"] = {"state": "sent", "to": job.get("tg_from"),
-                                 "shrunk": True}
-                else:
+            except Exception:
+                pass  # compact copy + web link below, as on cloud
+        if size > tg.MAX_BYTES:
+            small = _tg_shrink_for_send(
+                out, out.with_name("output_tg.mp4"))
+            if small:
+                record({"state": "sending"})
+                _save(job)
+                tg.send_video(chat_id, small, caption=cap_shrunk)
+                tg.send_message(
+                    chat_id,
+                    "🌐 quality အပြည့် ကို ဒီမှာ ယူနိုင်ပါတယ်: "
+                    + APP_LINK
+                    + "\n(Jobs စာရင်းထဲမှာ ၂၄ နာရီ အတွင်း ယူပေးပါ)")
+                record({"state": "sent", "shrunk": True})
+            else:
+                if notify_failure:
                     tg.send_message(
                         chat_id,
-                        f"✅ video ပြီးပါပြီ — ဒါပေမဲ့ ဖိုင် {out.stat().st_size / 1e6:.0f}MB "
+                        f"✅ video ပြီးပါပြီ — ဒါပေမဲ့ ဖိုင် {size / 1e6:.0f}MB "
                         "ဖြစ်နေလို့ Telegram bot ကနေ ပို့လို့ မရပါ (အများဆုံး 50MB ပါ)\n"
                         "🌐 web app မှာ ယူနိုင်ပါတယ်: " + APP_LINK
                         + "\n(Jobs စာရင်းထဲမှာ ၂၄ နာရီ အတွင်း ယူပေးပါ) 🙏")
-                    job["tg"] = {"state": "failed", "to": job.get("tg_from"),
-                                 "error": "file > 50MB"}
-            else:
-                job["tg"] = {"state": "sending", "to": job.get("tg_from")}
-                _save(job)
-                tg.send_video(chat_id, out,
-                              caption="🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို\n"
-                                      + (job.get("url") or "")
-                                      + "\n🙏 ကျေးဇူးတင်ပါတယ်")
-                job["tg"] = {"state": "sent", "to": job.get("tg_from")}
-        except Exception as e:
-            job["tg"] = {"state": "failed", "to": job.get("tg_from"),
-                         "error": str(e)[:200]}
-            # A failed delivery must not be silent: tell the customer
-            # where else to get the video (same promise as oversized).
+                record({"state": "failed", "error": "file > 50MB"})
+        else:
+            record({"state": "sending"})
+            _save(job)
+            tg.send_video(chat_id, out, caption=cap_full)
+            record({"state": "sent"})
+    except Exception as e:
+        record({"state": "failed", "error": str(e)[:200]})
+        if notify_failure:
+            # A failed delivery must not be silent: tell the
+            # customer where else to get the video (same promise
+            # as oversized).
             try:
                 tg.send_message(
                     chat_id,
@@ -421,7 +417,91 @@ def _tg_deliver_async(job):
                     + "\n(Jobs စာရင်းထဲမှာ ၂၄ နာရီ အတွင်း ယူပေးပါ)")
             except Exception:
                 pass
-        _save(job)
+    _save(job)
+
+
+def _tg_deliver_async(job):
+    """A bot-submitted job finished: send the video back to its
+    chat. Over the bot API's 50 MB cap the user still gets the
+    video: a 480p-class compressed copy goes to the chat and the
+    full-quality file stays in their web jobs list (bot jobs are
+    kept 24h). The delivery itself lives in _deliver_video_core,
+    shared with web-job auto-send (build 188)."""
+    chat_id = job.get("tg_chat_id")
+    if not chat_id:
+        return
+
+    def record(d):
+        job["tg"] = {**d, "to": job.get("tg_from")}
+
+    def go():
+        _deliver_video_core(
+            job, chat_id, record,
+            cap_full="🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို\n"
+                     + (job.get("url") or "")
+                     + "\n🙏 ကျေးဇူးတင်ပါတယ်",
+            cap_shrunk="🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို\n"
+                       "(ဖိုင် ကြီးလို့ Telegram အတွက် ချုံ့ ထားပါတယ် — "
+                       "quality အပြည့် ကို web app မှာ ယူနိုင်ပါတယ် 🙏)",
+            notify_failure=True)
+
+    threading.Thread(target=go, daemon=True).start()
+
+
+def _web_tg_autosend(job):
+    """Build 188 (owner order 2026-11-15): a finished WEB job is
+    delivered to the account's linked Telegram chat automatically
+    — "web job ပြီးတာနဲ့ TG ကို အလိုအလျောက် ပို့ပေး" — so the
+    customer finds the video in their Telegram without tapping
+    the ✉️ button. Same delivery core and rules as bot jobs
+    (_deliver_video_core), with a caption naming it as a web job
+    result. Boundaries:
+
+    * Bot-origin jobs never come here: job["tg_chat_id"] is the
+      origin marker set at bot submission, and _tg_deliver_async
+      already delivered those to their chat — a second send
+      would be a duplicate.
+    * The target is ONLY the account's own linked chat (the
+      build-159 rule); no linked chat → nothing happens and the
+      web download stands as today.
+    * Fires after the done flip and the charge, fire-and-forget:
+      a failed send is recorded on the job (job["auto_tg"]) and
+      can never fail or re-charge the job; the manual ✉️ button
+      remains available.
+    * Exactly-once: the job["auto_tg"] record is set and saved
+      BEFORE the thread fires, so a re-finish (a review re-render
+      calls _finish again) or a restart can never send twice."""
+    if job.get("tg_chat_id") or job.get("auto_tg"):
+        return
+    uid = job.get("user_id")
+    if not uid:
+        return
+    try:
+        user = accounts.get_user(uid)
+    except Exception:
+        return
+    chat_id = (user or {}).get("tg_chat_id")
+    if not chat_id:
+        return
+    chat_id = int(chat_id)
+    job["auto_tg"] = {"state": "sending", "to": chat_id}
+    _save(job)
+
+    def record(d):
+        job["auto_tg"] = {**d, "to": chat_id}
+
+    def go():
+        _deliver_video_core(
+            job, chat_id, record,
+            cap_full="🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို "
+                     "(web app ကနေ လုပ်ထားတာ)\n"
+                     + (job.get("url") or "")
+                     + "\n🙏 ကျေးဇူးတင်ပါတယ်",
+            cap_shrunk="🎬 မြန်မာ ဘာသာပြန် ဗီဒီယို "
+                       "(web app ကနေ လုပ်ထားတာ)\n"
+                       "(ဖိုင် ကြီးလို့ Telegram အတွက် ချုံ့ ထားပါတယ် — "
+                       "quality အပြည့် ကို web app မှာ ယူနိုင်ပါတယ် 🙏)",
+            notify_failure=False)
 
     threading.Thread(target=go, daemon=True).start()
 
@@ -1626,6 +1706,7 @@ def _finish(job):
     _save(job)
     _enforce_done_cap(job)
     _tg_deliver_async(job)
+    _web_tg_autosend(job)
     threading.Thread(target=_small_copy_async, args=(job,),
                      daemon=True).start()
 
