@@ -1586,6 +1586,29 @@ $("googleDel").onclick = async () => {
 };
 loadGoogleState();
 
+/* ---------------- settings loaders: recovery path (build 185) ----
+   Each settings card's visibility is decided by its loader's fetch:
+   a non-OK response (a customer's 403 — or ANY transient failure)
+   keeps the card hidden. The init calls above fire exactly once, in
+   the parse-time burst, so a single transient failure at page load
+   used to hide every owner card for the whole session with NO way
+   back (build 184 owner report: panel showed only the plain
+   sections, daily-limit last). Recovery: re-run every loader when
+   loadMe() confirms an admin session and whenever the ⚙️ Settings
+   panel is opened. The loaders themselves are unchanged — a
+   non-admin's 403 still keeps every card hidden, full stop. */
+function loadAllSettings() {
+  loadKeyState();
+  loadOaState();
+  loadOrState();
+  loadXkState();
+  loadAsState();
+  loadTgState();
+  loadTgApiState();
+  loadGoogleState();
+  loadDailyLimit();
+}
+
 /* ---------------- daily job limit settings (build 180) ---------------- */
 async function loadDailyLimit() {
   try {
@@ -1697,7 +1720,11 @@ $("apiToggle").onclick = () => {
 };
 $("setToggle").onclick = () => {
   const p = $("settingsPanel");
-  p.style.display = p.style.display === "none" ? "" : "none";
+  const open = p.style.display === "none";
+  p.style.display = open ? "" : "none";
+  // Build 185: opening the panel re-runs the settings loaders, so a
+  // card hidden by a transient init-time failure comes back.
+  if (open) loadAllSettings();
 };
 $("payToggle").onclick = () => {
   const p = $("payBlock");
@@ -1714,7 +1741,7 @@ async function loadMe() {
     $("authOut").style.display = ME ? "none" : "";
     $("authIn").style.display = ME ? "" : "none";
     $("adminCard").classList.toggle("show", !!(ME && ME.role === "admin"));
-    if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); loadWall(); loadDailyLimit(); renderEngineStats(); }
+    if (ME && ME.role === "admin") { loadTopups(); loadBotOpen(); loadWall(); loadDailyLimit(); renderEngineStats(); loadAllSettings(); }
     if (ME && ME.role !== "admin") {
       // Customers never see the owner's key / bot settings cards.
       $("keyCard").classList.remove("show");
@@ -2009,6 +2036,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 184</p>
+<p class="hint" id="buildTag" style="text-align:center">build 185</p>
 </body>
 </html>
