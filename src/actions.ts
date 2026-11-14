@@ -3181,6 +3181,136 @@ async function settleMatch(
   return true;
 }
 
+/** Draw settlement (dispute outcome): the pot minus the platform fee is
+ *  split EQUALLY among ALL participants (both sides) — every player gets
+ *  the same share, the indivisible remainder joins the platform fee take,
+ *  and nobody's win/loss record moves. CLAIM FIRST, exactly like
+ *  settleMatch: atomically flip to "completed" with winnerId NULL and
+ *  finishReason "draw" from the same non-terminal states; the race loser
+ *  is a clean no-op. Participant rows are stamped state "paid" with
+ *  payoutAmount = share — deliberately NOT a new state value: the
+ *  receivedFromMatch fallback, the recent-winners team branch and the
+ *  client's per-player payout line all key on "paid", and draw payees
+ *  DID receive a payout (the payout ledger rows written here are the
+ *  primary source for all of them anyway). NO referral payouts: every
+ *  pending referral row for the match is cancelled, mirroring the team
+ *  branch's leftover cancellation. */
+async function settleDrawMatch(
+  ctx: Ctx | null,
+  db: Db,
+  match: typeof schema.matches.$inferSelect,
+): Promise<boolean> {
+  const claim = await db
+    .update(schema.matches)
+    .set({ status: "completed", winnerId: null, completedAt: new Date(), finishReason: "draw" })
+    .where(
+      and(
+        eq(schema.matches.id, match.id),
+        inArray(schema.matches.status, ["ready_check", "live", "result_pending", "disputed"]),
+      ),
+    )
+    .returning({ id: schema.matches.id });
+  if (claim.length === 0) return false;
+  await bumpCompletedMatchesTotal(db);
+
+  const fee = match.feeAmount;
+  const snapParts = await participantsFor(db, match.id);
+  if (match.teamSize > 1 && snapParts.length > 0) {
+    const payees = snapParts.filter((pt) => pt.state === "locked");
+    const pot = match.stake * payees.length;
+    const share = payees.length > 0 ? Math.floor((pot - fee) / payees.length) : 0;
+    const remainder = pot - fee - share * payees.length;
+    for (const pt of payees) {
+      const p = await getPlayer(db, pt.playerId);
+      await db
+        .update(schema.matchParticipants)
+        .set({ state: "paid", payoutAmount: share })
+        .where(eq(schema.matchParticipants.id, pt.id));
+      if (!p) continue;
+      const nb = p.balance + share;
+      await db
+        .update(schema.players)
+        .set({
+          balance: nb,
+          lockedCoins: Math.max(0, p.lockedCoins - pt.stake),
+        })
+        .where(eq(schema.players.id, pt.playerId));
+      await addTxn(db, {
+        playerId: pt.playerId,
+        type: "payout",
+        amount: share,
+        balanceAfter: nb,
+        note: `Match ${match.code} draw — သရေ share (pot ${pot} − fee ${fee}) ÷ ${payees.length}`,
+        matchId: match.id,
+      });
+      await notify(db, {
+        playerId: pt.playerId,
+        type: "result",
+        title: "Match သရေ ဖြစ်ပါတယ် 🤝",
+        body: `${match.code} — သရေ ဖြစ်လို့ သင့်ဝေစု ${share} coins ရရှိပါတယ်။`,
+        matchId: match.id,
+      });
+    }
+    await addTxn(db, {
+      playerId: null,
+      type: "platform_fee",
+      amount: fee + remainder,
+      note: `Platform fee from ${match.code} (${match.feeLabel}) — draw${remainder > 0 ? ` + split remainder ${remainder}` : ""}`,
+      matchId: match.id,
+    });
+  } else {
+    const pot = match.stake * 2;
+    const share = Math.floor((pot - fee) / 2);
+    const remainder = pot - fee - share * 2;
+    for (const pid of [match.playerAId, match.playerBId]) {
+      const p = await getPlayer(db, pid);
+      if (!p) continue;
+      const nb = p.balance + share;
+      await db
+        .update(schema.players)
+        .set({
+          balance: nb,
+          lockedCoins: Math.max(0, p.lockedCoins - match.stake),
+        })
+        .where(eq(schema.players.id, pid));
+      await addTxn(db, {
+        playerId: pid,
+        type: "payout",
+        amount: share,
+        balanceAfter: nb,
+        note: `Match ${match.code} draw — သရေ share (pot ${pot} − fee ${fee}) ÷ 2`,
+        matchId: match.id,
+      });
+      await notify(db, {
+        playerId: pid,
+        type: "result",
+        title: "Match သရေ ဖြစ်ပါတယ် 🤝",
+        body: `${match.code} — သရေ ဖြစ်လို့ သင့်ဝေစု ${share} coins ရရှိပါတယ်။`,
+        matchId: match.id,
+      });
+    }
+    await addTxn(db, {
+      playerId: null,
+      type: "platform_fee",
+      amount: fee + remainder,
+      note: `Platform fee from ${match.code} (${match.feeLabel}) — draw${remainder > 0 ? ` + split remainder ${remainder}` : ""}`,
+      matchId: match.id,
+    });
+  }
+  // No referral commissions on a draw — cancel every pending row.
+  await db
+    .update(schema.referralCommissions)
+    .set({ status: "cancelled" })
+    .where(
+      and(
+        eq(schema.referralCommissions.matchId, match.id),
+        eq(schema.referralCommissions.status, "pending"),
+      ),
+    );
+  if (ctx) ctx.invalidateQueries();
+  return true;
+}
+
 async function refundMatch(
   db: Db,
   match: typeof schema.matches.$inferSelect,
@@ -3255,12 +3385,19 @@ async function refundMatch(
  *  is no longer disputed returns !ok with ZERO money movement, so a
  *  second tap / double delivery can never settle or refund twice —
  *  settleMatch / refundMatch are themselves claim-guarded as well. */
+type DisputePenalty = {
+  playerId: number;
+  fine: number;
+  ban: boolean;
+};
+
 async function resolveDisputeInternal(
   ctx: Ctx | null,
   db: Db,
   matchId: number,
   winnerId: number,
   actorName: string,
+  penalty?: DisputePenalty | null,
 ): Promise<{ ok: boolean; error: string }> {
   const rows = await db
     .select()
@@ -3270,14 +3407,109 @@ async function resolveDisputeInternal(
   const m = rows[0];
   if (!m || m.status !== "disputed")
     return { ok: false, error: "Dispute match မဟုတ်ပါ" };
+  const hasPenalty = !!penalty && (penalty.fine > 0 || penalty.ban || penalty.playerId !== 0);
+  if (hasPenalty) {
+    // Penalty rides ONLY on a win award to side A or B — never on a
+    // refund (winnerId 0) or a draw (winnerId −1). Validated BEFORE any
+    // settlement so a rejected penalty moves no money at all.
+    if (winnerId !== m.playerAId && winnerId !== m.playerBId)
+      return { ok: false, error: "Penalty ကို အနိုင်ပေးတဲ့ အခါမှသာ ထည့်လို့ ရပါတယ် (refund/draw မှာ မရပါ)" };
+    if (!penalty || penalty.playerId === 0)
+      return { ok: false, error: "Penalty player ရွေးပါ" };
+    if (penalty.fine < 0 || !Number.isFinite(penalty.fine))
+      return { ok: false, error: "Fine ပမာဏ မမှန်ပါ" };
+    const parts = await participantsFor(db, m.id);
+    const isParticipant =
+      penalty.playerId === m.playerAId ||
+      penalty.playerId === m.playerBId ||
+      parts.some((pt) => pt.playerId === penalty.playerId);
+    if (!isParticipant)
+      return { ok: false, error: "Penalty player က match ထဲမှာ ပါဝင်သူ ဖြစ်ရပါမယ်" };
+    const targetPre = await getPlayer(db, penalty.playerId);
+    if (!targetPre) return { ok: false, error: "Penalty player မတွေ့ပါ" };
+    // Hard guard (same as adminPlayerAction): the fixed Owner account
+    // can never be fined/banned through a dispute — reject the WHOLE
+    // resolve before settling, so nothing moves.
+    if (isFixedAdminEmail(targetPre.email))
+      return { ok: false, error: "Fixed Owner အကောင့်ကို ပြင်/ ban လို့ မရပါ" };
+  }
+  let settled = false;
   if (winnerId === 0) {
     await refundMatch(db, m, "Dispute — admin refund");
+  } else if (winnerId === -1) {
+    await settleDrawMatch(ctx, db, m);
   } else {
     if (winnerId !== m.playerAId && winnerId !== m.playerBId)
       return { ok: false, error: "Winner က match ထဲက player ဖြစ်ရပါမယ်" };
-    await settleMatch(ctx, db, m, winnerId);
+    settled = await settleMatch(ctx, db, m, winnerId);
   }
-  await logAct(db, actorName, `Dispute ${m.code} resolved (winner: ${winnerId || "refund"})`);
+  // Penalty applies ONLY when the win settle actually happened. The
+  // not-disputed early return above already makes a replayed resolve a
+  // no-op, and the penalty stays strictly behind it (and behind the
+  // settle claim), so a penalty can never land twice or on its own.
+  let penaltyNote = "";
+  if (hasPenalty && settled && penalty) {
+    const target = await getPlayer(db, penalty.playerId);
+    if (target) {
+      let applied = 0;
+      if (penalty.fine > 0) {
+        // Race-safe guarded debit (placeReportHold pattern): cap at the
+        // target's CURRENT post-settlement balance and debit only while
+        // the balance still covers the amount — never negative.
+        const want = Math.min(Math.floor(penalty.fine), Math.max(0, target.balance));
+        if (want > 0) {
+          const r = await db
+            .update(schema.players)
+            .set({ balance: sql`${schema.players.balance} - ${want}` })
+            .where(
+              and(
+                eq(schema.players.id, target.id),
+                gte(schema.players.balance, want),
+              ),
+            )
+            .returning({ balance: schema.players.balance });
+          if (r[0]) {
+            applied = want;
+            await addTxn(db, {
+              playerId: target.id,
+              type: "admin_adjust",
+              amount: -applied,
+              balanceAfter: r[0].balance,
+              note: `Dispute penalty — Match ${m.code}`,
+              matchId: m.id,
+            });
+          }
+        }
+      }
+      if (penalty.ban) {
+        await db
+          .update(schema.players)
+          .set({ status: "perm_banned" })
+          .where(eq(schema.players.id, target.id));
+      }
+      if (applied > 0 || penalty.ban) {
+        await notify(db, {
+          playerId: target.id,
+          type: "penalty",
+          title: "Dispute ပြစ်ဒဏ် ⚖️",
+          body:
+            `Match ${m.code} dispute ဆုံးဖြတ်ချက်အရ ` +
+            [
+              applied > 0 ? `🪙 ${applied} coin ဒဏ်ငွေ ဖြတ်ထားပါတယ်` : "",
+              penalty.ban ? "အကောင့်ကို အပြီးတိုင် ပိတ်ထားပါတယ်" : "",
+            ].filter(Boolean).join(" • ") +
+            ` (Dispute penalty for match ${m.code}.)`,
+          matchId: m.id,
+        });
+      }
+      penaltyNote = ` — penalty: ${target.name} (#${target.id}) fine ${applied}${penalty.ban ? " + perm_ban" : ""}`;
+    }
+  }
+  await logAct(
+    db,
+    actorName,
+    `Dispute ${m.code} resolved (winner: ${winnerId === -1 ? "draw" : winnerId || "refund"})${penaltyNote}`,
+  );
   return { ok: true, error: "" };
 }
 
@@ -3290,6 +3522,7 @@ function disputeKeyboard(matchId: number, aId: number, bId: number, aName: strin
     inline_keyboard: [
       [{ text: `🏆 ${short(aName)} အနိုင်`, callback_data: `dsp:${matchId}:${aId}` }],
       [{ text: `🏆 ${short(bName)} အနိုင်`, callback_data: `dsp:${matchId}:${bId}` }],
+      [{ text: "🤝 Draw — 50/50 ခွဲပေး", callback_data: `dsp:${matchId}:-1` }],
       [{ text: "↩️ နှစ်ဖက်စလုံး ပြန်အမ်း", callback_data: `dsp:${matchId}:0` }],
     ],
   };
@@ -6859,15 +7092,20 @@ export const Actions = {
   }),
 
   resolveDispute: defineAction({
-    description: "Admin action: settle a disputed match by declaring a winner or refunding both sides.",
+    description: "Admin action: settle a disputed match by declaring a winner, a draw, or refunding both sides, with an optional penalty on a win award.",
     request: z.object({
       match_id: z.number(),
-      winner_id: z.number(), // 0 = refund both
+      winner_id: z.number(), // 0 = refund both, -1 = draw
       actor: z.string().default("admin"),
       actor_player_id: z.number().default(0),
       session_token: z.string().default(""),
       confirmed: z.boolean().default(false),
       totp_code: z.string().default(""),
+      // Punish add-on (win award only): fine and/or perm-ban one match
+      // participant. All optional; absent/zero/false = plain resolution.
+      penalty_player_id: z.number().int().default(0),
+      penalty_fine: z.number().int().min(0).max(10000000).default(0),
+      penalty_ban: z.boolean().default(false),
     }),
     response: z.object({ ok: z.boolean(), error: z.string() }),
     async handler(ctx, args) {
@@ -6881,9 +7119,27 @@ export const Actions = {
         return { ok: false, error: "Dispute ဆုံးဖြတ်ရန် security confirmation လိုပါတယ်" };
       const err2fa = await checkAdmin2fa(db, auth.actor.id, args.totp_code);
       if (err2fa) return { ok: false, error: err2fa };
+      const hasPenalty =
+        args.penalty_fine > 0 || args.penalty_ban || args.penalty_player_id !== 0;
+      if (hasPenalty) {
+        // A penalty is as powerful as perm_ban / adjust_coins, so it
+        // carries the SAME gate on top of the dispute gate: Owner/Admin
+        // only. Moderators keep plain win / refund / draw.
+        const pa = await requireOwnerOrAdmin(db, args.actor_player_id, args.session_token);
+        if (pa.error || !pa.actor)
+          return { ok: false, error: "Penalty ထည့်ရန် Owner/Admin role လိုပါတယ် (moderator မရပါ)" };
+        // Penalty only ever rides on a win award to side A or B.
+        if (args.winner_id === 0 || args.winner_id === -1)
+          return { ok: false, error: "Penalty ကို အနိုင်ပေးတဲ့ အခါမှသာ ထည့်လို့ ရပါတယ် (refund/draw မှာ မရပါ)" };
+      }
       // Post-gate logic lives in resolveDisputeInternal (Batch 21) —
       // shared verbatim with the Telegram dsp callback.
-      const r = await resolveDisputeInternal(ctx, db, args.match_id, args.winner_id, auth.actor.name);
+      const r = await resolveDisputeInternal(
+        ctx, db, args.match_id, args.winner_id, auth.actor.name,
+        hasPenalty
+          ? { playerId: args.penalty_player_id, fine: args.penalty_fine, ban: args.penalty_ban }
+          : null,
+      );
       if (!r.ok) return { ok: false, error: r.error };
       ctx.invalidateQueries();
       return { ok: true, error: "" };
@@ -8086,9 +8342,9 @@ export const Actions = {
         return { ok: false, error: "Telegram chat မကိုက်ပါ — ဆုံးဖြတ်ခွင့် မရှိပါ", handled: false };
       const data = typeof cq.data === "string" ? cq.data : "";
       // Disputes use their own prefix (Batch 21): "dsp:<matchId>:<winnerId>"
-      // — winnerId 0 means refund both. Same host-secret + chat-id gates
+      // — winnerId 0 means refund both, −1 means draw. Same host-secret + chat-id gates
       // above protect this branch exactly like the money branches.
-      const dsp = data.match(/^dsp:(\d+):(\d+)$/);
+      const dsp = data.match(/^dsp:(\d+):(-?\d+)$/);
       // Diamond orders use their own prefix: "dd:<orderId>:<approve|reject>".
       const dd = dsp ? null : data.match(/^dd:(\d+):(approve|reject)$/);
       const m = dd || dsp ? null : data.match(/^(pur|wd):(\d+):(approve|reject|paid)$/);
@@ -8112,7 +8368,9 @@ export const Actions = {
         outcome = r.ok
           ? winnerId > 0
             ? "⚖️ Dispute ဖြေရှင်းပြီး — winner သတ်မှတ် settle လုပ်ပြီးပါပြီ"
-            : "↩️ Dispute ဖြေရှင်းပြီး — နှစ်ဖက်စလုံး ပြန်အမ်းပြီးပါပြီ"
+            : winnerId === -1
+              ? "🤝 Dispute ဖြေရှင်းပြီး — သရေ (draw) အဖြစ် ခွဲပေးပြီးပါပြီ"
+              : "↩️ Dispute ဖြေရှင်းပြီး — နှစ်ဖက်စလုံး ပြန်အမ်းပြီးပါပြီ"
           : r.error;
         // A second tap lands here: the match is no longer disputed, the
         // internal returns !ok with zero money movement — present it
@@ -9797,7 +10055,7 @@ export const Actions = {
           held_amount: 0,
           hold_received: 0,
           hold_status: "",
-          winner_name: winner?.name ?? "",
+          winner_name: m.finishReason === "draw" ? "🤝 သရေ (Draw)" : (winner?.name ?? ""),
           side_a: await sideOf("A", m.playerAId),
           side_b: await sideOf("B", m.playerBId),
           rules: (m.customRules ?? "").split("\n").map((x) => x.trim()).filter(Boolean),

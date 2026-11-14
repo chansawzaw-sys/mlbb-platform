@@ -5,13 +5,16 @@
 // bundled /assets/ files are served cache-first from a version-free
 // media cache that survives shell upgrades, so images and background
 // music no longer re-download on every visit.
+// v17: dispute Draw outcome + win-award penalty (fine/ban), draggable
+// BGM button, and refresh restore (reload skips the splash and returns
+// to the session's saved view).
 // Safety-first policy for a live-money app:
 //  - /actions is NEVER intercepted or cached (always fresh, always network).
 //  - Navigations are NETWORK-FIRST (online users always get the freshest
 //    HTML/bundle); the cached shell is only an offline fallback.
 //  - Same-origin static assets are CACHE-FIRST (they are content-hashed).
 //  - Non-GET requests and everything else are left completely untouched.
-const CACHE_NAME = "mlbb-shell-v16";
+const CACHE_NAME = "mlbb-shell-v17";
 // Media cache: deliberately NOT versioned with the shell — uploaded
 // images / BGM tracks keep their timestamped URLs, so a cached copy is
 // valid until the URL itself changes.

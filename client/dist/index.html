@@ -29,6 +29,7 @@
     <title>Fight for Legendary</title>
     <!-- Splash screen (inline): paints before the app bundle arrives so
          every fresh document load opens with the cinematic logo intro.
+         A browser reload skips it entirely (see the controller).
          All ids/classes are ffs- prefixed to avoid colliding with app
          styles. The overlay always lifts: a 3.5s primary timer, a 4.5s
          backup timeout, and a CSS-only auto-lift at ~4.6s even if the
@@ -333,7 +334,7 @@
       }
     </style>
     
-  <link rel="stylesheet" crossorigin href="./assets/index-cvnzwyrs.css"><script type="module" crossorigin src="./assets/index-2xc25e1m.js"></script></head>
+  <link rel="stylesheet" crossorigin href="./assets/index-4bm6qdyh.css"><script type="module" crossorigin src="./assets/index-2bfp58qx.js"></script></head>
   <body>
     <div
       data-generated-space-root=""
@@ -345,6 +346,22 @@
       // visibility/blur listeners). The app underneath loads normally
       // from t=0; this only manages the overlay + synthesized sting.
       (function () {
+        // Refresh restore (E2): a browser RELOAD skips the splash
+        // entirely — no overlay, no sting — and the app restores the
+        // session view itself. Fresh launches (navigation type
+        // "navigate", a new session) play the full intro as specced.
+        try {
+          var navType = "";
+          if (window.performance && typeof performance.getEntriesByType === "function") {
+            var navEntries = performance.getEntriesByType("navigation");
+            if (navEntries && navEntries[0] && navEntries[0].type) navType = String(navEntries[0].type);
+          }
+          if (!navType && window.performance && performance.navigation) {
+            // Legacy fallback: performance.navigation.type 1 = reload.
+            navType = performance.navigation.type === 1 ? "reload" : "navigate";
+          }
+          if (navType === "reload") return;
+        } catch (e) { /* detection failed — play the splash as before */ }
         var TOTAL_MS = 3500;
         var BACKUP_MS = 4500;
         var MUTE_KEY = "ffl-splash-muted";
