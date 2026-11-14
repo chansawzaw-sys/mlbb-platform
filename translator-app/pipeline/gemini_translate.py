@@ -23,6 +23,7 @@ import re
 import time
 from pathlib import Path
 
+from . import tunnel
 from .common import PROJECT_ROOT
 
 DEFAULT_MODEL = "gemini-2.0-flash"
@@ -130,11 +131,15 @@ def list_models():
         return [], "no GEMINI_API_KEY configured"
     url = "https://generativelanguage.googleapis.com/v1beta/models"
     last = ""
+    # Build 189: ListModels is part of Gemini reachability
+    # diagnosis (the app's probe uses it), so it takes the same
+    # tunnel as generateContent when the tunnel is verified up.
+    proxies = tunnel.requests_proxies()
     for use_query in (False, True):
         try:
             resp = requests.get(
                 url + (f"?key={key}" if use_query else ""),
-                timeout=30,
+                timeout=30, proxies=proxies,
                 headers={} if use_query else {"x-goog-api-key": key})
         except Exception as e:
             last = f"net:{e}"[:120]
@@ -226,6 +231,11 @@ def translate_all(segments, style="subs"):
     key = get_api_key()
     if not key:
         raise RuntimeError("no GEMINI_API_KEY configured")
+    # Build 189: direct Gemini is location-blocked from this
+    # server, so when the owner's VPN tunnel is verified up the
+    # calls leave through it (per-call `proxies`, nothing global;
+    # None — requests' default — whenever the tunnel is down).
+    proxies = tunnel.requests_proxies()
     model = os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
     payload_in = [{"id": i, "text": (s.get("text") or "").strip()}
                   for i, s in enumerate(segments)]
@@ -246,7 +256,7 @@ def translate_all(segments, style="subs"):
                 try:
                     resp = requests.post(
                         url + (f"?key={key}" if use_query else ""),
-                        json=body, timeout=120,
+                        json=body, timeout=120, proxies=proxies,
                         headers={**({} if use_query else
                                     {"x-goog-api-key": key}),
                                  "Content-Type": "application/json"})

@@ -2291,6 +2291,68 @@ def telegram_api_delete():
                     "api_hash_set": False, "mode": "cloud"})
 
 
+# ---------- VPN tunnel for Gemini/OpenAI (build 189) ----------
+# Direct Gemini is location-blocked and direct OpenAI is
+# territory-blocked from this VPS — Google/OpenAI judge the
+# caller's IP country. The owner pastes a node from his own
+# V2Ray subscription here (a vless:// or vmess:// share link, or
+# a subscription URL); pipeline/tunnel.py parses it at save time
+# into an xray client config (tun-xray.json in the app dir,
+# chmod 600), and the deploy bootstrap (§13e) runs xray-core
+# with it: one HTTP proxy inbound on 127.0.0.1, used ONLY by the
+# Gemini/OpenAI clients, only after an egress check through the
+# proxy has passed (VT_TUNNEL_PROXY + VT_TUNNEL_CONF_SHA in
+# .env — written by the bootstrap, never from this UI). The
+# pasted link is a credential: it is stored base64'd in .env
+# (chmod 600) exactly like the other keys, and no endpoint ever
+# returns it or the config — only whether a node is configured,
+# its label, whether the tunnel is verified up, the exit
+# country, and the engines' last probe verdicts.
+
+@app.get("/api/settings/tunnel")
+def tunnel_status():
+    from pipeline import tunnel
+    info = tunnel.status()
+    try:
+        probe = json.loads((ROOT / ".translate_probe.json")
+                           .read_text(encoding="utf-8"))
+        info["gemini_ok"] = probe.get("gemini_ok")
+        info["openai_ok"] = probe.get("openai_ok")
+        info["probe_ts"] = probe.get("ts")
+    except Exception:
+        info["gemini_ok"] = None
+        info["openai_ok"] = None
+        info["probe_ts"] = None
+    return jsonify(info)
+
+
+@app.post("/api/settings/tunnel")
+def tunnel_save():
+    from pipeline import tunnel
+    data = request.get_json(force=True, silent=True) or {}
+    raw = (data.get("link") or "").strip()
+    if not raw:
+        return jsonify({"error": "အရင် link သို့မဟုတ် subscription URL ထည့်ပါ"}), 400
+    if len(raw) > 100_000:
+        return jsonify({"error": "ထည့်တာ ကြီးလွန်းပါတယ် — link တစ်ခုပဲ ထည့်ပါ"}), 400
+    try:
+        res = tunnel.save_link(raw)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    info = tunnel.status()
+    info.update({"ok": True, **res})
+    return jsonify(info)
+
+
+@app.delete("/api/settings/tunnel")
+def tunnel_delete():
+    from pipeline import tunnel
+    tunnel.clear()
+    info = tunnel.status()
+    info["ok"] = True
+    return jsonify(info)
+
+
 # ---------- Apps Script bridge (server-side only, build 137) ----------
 # The owner's AutoTranslate.gs Web App URL + WEB_SECRET. Same rules as
 # the Gemini/OpenAI keys: admin-only (see _accounts_guard — every

@@ -17,6 +17,7 @@ import os
 import time
 from pathlib import Path
 
+from . import tunnel
 from .common import PROJECT_ROOT
 from .gemini_translate import (_extract_json_array, _prompt_for,
                                _validated_result)
@@ -69,6 +70,11 @@ def translate_all(segments, style="subs"):
     key = get_api_key()
     if not key:
         raise RuntimeError("no OPENAI_API_KEY configured")
+    # Build 189: direct OpenAI is territory-blocked from this
+    # server, so when the owner's VPN tunnel is verified up the
+    # calls leave through it (per-call `proxies`, nothing global;
+    # None — requests' default — whenever the tunnel is down).
+    proxies = tunnel.requests_proxies()
     payload_in = [{"id": i, "text": (s.get("text") or "").strip()}
                   for i, s in enumerate(segments)]
     prompt = _prompt_for(style).replace(
@@ -80,6 +86,7 @@ def translate_all(segments, style="subs"):
         try:
             resp = requests.post(
                 _API_URL, json={**body, "model": mdl}, timeout=120,
+                proxies=proxies,
                 headers={"Authorization": f"Bearer {key}",
                          "Content-Type": "application/json"})
         except Exception as e:  # network-level: next model shape

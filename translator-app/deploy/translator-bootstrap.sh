@@ -662,6 +662,196 @@ EOF
 )
 tgba_setup || echo "WARN: local Telegram API setup hit an error — continuing the translator deploy."
 
+# --- 13e. VPN tunnel for Gemini/OpenAI (build 189) -------------------------
+# Direct Gemini is location-blocked and direct OpenAI is
+# territory-blocked from this VPS (the engines judge the API
+# caller's IP country; the box is in Hong Kong). When the owner
+# has saved a node from his own V2Ray subscription in the app's
+# Admin card, the app has already parsed it into an xray client
+# config at $APP_DIR/tun-xray.json (chmod 600 — it carries the
+# node credential). This section installs xray-core (the standard
+# V2Ray client; pinned release + sha256 below, verified before
+# anything is installed) and runs it as the tun-xray unit with
+# ONE loopback HTTP proxy inbound on 127.0.0.1:18119. The app's
+# Gemini/OpenAI clients — and nothing else in the system — pass
+# that proxy explicitly per request, and only after this section
+# has verified real egress through it: only then are
+# VT_TUNNEL_PROXY / VT_TUNNEL_COUNTRY / VT_TUNNEL_CONF_SHA (the
+# sha of the very config verified) written into the app .env,
+# and the app re-checks that sha on every call, so a re-saved
+# node is never trusted until it has been verified here.
+#
+# FAIL-SAFE BY CONSTRUCTION (same shape as 13d): one subshell
+# with set +e behind `|| true` — no failure in here (offline,
+# bad download, dead node, xray won't start) can fail or slow
+# the translator deploy; the engines simply stay on their
+# direct route, exactly as without a tunnel. When the config is
+# ABSENT the section clears the app-side pointers and stops the
+# unit; the binary is left installed but unused.
+TUNX_VERSION='26.11.9'
+TUNX_HOME="${TUNX_HOME:-/opt/tun-xray}"
+TUNX_UNIT="${TUNX_UNIT:-/etc/systemd/system/tun-xray.service}"
+TUNX_DL_BASE="${TUNX_DL_BASE:-https://github.com/XTLS/Xray-core/releases/download/v${TUNX_VERSION}}"
+TUNX_PORT='18119'
+TUNX_CONF='tun-xray.json'
+
+tunx_env_get() {  # $1 = key -> last value in the app .env ("" if absent)
+  [ -f "$APP_DIR/.env" ] || return 0
+  grep -E "^$1=" "$APP_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d ' \r' || true
+}
+
+tunx_env_set() {  # $1 = key, $2 = value ("" removes the line)
+  local env_file="$APP_DIR/.env" tmp
+  [ -f "$env_file" ] || return 0
+  tmp="$(mktemp)" || return 0
+  grep -v "^$1=" "$env_file" > "$tmp" 2>/dev/null || true
+  if [ -n "$2" ]; then
+    echo "$1=$2" >> "$tmp"
+  fi
+  cat "$tmp" > "$env_file"
+  rm -f "$tmp"
+  chmod 600 "$env_file" 2>/dev/null || true
+  chown "$APP_USER:$APP_USER" "$env_file" 2>/dev/null || true
+}
+
+tunx_clear_pointers() {
+  tunx_env_set VT_TUNNEL_PROXY ""
+  tunx_env_set VT_TUNNEL_COUNTRY ""
+  tunx_env_set VT_TUNNEL_CONF_SHA ""
+}
+
+tunx_setup() (
+  set +e  # contained to this subshell: nothing here may fail the deploy
+  conf_src="$APP_DIR/$TUNX_CONF"
+  if [ ! -s "$conf_src" ] \
+     || ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$conf_src" 2>/dev/null; then
+    if grep -q '^VT_TUNNEL_PROXY=' "$APP_DIR/.env" 2>/dev/null; then
+      tunx_clear_pointers
+      echo "VPN tunnel: no config — tunnel pointers cleared (Gemini/OpenAI direct)."
+    else
+      echo "VPN tunnel: not configured (Gemini/OpenAI direct)."
+    fi
+    systemctl disable --now tun-xray.service >/dev/null 2>&1 || true
+    exit 0
+  fi
+
+  case "$(uname -m)" in
+    x86_64|amd64)   tunx_arch='64';        tunx_sha='b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82' ;;
+    aarch64|arm64)  tunx_arch='arm64-v8a'; tunx_sha='64ed6858982a7f5eb85d88b811089063bd4f17561f4c8f44e0f1dc8e6f6430be' ;;
+    *) echo "VPN tunnel: unsupported arch $(uname -m) — skipped."; exit 0 ;;
+  esac
+  tunx_asset="Xray-linux-${tunx_arch}.zip"
+  tunx_bin="$TUNX_HOME/bin/xray"
+
+  # (a) binary: download once per pinned version, sha256-verified.
+  # Only the `xray` member is extracted (the geo data files are
+  # not referenced by a proxy-only client config).
+  if [ ! -x "$tunx_bin" ] || [ "$(cat "$TUNX_HOME/VERSION" 2>/dev/null)" != "$TUNX_VERSION" ]; then
+    tunx_dl="$(mktemp -d)"
+    echo "VPN tunnel: downloading xray-core v${TUNX_VERSION} (linux-${tunx_arch})..."
+    if curl -fsSL --max-time 300 -o "$tunx_dl/$tunx_asset" "$TUNX_DL_BASE/$tunx_asset" \
+       && echo "${tunx_sha}  $tunx_dl/$tunx_asset" | sha256sum -c - >/dev/null 2>&1 \
+       && python3 -c 'import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extract("xray", sys.argv[2])' "$tunx_dl/$tunx_asset" "$tunx_dl"; then
+      mkdir -p "$TUNX_HOME/bin"
+      install -m 755 "$tunx_dl/xray" "$tunx_bin"
+      echo "$TUNX_VERSION" > "$TUNX_HOME/VERSION"
+      echo "VPN tunnel: xray v${TUNX_VERSION} installed at $tunx_bin."
+    else
+      echo "WARN: xray download/verify failed — skipping (Gemini/OpenAI stay direct)."
+      rm -rf "$tunx_dl"
+      exit 0
+    fi
+    rm -rf "$tunx_dl"
+  fi
+  if [ ! -x "$tunx_bin" ]; then
+    echo "WARN: xray binary missing — skipping."
+    exit 0
+  fi
+
+  mkdir -p "$TUNX_HOME"
+  chown "$APP_USER:$APP_USER" "$TUNX_HOME" 2>/dev/null || true
+
+  # (b) config: install the app's rendered config (it carries the
+  # node credential, so 600), and let xray itself judge it before
+  # anything is pointed at the tunnel.
+  conf_dst="$TUNX_HOME/config.json"
+  conf_sha="$(sha256sum "$conf_src" | cut -d' ' -f1)"
+  conf_changed=0
+  if [ ! -f "$conf_dst" ] || [ "$(sha256sum "$conf_dst" 2>/dev/null | cut -d' ' -f1)" != "$conf_sha" ]; then
+    cp "$conf_src" "$conf_dst"
+    conf_changed=1
+  fi
+  chmod 600 "$conf_dst" 2>/dev/null || true
+  chown "$APP_USER:$APP_USER" "$conf_dst" 2>/dev/null || true
+  if ! "$tunx_bin" run -test -config "$conf_dst" >/dev/null 2>&1; then
+    echo "WARN: xray rejects the saved config — tunnel pointers cleared (Gemini/OpenAI stay direct)."
+    tunx_clear_pointers
+    systemctl stop tun-xray.service >/dev/null 2>&1 || true
+    exit 0
+  fi
+
+  # (c) systemd unit. Unlike 13d's unit it embeds NO secret (the
+  # credential lives in the 600 config file), so default perms.
+  unit_changed=0
+  tunx_unit_tmp="$(mktemp)"
+  cat > "$tunx_unit_tmp" <<EOF
+[Unit]
+Description=VPN tunnel (xray) for the translator's Gemini/OpenAI (build 189)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$APP_USER
+Group=$APP_USER
+WorkingDirectory=$TUNX_HOME
+ExecStart=$tunx_bin run -config $conf_dst
+Restart=on-failure
+RestartSec=5
+MemoryMax=512M
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if [ ! -f "$TUNX_UNIT" ] || ! cmp -s "$tunx_unit_tmp" "$TUNX_UNIT"; then
+    cat "$tunx_unit_tmp" > "$TUNX_UNIT"
+    unit_changed=1
+  fi
+  rm -f "$tunx_unit_tmp"
+  systemctl daemon-reload
+  systemctl enable tun-xray.service >/dev/null 2>&1 || true
+  if [ "$conf_changed" -eq 1 ] || [ "$unit_changed" -eq 1 ] \
+     || ! systemctl is-active --quiet tun-xray.service; then
+    systemctl restart tun-xray.service || echo "WARN: tun-xray failed to start."
+    sleep 2
+  fi
+
+  # (d) point the app at the tunnel ONLY when it is really up and
+  # carrying traffic: one lightweight egress check THROUGH the
+  # proxy; the country it reports is what the Admin card shows.
+  if systemctl is-active --quiet tun-xray.service; then
+    tunx_trace="$(curl -fsS --max-time 25 --proxy "http://127.0.0.1:${TUNX_PORT}" \
+                  https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+    tunx_country="$(printf '%s' "$tunx_trace" | grep -E '^loc=' | head -1 | cut -d= -f2 | tr -d ' \r' | cut -c1-2)"
+    if [ -n "$tunx_trace" ] && [ -n "$tunx_country" ]; then
+      tunx_env_set VT_TUNNEL_PROXY "http://127.0.0.1:${TUNX_PORT}"
+      tunx_env_set VT_TUNNEL_COUNTRY "$tunx_country"
+      tunx_env_set VT_TUNNEL_CONF_SHA "$conf_sha"
+      echo "VPN tunnel: live on 127.0.0.1:${TUNX_PORT} — egress country ${tunx_country}; Gemini/OpenAI will use it."
+    else
+      tunx_clear_pointers
+      echo "WARN: tunnel egress check failed (node down?) — tunnel pointers cleared; Gemini/OpenAI stay direct."
+    fi
+  else
+    tunx_clear_pointers
+    echo "WARN: tun-xray is not active; tunnel pointers cleared (Gemini/OpenAI stay direct)."
+  fi
+  exit 0
+)
+tunx_setup || echo "WARN: VPN tunnel setup hit an error — continuing the translator deploy."
+
 # --- 13b. Myanmar fonts -------------------------------------------------------------------------
 # The repo ships the fonts as .ttf.b64 (the push channel is text
 # only). The app service runs as an unprivileged system user and

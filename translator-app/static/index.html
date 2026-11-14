@@ -310,6 +310,17 @@
     </div>
   </div>
 
+  <div class="card" id="tunCard">
+    <h3 style="margin-top:0">🌐 VPN Tunnel (Gemini / OpenAI အတွက်)</h3>
+    <div class="keyPill" id="tunPill">…</div>
+    <p class="hint">Gemini နဲ့ OpenAI က ဒီ server ရှိတဲ့ <b>Hong Kong</b> ကို ပိတ်ထားလို့ တိုက်ရိုက် သုံးလို့ မရပါ။ ဆရာ့ V2Ray subscription က <b>vless://</b> သို့မဟုတ် <b>vmess://</b> link (သို့) <b>subscription URL</b> ကို ဒီမှာ ထည့်ရင် နောက် update မှာ ဒီ server ပေါ်မှာ tunnel တက်လာပြီး <b>အဲဒီ engine ၂ ခုပဲ</b> tunnel ကနေ သွားမယ် — <b>ကျန်တာ အကုန် (download, Telegram, OpenRouter…) မူလ လမ်းအတိုင်း</b>ပဲ။ Tunnel တက်ပြီး စစ်ပြီး ဖြစ်ရင် Gemini က ဘာသာပြန် မှာ <b>ဦးဆောင်</b> ဖြစ်သွားမယ်။ Subscription ထဲမှာ node အများကြီး ပါရင် <b>Singapore (SG)</b> node ကို အရင် ရွေးပေးမယ် — ရွေးထားတဲ့ node နာမည်ကို အောက်က အခြေအနေ မှာ အမြဲ ပြထားတယ်။ ဒီ link ကို <b>chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ။ အခြေအနေ: <span id="tunState">…</span></p>
+    <textarea id="tunInput" rows="3" placeholder="vless://… သို့မဟုတ် vmess://… သို့မဟုတ် subscription URL ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box"></textarea>
+    <div class="row">
+      <button class="ghost" id="tunSave">သိမ်းမယ်</button>
+      <button class="ghost" id="tunDel">ဖျက်မယ်</button>
+    </div>
+  </div>
+
   <div class="card" id="googleCard">
     <h3 style="margin-top:0">🔐 Google login (တစ်ချက် နှိပ် ဝင်ရန်)</h3>
     <div class="keyPill" id="googlePill">…</div>
@@ -1581,6 +1592,51 @@ $("tgApiDel").onclick = async () => {
 };
 loadTgApiState();
 
+/* ---------------- VPN tunnel settings (build 189) ---------------- */
+async function loadTunState() {
+  try {
+    const r = await fetch("/api/settings/tunnel");
+    const d = await r.json();
+    // Owner-only card: a non-admin's 403 has no "configured"
+    // field and the card stays hidden, exactly like the cards
+    // above. The GET never carries the link or the config —
+    // only booleans, the node label and the exit country.
+    if (!r.ok || !("configured" in d)) {
+      $("tunCard").classList.remove("show");
+      return;
+    }
+    setPill("tunPill", d.configured);
+    $("tunState").textContent = !d.configured
+      ? "❌ မထည့်ရသေး (Gemini/OpenAI တိုက်ရိုက် ပိတ်ထိနေဆဲ)"
+      : (d.up
+          ? "✅ Tunnel တက်နေတယ်" + (d.country ? " (exit: " + d.country + ")" : "")
+            + (d.label ? " · node: " + d.label : "")
+            + (d.gemini_ok ? " — Gemini ဦးဆောင်" : "")
+          : "⏳ ထည့်ပြီးသား" + (d.label ? " (node: " + d.label + ")" : "")
+            + " — Tunnel က နောက် update မှာ တက်လာမယ်");
+    $("tunCard").classList.add("show");
+  } catch (e) { $("tunState").textContent = "?"; }
+}
+$("tunSave").onclick = async () => {
+  const link = $("tunInput").value.trim();
+  if (!link) { alert("link သို့မဟုတ် subscription URL အရင် ထည့်ပါ"); return; }
+  const res = await fetch("/api/settings/tunnel", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({link: link})});
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok) { alert(d.error || "သိမ်းလို့ မရပါ"); return; }
+  $("tunInput").value = "";
+  loadTunState();
+  alert("သိမ်းပြီးပြီ — ရွေးထားတဲ့ node: " + (d.label || "?")
+    + " — နောက် update (၁၅ မိနစ် အတွင်း) မှာ tunnel တက်လာပြီး စစ်ပြီးရင် Gemini ဦးဆောင် ဖြစ်သွားမယ်");
+};
+$("tunDel").onclick = async () => {
+  await fetch("/api/settings/tunnel", {method: "DELETE"});
+  loadTunState();
+  alert("ဖျက်ပြီးပါပြီ — Gemini/OpenAI က တိုက်ရိုက် လမ်းကို ပြန်သုံးမယ်");
+};
+loadTunState();
+
 /* ---------------- Google client ID settings (build 180) ---------------- */
 async function loadGoogleState() {
   try {
@@ -1636,6 +1692,7 @@ function loadAllSettings() {
   loadAsState();
   loadTgState();
   loadTgApiState();
+  loadTunState();
   loadGoogleState();
   loadDailyLimit();
 }
@@ -2092,6 +2149,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 188</p>
+<p class="hint" id="buildTag" style="text-align:center">build 189</p>
 </body>
 </html>

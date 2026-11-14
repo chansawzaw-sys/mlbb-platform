@@ -1,6 +1,12 @@
 """Step 3: translate each segment to Myanmar (Burmese).
 
 Provider chain:
+  0-lead. Gemini Flash FIRST, but only while the app probe's
+     fresh verdict says it works (build 189): through the
+     owner's VPN tunnel (pipeline/tunnel.py) the location
+     block is gone, and Gemini is the quality target — free on
+     the owner's key. A red or stale verdict removes this slot
+     and the order below is exactly the pre-189 one.
   0. OpenRouter (build 147 module, when configured): ONE request
      for ALL segments, natural spoken Burmese. Any failure ->
      xKiro (build 155 module) -> Gemini Flash (only when
@@ -350,6 +356,66 @@ def _probe_blocked(engine):
     return False
 
 
+def _probe_engine_ok(engine):
+    """Build 189: True when the app's most recent translate probe
+    found this engine WORKING and the verdict is still fresh
+    (same 6 h freshness as _probe_blocked above).
+
+    The probe (app.py _run_translate_probe) calls the engines
+    through the exact client code jobs use — including the VPN
+    tunnel (build 189) whenever it is verified up — so a green
+    verdict here means the engine can carry a real job right
+    now. It is the gate for the chain's one dynamic move: while
+    Gemini's verdict is green, Gemini LEADS the chain (it is
+    the owner's quality target and costs nothing on his key);
+    the moment the verdict is red or stale, the order is the
+    build-168 free-first order again, byte for byte."""
+    try:
+        data = json.loads((PROJECT_ROOT / ".translate_probe.json")
+                          .read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    ts = float(data.get("ts") or 0)
+    if not ts or time.time() - ts > _PROBE_FRESH_S:
+        return False
+    return data.get(f"{engine}_ok") is True
+
+
+def _gemini_attempt(segs, style, report):
+    """ONE Gemini attempt with the chain's usual report
+    semantics; the translated segment list, or None when the
+    engine is unconfigured / probe-skipped / failed (the error
+    lands in report["gemini_err"]). Called from the build-189
+    lead slot and from Gemini's historical fallback slot — the
+    caller guarantees it runs at most once per job."""
+    try:
+        from . import gemini_translate
+        if gemini_translate.key_configured() \
+                and not _probe_blocked("gemini"):
+            by_idx = gemini_translate.translate_all(segs, style=style)
+            out = [{**seg, "text_my": by_idx[i], "provider": "gemini"}
+                   for i, seg in enumerate(segs)]
+            return _fill_missing(out, report)
+    except Exception as e:
+        report["gemini_err"] = str(e)[:120]
+    return None
+
+
+def _openai_attempt(segs, style, report):
+    """ONE OpenAI attempt; same contract as _gemini_attempt."""
+    try:
+        from . import openai_translate
+        if openai_translate.key_configured() \
+                and not _probe_blocked("openai"):
+            by_idx = openai_translate.translate_all(segs, style=style)
+            out = [{**seg, "text_my": by_idx[i], "provider": "openai"}
+                   for i, seg in enumerate(segs)]
+            return _fill_missing(out, report)
+    except Exception as e:
+        report["openai_err"] = str(e)[:120]
+    return None
+
+
 def _fill_missing(out, report=None):
     """No silent gaps (owner complaint 2026-11-09: subtitle lines
     missing from the finished video). Batch endpoints — Gemini
@@ -446,6 +512,26 @@ def translate_segments(workdir, style="subs"):
     workdir = Path(workdir)
     segs = load_segments(workdir / "segments_en.json")
     report = {"batch": {}, "chain": {}, "fill": {}}
+    # 0-lead. Gemini FIRST while its probe verdict is green
+    # (build 189): direct Gemini is location-blocked from this
+    # VPS, but through the owner's VPN tunnel (xray on loopback,
+    # used ONLY by the Gemini/OpenAI clients) it answers — and
+    # the app probe, which exercises the same tunneled client,
+    # proves it before any job trusts it. Green probe -> Gemini
+    # leads: it is the owner's quality target and free on his
+    # key. Red/stale probe -> this block simply does not run
+    # and the build-168 free-first order below is untouched.
+    # The attempt is remembered so Gemini's historical slot
+    # further down never retries it within the same job.
+    gemini_tried = False
+    if segs and _probe_engine_ok("gemini"):
+        gemini_tried = True
+        out = _gemini_attempt(segs, style, report)
+        if out is not None:
+            _write_report(workdir, report)
+            save_segments(out, workdir / "segments_my.json")
+            write_srt(out, workdir / "subs_my.srt")
+            return out
     # 0. OpenRouter batch — the FIRST gateway (build 147; build
     # 168 free-first reorder, owner order 2026-11-13): the owner
     # deferred the paid credit purchase, so the best FREE models
@@ -505,46 +591,36 @@ def translate_segments(workdir, style="subs"):
     # OpenAI, with the error kept in the report for diagnosis.
     # Build 186: while the app probe's region-block verdict is
     # fresh, the attempt is skipped outright (see _probe_blocked).
-    if segs and _probe_blocked("gemini"):
+    # Build 189: when the lead slot above already ran the
+    # attempt (green probe), this slot is skipped entirely —
+    # one attempt per job, whichever slot it came from.
+    if segs and _probe_blocked("gemini") and not gemini_tried:
         report["gemini_skipped"] = "region-blocked (fresh probe)"
-    if segs:
-        try:
-            from . import gemini_translate
-            if gemini_translate.key_configured() \
-                    and not _probe_blocked("gemini"):
-                by_idx = gemini_translate.translate_all(segs, style=style)
-                out = [{**seg, "text_my": by_idx[i], "provider": "gemini"}
-                       for i, seg in enumerate(segs)]
-                out = _fill_missing(out, report)
-                _write_report(workdir, report)
-                save_segments(out, workdir / "segments_my.json")
-                write_srt(out, workdir / "subs_my.srt")
-                return out
-        except Exception as e:
-            report["gemini_err"] = str(e)[:120]
+    if segs and not gemini_tried:
+        out = _gemini_attempt(segs, style, report)
+        if out is not None:
+            _write_report(workdir, report)
+            save_segments(out, workdir / "segments_my.json")
+            write_srt(out, workdir / "subs_my.srt")
+            return out
     # 0d. OpenAI batch — fourth engine, when a key is configured.
     # Direct OpenAI is region-blocked from the VPS (403
     # unsupported territory), so since build 168 it sits behind
     # the working gateways like Gemini. Any failure falls through
     # to Apps Script. Build 186: skipped while the probe's
     # region-block verdict is fresh, like Gemini above.
+    # Build 189: OpenAI keeps exactly this slot — after Gemini,
+    # never promoted above it; through the tunnel it answers
+    # here on the days Gemini itself is down.
     if segs and _probe_blocked("openai"):
         report["openai_skipped"] = "region-blocked (fresh probe)"
     if segs:
-        try:
-            from . import openai_translate
-            if openai_translate.key_configured() \
-                    and not _probe_blocked("openai"):
-                by_idx = openai_translate.translate_all(segs, style=style)
-                out = [{**seg, "text_my": by_idx[i], "provider": "openai"}
-                       for i, seg in enumerate(segs)]
-                out = _fill_missing(out, report)
-                _write_report(workdir, report)
-                save_segments(out, workdir / "segments_my.json")
-                write_srt(out, workdir / "subs_my.srt")
-                return out
-        except Exception as e:
-            report["openai_err"] = str(e)[:120]
+        out = _openai_attempt(segs, style, report)
+        if out is not None:
+            _write_report(workdir, report)
+            save_segments(out, workdir / "segments_my.json")
+            write_srt(out, workdir / "subs_my.srt")
+            return out
     # 0e. Apps Script batch — fifth engine (build 137, owner request
     # 2026-11-10): the owner's own Google account translates via
     # LanguageApp, so the throttled VPS IP never touches Google.
