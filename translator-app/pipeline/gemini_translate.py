@@ -134,13 +134,16 @@ def list_models():
     # Build 189: ListModels is part of Gemini reachability
     # diagnosis (the app's probe uses it), so it takes the same
     # tunnel as generateContent when the tunnel is verified up.
-    proxies = tunnel.requests_proxies()
+    # Build 196: kwargs come from the one shared helper, like
+    # every Gemini/OpenAI call site.
     for use_query in (False, True):
         try:
             resp = requests.get(
                 url + (f"?key={key}" if use_query else ""),
-                timeout=30, proxies=proxies,
-                headers={} if use_query else {"x-goog-api-key": key})
+                **tunnel.request_kwargs(
+                    timeout=30,
+                    headers={} if use_query else
+                    {"x-goog-api-key": key}))
         except Exception as e:
             last = f"net:{e}"[:120]
             continue
@@ -235,7 +238,9 @@ def translate_all(segments, style="subs"):
     # server, so when the owner's VPN tunnel is verified up the
     # calls leave through it (per-call `proxies`, nothing global;
     # None — requests' default — whenever the tunnel is down).
-    proxies = tunnel.requests_proxies()
+    # Build 196: the kwargs of every attempt come from the one
+    # shared helper (tunnel.request_kwargs), as at every other
+    # Gemini/OpenAI call site.
     model = os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
     payload_in = [{"id": i, "text": (s.get("text") or "").strip()}
                   for i, s in enumerate(segments)]
@@ -256,10 +261,12 @@ def translate_all(segments, style="subs"):
                 try:
                     resp = requests.post(
                         url + (f"?key={key}" if use_query else ""),
-                        json=body, timeout=120, proxies=proxies,
-                        headers={**({} if use_query else
-                                    {"x-goog-api-key": key}),
-                                 "Content-Type": "application/json"})
+                        **tunnel.request_kwargs(
+                            json=body, timeout=120,
+                            headers={**({} if use_query else
+                                        {"x-goog-api-key": key}),
+                                     "Content-Type":
+                                         "application/json"}))
                 except Exception as e:  # network-level: next shape
                     attempts.append(f"{mdl}@{ver}=net:{e}"[:60])
                     continue

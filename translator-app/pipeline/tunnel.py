@@ -1059,6 +1059,19 @@ def requests_proxies():
     return {"http": url, "https": url}
 
 
+def request_kwargs(**kwargs):
+    """The full kwargs for a requests call in the Gemini / OpenAI
+    clients (build 196): the caller's own arguments (timeout,
+    headers, json, ...) plus the tunnel `proxies`. This is the
+    ONE place the `proxies` key is set for those clients — every
+    call site (ListModels, the probe's test generateContent,
+    real-job translate, OpenAI) builds its kwargs here, so no
+    site can forget the tunnel or drift from the others. Tunnel
+    down -> proxies=None, byte-for-byte requests' default."""
+    kwargs["proxies"] = requests_proxies()
+    return kwargs
+
+
 def _disk_triple():
     """The triple of the config currently on disk, read from
     the sing-box shape, or None when there is none / it is

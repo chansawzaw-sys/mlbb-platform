@@ -74,7 +74,8 @@ def translate_all(segments, style="subs"):
     # server, so when the owner's VPN tunnel is verified up the
     # calls leave through it (per-call `proxies`, nothing global;
     # None — requests' default — whenever the tunnel is down).
-    proxies = tunnel.requests_proxies()
+    # Build 196: kwargs from the one shared helper, like every
+    # Gemini/OpenAI call site.
     payload_in = [{"id": i, "text": (s.get("text") or "").strip()}
                   for i, s in enumerate(segments)]
     prompt = _prompt_for(style).replace(
@@ -85,10 +86,10 @@ def translate_all(segments, style="subs"):
     for mdl in _models():
         try:
             resp = requests.post(
-                _API_URL, json={**body, "model": mdl}, timeout=120,
-                proxies=proxies,
-                headers={"Authorization": f"Bearer {key}",
-                         "Content-Type": "application/json"})
+                _API_URL, **tunnel.request_kwargs(
+                    json={**body, "model": mdl}, timeout=120,
+                    headers={"Authorization": f"Bearer {key}",
+                             "Content-Type": "application/json"}))
         except Exception as e:  # network-level: next model shape
             attempts.append(f"{mdl}=net:{e}"[:60])
             continue
