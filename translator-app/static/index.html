@@ -114,22 +114,50 @@
   .chip { width: auto; margin-top: 0; padding: 10px 14px; border-radius: 999px;
           background: #f3ead3; color: #3d382f; border: 1px solid #cbbd97; font-size: 14px; }
   .chip.on { background: #2b5cff; border-color: #2b5cff; font-weight: 700; }
-  /* ---------- voice library (build 207) ---------- */
-  .vlib-search { width: 100%; padding: 10px 12px; border-radius: 10px;
+  /* ---------- voice library (build 207; tabbed sheet + overflow
+     fix in build 208) ---------- */
+  /* Build 208 overflow fix: .vlib-row is a flex ITEM of .chips
+     with flex-basis:100%; with the default min-width:auto it
+     could not shrink below its min-content size, and that
+     min-content was set by the nowrap .vlib-desc's full-length
+     text — so every row rendered at its own description's
+     unwrapped width (459–543px on a 360px phone) and the page
+     scrolled sideways. min-width:0 on the row (and overflow:
+     hidden on .vlib-main) lets the row take the container
+     width and the ellipsis engage. */
+  .vlib-handle { flex-basis: 100%; min-width: 0; display: flex;
+    justify-content: center; margin: 2px 0 0; }
+  .vlib-handle span { width: 44px; height: 4px; border-radius: 2px;
+    background: #d8cba6; display: block; }
+  .vlib-search { width: 100%; min-width: 0; flex-basis: 100%;
+    padding: 10px 12px; border-radius: 10px;
     border: 1px solid #cbbd97; background: #fffdf8; color: #33302a;
     font-size: 15px; margin: 6px 0 4px; font-family: inherit;
     box-sizing: border-box; }
+  .vlib-tabs { display: flex; gap: 6px; background: #efe5cb;
+    border: 1px solid #ddd0b2; padding: 4px; border-radius: 999px;
+    margin: 8px 0 4px; flex-basis: 100%; min-width: 0; }
+  .vlib-tab { flex: 1 1 0; min-width: 0; width: auto; margin: 0;
+    padding: 9px 4px; border-radius: 999px; background: transparent;
+    border: 0; font-size: 13.5px; font-weight: 600; color: #6f6650;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-family: inherit; cursor: pointer; }
+  .vlib-tab.on { background: #fffdf8; color: #33302a;
+    box-shadow: 0 1px 3px rgba(60,50,20,.25); }
   .vlib-group { font-weight: 700; margin: 12px 0 6px; color: #57503f;
-    flex-basis: 100%; }
+    flex-basis: 100%; min-width: 0; }
+  .vlib-note { flex-basis: 100%; min-width: 0; font-size: 12.5px;
+    color: #6f6650; line-height: 1.7; margin: 6px 0; }
   .vlib-row { display: flex; align-items: center; gap: 10px; padding: 10px;
     border: 1px solid #cbbd97; border-radius: 12px; background: #fffdf8;
-    margin: 0 0 8px; cursor: pointer; flex-basis: 100%; }
+    margin: 0 0 8px; cursor: pointer; flex-basis: 100%; min-width: 0; }
   .vlib-row.on { background: #2b5cff; border-color: #2b5cff; color: #fff; }
   .vlib-ava { width: 38px; height: 38px; border-radius: 50%; flex: 0 0 auto;
     background: #e9c767; color: #3d382f; display: flex; align-items: center;
     justify-content: center; font-weight: 700; font-size: 17px; }
-  .vlib-main { flex: 1; min-width: 0; }
-  .vlib-name { font-weight: 700; }
+  .vlib-main { flex: 1; min-width: 0; overflow: hidden; }
+  .vlib-name { font-weight: 700; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; }
   .vlib-desc { font-size: 12.5px; opacity: .78; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; }
   .vlib-play { width: auto; margin: 0; padding: 8px 13px; border-radius: 999px;
@@ -617,9 +645,13 @@ let blur = null;                      // {x,y,w,h} normalized
    မူလ / pitch-variant styles. The fallback list mirrors
    /api/voices so the picker still works if the fetch fails.
    Build 207: the picker is a voice LIBRARY — searchable rows
-   (avatar + "Name · Tag" + description + ▶ preview) grouped
-   into the built-in styles and, when the caller passes the
-   build-206 gate, the 🌟 Premium ElevenLabs voices. Selection
+   (avatar + "Name · Tag" + description + ▶ preview).
+   Build 208: the library is a TABBED sheet — "အသင့်သုံး
+   အသံများ" holds the whole catalogue (built-in styles +
+   every ElevenLabs registry voice, sent only when the
+   caller passes the build-206 gate); "ကိုယ်ပိုင် အသံများ"
+   holds the caller's OWN clones from the payload's "mine"
+   array (empty until the Voice Clone build). Selection
    values are unchanged: style keys and "el:<voice_id>". */
 const VOICE_STYLES_FALLBACK = [
   {id: "thiha", label: "Thiha (မူလ)", name: "Thiha", tag: "ပုံမှန်", desc: "ယောက်ျား အသံ — မူလ လေသံ၊ ဇာတ်ကြောင်း ပြောရန် သင့်တော်", preview: "/voice-previews/std-thiha.mp3"},
@@ -630,6 +662,11 @@ const VOICE_STYLES_FALLBACK = [
   {id: "nilar-high", label: "Nilar အသံမြင့်", name: "Nilar", tag: "အသံမြင့်", desc: "Nilar အသံကို မြင့်အောင် လုပ်ထားတာ — ရွှင်လန်းတဲ့ အကြောင်းအရာ အတွက်", preview: "/voice-previews/std-nilar-high.mp3"}];
 let voiceList = VOICE_STYLES_FALLBACK;
 let voiceFilter = "";
+let voiceTab = null;   // build 208: null = auto (tab of the current
+                       // selection); "mine" | "std" once tapped
+let myVoiceList = [];  // build 208: the CALLER's own clones, from
+                       // the /api/voices payload's "mine" array
+                       // (empty until the Voice Clone build)
 let previewAudio = null, previewPlayingId = null;
 function escAttr(s) {
   return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;")
@@ -660,25 +697,51 @@ function voiceRow(v) {
     + (v.preview ? `<button class="vlib-play" data-preview="${v.id}">▶</button>` : "")
     + `</div>`;
 }
+/* Build 208: the library is a tabbed sheet (Burma-Voice style).
+   Tab mapping (owner's definition): "အသင့်သုံး အသံများ"
+   (ready-made) = the whole catalogue — the built-in styles
+   PLUS every ElevenLabs registry voice (the server applies
+   the build-206 gate before sending them). "ကိုယ်ပိုင်
+   အသံများ" (mine) = the CALLER's own cloned voices, from the
+   payload's "mine" array — per-account, and empty for
+   everyone until the self-serve Voice Clone build lands, so
+   the tab shows its empty note. Search filters within the
+   active tab only. */
 function voiceChips(vs) {
   voiceList = vs;
   const f = voiceFilter.trim().toLowerCase();
   const match = v => !f || [v.name, v.label, v.tag, v.desc]
     .join(" ").toLowerCase().includes(f);
-  const prem = vs.filter(v => v.premium && match(v));
-  const std = vs.filter(v => !v.premium && match(v));
-  let html = `<input class="vlib-search" id="voiceSearch" type="search" `
-    + `placeholder="🔍 အသံ ရှာရန် (နာမည် / ပုံစံ)" value="${escAttr(voiceFilter)}">`;
-  if (prem.length) {
-    html += `<div class="vlib-group">🌟 Premium (${prem[0].rate || 2} credits/မိနစ်)</div>`
-      + prem.map(voiceRow).join("");
+  const selMine = myVoiceList.find(v => v.id === W.voice);
+  const tab = voiceTab || (selMine ? "mine" : "std");
+  const shown = (tab === "mine" ? myVoiceList : vs).filter(match);
+  let html = `<div class="vlib-handle"><span></span></div>`
+    + `<input class="vlib-search" id="voiceSearch" type="search" `
+    + `placeholder="🔍 အသံ ရှာရန် (နာမည် / ပုံစံ)" value="${escAttr(voiceFilter)}">`
+    + `<div class="vlib-tabs">`
+    + `<button type="button" class="vlib-tab${tab === "mine" ? " on" : ""}" data-vtab="mine">ကိုယ်ပိုင် အသံများ</button>`
+    + `<button type="button" class="vlib-tab${tab === "std" ? " on" : ""}" data-vtab="std">အသင့်သုံး အသံများ</button>`
+    + `</div>`;
+  if (tab === "mine") {
+    if (!myVoiceList.length) {
+      html += `<p class="vlib-note">Clone အသံတွေ မထည့်ရသေးပါ — ကိုယ်ပိုင် အသံကို Voice Clone အပိုင်းမှာ ထည့်နိုင်ပါတယ်</p>`;
+    } else {
+      const pv = shown.find(v => v.premium);
+      if (pv)
+        html += `<div class="vlib-group">🌟 Premium (${pv.rate || 2} credits/မိနစ်)</div>`;
+      html += shown.length ? shown.map(voiceRow).join("")
+        : `<p class="vlib-note">ရှာတာ မတွေ့ပါ — တခြား စာလုံး စမ်းကြည့်ပါ</p>`;
+    }
+  } else {
+    const premShown = shown.filter(v => v.premium);
+    const stdShown = shown.filter(v => !v.premium);
+    if (premShown.length)
+      html += `<div class="vlib-group">🌟 Premium (${premShown[0].rate || 2} credits/မိနစ်)</div>`
+        + premShown.map(voiceRow).join("");
+    html += stdShown.map(voiceRow).join("");
+    if (!shown.length)
+      html += `<p class="vlib-note">ရှာတာ မတွေ့ပါ — တခြား စာလုံး စမ်းကြည့်ပါ</p>`;
   }
-  if (std.length) {
-    html += `<div class="vlib-group">🎙 ပုံမှန် အသံ</div>`
-      + std.map(voiceRow).join("");
-  }
-  if (!prem.length && !std.length)
-    html += `<p class="hint">ရှာတာ မတွေ့ပါ — တခြား စာလုံး စမ်းကြည့်ပါ</p>`;
   $("voiceChips").innerHTML = html;
   const si = $("voiceSearch");
   si.oninput = () => {
@@ -688,17 +751,21 @@ function voiceChips(vs) {
     const n = $("voiceSearch");
     n.focus(); try { n.setSelectionRange(pos, pos); } catch (e) {}
   };
+  $("voiceChips").querySelectorAll(".vlib-tab").forEach(b =>
+    b.onclick = () => { stopPreview(); voiceTab = b.dataset.vtab; voiceChips(voiceList); });
   $("voiceChips").querySelectorAll(".vlib-row").forEach(r =>
     r.onclick = () => { stopPreview(); W.voice = r.dataset.voice; voiceChips(voiceList); });
   $("voiceChips").querySelectorAll(".vlib-play").forEach(b =>
     b.onclick = (ev) => {
       ev.stopPropagation();
-      const v = voiceList.find(x => x.id === b.dataset.preview);
+      const v = voiceList.concat(myVoiceList).find(x => x.id === b.dataset.preview);
       if (v && v.preview) togglePreview(v, b);
     });
 }
-fetch("/api/voices").then(r => r.json()).then(voiceChips).catch(() =>
-  voiceChips(VOICE_STYLES_FALLBACK));
+fetch("/api/voices").then(r => r.json()).then(d => {
+  myVoiceList = (d && d.mine) || [];
+  voiceChips((d && d.voices) || d || VOICE_STYLES_FALLBACK);
+}).catch(() => voiceChips(VOICE_STYLES_FALLBACK));
 
 /* ---------------- preview ---------------- */
 $("previewBtn").onclick = async () => {
@@ -975,7 +1042,7 @@ function wizSummaryRender() {
     lines.push("🔤 စာတန်း: " + ({box: "အကွက်ထဲမှာ", bottom: "အောက်ခြေ", top: "အပေါ်"})[W.place]
       + " · အရွယ် " + W.subSize + "% · အရောင် " + W.color);
   lines.push("🏷 Logo: " + (logoId && W.logoChoice === "yes" ? "ထည့်မယ်" : "မထည့်ဘူး"));
-  const selVoice = voiceList.find(v => v.id === W.voice) || {};
+  const selVoice = voiceList.concat(myVoiceList).find(v => v.id === W.voice) || {};
   const voiceRate = selVoice.premium ? (selVoice.rate || 2) : 1;
   if (W.mode !== "subs") {
     lines.push("🎙 အသံ: " + (selVoice.premium ? "🌟 " : "")
@@ -2456,6 +2523,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 207</p>
+<p class="hint" id="buildTag" style="text-align:center">build 208</p>
 </body>
 </html>

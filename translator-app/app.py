@@ -53,7 +53,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 207"
+BUILD_TAG = "build 208"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -2114,7 +2114,15 @@ def voices():
     # receive the premium entries; everyone else (including
     # logged-out page loads) gets exactly the standard list.
     out += elevenlabs_tts.picker_entries(_current_user())
-    return jsonify(out)
+    # Build 208: the payload is an object. "voices" is the
+    # catalogue above (built-ins + gate-filtered registry
+    # voices — the picker's Ready-made tab). "mine" is the
+    # CALLER's own cloned voices, read from the per-account
+    # clone store; that store (self-serve Voice Clone) lands
+    # in a later build, so mine is [] for everyone until
+    # then, logged-out callers included — the picker's
+    # My-voices tab renders its empty note from it.
+    return jsonify({"voices": out, "mine": []})
 
 
 _STD_PREVIEW_LOCK = threading.Lock()
