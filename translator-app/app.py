@@ -53,7 +53,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 205"
+BUILD_TAG = "build 206"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1265,6 +1265,26 @@ def _tg_pick_rows(flow):
 _TG_SUB_COLORS = ("white", "yellow", "blue", "green", "red", "black")
 
 
+# Build 206: while the owner tests the ElevenLabs premium
+# voices they are gated (elevenlabs_tts.elevenlabs_allowed):
+# test mode = admins + the Admin-card test usernames only. The
+# bot judges a chat by its LINKED account; the fixed Telegram
+# admin chat counts as an admin principal even when unlinked
+# (its jobs already bypass the account checks below).
+_EL_GATE_MSG = ("🙏 တောင်းပန်ပါတယ် — ဒီ 🌟 Premium အသံ က အခု "
+                "စမ်းသပ်ဆဲ ဖြစ်လို့ သတ်မှတ်ထားတဲ့ account တွေ ပဲ "
+                "သုံးလို့ရပါသေးတယ်။ မကြာခင် အားလုံး အတွက် "
+                "ဖွင့်ပေးပါမယ်")
+
+
+def _tg_el_subject(chat_id):
+    from pipeline import telegram_send as tg
+    acct = accounts.user_for_tg(chat_id)
+    if acct is None and tg.is_admin(chat_id):
+        return {"role": "admin", "username": ""}
+    return acct
+
+
 def _tg_voice_step(chat_id, flow):
     from pipeline import telegram_send as tg
     flow["step"] = "voice"
@@ -1277,7 +1297,10 @@ def _tg_voice_step(chat_id, flow):
     # is empty otherwise). Their callback is "e:<voice_id>" —
     # distinct from the "v:<style>" buttons — and the stored pick
     # is the same "el:<voice_id>" value the web wizard sends.
-    for e in elevenlabs_tts.picker_entries():
+    # Build 206: picker_entries also judges the chat's linked
+    # account through the access gate — in test mode a customer
+    # chat never sees these buttons at all.
+    for e in elevenlabs_tts.picker_entries(_tg_el_subject(chat_id)):
         rows.append([("🌟 " + e["label"]
                       + f" ({e['rate']} credits/မိနစ်)",
                       "e:" + elevenlabs_tts.voice_id_of(e["id"]))])
@@ -1340,6 +1363,16 @@ def _tg_start_flow_job(chat_id, flow):
     from pipeline import telegram_send as tg
     ratio = flow.get("ratio") or "orig"
     acct = accounts.user_for_tg(chat_id)
+    if elevenlabs_tts.is_el_voice(flow.get("voice_style")) \
+            and not elevenlabs_tts.elevenlabs_allowed(
+                _tg_el_subject(chat_id)):
+        # Build 206: the credit pre-check below must agree with
+        # the gate — a premium pick this chat may not use (mode
+        # flipped mid-flow, crafted callback) is refused HERE,
+        # before any quote math, and no job is created.
+        _TG_FLOW.pop(chat_id, None)
+        tg.send_message(chat_id, _EL_GATE_MSG)
+        return
     if not tg.is_admin(chat_id):
         if not acct:
             _TG_FLOW.pop(chat_id, None)
@@ -1392,7 +1425,8 @@ def _tg_start_flow_job(chat_id, flow):
                          "subs": ({"color": flow["sub_color"]}
                                   if flow.get("sub_color") else None),
                          "speed_cap": flow.get("speed_cap") or 1.3,
-                         "quality": flow.get("quality") or "hd"})
+                         "quality": flow.get("quality") or "hd"},
+                        user=_tg_el_subject(chat_id))
     if err:
         tg.send_message(chat_id, "🙏 တောင်းပန်ပါတယ် — " + err)
         return
@@ -1614,6 +1648,14 @@ def _on_tg_callback(cq):
         # ignored, never substituted with a free voice.
         entry = elevenlabs_tts.find_voice(data[2:])
         if not entry:
+            return
+        # Build 206: the access gate judges the tap too — the
+        # buttons may predate a mode flip, or the callback may
+        # be replayed by a chat that never saw them. Refuse
+        # with a polite note; the flow stays on the voice step.
+        if not elevenlabs_tts.elevenlabs_allowed(
+                _tg_el_subject(chat_id)):
+            tg.send_message(chat_id, _EL_GATE_MSG)
             return
         flow["voice_style"] = "el:" + entry["id"]
         _tg_speed_step(chat_id, flow)
@@ -2058,7 +2100,11 @@ def voices():
     # when the owner has configured a key + registry
     # (picker_entries() is empty otherwise), so an unconfigured
     # install returns exactly the build-200 payload.
-    out += elevenlabs_tts.picker_entries()
+    # Build 206: picker_entries() also applies the access gate
+    # to the CALLER — in test mode only admins + test accounts
+    # receive the premium entries; everyone else (including
+    # logged-out page loads) gets exactly the standard list.
+    out += elevenlabs_tts.picker_entries(_current_user())
     return jsonify(out)
 
 
@@ -2557,6 +2603,8 @@ def elevenlabs_status():
         "configured": elevenlabs_tts.key_configured(),
         "model": elevenlabs_tts.get_model(),
         "credits_per_min": elevenlabs_tts.credits_per_min(),
+        "access": elevenlabs_tts.get_access_mode(),
+        "test_users": elevenlabs_tts.get_test_users(),
         "voices": elevenlabs_tts.get_voices()})
 
 
@@ -2580,20 +2628,44 @@ def elevenlabs_key_delete():
 
 @app.post("/api/settings/elevenlabs")
 def elevenlabs_save():
+    # Build 206: partial saves — each PRESENT field is validated
+    # then written; absent fields keep their saved values. The
+    # card sends all four (model, rate, access, test users) at
+    # once; build 205's model+rate-only posts keep working.
     data = request.get_json(force=True) or {}
-    model = data.get("model")
-    if model not in elevenlabs_tts.MODELS:
-        return jsonify({"error": "model မမှန်ပါ"}), 400
-    try:
-        rate = int(data.get("credits_per_min"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "credit နှုန်း မမှန်ပါ"}), 400
-    if not 1 <= rate <= 100:
-        return jsonify({"error": "credit နှုန်း 1–100 အတွင်း ဖြစ်ရပါမယ်"}), 400
-    _env_write("ELEVENLABS_MODEL", model)
-    _env_write("ELEVENLABS_CREDITS_PER_MIN", str(rate))
-    return jsonify({"ok": True, "model": model,
-                    "credits_per_min": rate})
+    writes = {}
+    if "model" in data:
+        if data["model"] not in elevenlabs_tts.MODELS:
+            return jsonify({"error": "model မမှန်ပါ"}), 400
+        writes["ELEVENLABS_MODEL"] = data["model"]
+    if "credits_per_min" in data:
+        try:
+            rate = int(data["credits_per_min"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "credit နှုန်း မမှန်ပါ"}), 400
+        if not 1 <= rate <= 100:
+            return jsonify({"error": "credit နှုန်း 1–100 အတွင်း ဖြစ်ရပါမယ်"}), 400
+        writes["ELEVENLABS_CREDITS_PER_MIN"] = str(rate)
+    if "access" in data:
+        if data["access"] not in elevenlabs_tts.ACCESS_MODES:
+            return jsonify({"error": "သုံးခွင့် ပုံစံ မမှန်ပါ"}), 400
+        writes["ELEVENLABS_ACCESS"] = data["access"]
+    if "test_users" in data:
+        users, uerr = elevenlabs_tts.parse_test_users(
+            data["test_users"])
+        if uerr:
+            return jsonify({"error": uerr}), 400
+        writes["ELEVENLABS_TEST_USERS"] = ",".join(users)
+    if not writes:
+        return jsonify({"error": "သိမ်းစရာ ဆက်တင် မပါပါ"}), 400
+    for k, v in writes.items():
+        _env_write(k, v)
+    return jsonify({"ok": True,
+                    "model": elevenlabs_tts.get_model(),
+                    "credits_per_min":
+                        elevenlabs_tts.credits_per_min(),
+                    "access": elevenlabs_tts.get_access_mode(),
+                    "test_users": elevenlabs_tts.get_test_users()})
 
 
 @app.post("/api/settings/elevenlabs-voices")
@@ -3824,11 +3896,17 @@ def _build_subs(data):
     }
 
 
-def _new_job(data):
+def _new_job(data, user=None):
     """Build a job record from request-style data, or (None, error).
     Shared by the web form and the Telegram bot, so a job is a job
     however it arrives. The caller registers it in JOBS and decides
-    when its worker starts."""
+    when its worker starts.
+
+    `user` is the caller's account (web session user / the bot
+    chat's gate subject) — build 206 judges an ElevenLabs premium
+    pick against the access gate with it. user=None means the
+    caller has no gate subject (accounts not enforced, trusted
+    internal call): the pre-206 behaviour, no gate applied."""
     url = (data.get("url") or "").strip()
     mode = data.get("mode") or "both"
     font = data.get("font") or "noto"
@@ -3868,6 +3946,17 @@ def _new_job(data):
         if el_entry is None:
             return None, ("ရွေးထားတဲ့ ElevenLabs အသံ မရှိတော့ပါ — "
                           "အသံ ပြန်ရွေးပေးပါ")
+        if user is not None \
+                and not elevenlabs_tts.elevenlabs_allowed(user):
+            # Build 206: THE enforcement — hiding the picker
+            # group is not enough; a premium pick from an
+            # account outside the gate (test mode: not an
+            # admin, not a listed test username) refuses the
+            # job here, on both surfaces, before any quote.
+            return None, ("ဒီ Premium အသံ က အခု စမ်းသပ်ဆဲ "
+                          "ဖြစ်လို့ သတ်မှတ်ထားတဲ့ account တွေ ပဲ "
+                          "သုံးလို့ရပါသေးတယ် — မကြာခင် အားလုံး "
+                          "အတွက် ဖွင့်ပေးပါမယ်")
         voice = "el:" + el_entry["id"]
         voice_style = voice
         voice_rate, voice_pitch = 0, 0
@@ -3928,10 +4017,13 @@ def _new_job(data):
 @app.post("/api/jobs")
 def create_job():
     data = request.get_json(force=True)
-    job, err = _new_job(data)
+    # Build 206: the session user is resolved BEFORE _new_job so
+    # the ElevenLabs access gate can judge a premium pick (the
+    # setup/daily gates below reuse the same `me`).
+    me = _current_user()
+    job, err = _new_job(data, user=me)
     if err:
         return jsonify({"error": err}), 400
-    me = _current_user()
     if me:
         # Build 187: one-time setup gate — refused before the job
         # exists (and before has_job is marked), like the daily

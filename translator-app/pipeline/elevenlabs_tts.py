@@ -17,6 +17,13 @@ an admin save takes effect without a restart:
   ELEVENLABS_VOICES          JSON list [{"id": ..., "name": ...}]
   ELEVENLABS_MODEL           eleven_v4_turbo (default) | eleven_v4
   ELEVENLABS_CREDITS_PER_MIN premium rate, integer, default 2
+  ELEVENLABS_ACCESS          "test" (default) | "all" (build 206)
+  ELEVENLABS_TEST_USERS      comma-separated usernames allowed
+                             in test mode (build 206); defaults
+                             to htetheather,heatherhh when the
+                             key is ABSENT — a present-but-empty
+                             value is the owner's explicit "no
+                             test users" and wins over the default
 
 A job carries the pick as voice = "el:<voice_id>" — unambiguous
 next to the edge-tts style keys on both surfaces (web + bot).
@@ -140,6 +147,94 @@ def credits_per_min():
         return DEFAULT_CREDITS_PER_MIN
 
 
+# ---------- Access gate (build 206) ----------
+# While the owner tests the premium voices they are NOT on sale:
+# ELEVENLABS_ACCESS = "test" (the default) restricts them to
+# admin accounts + the usernames in ELEVENLABS_TEST_USERS. The
+# owner flips ELEVENLABS_ACCESS to "all" from the Admin card
+# when he starts selling — no deploy. EVERY surface (web picker,
+# web job creation, bot step, bot taps, bot pre-check) judges
+# through elevenlabs_allowed() so the surfaces can never drift.
+
+ACCESS_MODES = ("test", "all")
+DEFAULT_ACCESS = "test"
+DEFAULT_TEST_USERS = ("htetheather", "heatherhh")
+
+
+def _env_has(key):
+    """True when the key EXISTS at all (os.environ or a .env
+    line), even with an empty value — unlike _env_raw, which
+    cannot tell "absent" from "present but empty". The gate
+    needs the distinction: an absent ELEVENLABS_TEST_USERS
+    means the shipped defaults, a present-but-empty one is the
+    owner deliberately clearing the list."""
+    if key in os.environ:
+        return True
+    try:
+        if ENV_PATH.exists():
+            for line in ENV_PATH.read_text(
+                    encoding="utf-8").splitlines():
+                if line.strip().startswith(key + "="):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def get_access_mode():
+    m = _env_raw("ELEVENLABS_ACCESS").strip().lower()
+    return m if m in ACCESS_MODES else DEFAULT_ACCESS
+
+
+def get_test_users():
+    """The test-mode username list, as stored (case preserved;
+    comparisons lowercase both sides — usernames are
+    case-insensitive in this app). Absent key -> the defaults;
+    present key -> exactly what the owner saved, empty included."""
+    if not _env_has("ELEVENLABS_TEST_USERS"):
+        return list(DEFAULT_TEST_USERS)
+    raw = _env_raw("ELEVENLABS_TEST_USERS")
+    return [u.strip() for u in raw.split(",") if u.strip()]
+
+
+def parse_test_users(value):
+    """Validate an Admin-card test-users value (a comma string
+    or a list) -> (usernames, None) or (None, Burmese error).
+    Entries are deduped case-insensitively, first spelling kept."""
+    if isinstance(value, (list, tuple)):
+        parts = [str(v) for v in value]
+    else:
+        parts = str(value or "").split(",")
+    out, seen = [], set()
+    for part in parts:
+        u = part.strip()
+        if not u:
+            continue
+        if len(u) > 40 or any(ch.isspace() for ch in u) \
+                or not all(ch.isalnum() or ch in "_.-" for ch in u):
+            return None, ("စမ်းသပ် username မမှန်ပါ: " + u)
+        if u.lower() not in seen:
+            seen.add(u.lower())
+            out.append(u)
+    return out, None
+
+
+def elevenlabs_allowed(user):
+    """THE gate. Mode "all" -> everyone (the owner opened the
+    premium voices for sale). Test mode -> admins and listed
+    test usernames only; anonymous / no account -> False."""
+    if get_access_mode() == "all":
+        return True
+    if not user:
+        return False
+    if user.get("role") == "admin":
+        return True
+    uname = (user.get("username") or "").strip().lower()
+    if not uname:
+        return False
+    return uname in {u.lower() for u in get_test_users()}
+
+
 def is_el_voice(value):
     return bool(value) and str(value).startswith(EL_PREFIX)
 
@@ -148,11 +243,16 @@ def voice_id_of(value):
     return str(value)[len(EL_PREFIX):]
 
 
-def picker_entries():
+def picker_entries(user=None):
     """Picker entries for /api/voices and the bot voice step.
     EMPTY unless a key is set AND the registry has voices — an
-    unconfigured install shows customers nothing new."""
+    unconfigured install shows customers nothing new — AND the
+    given user passes the build-206 access gate (test mode:
+    admins + test usernames only, so a customer never even sees
+    the premium group while the owner is testing)."""
     if not key_configured():
+        return []
+    if not elevenlabs_allowed(user):
         return []
     rate = credits_per_min()
     return [{"id": EL_PREFIX + v["id"], "label": v["name"],
