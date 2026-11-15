@@ -44,6 +44,17 @@ models accept ONLY those two voice settings. model_id is always
 sent explicitly: the endpoint's own default is a legacy model
 with no Burmese. Billing is per character, by model only — a
 clone costs exactly what a library voice costs.
+
+Build 207 — voice library: registry entries may carry a `tag`
+(short style label) and `desc` (one-line description) for the
+Burma-Voice-style picker, and each voice can have ONE preview
+clip: the fixed SAMPLE_TEXT synthesized once (when the admin
+adds the voice, or presses the regenerate button) into
+PREVIEW_DIR as el-<voice_id>.mp3 — filename convention only,
+nothing extra in .env. Preview generation is best-effort and
+NEVER raises: a missing key or API error leaves the voice
+saved without a clip. (The job path is the one that must fail
+loud; a preview is decoration.)
 """
 import json
 import os
@@ -100,7 +111,10 @@ def key_configured():
 
 
 def get_voices():
-    """The registry as [{"id": voice_id, "name": display}].
+    """The registry as [{"id": voice_id, "name": display}] —
+    plus the optional voice-library fields "tag" / "desc"
+    (build 207) when the saved entry carries non-empty ones;
+    entries saved before they existed simply lack the keys.
     Missing or malformed data reads as an EMPTY registry (the
     feature stays invisible) rather than breaking the picker."""
     raw = _env_raw("ELEVENLABS_VOICES")
@@ -121,8 +135,13 @@ def get_voices():
     if isinstance(data, list):
         for e in data:
             if isinstance(e, dict) and e.get("id"):
-                out.append({"id": str(e["id"]),
-                            "name": str(e.get("name") or e["id"])})
+                entry = {"id": str(e["id"]),
+                         "name": str(e.get("name") or e["id"])}
+                for field in ("tag", "desc"):
+                    val = e.get(field)
+                    if isinstance(val, str) and val.strip():
+                        entry[field] = val.strip()
+                out.append(entry)
     return out
 
 
@@ -256,7 +275,63 @@ def picker_entries(user=None):
         return []
     rate = credits_per_min()
     return [{"id": EL_PREFIX + v["id"], "label": v["name"],
+             "name": v["name"], "tag": v.get("tag", ""),
+             "desc": v.get("desc", ""),
+             "preview": preview_url_el(v["id"]),
              "premium": True, "rate": rate} for v in get_voices()]
+
+
+# ---------- Voice-library previews (build 207) ----------
+# One fixed sample line per voice, synthesized ONCE (admin adds
+# the voice / presses regenerate) and served by filename
+# convention — nothing about previews is recorded in .env. The
+# folder sits at the app root so it survives the updater's
+# no-delete copy, like .env / users.db. app.py serves the files
+# at /voice-previews/<name> and parks the built-in styles' lazy
+# previews in the same folder (std-<style key>.mp3).
+
+SAMPLE_TEXT = "မင်္ဂလာပါ။ ဒါကတော့ ကျွန်တော့်ရဲ့ အသံနမူနာတစ်ခုပါ။"
+PREVIEW_DIR = PROJECT_ROOT / "voice_previews"
+
+
+def preview_filename_el(voice_id):
+    return f"el-{voice_id}.mp3"
+
+
+def preview_path_el(voice_id):
+    return PREVIEW_DIR / preview_filename_el(voice_id)
+
+
+def preview_url_el(voice_id):
+    """Public URL of the voice's preview clip, or None when the
+    clip has not been generated (or generation failed)."""
+    if preview_path_el(voice_id).exists():
+        return f"/voice-previews/{preview_filename_el(voice_id)}"
+    return None
+
+
+def generate_preview(voice_id):
+    """Best-effort preview synthesis -> PREVIEW_DIR/el-<id>.mp3.
+    Returns True when the clip exists afterwards. NEVER raises:
+    no key / API error just leaves the voice without a preview
+    (unlike a job, which must fail loud)."""
+    try:
+        if not key_configured():
+            return False
+        PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = PREVIEW_DIR / (preview_filename_el(voice_id) + ".tmp")
+        try:
+            _synth_one(get_api_key(), get_model(), voice_id,
+                       SAMPLE_TEXT, tmp)
+            tmp.replace(preview_path_el(voice_id))
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return preview_path_el(voice_id).exists()
+    except Exception:
+        return False
 
 
 def _synth_one(key, model, voice_id, text, out_path):

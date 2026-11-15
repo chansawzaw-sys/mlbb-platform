@@ -114,6 +114,27 @@
   .chip { width: auto; margin-top: 0; padding: 10px 14px; border-radius: 999px;
           background: #f3ead3; color: #3d382f; border: 1px solid #cbbd97; font-size: 14px; }
   .chip.on { background: #2b5cff; border-color: #2b5cff; font-weight: 700; }
+  /* ---------- voice library (build 207) ---------- */
+  .vlib-search { width: 100%; padding: 10px 12px; border-radius: 10px;
+    border: 1px solid #cbbd97; background: #fffdf8; color: #33302a;
+    font-size: 15px; margin: 6px 0 4px; font-family: inherit;
+    box-sizing: border-box; }
+  .vlib-group { font-weight: 700; margin: 12px 0 6px; color: #57503f;
+    flex-basis: 100%; }
+  .vlib-row { display: flex; align-items: center; gap: 10px; padding: 10px;
+    border: 1px solid #cbbd97; border-radius: 12px; background: #fffdf8;
+    margin: 0 0 8px; cursor: pointer; flex-basis: 100%; }
+  .vlib-row.on { background: #2b5cff; border-color: #2b5cff; color: #fff; }
+  .vlib-ava { width: 38px; height: 38px; border-radius: 50%; flex: 0 0 auto;
+    background: #e9c767; color: #3d382f; display: flex; align-items: center;
+    justify-content: center; font-weight: 700; font-size: 17px; }
+  .vlib-main { flex: 1; min-width: 0; }
+  .vlib-name { font-weight: 700; }
+  .vlib-desc { font-size: 12.5px; opacity: .78; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+  .vlib-play { width: auto; margin: 0; padding: 8px 13px; border-radius: 999px;
+    flex: 0 0 auto; background: #f3ead3; color: #3d382f;
+    border: 1px solid #cbbd97; font-size: 14px; }
 </style>
 </head>
 <body>
@@ -312,9 +333,12 @@
     <div id="elVoiceList"></div>
     <input type="text" id="elVoiceName" placeholder="အသံ နာမည် (customer မြင်ရမယ် — ဥပမာ ကိုလတ်)" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-top:6px">
     <input type="text" id="elVoiceId" placeholder="Voice ID (ElevenLabs ထဲက)" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-top:6px">
+    <input type="text" id="elVoiceTag" placeholder="ပုံစံ (tag) — ဥပမာ News, Sports (မထည့်လဲ ရ)" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-top:6px">
+    <input type="text" id="elVoiceDesc" placeholder="ရှင်းလင်းချက် တစ်ကြောင်း — ဥပမာ သတင်း ဖတ်တဲ့ လေသံ (မထည့်လဲ ရ)" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-top:6px">
     <div class="row">
       <button class="ghost" id="elVoiceAdd">အသံ ထည့်မယ်</button>
     </div>
+    <p class="hint">အသံ ထည့်ရင် preview အသံနမူနာ အလိုအလျောက် ထုတ်ပေးမယ် — မရရင် အသံ စာရင်းထဲက «preview ထုတ်ရန်» နဲ့ ပြန်စမ်းနိုင်တယ်။ အသံ ပြင်ချင်ရင် နာမည်/ID အတူတူနဲ့ ပြန်ထည့်ပါ (အစားထိုး ပြင်ပေးမယ်)။</p>
   </div>
 
   <div class="card" id="asCard">
@@ -591,35 +615,87 @@ let blur = null;                      // {x,y,w,h} normalized
 /* Voice styles (build 200): chip ids are style keys from the
    shared table in pipeline.tts — the two my-MM voices, each in
    မူလ / pitch-variant styles. The fallback list mirrors
-   /api/voices so the picker still works if the fetch fails. */
+   /api/voices so the picker still works if the fetch fails.
+   Build 207: the picker is a voice LIBRARY — searchable rows
+   (avatar + "Name · Tag" + description + ▶ preview) grouped
+   into the built-in styles and, when the caller passes the
+   build-206 gate, the 🌟 Premium ElevenLabs voices. Selection
+   values are unchanged: style keys and "el:<voice_id>". */
 const VOICE_STYLES_FALLBACK = [
-  {id: "thiha", label: "Thiha (မူလ)"},
-  {id: "thiha-deep", label: "Thiha အသံနက်"},
-  {id: "thiha-light", label: "Thiha အသံပါး"},
-  {id: "nilar", label: "Nilar (မူလ)"},
-  {id: "nilar-deep", label: "Nilar အသံနက်"},
-  {id: "nilar-high", label: "Nilar အသံမြင့်"}];
+  {id: "thiha", label: "Thiha (မူလ)", name: "Thiha", tag: "ပုံမှန်", desc: "ယောက်ျား အသံ — မူလ လေသံ၊ ဇာတ်ကြောင်း ပြောရန် သင့်တော်", preview: "/voice-previews/std-thiha.mp3"},
+  {id: "thiha-deep", label: "Thiha အသံနက်", name: "Thiha", tag: "အသံနက်", desc: "Thiha အသံကို နိမ့်နက်အောင် လုပ်ထားတာ — တည်ငြိမ်တဲ့ ဇာတ်ကြောင်း အတွက်", preview: "/voice-previews/std-thiha-deep.mp3"},
+  {id: "thiha-light", label: "Thiha အသံပါး", name: "Thiha", tag: "အသံပါး", desc: "Thiha အသံကို မြင့်ပေါ့အောင် လုပ်ထားတာ — ပေါ့ပါးတဲ့ အကြောင်းအရာ အတွက်", preview: "/voice-previews/std-thiha-light.mp3"},
+  {id: "nilar", label: "Nilar (မူလ)", name: "Nilar", tag: "ပုံမှန်", desc: "မိန်းကလေး အသံ — မူလ လေသံ၊ ဇာတ်ကြောင်း ပြောရန် သင့်တော်", preview: "/voice-previews/std-nilar.mp3"},
+  {id: "nilar-deep", label: "Nilar အသံနက်", name: "Nilar", tag: "အသံနက်", desc: "Nilar အသံကို နိမ့်နက်အောင် လုပ်ထားတာ — တည်ငြိမ်တဲ့ လေသံ အတွက်", preview: "/voice-previews/std-nilar-deep.mp3"},
+  {id: "nilar-high", label: "Nilar အသံမြင့်", name: "Nilar", tag: "အသံမြင့်", desc: "Nilar အသံကို မြင့်အောင် လုပ်ထားတာ — ရွှင်လန်းတဲ့ အကြောင်းအရာ အတွက်", preview: "/voice-previews/std-nilar-high.mp3"}];
 let voiceList = VOICE_STYLES_FALLBACK;
+let voiceFilter = "";
+let previewAudio = null, previewPlayingId = null;
+function escAttr(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;");
+}
+function stopPreview() {
+  if (previewAudio) { previewAudio.pause(); previewAudio = null; }
+  previewPlayingId = null;
+  document.querySelectorAll(".vlib-play").forEach(b => b.textContent = "▶");
+}
+function togglePreview(v, btn) {
+  if (previewPlayingId === v.id) { stopPreview(); return; }
+  stopPreview();
+  const a = new Audio(v.preview);
+  previewAudio = a; previewPlayingId = v.id; btn.textContent = "⏸";
+  a.onended = () => { if (previewPlayingId === v.id) stopPreview(); };
+  a.onerror = () => { btn.style.display = "none"; stopPreview(); };
+  a.play().catch(() => { btn.style.display = "none"; stopPreview(); });
+}
+function voiceRow(v) {
+  const title = (v.name || v.label) + (v.tag ? " · " + v.tag : "");
+  const ava = (v.name || v.label || "?").trim().charAt(0).toUpperCase();
+  return `<div class="vlib-row${v.id === W.voice ? " on" : ""}" data-voice="${v.id}">`
+    + `<div class="vlib-ava">${ava}</div>`
+    + `<div class="vlib-main"><div class="vlib-name">${title}</div>`
+    + (v.desc ? `<div class="vlib-desc">${v.desc}</div>` : "")
+    + `</div>`
+    + (v.preview ? `<button class="vlib-play" data-preview="${v.id}">▶</button>` : "")
+    + `</div>`;
+}
 function voiceChips(vs) {
   voiceList = vs;
-  /* Build 205: ElevenLabs premium entries (premium:true) render
-     as their own labelled group under the free styles, with the
-     per-minute credit rate on the group header. With no premium
-     entries the markup is exactly the build-200 chips. */
-  const std = vs.filter(v => !v.premium);
-  const prem = vs.filter(v => v.premium);
-  let html = std.map(v =>
-    `<button class="chip${v.id === W.voice ? " on" : ""}" data-voice="${v.id}">${v.label}</button>`).join("");
+  const f = voiceFilter.trim().toLowerCase();
+  const match = v => !f || [v.name, v.label, v.tag, v.desc]
+    .join(" ").toLowerCase().includes(f);
+  const prem = vs.filter(v => v.premium && match(v));
+  const std = vs.filter(v => !v.premium && match(v));
+  let html = `<input class="vlib-search" id="voiceSearch" type="search" `
+    + `placeholder="🔍 အသံ ရှာရန် (နာမည် / ပုံစံ)" value="${escAttr(voiceFilter)}">`;
   if (prem.length) {
-    html += `<div class="hint" style="flex-basis:100%;margin:4px 0 0">🌟 ElevenLabs Premium (${prem[0].rate} credits/မိနစ်)</div>`
-      + prem.map(v =>
-        `<button class="chip${v.id === W.voice ? " on" : ""}" data-voice="${v.id}">🌟 ${v.label}</button>`).join("");
+    html += `<div class="vlib-group">🌟 Premium (${prem[0].rate || 2} credits/မိနစ်)</div>`
+      + prem.map(voiceRow).join("");
   }
+  if (std.length) {
+    html += `<div class="vlib-group">🎙 ပုံမှန် အသံ</div>`
+      + std.map(voiceRow).join("");
+  }
+  if (!prem.length && !std.length)
+    html += `<p class="hint">ရှာတာ မတွေ့ပါ — တခြား စာလုံး စမ်းကြည့်ပါ</p>`;
   $("voiceChips").innerHTML = html;
-  $("voiceChips").querySelectorAll(".chip").forEach(c => c.onclick = () => {
-    $("voiceChips").querySelectorAll(".chip").forEach(x => x.classList.remove("on"));
-    c.classList.add("on"); W.voice = c.dataset.voice;
-  });
+  const si = $("voiceSearch");
+  si.oninput = () => {
+    voiceFilter = si.value;
+    const pos = si.selectionStart;
+    voiceChips(voiceList);
+    const n = $("voiceSearch");
+    n.focus(); try { n.setSelectionRange(pos, pos); } catch (e) {}
+  };
+  $("voiceChips").querySelectorAll(".vlib-row").forEach(r =>
+    r.onclick = () => { stopPreview(); W.voice = r.dataset.voice; voiceChips(voiceList); });
+  $("voiceChips").querySelectorAll(".vlib-play").forEach(b =>
+    b.onclick = (ev) => {
+      ev.stopPropagation();
+      const v = voiceList.find(x => x.id === b.dataset.preview);
+      if (v && v.preview) togglePreview(v, b);
+    });
 }
 fetch("/api/voices").then(r => r.json()).then(voiceChips).catch(() =>
   voiceChips(VOICE_STYLES_FALLBACK));
@@ -1429,9 +1505,14 @@ loadXkState();
 /* ---------------- ElevenLabs settings (build 205) ---------------- */
 function elVoiceListRender(voices) {
   $("elVoiceList").innerHTML = (voices || []).map(v =>
-    `<div class="row" style="align-items:center;gap:8px">
-       <span>🌟 ${v.name} <span class="hint">(${v.id})</span></span>
-       <button class="ghost" data-el-del="${v.id}">ဖျက်မယ်</button>
+    `<div style="border-top:1px solid #ddd0b2;padding:8px 0">
+       <div>🌟 <b>${v.name}</b>${v.tag ? " · " + v.tag : ""} <span class="hint">(${v.id})</span></div>
+       ${v.desc ? `<div class="hint">${v.desc}</div>` : ""}
+       <div class="hint">${v.preview ? "🔊 preview ရှိ" : "🔇 preview မရှိသေး"}</div>
+       <div class="row">
+         <button class="ghost" data-el-regen="${v.id}">preview ထုတ်ရန်</button>
+         <button class="ghost" data-el-del="${v.id}">ဖျက်မယ်</button>
+       </div>
      </div>`).join("");
   $("elVoiceList").querySelectorAll("[data-el-del]").forEach(b =>
     b.onclick = async () => {
@@ -1440,7 +1521,17 @@ function elVoiceListRender(voices) {
          body: JSON.stringify({id: b.dataset.elDel})});
       const d = await res.json();
       if (!res.ok) { alert(d.error || "ဖျက်လို့ မရပါ"); return; }
-      elVoiceListRender(d.voices);
+      loadElState();
+    });
+  $("elVoiceList").querySelectorAll("[data-el-regen]").forEach(b =>
+    b.onclick = async () => {
+      const res = await fetch("/api/settings/elevenlabs-voices/preview",
+        {method: "POST", headers: {"Content-Type": "application/json"},
+         body: JSON.stringify({id: b.dataset.elRegen})});
+      const d = await res.json();
+      if (!res.ok) { alert(d.error || "ထုတ်လို့ မရပါ"); return; }
+      if (d.preview === false && d.note) alert(d.note);
+      loadElState();
     });
 }
 async function loadElState() {
@@ -1494,14 +1585,18 @@ $("elCfgSave").onclick = async () => {
 $("elVoiceAdd").onclick = async () => {
   const name = $("elVoiceName").value.trim();
   const id = $("elVoiceId").value.trim();
+  const tag = $("elVoiceTag").value.trim();
+  const desc = $("elVoiceDesc").value.trim();
   if (!name || !id) { alert("နာမည် နဲ့ Voice ID နှစ်ခုလုံး ထည့်ပါ"); return; }
   const res = await fetch("/api/settings/elevenlabs-voices", {method: "POST",
-    headers: {"Content-Type": "application/json"}, body: JSON.stringify({id, name})});
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({id, name, tag, desc})});
   const d = await res.json();
   if (!res.ok) { alert(d.error || "ထည့်လို့ မရပါ"); return; }
   $("elVoiceName").value = ""; $("elVoiceId").value = "";
-  elVoiceListRender(d.voices);
-  alert("ထည့်ပြီးပြီ");
+  $("elVoiceTag").value = ""; $("elVoiceDesc").value = "";
+  if (d.preview === false && d.note) alert(d.note);
+  else alert("ထည့်ပြီးပြီ — preview အသံပါ ထုတ်ပြီးပါပြီ");
+  loadElState();
 };
 loadElState();
 
@@ -2361,6 +2456,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 206</p>
+<p class="hint" id="buildTag" style="text-align:center">build 207</p>
 </body>
 </html>

@@ -55,17 +55,29 @@ VOICE_NILAR = "my-MM-NilarNeural"
 # consumes.
 VOICE_STYLES = [
     {"key": "thiha", "label": "Thiha (မူလ)",
-     "voice": VOICE_THIHA, "pitch": 0, "rate": 0},
+     "voice": VOICE_THIHA, "pitch": 0, "rate": 0,
+     "name": "Thiha", "tag": "ပုံမှန်",
+     "desc": "ယောက်ျား အသံ — မူလ လေသံ၊ ဇာတ်ကြောင်း ပြောရန် သင့်တော်"},
     {"key": "thiha-deep", "label": "Thiha အသံနက်",
-     "voice": VOICE_THIHA, "pitch": -8, "rate": 0},
+     "voice": VOICE_THIHA, "pitch": -8, "rate": 0,
+     "name": "Thiha", "tag": "အသံနက်",
+     "desc": "Thiha အသံကို နိမ့်နက်အောင် လုပ်ထားတာ — တည်ငြိမ်တဲ့ ဇာတ်ကြောင်း အတွက်"},
     {"key": "thiha-light", "label": "Thiha အသံပါး",
-     "voice": VOICE_THIHA, "pitch": 8, "rate": 0},
+     "voice": VOICE_THIHA, "pitch": 8, "rate": 0,
+     "name": "Thiha", "tag": "အသံပါး",
+     "desc": "Thiha အသံကို မြင့်ပေါ့အောင် လုပ်ထားတာ — ပေါ့ပါးတဲ့ အကြောင်းအရာ အတွက်"},
     {"key": "nilar", "label": "Nilar (မူလ)",
-     "voice": VOICE_NILAR, "pitch": 0, "rate": 0},
+     "voice": VOICE_NILAR, "pitch": 0, "rate": 0,
+     "name": "Nilar", "tag": "ပုံမှန်",
+     "desc": "မိန်းကလေး အသံ — မူလ လေသံ၊ ဇာတ်ကြောင်း ပြောရန် သင့်တော်"},
     {"key": "nilar-deep", "label": "Nilar အသံနက်",
-     "voice": VOICE_NILAR, "pitch": -8, "rate": 0},
+     "voice": VOICE_NILAR, "pitch": -8, "rate": 0,
+     "name": "Nilar", "tag": "အသံနက်",
+     "desc": "Nilar အသံကို နိမ့်နက်အောင် လုပ်ထားတာ — တည်ငြိမ်တဲ့ လေသံ အတွက်"},
     {"key": "nilar-high", "label": "Nilar အသံမြင့်",
-     "voice": VOICE_NILAR, "pitch": 8, "rate": 0},
+     "voice": VOICE_NILAR, "pitch": 8, "rate": 0,
+     "name": "Nilar", "tag": "အသံမြင့်",
+     "desc": "Nilar အသံကို မြင့်အောင် လုပ်ထားတာ — ရွှင်လန်းတဲ့ အကြောင်းအရာ အတွက်"},
 ]
 STYLE_BY_KEY = {s["key"]: s for s in VOICE_STYLES}
 # The product default the owner settled on: Thiha, original pitch.
@@ -93,6 +105,26 @@ def style_label(value):
     """Display label for a style key / plain voice id (pickers,
     summaries) — resolves through the same table."""
     return resolve_style(value)["label"]
+
+
+def style_library():
+    """Voice-library metadata for the built-in styles (build
+    207): persona name + style tag + one-line description per
+    style, for the picker's library rows. The styles are pitch
+    variants of the two my-MM voices — the descriptions say so
+    honestly."""
+    return [{"key": s["key"], "label": s["label"],
+             "name": s.get("name", ""), "tag": s.get("tag", ""),
+             "desc": s.get("desc", "")} for s in VOICE_STYLES]
+
+
+def synthesize_sample(text, style_key, out_path):
+    """One-shot synthesis of a short sample line in a built-in
+    style (the picker's preview clips, build 207). Raises on
+    failure — the caller decides what an absent preview means."""
+    style = resolve_style(style_key)
+    asyncio.run(_edge_synth(text, style["voice"], out_path,
+                            rate=style["rate"], pitch=style["pitch"]))
 
 
 def _clamp(value, lo, hi):

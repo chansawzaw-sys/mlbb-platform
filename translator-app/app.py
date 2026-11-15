@@ -53,7 +53,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 206"
+BUILD_TAG = "build 207"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1299,10 +1299,13 @@ def _tg_voice_step(chat_id, flow):
     # is the same "el:<voice_id>" value the web wizard sends.
     # Build 206: picker_entries also judges the chat's linked
     # account through the access gate — in test mode a customer
-    # chat never sees these buttons at all.
+    # chat never sees these buttons at all. Build 207: the
+    # button shows "Name · Tag" when the voice carries a tag.
     for e in elevenlabs_tts.picker_entries(_tg_el_subject(chat_id)):
-        rows.append([("🌟 " + e["label"]
-                      + f" ({e['rate']} credits/မိနစ်)",
+        label = "🌟 " + e["label"]
+        if e.get("tag"):
+            label += " · " + e["tag"]
+        rows.append([(label + f" ({e['rate']} credits/မိနစ်)",
                       "e:" + elevenlabs_tts.voice_id_of(e["id"]))])
     tg.send_message(chat_id, "အသံ ရွေးပေးပါ", buttons=rows)
 
@@ -2094,8 +2097,14 @@ def voices():
     # voice + pitch at job creation. Static on purpose: the table
     # IS the catalogue, so the picker works even when the live
     # edge-tts voice list cannot be reached.
-    out = [{"id": s["key"], "label": s["label"]}
-           for s in tts.VOICE_STYLES]
+    # Build 207: every entry also carries the voice-library
+    # fields (name / tag / desc / preview) for the library-sheet
+    # picker; the built-in previews live at /voice-previews/
+    # std-<key>.mp3 and are generated lazily on first request.
+    out = [{"id": s["key"], "label": s["label"], "name": s["name"],
+            "tag": s["tag"], "desc": s["desc"],
+            "preview": f"/voice-previews/std-{s['key']}.mp3"}
+           for s in tts.style_library()]
     # Build 205: ElevenLabs premium voices join the picker ONLY
     # when the owner has configured a key + registry
     # (picker_entries() is empty otherwise), so an unconfigured
@@ -2106,6 +2115,57 @@ def voices():
     # logged-out page loads) gets exactly the standard list.
     out += elevenlabs_tts.picker_entries(_current_user())
     return jsonify(out)
+
+
+_STD_PREVIEW_LOCK = threading.Lock()
+
+
+def _ensure_std_preview(style_key):
+    """Lazily synthesize a built-in style's preview clip ONCE
+    and cache it next to the ElevenLabs previews (build 207).
+    Returns the file path, or None — unknown style, or the
+    synthesis failed (the picker row then simply has no working
+    preview; the front-end hides the button on audio error)."""
+    path = elevenlabs_tts.PREVIEW_DIR / f"std-{style_key}.mp3"
+    if path.exists():
+        return path
+    if style_key not in tts.STYLE_BY_KEY:
+        return None
+    with _STD_PREVIEW_LOCK:
+        if path.exists():
+            return path
+        tmp = elevenlabs_tts.PREVIEW_DIR / f"std-{style_key}.tmp.mp3"
+        try:
+            elevenlabs_tts.PREVIEW_DIR.mkdir(parents=True,
+                                             exist_ok=True)
+            tts.synthesize_sample(elevenlabs_tts.SAMPLE_TEXT,
+                                  style_key, tmp)
+            tmp.replace(path)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
+    return path if path.exists() else None
+
+
+@app.get("/voice-previews/<name>")
+def voice_preview_file(name):
+    """Serve a voice-library preview clip (build 207). Strict
+    filename shape — el-<voice id>.mp3 / std-<style key>.mp3
+    only, no traversal. Built-in clips generate lazily on first
+    request; ElevenLabs clips exist only if the admin generated
+    one, so a missing file is a plain 404."""
+    if not re.fullmatch(r"(?:el|std)-[A-Za-z0-9_-]{1,64}\.mp3",
+                        name or ""):
+        return jsonify({"error": "မရှိပါ"}), 404
+    path = elevenlabs_tts.PREVIEW_DIR / name
+    if not path.exists() and name.startswith("std-"):
+        _ensure_std_preview(name[4:-4])
+    if not path.exists():
+        return jsonify({"error": "မရှိပါ"}), 404
+    return send_file(path, mimetype="audio/mpeg")
 
 
 def _public_url_ok(url):
@@ -2597,6 +2657,15 @@ def xkiro_key_delete():
 # restricts to admins; customers never see them here (they see
 # the names alone, in the picker, and only when configured).
 
+def _el_status_voices():
+    """Registry entries for the Admin card (build 207): tag/desc
+    always present, plus whether a preview clip exists."""
+    return [{**v, "tag": v.get("tag", ""), "desc": v.get("desc", ""),
+             "preview": elevenlabs_tts.preview_path_el(
+                 v["id"]).exists()}
+            for v in elevenlabs_tts.get_voices()]
+
+
 @app.get("/api/settings/elevenlabs")
 def elevenlabs_status():
     return jsonify({
@@ -2605,7 +2674,7 @@ def elevenlabs_status():
         "credits_per_min": elevenlabs_tts.credits_per_min(),
         "access": elevenlabs_tts.get_access_mode(),
         "test_users": elevenlabs_tts.get_test_users(),
-        "voices": elevenlabs_tts.get_voices()})
+        "voices": _el_status_voices()})
 
 
 @app.post("/api/settings/elevenlabs-key")
@@ -2673,17 +2742,58 @@ def elevenlabs_voice_add():
     data = request.get_json(force=True) or {}
     vid = (data.get("id") or "").strip()
     name = (data.get("name") or "").strip()
+    tag = (data.get("tag") or "").strip()
+    desc = (data.get("desc") or "").strip()
     if not vid or len(vid) > 64 \
             or not all(ch.isalnum() or ch in "_-" for ch in vid):
         return jsonify({"error": "Voice ID မမှန်ပါ"}), 400
     if not name or len(name) > 60:
         return jsonify({"error": "အသံ နာမည် ထည့်ပါ (အများဆုံး 60 လုံး)"}), 400
+    if len(tag) > 40:
+        return jsonify({"error": "ပုံစံ (tag) ရှည်လွန်းပါတယ် — အများဆုံး 40 လုံး"}), 400
+    if len(desc) > 160:
+        return jsonify({"error": "ရှင်းလင်းချက် ရှည်လွန်းပါတယ် — အများဆုံး 160 လုံး"}), 400
+    # Build 207: re-adding an id replaces the WHOLE entry (the
+    # edit path) — tag/desc are stored only when non-empty, so a
+    # plain {id, name} save keeps the build-205 shape exactly.
+    entry = {"id": vid, "name": name}
+    if tag:
+        entry["tag"] = tag
+    if desc:
+        entry["desc"] = desc
     voices = [v for v in elevenlabs_tts.get_voices()
               if v["id"] != vid]
-    voices.append({"id": vid, "name": name})
+    voices.append(entry)
     _env_write("ELEVENLABS_VOICES",
                json.dumps(voices, ensure_ascii=False))
-    return jsonify({"ok": True, "voices": voices})
+    # Build 207: synthesize the library preview right away.
+    # Best-effort — the voice stays saved either way; the admin
+    # gets a polite note (and the regenerate button) on failure.
+    preview_ok = elevenlabs_tts.generate_preview(vid)
+    resp = {"ok": True, "voices": voices, "preview": preview_ok}
+    if not preview_ok:
+        resp["note"] = ("အသံ သိမ်းပြီးပါပြီ — ဒါပေမဲ့ preview အသံ "
+                        "ထုတ်လို့ မရသေးပါ။ API key စစ်ပြီး «preview "
+                        "ထုတ်ရန်» ခလုတ်နဲ့ ပြန်စမ်းနိုင်ပါတယ်")
+    return jsonify(resp)
+
+
+@app.post("/api/settings/elevenlabs-voices/preview")
+def elevenlabs_voice_preview_regen():
+    """(Re)generate one voice's library preview clip (build
+    207). Best-effort like the add-time generation: failure
+    leaves the voice untouched and says so politely."""
+    data = request.get_json(force=True, silent=True) or {}
+    vid = (data.get("id") or "").strip()
+    if not elevenlabs_tts.find_voice(vid):
+        return jsonify({"error": "အဲဒီ အသံ မရှိပါ"}), 404
+    ok = elevenlabs_tts.generate_preview(vid)
+    resp = {"ok": True, "preview": ok,
+            "voices": elevenlabs_tts.get_voices()}
+    if not ok:
+        resp["note"] = ("preview အသံ ထုတ်လို့ မရပါ — API key နဲ့ "
+                        "အင်တာနက် စစ်ပြီး ပြန်စမ်းပါ")
+    return jsonify(resp)
 
 
 @app.delete("/api/settings/elevenlabs-voices")
@@ -2694,6 +2804,11 @@ def elevenlabs_voice_remove():
               if v["id"] != vid]
     _env_write("ELEVENLABS_VOICES",
                json.dumps(voices, ensure_ascii=False))
+    # Build 207: the removed voice's preview clip goes with it.
+    try:
+        elevenlabs_tts.preview_path_el(vid).unlink(missing_ok=True)
+    except Exception:
+        pass
     return jsonify({"ok": True, "voices": voices})
 
 
