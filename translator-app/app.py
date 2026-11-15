@@ -44,6 +44,12 @@ UPLOADS_DIR = ROOT / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__, static_folder=None)
+# Build 193: the single source of truth for the running build. The
+# page's footer tag (static/index.html #buildTag) must carry the
+# same string — proof193 asserts they are equal — and the page
+# polls /api/version so a device still showing an older shell
+# reloads itself once instead of sitting on a stale build.
+BUILD_TAG = "build 194"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -270,10 +276,14 @@ def _tg_shrink_for_send(out, dest, budget=47_000_000):
         vf = f"scale={tw}:{th}"
         total_k = budget * 8 / dur / 1000.0 * 0.94
         video_k = int(max(220, total_k - 96))
+        # Build 193: "-threads 2" caps this encode's CPU so a
+        # small-copy/shrink pass cannot starve the web server
+        # sharing the box (same cap in retime/burn/fx).
         sh(["ffmpeg", "-y", "-v", "error", "-i", str(out), "-vf", vf,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
             "-maxrate", f"{video_k}k", "-bufsize", f"{2 * video_k}k",
-            "-c:a", "aac", "-b:a", "96k", str(dest)], timeout=1800)
+            "-c:a", "aac", "-b:a", "96k", "-threads", "2",
+            str(dest)], timeout=1800)
         if dest.exists() and dest.stat().st_size <= tg.MAX_BYTES:
             return dest
     except Exception:
@@ -1781,6 +1791,15 @@ def static_files(filename):
 def service_worker():
     # Served from the root so its scope covers the whole app.
     return send_from_directory(ROOT / "static", "sw.js")
+
+
+@app.get("/api/version")
+def api_version():
+    # Build 193: lets an already-open page notice it is running an
+    # older build than the server (see the check in index.html).
+    resp = jsonify({"build": BUILD_TAG})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.get("/api/voices")
@@ -3803,4 +3822,11 @@ for _target in (_backup_loop, _job_dispatcher):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8611"))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    # Build 193: serve through waitress (production WSGI server),
+    # matching deploy/serve.py; fall back to the Werkzeug dev
+    # server only where waitress is not installed (bare dev runs).
+    try:
+        from waitress import serve
+        serve(app, host="0.0.0.0", port=port, threads=8)
+    except ImportError:
+        app.run(host="0.0.0.0", port=port, threaded=True)

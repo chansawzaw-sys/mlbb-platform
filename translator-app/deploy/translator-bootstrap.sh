@@ -231,7 +231,7 @@ cat > "$DEPLOY_DIR/serve.py" <<'PYEOF'
 """Video Translator production launcher (deploy artifact — NOT an app file).
 
 Runs the exact Flask app object from app.py through the app's own venv, the
-same way run.sh does (.venv/bin/python + app), with two deliberate deltas:
+same way run.sh does (.venv/bin/python + app), with three deliberate deltas:
 
 1. Binds 127.0.0.1 instead of app.py's hardcoded 0.0.0.0, on the internal
    port (PORT env). Caddy is the only public door.
@@ -311,7 +311,15 @@ if os.environ.get("TRANSLATOR_GATE", "on") != "off":
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8613"))
-    appmod.app.run(host="127.0.0.1", port=port, threaded=True)
+    # Build 193, delta 3: waitress (production WSGI server, pinned
+    # in requirements.txt) instead of the Werkzeug dev server.
+    # The dev server threaded=True still funnels every request
+    # through the same process the job workers saturate, and page
+    # loads starved behind them (17 s TTFB measured live); waitress
+    # serves the identical app object from a fixed pool of 8
+    # request threads and streams large/range responses properly.
+    from waitress import serve
+    serve(appmod.app, host="127.0.0.1", port=port, threads=8)
 PYEOF
 .venv/bin/python -m py_compile "$DEPLOY_DIR/serve.py"
 echo "Launcher installed at $DEPLOY_DIR/serve.py"
@@ -345,6 +353,10 @@ Environment=PORT=$INTERNAL_PORT
 Environment=TRANSLATOR_APP_DIR=$APP_DIR
 Environment=TRANSLATOR_GATE=on
 Environment=PYTHONUNBUFFERED=1
+# Build 193: cap OpenMP threads (whisper/ctranslate2) so concurrent
+# jobs leave CPU headroom for the web tier on the 4-core box; the
+# per-encode ffmpeg cap (-threads 2) lives in the pipeline itself.
+Environment=OMP_NUM_THREADS=2
 $VT_ENV_LINE
 ExecStart=$APP_DIR/.venv/bin/python $DEPLOY_DIR/serve.py
 Restart=on-failure

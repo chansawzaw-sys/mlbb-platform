@@ -196,10 +196,17 @@ def _video_single_pass(src, chunks, out, cap_k=2500, timeout=1800):
     the chunked path, exactly like any other encode failure."""
     filters, _label = _video_graph(chunks)
     mr = target_maxrate_k(src, cap_k)
+    # Build 193: "-threads 2" on every libx264 encode in the
+    # pipeline (here, _video_merged, _video_chunked, burn, fx and
+    # the app.py shrink/small-copy) — with up to four jobs on a
+    # 4-core box, an uncapped encode per job starved the web
+    # server sharing the process; two threads per encode leaves
+    # the web tier headroom while jobs still overlap.
     run(["ffmpeg", "-y", "-v", "error", "-i", str(src),
          "-filter_complex", ";".join(filters), "-map", "[outv]",
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-         "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k", str(out)],
+         "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
+         "-threads", "2", str(out)],
         timeout=timeout)
 
 
@@ -225,7 +232,7 @@ def _video_merged(src, chunks, dub_wav, spec, cap_k=2500, timeout=1800):
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
             "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
             "-c:a", "aac", "-b:a", "96k", "-shortest",
-            str(spec["output"])]
+            "-threads", "2", str(spec["output"])]
     run(cmd, timeout=timeout)
 
 
@@ -283,7 +290,7 @@ def _video_chunked(src, chunks, cdir, out, cap_k=2500):
              "-i", str(src), "-vf", _piece_vf(c, dur), "-an",
              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
              "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-             str(vout)], timeout=1200)
+             "-threads", "2", str(vout)], timeout=1200)
         vlist.append(vout)
     lst = cdir / "vlist_fb.txt"
     lst.write_text("".join(f"file '{f.resolve()}'\n" for f in vlist),

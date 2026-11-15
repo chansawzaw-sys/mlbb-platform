@@ -149,7 +149,7 @@ def apply_effects(input_mp4, output_mp4, fx, cap_k=2500):
     cmd += ["-filter_complex", ";".join(filters), "-map", cur, "-map", "0:a?",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
             "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-            "-c:a", "copy", str(output_mp4)]
+            "-c:a", "copy", "-threads", "2", str(output_mp4)]
     run(cmd)
     return output_mp4
 

@@ -473,7 +473,7 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
             cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]",
                     "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
                     "-crf", "24", "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-                    "-c:a", "copy", str(output_mp4)]
+                    "-c:a", "copy", "-threads", "2", str(output_mp4)]
             run(cmd)
             return output_mp4
     ass_path, fonts_dir, _w, _h = _prepare_ass(
@@ -483,7 +483,7 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
     run(["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4), "-vf", vf,
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
          "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-         "-c:a", "copy", str(output_mp4)])
+         "-c:a", "copy", "-threads", "2", str(output_mp4)])
     return output_mp4
 
 

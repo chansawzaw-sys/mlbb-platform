@@ -2171,7 +2171,35 @@ window.tgSend = async function (id) {
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
+// Build 193 version check: if the server has moved to a newer
+// build than this page, reload ONCE (sessionStorage guard, so no
+// reload loops) — a device must never sit on a stale shell.
+// Silent when offline or already current.
+(function () {
+  function check() {
+    try {
+      var el = document.getElementById("buildTag");
+      var mine = el ? el.textContent.trim() : "";
+      if (!mine) return;
+      if (sessionStorage.getItem("vt_build_reloaded")) return;
+      fetch("/api/version", { cache: "no-store" })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d && d.build && d.build !== mine) {
+            sessionStorage.setItem("vt_build_reloaded", "1");
+            location.reload();
+          }
+        })
+        .catch(function () {});
+    } catch (e) {}
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", check);
+  } else {
+    check();
+  }
+})();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 192</p>
+<p class="hint" id="buildTag" style="text-align:center">build 194</p>
 </body>
 </html>

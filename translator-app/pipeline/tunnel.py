@@ -80,13 +80,32 @@ owner saves a DIFFERENT node, the old tunnel stops being
 trusted until the script has verified the new one, and deleting
 the settings (clear()) removes the pointers at once.
 
+Build 194: HTTP-Upgrade transport. The owner's subscription
+turned out to carry VLESS nodes whose transport is
+**httpupgrade** (his phone's proxy app shows "VLESS /
+HTTPUPGRADE" for the Singapore nodes) — a transport this
+module did not know, so those nodes never became usable
+candidates and the build-192 walk exhausted the rest. The
+parser now accepts type=httpupgrade (vless query param, or
+the vmess JSON `net` field) and renders sing-box's
+{"type": "httpupgrade", "host": ..., "path": ...} transport
+block (validated against the pinned sing-box v1.14.4 binary,
+which also proves XHTTP is NOT available: it rejects
+{"type": "xhttp"} as an unknown transport, so xhttp nodes
+stay cleanly skipped). The renderer also gained the guard
+this incident argues for: an unrecognised transport value
+now raises instead of falling through to a plain-tcp render
+— a config sing-box would validate that is wrong on the
+wire.
+
 Supported node formats: vless and vmess share links with
-tcp / ws / grpc / h2 transports and none / tls / reality
-security (the shapes real subscriptions overwhelmingly use).
-Shadowsocks / trojan links and kcp / quic / xhttp transports
-are recognised but NOT supported. Two xray-only shapes have no
-sing-box equivalent and degrade to plain tcp silently: tcp
-"http" header camouflage and reality spiderX. Node selection
+tcp / ws / grpc / h2 / httpupgrade transports and none / tls
+/ reality security (the shapes real subscriptions
+overwhelmingly use). Shadowsocks / trojan links and
+kcp / quic / xhttp transports are recognised but NOT
+supported. Two xray-only shapes have no sing-box equivalent
+and degrade to plain tcp silently: tcp "http" header
+camouflage and reality spiderX. Node selection
 from a subscription (the owner's purchase is a reseller
 subscription URL with nodes in many countries): a node whose
 remark names Singapore (SG) wins — that is the owner's exit and
@@ -136,7 +155,7 @@ _UUID_RE = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _LINK_RE = re.compile(r"(?:vless|vmess|ss|trojan)://[^\s\"'<>]+")
 _SUPPORTED = ("vless://", "vmess://")
-_TRANSPORTS = ("tcp", "ws", "grpc", "h2")
+_TRANSPORTS = ("tcp", "ws", "grpc", "h2", "httpupgrade")
 _VMESS_SECURITIES = ("auto", "aes-128-gcm", "chacha20-poly1305",
                      "none", "zero")
 
@@ -254,7 +273,7 @@ def _node_base(network, security, *, sni="", host_header="",
     if net == "splithttp":
         net = "xhttp"
     if net not in _TRANSPORTS:
-        raise ValueError(f"transport '{network}' မရသေးပါ (tcp/ws/grpc/h2 ပဲ ရပါတယ်)")
+        raise ValueError(f"transport '{network}' မရသေးပါ (tcp/ws/grpc/h2/httpupgrade ပဲ ရပါတယ်)")
     sec = (security or "none").lower()
     if sec not in ("none", "", "tls", "reality"):
         raise ValueError(f"security '{security}' မရသေးပါ")
@@ -400,9 +419,37 @@ def render_outbound(node):
         if hosts:
             h2["host"] = hosts
         ob["transport"] = h2
-    # tcp: no transport block (sing-box default). The xray-era
-    # tcp "http" header camouflage has no sing-box equivalent
-    # and is dropped (plain tcp) — see the module docstring.
+    elif net == "httpupgrade":
+        # Build 194: the owner's reseller nodes are VLESS over
+        # HTTP-Upgrade (Happ shows "VLESS / HTTPUPGRADE").
+        # sing-box's httpupgrade transport takes the upgrade
+        # Host and path as dedicated fields; empty fields are
+        # omitted (the binary accepts the bare block and the
+        # server-side defaults then apply).
+        hu = {"type": "httpupgrade"}
+        if node.get("host"):
+            hu["host"] = node["host"]
+        if node.get("path"):
+            hu["path"] = node["path"]
+        ob["transport"] = hu
+    elif net == "tcp":
+        # tcp: no transport block (sing-box default). The
+        # xray-era tcp "http" header camouflage has no sing-box
+        # equivalent and is dropped (plain tcp) — see the
+        # module docstring.
+        pass
+    else:
+        # Build 194: NEVER fall through to plain tcp. Before
+        # this guard, an unrecognised transport value rendered
+        # with no transport block at all — a config sing-box
+        # validates happily that is wrong on the wire (the
+        # server waits for a handshake that never comes, and
+        # every egress check fails). _node_base() already
+        # rejects such nodes at parse time; this raise makes
+        # the renderer itself uphold the same contract for any
+        # node dict it is handed.
+        raise ValueError(f"transport '{net}' မရသေးပါ "
+                         "(tcp/ws/grpc/h2/httpupgrade ပဲ ရပါတယ်)")
     sec = node.get("security") or "none"
     if sec == "tls":
         tls = {"enabled": True, "insecure": bool(node.get("allow_insecure"))}
