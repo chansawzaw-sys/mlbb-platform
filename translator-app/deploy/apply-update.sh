@@ -14,11 +14,48 @@
 # With --auto it runs unattended (installed as a systemd timer by the
 # bootstrap): no password prompt, no-op when nothing changed, and a
 # lock so runs never overlap.
+
+# Build 192 — SELF-OVERWRITE GUARD. This script is normally run
+# FROM $APP/deploy/apply-update.sh (the timer and the owner's
+# manual runs both do), and the update below copies the new tree
+# over $APP — including this very file, in place, while bash is
+# still reading it. Bash reads a script incrementally from a file
+# offset; replacing the bytes under that offset shifts the text
+# it parses next. Seen live in the build-191 deploy: the ONLY
+# 190->191 change to this file was one comment word at byte 3640
+# (tun-xray -> tun-singbox, +3 bytes), so after the `cp -r` the
+# parser resumed 3 bytes early, the quoting of the line-123
+# password prompt broke, and its "(just press Enter...)" paren
+# surfaced as a bare token: "apply-update.sh: line 124: syntax
+# error near unexpected token `('". The run died before the
+# bootstrap call (a later, no-change run then worked — the file
+# was already replaced by then). Fix: before doing anything,
+# copy this script to a private temp file and re-exec THAT —
+# the running bytes are then never the copy target. The temp
+# copy removes itself on exit.
+if [ -z "${APPLY_UPDATE_STABLE:-}" ]; then
+  _au_src="${BASH_SOURCE[0]:-$0}"
+  _au_tmp="$(mktemp /tmp/.apply-update.XXXXXXXXXX 2>/dev/null || true)"
+  if [ -n "$_au_tmp" ] && [ -n "$_au_src" ] \
+     && cp "$_au_src" "$_au_tmp" 2>/dev/null; then
+    APPLY_UPDATE_STABLE=1 exec bash "$_au_tmp" "$@"
+  fi
+  # No temp copy available: fall through and run in place (the
+  # pre-192 behaviour) rather than not updating at all.
+fi
+if [ -n "${APPLY_UPDATE_STABLE:-}" ]; then
+  case "${BASH_SOURCE[0]:-}" in
+    /tmp/.apply-update.*) trap 'rm -f "${BASH_SOURCE[0]:-}"' EXIT ;;
+  esac
+fi
+
 set -euo pipefail
 
-REPO='/opt/mlbb-platform'
-APP='/opt/video-translator'
-AUTH_FILE='/root/translator-auth.txt'
+# APPLY_UPDATE_* overrides exist for the proof harnesses; the
+# production defaults are the historical paths.
+REPO="${APPLY_UPDATE_REPO:-/opt/mlbb-platform}"
+APP="${APPLY_UPDATE_APP:-/opt/video-translator}"
+AUTH_FILE="${APPLY_UPDATE_AUTH_FILE:-/root/translator-auth.txt}"
 AUTO=0
 if [ "${1:-}" = "--auto" ]; then
   AUTO=1

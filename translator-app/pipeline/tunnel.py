@@ -54,6 +54,22 @@ older build's selection rules — or rendered for the retired
 xray engine — becomes a current sing-box config on the next
 activation run, with no owner re-save.
 
+Build 192: node egress-failover. A subscription's first node
+can simply be dead — the owner's first sing-box activation
+validated its config, then failed the egress check on the
+picked node and stopped there. The activation now walks the
+candidate list this module exposes (`python3 -m pipeline.tunnel
+candidates` / `render N`): every usable node in selection
+order, each rendered, checked and egress-tested in turn; the
+first one actually carrying traffic wins. The saved input is
+resolved ONCE per walk and the scanned source text is cached
+(tun-candidates.cache, chmod 600 — it carries node credentials
+exactly like the rendered config does), so every `render N`
+renders the SAME list the walk was planned from, with no
+repeated subscription fetch. The winning node's index is
+persisted (VT_TUNNEL_NODE_IDX) so a later walk tries the
+known-good node first instead of rotating away from it.
+
 Verification handshake with the activation script: after
 sing-box is up AND an egress check through the proxy has
 answered, the script writes VT_TUNNEL_PROXY + VT_TUNNEL_COUNTRY
@@ -95,12 +111,14 @@ import sys
 import urllib.parse
 from pathlib import Path
 
+from . import envfile
 from .common import PROJECT_ROOT
 
 PROXY_PORT = 18119
 PROXY_URL = f"http://127.0.0.1:{PROXY_PORT}"
 CONF_NAME = "tun-singbox.json"
 LEGACY_CONF_NAME = "tun-xray.json"  # builds 189/190; removed on sight
+CACHE_NAME = "tun-candidates.cache"  # build 192: resolved source text
 ENGINE = "sing-box"
 
 _ENV_LINK = "VT_TUNNEL_LINK_B64"
@@ -109,6 +127,7 @@ _ENV_PROXY = "VT_TUNNEL_PROXY"
 _ENV_COUNTRY = "VT_TUNNEL_COUNTRY"
 _ENV_SHA = "VT_TUNNEL_CONF_SHA"
 _ENV_SKIPSG = "VT_TUNNEL_SKIPPED_SG"
+_ENV_NODE_IDX = "VT_TUNNEL_NODE_IDX"  # build 192: failover winner
 
 _STATUS_NAME = "tun-status.json"
 
@@ -149,22 +168,13 @@ def _env_get(key):
 
 
 def _env_set(key, value):
-    """Set or remove (value "") one .env line, chmod 600 — the
-    same line surgery as app.py's _env_write/_env_remove (this
-    module cannot import app.py: app imports the pipeline)."""
-    p = _env_path()
-    lines = []
-    if p.exists():
-        lines = [ln for ln in p.read_text(encoding="utf-8").splitlines()
-                 if not ln.startswith(key + "=")]
-    if value:
-        lines.append(f"{key}={value}")
-    p.write_text("\n".join(lines) + ("\n" if lines else ""),
-                 encoding="utf-8")
-    try:
-        os.chmod(p, 0o600)
-    except Exception:
-        pass
+    """Set or remove (value "") one .env line, chmod 600 — via
+    pipeline.envfile (build 192): fresh read inside an flock,
+    foreign lines preserved byte-for-byte, atomic replace. The
+    pre-192 hand-rolled copy of this surgery (like app.py's)
+    could lose foreign keys when writers overlapped; see
+    envfile.py for the incident analysis."""
+    envfile.update(_env_path(), key, value if value else None)
 
 
 def _conf_sha():
@@ -473,20 +483,22 @@ def _pick_notes(chosen, skipped_sg):
             "triple": node_triple(node)}
 
 
-def _select_node(text):
+def _candidates_from_text(text):
     """Scan a body of text (a subscription payload, decoded or
-    not) for share links and choose the node to run.
+    not) for share links and return EVERY usable node in
+    selection order (build 192): SG-labelled nodes first
+    (stable, in input order), then the rest in input order —
+    element 0 is the node builds ≤191 picked. "Usable" = a
+    vless/vmess link this build can parse and render —
+    sing-box accepts plain (unencrypted-transport) nodes, so
+    the build-190 xray encryption mirror no longer applies.
 
-    Preference order (build 191): the first usable SG node,
-    else the first usable node. "Usable" = a vless/vmess link
-    this build can parse and render — sing-box accepts plain
-    (unencrypted-transport) nodes, so the build-190 xray
-    encryption mirror no longer applies. When an SG node
-    exists in the input but cannot be used (an unsupported
-    scheme like ss/trojan, or a parse failure) and a non-SG
-    node wins instead, the SG node's label is recorded in the
-    notes so the card can say it was skipped and why.
-    Returns (node, label, raw_link, node_count, notes)."""
+    Also returns the skipped-SG note: when an SG node exists in
+    the input but cannot be used (an unsupported scheme like
+    ss/trojan, or a parse failure) AND no usable SG node
+    exists at all, the unusable SG node's label is returned so
+    the card can say it was skipped and why. Raises ValueError
+    (owner-facing Burmese) when nothing is usable."""
     links = _LINK_RE.findall(text or "")
     if not links:
         raise ValueError("link မတွေ့ပါ — vless:// သို့မဟုတ် vmess:// "
@@ -515,18 +527,21 @@ def _select_node(text):
             raise ValueError("သုံးလို့ရတဲ့ node မတွေ့ပါ — " + errs[0])
         raise ValueError("vless/vmess node မတွေ့ပါ — ဒီ subscription မှာ "
                          "ss/trojan ပဲ ရှိနေပါတယ် (မရသေးပါ)")
-    chosen = None
-    for p in parsed:
-        if _SG_RE.search(p[1] or ""):
-            chosen = p
-            break
-    if chosen is None:
-        chosen = parsed[0]
-    else:
-        skipped_sg = ""  # an SG node DID win — nothing was skipped
-    node, label, link = chosen
-    return (node, label, link, len(parsed),
-            _pick_notes(chosen, skipped_sg))
+    sg = [p for p in parsed if _SG_RE.search(p[1] or "")]
+    rest = [p for p in parsed if not _SG_RE.search(p[1] or "")]
+    if sg:
+        skipped_sg = ""  # a usable SG node exists — nothing skipped
+    return sg + rest, skipped_sg
+
+
+def _select_node(text):
+    """The pre-192 single pick, kept for resolve_input():
+    element 0 of the candidate order + the selection notes.
+    Returns (node, label, raw_link, node_count, notes)."""
+    ordered, skipped_sg = _candidates_from_text(text)
+    node, label, link = ordered[0]
+    return (node, label, link, len(ordered),
+            _pick_notes(ordered[0], skipped_sg))
 
 
 def _fetch_subscription(url):
@@ -552,11 +567,13 @@ def _fetch_subscription(url):
     return resp.text or ""
 
 
-def resolve_input(raw):
-    """Whatever the owner pasted -> (node, label, kind, nodes,
-    notes): the chosen node + label, how the input arrived, how
-    many parseable nodes the input offered, and the selection
-    notes (skipped SG label, chosen triple) from _pick_notes.
+def _scan_text(raw):
+    """Whatever the owner pasted -> (text_to_scan, kind): the
+    plain text the share links are scanned from, and how the
+    input arrived. A subscription URL is fetched ONCE, here;
+    callers that need the same resolution again (the build-192
+    failover walk) reuse this text via the candidates cache
+    instead of fetching again.
 
     kind: "link" (one or more share links pasted directly),
     "subscription" (an http(s) URL that was fetched), or
@@ -566,35 +583,183 @@ def resolve_input(raw):
         raise ValueError("အရင် link သို့မဟုတ် subscription URL ထည့်ပါ")
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     if len(lines) == 1 and lines[0].startswith(_SUPPORTED):
-        node, label = parse_share_link(lines[0])
-        chosen = (node, label, lines[0])
-        return node, label, "link", 1, _pick_notes(chosen, "")
+        return lines[0], "link"
     # A lone http(s) URL is a subscription to fetch — checked
     # BEFORE the link-list branch, which would otherwise eat it
     # (a URL contains "://" too).
     if re.fullmatch(r"https?://\S+", raw):
         body = _fetch_subscription(raw)
-        try:
-            node, label, _l, nodes, notes = _select_node(body)
-            return node, label, "subscription", nodes, notes
-        except ValueError:
-            decoded = _b64_loose(body)
-            if decoded:
-                node, label, _l, nodes, notes = _select_node(
-                    decoded.decode("utf-8", "replace"))
-                return node, label, "subscription", nodes, notes
-            raise
+        if _LINK_RE.search(body or ""):
+            return body, "subscription"
+        decoded = _b64_loose(body)
+        if decoded:
+            return decoded.decode("utf-8", "replace"), "subscription"
+        # Nothing scannable either way: let the candidate scan
+        # raise its own owner-facing error on the raw body.
+        return body, "subscription"
     if lines and all("://" in ln for ln in lines):
-        node, label, _link, nodes, notes = _select_node(raw)
-        return node, label, "link", nodes, notes
+        return raw, "link"
     decoded = _b64_loose(raw)
     if decoded:
-        node, label, _l, nodes, notes = _select_node(
-            decoded.decode("utf-8", "replace"))
-        return node, label, "subscription-paste", nodes, notes
+        return decoded.decode("utf-8", "replace"), "subscription-paste"
     raise ValueError("ပုံစံ မမှန်ပါ — vless:// / vmess:// link, "
                      "subscription URL, သို့မဟုတ် subscription "
                      "စာသား ထည့်ပါ")
+
+
+def _resolve_candidates(raw):
+    """Full resolution of a paste: (ordered_candidates,
+    kind, skipped_sg, scan_text). ordered_candidates is the
+    _candidates_from_text list of (node, label, raw_link)."""
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("အရင် link သို့မဟုတ် subscription URL ထည့်ပါ")
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if len(lines) == 1 and lines[0].startswith(_SUPPORTED):
+        # The single-link fast path keeps the parser's own
+        # precise error messages (the pre-192 behaviour).
+        node, label = parse_share_link(lines[0])
+        return [(node, label, lines[0])], "link", "", lines[0]
+    text, kind = _scan_text(raw)
+    ordered, skipped_sg = _candidates_from_text(text)
+    return ordered, kind, skipped_sg, text
+
+
+def resolve_input(raw):
+    """Whatever the owner pasted -> (node, label, kind, nodes,
+    notes): the chosen node (candidate 0) + label, how the
+    input arrived, how many parseable nodes the input offered,
+    and the selection notes (skipped SG label, chosen triple)
+    from _pick_notes."""
+    ordered, kind, skipped_sg, _text = _resolve_candidates(raw)
+    node, label, _link = ordered[0]
+    return node, label, kind, len(ordered), \
+        _pick_notes(ordered[0], skipped_sg)
+
+
+# ---------------- candidates cache (build 192) ----------------
+# The failover walk resolves the saved input ONCE (candidates)
+# and then renders candidates one by one (render N), each in
+# its own CLI process. Re-resolving per render would re-fetch a
+# subscription URL every time and could even return a DIFFERENT
+# list mid-walk. So the scanned source text is cached next to
+# the config, keyed by the sha256 of the saved-link value it
+# came from: while the saved link is unchanged, every render
+# scans the cached text. The cache carries node credentials
+# (it IS the subscription body) — chmod 600, gitignored,
+# removed by clear(), exactly like the rendered config.
+
+def _cache_path():
+    return PROJECT_ROOT / CACHE_NAME
+
+
+def _write_cache(link_b64, scan_text):
+    payload = json.dumps(
+        {"link_sha": hashlib.sha256(
+            (link_b64 or "").encode("utf-8")).hexdigest(),
+         "text": scan_text},
+        ensure_ascii=False)
+    p = _cache_path()
+    try:
+        if p.read_text(encoding="utf-8") == payload:
+            return
+    except Exception:
+        pass
+    p.write_text(payload, encoding="utf-8")
+    try:
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
+
+
+def _read_cache(link_b64):
+    """The cached scan text for THIS saved link, or None."""
+    try:
+        data = json.loads(_cache_path().read_text(encoding="utf-8"))
+        if data.get("link_sha") == hashlib.sha256(
+                (link_b64 or "").encode("utf-8")).hexdigest():
+            return data.get("text") or ""
+    except Exception:
+        pass
+    return None
+
+
+def _remove_cache():
+    try:
+        _cache_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _resolve_saved():
+    """Resolve the link stored in .env to the ordered candidate
+    list: (ordered, kind, skipped_sg). Returns None when no
+    link is saved; raises ValueError when the saved input no
+    longer resolves. Uses (and refreshes) the candidates cache,
+    so a subscription URL is fetched at most once per walk."""
+    b64 = _env_get(_ENV_LINK)
+    if not b64:
+        return None
+    cached = _read_cache(b64)
+    if cached is not None:
+        try:
+            ordered, skipped_sg = _candidates_from_text(cached)
+            return ordered, "cache", skipped_sg
+        except ValueError:
+            pass  # stale/corrupt cache — resolve fresh below
+    raw_bytes = _b64_loose(b64)
+    if raw_bytes is None:
+        raise ValueError("သိမ်းထားတဲ့ link ကို decode လုပ်လို့ မရပါ")
+    raw = raw_bytes.decode("utf-8", "replace")
+    ordered, kind, skipped_sg, text = _resolve_candidates(raw)
+    _write_cache(b64, text)
+    return ordered, kind, skipped_sg
+
+
+def _refresh_bookkeeping(label, skipped_sg):
+    _env_set(_ENV_LABEL, (label or "").replace("\n", " "))
+    _env_set(_ENV_SKIPSG, (skipped_sg or "").replace("\n", " "))
+
+
+def saved_candidates():
+    """The build-192 failover surface for the activation script
+    (`python3 -m pipeline.tunnel candidates`): every usable
+    node in the saved input, in selection order, as
+    [{"label": ..., "proto": ..., "transport": ...,
+    "security": ...}] — labels + triples ONLY, never an
+    address or an id. Returns None when no link is saved;
+    raises ValueError when the saved input no longer resolves.
+    Refreshes the label / skipped-SG bookkeeping to the default
+    pick, exactly like a re-render."""
+    res = _resolve_saved()
+    if res is None:
+        return None
+    ordered, _kind, skipped_sg = res
+    _remove_legacy_conf()
+    _refresh_bookkeeping(ordered[0][1], skipped_sg)
+    return [{"label": label, **node_triple(node)}
+            for node, label, _link in ordered]
+
+
+def render_candidate(index):
+    """Render candidate `index` (selection order, build 192) to
+    tun-singbox.json for the activation's failover walk.
+    Returns {"label": ..., **triple} of the rendered node.
+    Raises ValueError on a bad index or an unresolvable saved
+    input. Does NOT touch the verified pointers — the
+    activation owns them during the walk (and the app-side sha
+    check distrusts the old pointers the moment the config
+    bytes change anyway)."""
+    res = _resolve_saved()
+    if res is None:
+        raise ValueError("သိမ်းထားတဲ့ link မရှိပါ")
+    ordered, _kind, _skip = res
+    if not (0 <= int(index) < len(ordered)):
+        raise ValueError("node နံပါတ် မမှန်ပါ")
+    node, label, _link = ordered[int(index)]
+    _write_conf(node)
+    _remove_legacy_conf()
+    return {"label": label, **node_triple(node)}
 
 
 # ---------------- save / clear / status ----------------
@@ -641,19 +806,28 @@ def save_link(raw):
     ValueError with an owner-facing Burmese message; on ANY
     failure nothing is written (a previously working config
     is never clobbered by a bad paste)."""
-    node, label, kind, nodes, notes = resolve_input(raw)
+    ordered, kind, skipped_sg, text = _resolve_candidates(raw)
+    node, label, _link = ordered[0]
+    notes = _pick_notes(ordered[0], skipped_sg)
     _write_conf(node)
     _remove_legacy_conf()
-    _env_set(_ENV_LINK, base64.b64encode(
-        (raw or "").strip().encode("utf-8")).decode("ascii"))
+    link_b64 = base64.b64encode(
+        (raw or "").strip().encode("utf-8")).decode("ascii")
+    _env_set(_ENV_LINK, link_b64)
     _env_set(_ENV_LABEL, label.replace("\n", " "))
     # The SG node skipped for format reasons (label only — a
     # remark, not a credential) is persisted so the card keeps
     # showing the skip after a page reload.
     _env_set(_ENV_SKIPSG,
              (notes["skipped_sg"] or "").replace("\n", " "))
+    # A fresh paste invalidates the old failover winner hint
+    # (build 192): the indices belong to the OLD input's list.
+    _env_set(_ENV_NODE_IDX, "")
+    # Cache the scanned source text so the activation's
+    # failover walk renders this exact list (build 192).
+    _write_cache(link_b64, text)
     _drop_verified_pointers()
-    return {"label": label, "kind": kind, "nodes": nodes,
+    return {"label": label, "kind": kind, "nodes": len(ordered),
             "skipped_sg": notes["skipped_sg"],
             **notes["triple"]}
 
@@ -672,19 +846,14 @@ def rerender_from_saved():
     when a saved link exists and rendered (or was already
     current); False when no link is saved. Raises ValueError
     when the saved input no longer resolves."""
-    b64 = _env_get(_ENV_LINK)
-    if not b64:
+    res = _resolve_saved()
+    if res is None:
         return False
-    raw_bytes = _b64_loose(b64)
-    if raw_bytes is None:
-        raise ValueError("သိမ်းထားတဲ့ link ကို decode လုပ်လို့ မရပါ")
-    raw = raw_bytes.decode("utf-8", "replace")
-    node, label, _kind, _nodes, notes = resolve_input(raw)
+    ordered, _kind, skipped_sg = res
+    node, label, _link = ordered[0]
     changed = _write_conf(node)
     _remove_legacy_conf()
-    _env_set(_ENV_LABEL, label.replace("\n", " "))
-    _env_set(_ENV_SKIPSG,
-             (notes["skipped_sg"] or "").replace("\n", " "))
+    _refresh_bookkeeping(label, skipped_sg)
     if changed:
         _drop_verified_pointers()
     return True
@@ -700,9 +869,11 @@ def clear():
     except Exception:
         pass
     _remove_legacy_conf()
+    _remove_cache()
     _remove_status_file()
     for key in (_ENV_LINK, _ENV_LABEL, _ENV_PROXY,
-                _ENV_COUNTRY, _ENV_SHA, _ENV_SKIPSG):
+                _ENV_COUNTRY, _ENV_SHA, _ENV_SKIPSG,
+                _ENV_NODE_IDX):
         _env_set(key, "")
 
 
@@ -780,7 +951,9 @@ def status():
     Also carries: the engine name (build 191), the chosen
     node's triple (proto / transport / security), `skipped_sg`
     (label of an SG node skipped for format reasons while a
-    non-SG node won, "" when none), and — when the activation
+    non-SG node won, "" when none), the failover walk's
+    `tried` / `nodes` counts (build 192, when the last
+    activation recorded them), and — when the activation
     script's last attempt failed — `fail_kind` / `fail_reason`
     from tun-status.json (sanitized structural text written by
     deploy/activate-settings.sh; the file carries no addresses
@@ -805,6 +978,12 @@ def status():
                     st[key] = diag[key]
             if diag.get("engine"):
                 st["engine"] = diag["engine"]
+            # Build 192: how far the failover walk got (the
+            # winning node's label is the status `label` above —
+            # the activation persists it in VT_TUNNEL_LABEL).
+            for key in ("tried", "nodes"):
+                if isinstance(diag.get(key), int) and diag[key]:
+                    st[key] = diag[key]
             if not diag.get("ok"):
                 st["fail_kind"] = diag.get("kind") or ""
                 st["fail_reason"] = diag.get("reason") or ""
@@ -826,5 +1005,38 @@ if __name__ == "__main__":
             sys.exit(1)
         print("RERENDER_OK" if done else "RERENDER_NOLINK")
         sys.exit(0 if done else 2)
+    if len(sys.argv) > 1 and sys.argv[1] == "candidates":
+        # Build 192: the failover walk's planning call. Prints
+        # ONE JSON line {"count": N, "candidates": [{label,
+        # proto, transport, security}, ...]} — labels + triples
+        # only, never an address or an id. Exit: 0 ok, 2 no
+        # saved link, 1 saved link no longer resolves.
+        try:
+            cands = saved_candidates()
+        except ValueError:
+            print("CANDIDATES_FAIL")
+            sys.exit(1)
+        if cands is None:
+            print("CANDIDATES_NOLINK")
+            sys.exit(2)
+        print(json.dumps({"count": len(cands),
+                          "candidates": cands},
+                         ensure_ascii=False))
+        sys.exit(0)
+    if len(sys.argv) > 2 and sys.argv[1] == "render":
+        # Build 192: render candidate N (selection order) to
+        # tun-singbox.json for the failover walk. Prints ONE
+        # JSON line {"label": ..., "proto": ..., ...}. Exit:
+        # 0 ok, 2 no saved link, 1 bad index / unresolvable.
+        if not _env_get(_ENV_LINK):
+            print("RENDER_NOLINK")
+            sys.exit(2)
+        try:
+            info = render_candidate(int(sys.argv[2]))
+        except (ValueError, IndexError):
+            print("RENDER_FAIL")
+            sys.exit(1)
+        print(json.dumps(info, ensure_ascii=False))
+        sys.exit(0)
     print("tunnel configured:", configured(),
           "| verified up:", verified(), "| status:", status())

@@ -30,6 +30,7 @@ ensure_system_ca()
 
 from pipeline import accounts
 from pipeline import download as dl_mod
+from pipeline import envfile
 from pipeline import fx as fx_mod
 from pipeline import run_job, tts
 from pipeline.common import probe_duration, run as sh
@@ -2022,28 +2023,13 @@ def gemini_key_save():
         and all(ch.isalnum() or ch in "._-" for ch in key)
     if not ok_format:
         return jsonify({"error": "key မမှန်ပါ — Gemini key (AQ. သို့ AIza နဲ့ စတာ) ဖြစ်ရပါမယ်"}), 400
-    env_path = ROOT / ".env"
-    lines = []
-    if env_path.exists():
-        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
-                 if not ln.startswith("GEMINI_API_KEY=")]
-    lines.append(f"GEMINI_API_KEY={key}")
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    try:
-        os.chmod(env_path, 0o600)
-    except Exception:
-        pass
+    _env_write("GEMINI_API_KEY", key)
     return jsonify({"ok": True, "configured": True})
 
 
 @app.delete("/api/settings/gemini-key")
 def gemini_key_delete():
-    env_path = ROOT / ".env"
-    if env_path.exists():
-        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
-                 if not ln.startswith("GEMINI_API_KEY=")]
-        env_path.write_text("\n".join(lines) + ("\n" if lines else ""),
-                            encoding="utf-8")
+    _env_remove("GEMINI_API_KEY")
     return jsonify({"ok": True, "configured": False})
 
 
@@ -2063,28 +2049,13 @@ def openai_key_save():
         and all(ch.isalnum() or ch in "._-" for ch in key)
     if not ok_format:
         return jsonify({"error": "key မမှန်ပါ — OpenAI key (sk- နဲ့ စတာ) ဖြစ်ရပါမယ်"}), 400
-    env_path = ROOT / ".env"
-    lines = []
-    if env_path.exists():
-        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
-                 if not ln.startswith("OPENAI_API_KEY=")]
-    lines.append(f"OPENAI_API_KEY={key}")
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    try:
-        os.chmod(env_path, 0o600)
-    except Exception:
-        pass
+    _env_write("OPENAI_API_KEY", key)
     return jsonify({"ok": True, "configured": True})
 
 
 @app.delete("/api/settings/openai-key")
 def openai_key_delete():
-    env_path = ROOT / ".env"
-    if env_path.exists():
-        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
-                 if not ln.startswith("OPENAI_API_KEY=")]
-        env_path.write_text("\n".join(lines) + ("\n" if lines else ""),
-                            encoding="utf-8")
+    _env_remove("OPENAI_API_KEY")
     return jsonify({"ok": True, "configured": False})
 
 
@@ -2104,28 +2075,13 @@ def openrouter_key_save():
         and all(ch.isalnum() or ch in "._-" for ch in key)
     if not ok_format:
         return jsonify({"error": "key မမှန်ပါ — OpenRouter key (sk-or- နဲ့ စတာ) ဖြစ်ရပါမယ်"}), 400
-    env_path = ROOT / ".env"
-    lines = []
-    if env_path.exists():
-        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
-                 if not ln.startswith("OPENROUTER_API_KEY=")]
-    lines.append(f"OPENROUTER_API_KEY={key}")
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    try:
-        os.chmod(env_path, 0o600)
-    except Exception:
-        pass
+    _env_write("OPENROUTER_API_KEY", key)
     return jsonify({"ok": True, "configured": True})
 
 
 @app.delete("/api/settings/openrouter-key")
 def openrouter_key_delete():
-    env_path = ROOT / ".env"
-    if env_path.exists():
-        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
-                 if not ln.startswith("OPENROUTER_API_KEY=")]
-        env_path.write_text("\n".join(lines) + ("\n" if lines else ""),
-                            encoding="utf-8")
+    _env_remove("OPENROUTER_API_KEY")
     return jsonify({"ok": True, "configured": False})
 
 
@@ -2143,28 +2099,13 @@ def xkiro_key_save():
         and all(ch.isalnum() or ch in "._-" for ch in key)
     if not ok_format:
         return jsonify({"error": "key မမှန်ပါ — xKiro key ဖြစ်ရပါမယ်"}), 400
-    env_path = ROOT / ".env"
-    lines = []
-    if env_path.exists():
-        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
-                 if not ln.startswith("XKIRO_API_KEY=")]
-    lines.append(f"XKIRO_API_KEY={key}")
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    try:
-        os.chmod(env_path, 0o600)
-    except Exception:
-        pass
+    _env_write("XKIRO_API_KEY", key)
     return jsonify({"ok": True, "configured": True})
 
 
 @app.delete("/api/settings/xkiro-key")
 def xkiro_key_delete():
-    env_path = ROOT / ".env"
-    if env_path.exists():
-        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
-                 if not ln.startswith("XKIRO_API_KEY=")]
-        env_path.write_text("\n".join(lines) + ("\n" if lines else ""),
-                            encoding="utf-8")
+    _env_remove("XKIRO_API_KEY")
     return jsonify({"ok": True, "configured": False})
 
 
@@ -2176,26 +2117,19 @@ def xkiro_key_delete():
 # here, stored in .env like the Gemini key, never returned.
 
 def _env_write(key, value):
-    env_path = ROOT / ".env"
-    lines = []
-    if env_path.exists():
-        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
-                 if not ln.startswith(key + "=")]
-    lines.append(f"{key}={value}")
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    try:
-        os.chmod(env_path, 0o600)
-    except Exception:
-        pass
+    """Set one .env key via pipeline.envfile (build 192): the
+    file is re-read fresh inside an flock, every foreign line
+    is preserved byte-for-byte, and the write lands atomically.
+    The pre-192 hand-rolled read-modify-write here (and its
+    eight inline copies in the key-card handlers) could lose
+    OTHER cards' keys when saves overlapped — TG_API_ID /
+    TG_API_HASH were lost exactly that way; see
+    pipeline/envfile.py."""
+    envfile.update(ROOT / ".env", key, value)
 
 
 def _env_remove(key):
-    env_path = ROOT / ".env"
-    if env_path.exists():
-        lines = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
-                 if not ln.startswith(key + "=")]
-        env_path.write_text("\n".join(lines) + ("\n" if lines else ""),
-                            encoding="utf-8")
+    envfile.update(ROOT / ".env", key, None)
 
 
 @app.get("/api/settings/telegram")

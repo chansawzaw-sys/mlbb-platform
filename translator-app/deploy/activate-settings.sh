@@ -2,7 +2,11 @@
 # activate-settings.sh — settings activation for the video translator
 # (build 190; extracted from translator-bootstrap.sh §13d + §13e;
 # build 191: tunnel engine swapped xray-core -> sing-box, Telegram
-# section .env parsing hardened).
+# section .env parsing hardened; build 192: tunnel node
+# egress-failover walk, and every .env write in this script now
+# takes the shared .env.lock flock and lands by atomic rename —
+# the deploy-side half of the envfile root fix, see
+# pipeline/envfile.py).
 #
 # Two translator features are driven by values the owner saves in
 # Admin cards, NOT by code:
@@ -128,17 +132,27 @@ PYEOF
 }
 
 tgba_env_set_base() {  # $1 = base URL, or "" to remove TG_API_BASE
+  # Build 192: the write holds the shared .env.lock flock (the
+  # app-side writers in pipeline/envfile.py take the same lock)
+  # and lands by atomic rename of a temp file created IN the
+  # app dir — the pre-192 `cat tmp > .env` truncated the live
+  # file in place, one of the two overlap shapes that lost
+  # TG_API_ID / TG_API_HASH (see pipeline/envfile.py).
   local env_file="$APP_DIR/.env" tmp
   [ -f "$env_file" ] || return 0
-  tmp="$(mktemp)" || return 0
-  grep -v '^TG_API_BASE=' "$env_file" > "$tmp" 2>/dev/null || true
-  if [ -n "$1" ]; then
-    echo "TG_API_BASE=$1" >> "$tmp"
-  fi
-  cat "$tmp" > "$env_file"
-  rm -f "$tmp"
-  chmod 600 "$env_file" 2>/dev/null || true
-  chown "$APP_USER:$APP_USER" "$env_file" 2>/dev/null || true
+  tmp="$(mktemp "$APP_DIR/.env.tmp.XXXXXX")" || return 0
+  {
+    flock -x 9 2>/dev/null || true
+    grep -v '^TG_API_BASE=' "$env_file" > "$tmp" 2>/dev/null || true
+    if [ -n "$1" ]; then
+      echo "TG_API_BASE=$1" >> "$tmp"
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    chown "$APP_USER:$APP_USER" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$env_file"
+    flock -u 9 2>/dev/null || true
+  } 9>>"$APP_DIR/.env.lock"
+  rm -f "$tmp" 2>/dev/null || true
 }
 
 tgba_setup() (
@@ -303,6 +317,27 @@ EOF
 # Return codes: 0 = terminal (live / not configured / config
 # rejected — deterministic), 1 = transient (download, unit,
 # egress, render-path failure) so the next tick retries.
+#
+# Build 192 — node egress-failover: the build-191 section tested
+# exactly ONE node (the selection's first pick); the owner's
+# first sing-box activation validated that node's config, then
+# failed the egress check — the node was simply dead, and the
+# tunnel stayed down although the same subscription held more
+# nodes. This section now WALKS the candidate list the app
+# exposes (`pipeline.tunnel candidates` / `render N`): up to 6
+# attempts, each rendered, `sing-box check`ed, started and
+# egress-tested; the first candidate carrying traffic wins and
+# is persisted (VT_TUNNEL_LABEL + VT_TUNNEL_NODE_IDX), and the
+# next walk tries the known-good node first. A candidate whose
+# config sing-box rejects outright is skipped (deterministic);
+# if EVERY candidate is config-invalid the failure stays
+# terminal, otherwise it stays transient (marker stale, next
+# tick retries) exactly like the single-node egress failure.
+# Every attempt is recorded (sanitized) in tun-status.json's
+# attempts list, with the counts the Admin card shows. When no
+# link is saved but a rendered config sits on disk (the
+# pre-189/manual state), that config is the walk's single
+# candidate — the build-190/191 behaviour for that state.
 TUNSB_VERSION='1.14.4'
 TUNSB_HOME="${TUNSB_HOME:-/opt/tun-singbox}"
 TUNSB_UNIT="${TUNSB_UNIT:-/etc/systemd/system/tun-singbox.service}"
@@ -312,17 +347,23 @@ TUNSB_CONF='tun-singbox.json'
 TUNSB_LEGACY_UNIT='tun-xray.service'
 
 tuns_env_set() {  # $1 = key, $2 = value ("" removes the line)
+  # Build 192: shared .env.lock flock + atomic rename, exactly
+  # like tgba_env_set_base above (see pipeline/envfile.py).
   local env_file="$APP_DIR/.env" tmp
   [ -f "$env_file" ] || return 0
-  tmp="$(mktemp)" || return 0
-  grep -v "^$1=" "$env_file" > "$tmp" 2>/dev/null || true
-  if [ -n "$2" ]; then
-    echo "$1=$2" >> "$tmp"
-  fi
-  cat "$tmp" > "$env_file"
-  rm -f "$tmp"
-  chmod 600 "$env_file" 2>/dev/null || true
-  chown "$APP_USER:$APP_USER" "$env_file" 2>/dev/null || true
+  tmp="$(mktemp "$APP_DIR/.env.tmp.XXXXXX")" || return 0
+  {
+    flock -x 9 2>/dev/null || true
+    grep -v "^$1=" "$env_file" > "$tmp" 2>/dev/null || true
+    if [ -n "$2" ]; then
+      echo "$1=$2" >> "$tmp"
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    chown "$APP_USER:$APP_USER" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$env_file"
+    flock -u 9 2>/dev/null || true
+  } 9>>"$APP_DIR/.env.lock"
+  rm -f "$tmp" 2>/dev/null || true
 }
 
 tuns_clear_pointers() {
@@ -396,22 +437,61 @@ except Exception:
 PYEOF
 }
 
-tun_write_status() {  # $1 ok(1/0) $2 kind $3 reason $4 proto $5 transport $6 security $7 country
-  python3 - "$TUN_STATUS" "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PYEOF'
+tun_write_status() {  # $1 ok(1/0) $2 kind $3 reason $4 label $5 proto
+                      # $6 transport $7 security $8 country $9 tried $10 nodes
+  # Build 192: the status also carries the node's label, the
+  # failover walk's tried/total counts, and the per-attempt
+  # records accumulated in $TUN_ATT_FILE (one JSON object per
+  # line, written by tun_attempt_add — labels, triples, kinds
+  # and SANITIZED reasons only, never addresses or ids).
+  TUN_ATT_FILE="${TUN_ATT_FILE:-}" python3 - "$TUN_STATUS" "$@" <<'PYEOF'
 import json
 import os
 import sys
 import time
 
 path = sys.argv[1]
-data = {"ok": sys.argv[2] == "1",
-        "kind": sys.argv[3] or None,
-        "reason": sys.argv[4],
+a = sys.argv[2:]
+
+
+def g(i):
+    return a[i] if i < len(a) else ""
+
+
+attempts = []
+att = os.environ.get("TUN_ATT_FILE") or ""
+if att and os.path.exists(att):
+    try:
+        for ln in open(att, encoding="utf-8"):
+            ln = ln.strip()
+            if ln:
+                try:
+                    attempts.append(json.loads(ln))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def num(i):
+    try:
+        return int(g(i) or 0)
+    except Exception:
+        return 0
+
+
+data = {"ok": g(0) == "1",
+        "kind": g(1) or None,
+        "reason": g(2),
         "engine": "sing-box",
-        "proto": sys.argv[5],
-        "transport": sys.argv[6],
-        "security": sys.argv[7],
-        "country": sys.argv[8],
+        "label": g(3),
+        "proto": g(4),
+        "transport": g(5),
+        "security": g(6),
+        "country": g(7),
+        "tried": num(8),
+        "nodes": num(9),
+        "attempts": attempts,
         "ts": int(time.time())}
 tmp = path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as f:
@@ -422,31 +502,129 @@ PYEOF
   chown "$APP_USER:$APP_USER" "$TUN_STATUS" 2>/dev/null || true
 }
 
-tuns_rerender() {
-  # Build 191: ask the app to re-render $APP_DIR/tun-singbox.json
-  # from the link saved in .env (VT_TUNNEL_LINK_B64). Echoes one
-  # token: RERENDER_OK / RERENDER_NOLINK / RERENDER_FAIL (the app
-  # judged the saved input) / RERENDER_ERROR (the render path
-  # itself failed — transient). The app's venv python is
-  # preferred (it has `requests` for subscription URLs); the
-  # module itself needs only the stdlib otherwise.
-  if ! grep -Eq '^[[:space:]]*VT_TUNNEL_LINK_B64[[:space:]]*=' "$APP_DIR/.env" 2>/dev/null; then
-    echo "RERENDER_NOLINK"
-    return 0
-  fi
-  local py="$APP_DIR/.venv/bin/python" out
+tun_attempt_add() {  # $1 idx $2 label $3 proto $4 transport $5 security $6 kind $7 reason
+  [ -n "${TUN_ATT_FILE:-}" ] || return 0
+  python3 - "$TUN_ATT_FILE" "$@" <<'PYEOF' 2>/dev/null || true
+import json
+import sys
+
+path = sys.argv[1]
+a = sys.argv[2:]
+rec = {"i": int(a[0]) if a[0].isdigit() else a[0],
+       "label": a[1], "proto": a[2],
+       "transport": a[3], "security": a[4], "kind": a[5],
+       "reason": a[6] if len(a) > 6 else ""}
+with open(path, "a", encoding="utf-8") as f:
+    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+PYEOF
+}
+
+tuns_py() {
+  # The python that can import the app (build 191): the app's
+  # venv python is preferred (it has `requests` for subscription
+  # URLs); the tunnel module itself needs only the stdlib
+  # otherwise. Echoes the path, or nothing when there is none.
+  local py="$APP_DIR/.venv/bin/python"
   [ -x "$py" ] || py="$(command -v python3 || true)"
-  if [ -z "$py" ]; then
-    echo "RERENDER_ERROR"
+  printf '%s' "$py"
+}
+
+TUNS_CAND_JSON=""
+TUN_CAND_TOKEN=""
+
+tuns_candidates() {
+  # Build 192: ask the app for the failover candidate list of
+  # the link saved in .env (VT_TUNNEL_LINK_B64). Sets
+  # TUN_CAND_TOKEN (called DIRECTLY, never in a command
+  # substitution — the JSON path is a side effect): OK (the
+  # JSON — count + labels/triples only — is in $TUNS_CAND_JSON)
+  # / NOLINK (nothing saved) / FAIL (the app judged the saved
+  # input unresolvable — terminal) / ERROR (the listing path
+  # itself failed — transient).
+  TUN_CAND_TOKEN="ERROR"
+  if ! grep -Eq '^[[:space:]]*VT_TUNNEL_LINK_B64[[:space:]]*=' "$APP_DIR/.env" 2>/dev/null; then
+    TUN_CAND_TOKEN="NOLINK"
     return 0
   fi
-  out="$(cd "$APP_DIR" 2>/dev/null && "$py" -m pipeline.tunnel rerender 2>/dev/null)"
+  local py out
+  py="$(tuns_py)"
+  if [ -z "$py" ]; then
+    return 0
+  fi
+  TUNS_CAND_JSON="$(mktemp)"
+  out="$(cd "$APP_DIR" 2>/dev/null && "$py" -m pipeline.tunnel candidates 2>/dev/null)"
   case "$out" in
-    *RERENDER_OK*) echo "RERENDER_OK" ;;
-    *RERENDER_NOLINK*) echo "RERENDER_NOLINK" ;;
-    *RERENDER_FAIL*) echo "RERENDER_FAIL" ;;
-    *) echo "RERENDER_ERROR" ;;
+    *CANDIDATES_NOLINK*) TUN_CAND_TOKEN="NOLINK" ;;
+    *CANDIDATES_FAIL*) TUN_CAND_TOKEN="FAIL" ;;
+    \{*) printf '%s' "$out" > "$TUNS_CAND_JSON"; TUN_CAND_TOKEN="OK" ;;
+    *) TUN_CAND_TOKEN="ERROR" ;;
   esac
+}
+
+tuns_render() {  # $1 = candidate index -> OK / FAIL / ERROR
+  # Render candidate $1 to $APP_DIR/tun-singbox.json via the app
+  # (the candidate list comes from the app's cache of the ONE
+  # resolution, so indices are stable across the walk).
+  local py out
+  py="$(tuns_py)"
+  if [ -z "$py" ]; then
+    echo "ERROR"
+    return 0
+  fi
+  out="$(cd "$APP_DIR" 2>/dev/null && "$py" -m pipeline.tunnel render "$1" 2>/dev/null)"
+  case "$out" in
+    \{*) echo "OK" ;;
+    *RENDER_NOLINK*) echo "FAIL" ;;
+    *RENDER_FAIL*) echo "FAIL" ;;
+    *) echo "ERROR" ;;
+  esac
+}
+
+tuns_plan() {  # $1 = winner-hint index, $2 = winner-hint label
+  # The attempt order for the walk, from $TUNS_CAND_JSON plus
+  # the persisted winner hint (VT_TUNNEL_NODE_IDX +
+  # VT_TUNNEL_LABEL, build 192): the known-good node goes FIRST
+  # when it is still in the list (same index AND same label —
+  # a re-saved subscription invalidates the hint), then the
+  # rest in selection order; capped at 6 attempts. Prints
+  # "<total> <idx1> <idx2> ...". The hint is passed IN, read by
+  # the caller BEFORE the candidates call — that call refreshes
+  # VT_TUNNEL_LABEL to the default pick (its bookkeeping), which
+  # would otherwise clobber the hint's label half mid-flight.
+  python3 - "$TUNS_CAND_JSON" "$1" "$2" <<'PYEOF'
+import json
+import sys
+
+try:
+    d = json.load(open(sys.argv[1]))
+    cands = d.get("candidates") or []
+except Exception:
+    cands = []
+order = list(range(len(cands)))
+try:
+    hint = int(sys.argv[2])
+except Exception:
+    hint = -1
+hlabel = sys.argv[3] if len(sys.argv) > 3 else ""
+if 0 <= hint < len(cands) and hlabel \
+        and cands[hint].get("label") == hlabel:
+    order = [hint] + [i for i in order if i != hint]
+print(len(cands), *order[:6])
+PYEOF
+}
+
+tuns_cand_field() {  # $1 = candidate index, $2 = field name
+  python3 - "$TUNS_CAND_JSON" "$1" "$2" <<'PYEOF'
+import json
+import sys
+
+try:
+    d = json.load(open(sys.argv[1]))
+    c = (d.get("candidates") or [])[int(sys.argv[2])]
+    print(c.get(sys.argv[3]) or "")
+except Exception:
+    print("")
+PYEOF
 }
 
 tuns_setup() (
@@ -455,43 +633,74 @@ tuns_setup() (
   # run alongside — or instead of — the sing-box unit.
   systemctl disable --now "$TUNSB_LEGACY_UNIT" >/dev/null 2>&1 || true
 
-  # (0) re-render the config from the saved link (build 191), so
-  # state saved under the old engine/selection activates as-is.
-  case "$(tuns_rerender)" in
-    RERENDER_FAIL)
-      echo "WARN: the saved tunnel link could not be rendered into a config — tunnel pointers cleared (Gemini/OpenAI stay direct)."
-      tun_write_status 0 config-invalid "the saved link could not be parsed into a sing-box config" "" "" "" ""
+  TUN_ATT_FILE="$(mktemp)"
+  export TUN_ATT_FILE
+
+  # (0) the attempt plan (build 192). With a saved link, the app
+  # lists every usable candidate and the walk renders them one
+  # by one; with NO saved link, a rendered config already on
+  # disk is the single candidate (the pre-189/manual state);
+  # with neither, the tunnel is simply not configured.
+  cand_mode=""
+  cand_total=0
+  order=""
+  # The winner hint is captured BEFORE the candidates call
+  # (which refreshes VT_TUNNEL_LABEL — see tuns_plan).
+  hint_idx="$(tgba_env_get VT_TUNNEL_NODE_IDX)"
+  hint_label="$(tgba_env_get VT_TUNNEL_LABEL)"
+  tuns_candidates
+  case "$TUN_CAND_TOKEN" in
+    OK)
+      cand_mode="walk"
+      read -r cand_total order <<< "$(tuns_plan "$hint_idx" "$hint_label")"
+      if [ "${cand_total:-0}" -lt 1 ]; then
+        echo "WARN: tunnel candidate listing was empty (retried next run) — nothing changed."
+        exit 1
+      fi
+      ;;
+    FAIL)
+      echo "WARN: the saved tunnel link could not be resolved into nodes — tunnel pointers cleared (Gemini/OpenAI stay direct)."
+      tun_write_status 0 config-invalid "the saved link could not be parsed into a sing-box config" "" "" "" "" "" 0 0
       tuns_clear_pointers
       systemctl stop tun-singbox.service >/dev/null 2>&1 || true
       exit 0 ;;
-    RERENDER_ERROR)
-      echo "WARN: tunnel re-render path failed (retried next run) — nothing changed."
+    ERROR)
+      echo "WARN: tunnel candidate listing failed (retried next run) — nothing changed."
       exit 1 ;;
+    NOLINK)
+      if [ -s "$APP_DIR/$TUNSB_CONF" ] \
+         && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$APP_DIR/$TUNSB_CONF" 2>/dev/null; then
+        cand_mode="disk"
+        cand_total=1
+        order="disk"
+      else
+        if grep -q '^VT_TUNNEL_PROXY=' "$APP_DIR/.env" 2>/dev/null; then
+          tuns_clear_pointers
+          echo "VPN tunnel: no config — tunnel pointers cleared (Gemini/OpenAI direct)."
+        else
+          echo "VPN tunnel: not configured (Gemini/OpenAI direct)."
+        fi
+        rm -f "$TUN_STATUS"
+        systemctl disable --now tun-singbox.service >/dev/null 2>&1 || true
+        exit 0
+      fi ;;
   esac
 
-  conf_src="$APP_DIR/$TUNSB_CONF"
-  if [ ! -s "$conf_src" ] \
-     || ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$conf_src" 2>/dev/null; then
-    if grep -q '^VT_TUNNEL_PROXY=' "$APP_DIR/.env" 2>/dev/null; then
-      tuns_clear_pointers
-      echo "VPN tunnel: no config — tunnel pointers cleared (Gemini/OpenAI direct)."
-    else
-      echo "VPN tunnel: not configured (Gemini/OpenAI direct)."
-    fi
-    rm -f "$TUN_STATUS"
-    systemctl disable --now tun-singbox.service >/dev/null 2>&1 || true
-    exit 0
+  # Candidate 0's triple — what the install-phase statuses below
+  # describe (the walk re-reads each attempt's own triple).
+  if [ "$cand_mode" = "walk" ]; then
+    tuns_proto="$(tuns_cand_field 0 proto)"
+    tuns_transport="$(tuns_cand_field 0 transport)"
+    tuns_security="$(tuns_cand_field 0 security)"
+  else
+    read -r tuns_proto tuns_transport tuns_security <<< "$(tun_triple "$APP_DIR/$TUNSB_CONF")"
   fi
-
-  # The chosen node's triple — recorded in every status write
-  # below (it is what parser support gets extended from).
-  read -r tuns_proto tuns_transport tuns_security <<< "$(tun_triple "$conf_src")"
 
   case "$(uname -m)" in
     x86_64|amd64)   tuns_arch='amd64'; tuns_sha='699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968' ;;
     aarch64|arm64)  tuns_arch='arm64'; tuns_sha='436441f76ee2f7fe21b5b2d426d3cb261a480455a704865789ad533e4273ec26' ;;
     *) echo "VPN tunnel: unsupported arch $(uname -m) — skipped."
-       tun_write_status 0 unit-failed "unsupported architecture" "$tuns_proto" "$tuns_transport" "$tuns_security" ""
+       tun_write_status 0 unit-failed "unsupported architecture" "" "$tuns_proto" "$tuns_transport" "$tuns_security" "" 0 "$cand_total"
        exit 0 ;;
   esac
   tuns_asset="sing-box-${TUNSB_VERSION}-linux-${tuns_arch}.tar.gz"
@@ -510,7 +719,7 @@ tuns_setup() (
       echo "VPN tunnel: sing-box v${TUNSB_VERSION} installed at $tuns_bin."
     else
       echo "WARN: sing-box download/verify failed — skipping (Gemini/OpenAI stay direct)."
-      tun_write_status 0 unit-failed "sing-box download or checksum verification failed" "$tuns_proto" "$tuns_transport" "$tuns_security" ""
+      tun_write_status 0 unit-failed "sing-box download or checksum verification failed" "" "$tuns_proto" "$tuns_transport" "$tuns_security" "" 0 "$cand_total"
       rm -rf "$tuns_dl"
       exit 1
     fi
@@ -518,46 +727,16 @@ tuns_setup() (
   fi
   if [ ! -x "$tuns_bin" ]; then
     echo "WARN: sing-box binary missing — skipping."
-    tun_write_status 0 unit-failed "sing-box binary missing after the install attempt" "$tuns_proto" "$tuns_transport" "$tuns_security" ""
+    tun_write_status 0 unit-failed "sing-box binary missing after the install attempt" "" "$tuns_proto" "$tuns_transport" "$tuns_security" "" 0 "$cand_total"
     exit 1
   fi
 
   mkdir -p "$TUNSB_HOME"
   chown "$APP_USER:$APP_USER" "$TUNSB_HOME" 2>/dev/null || true
 
-  # (b) config: install the app's rendered config (it carries the
-  # node credential, so 600), and let sing-box itself judge it
-  # before anything is pointed at the tunnel. The verdict is
-  # CAPTURED (build 190) and stored sanitized.
-  conf_dst="$TUNSB_HOME/config.json"
-  conf_sha="$(sha256sum "$conf_src" | cut -d' ' -f1)"
-  conf_changed=0
-  if [ ! -f "$conf_dst" ] || [ "$(sha256sum "$conf_dst" 2>/dev/null | cut -d' ' -f1)" != "$conf_sha" ]; then
-    cp "$conf_src" "$conf_dst"
-    conf_changed=1
-  fi
-  chmod 600 "$conf_dst" 2>/dev/null || true
-  chown "$APP_USER:$APP_USER" "$conf_dst" 2>/dev/null || true
-  tuns_check_out="$("$tuns_bin" check -c "$conf_dst" 2>&1)"
-  if [ $? -ne 0 ]; then
-    # sing-box prints log-prefixed lines (FATAL[...] ...); the
-    # failure line itself is the diagnosis, so select it (not a
-    # tail window) before sanitizing.
-    tuns_reason="$(printf '%s' "$tuns_check_out" | grep -iE 'fatal|fail|error' | tail -n 1 | tun_sanitize)"
-    if [ -z "$tuns_reason" ]; then
-      tuns_reason="$(printf '%s' "$tuns_check_out" | tail -n 1 | tun_sanitize)"
-    fi
-    [ -n "$tuns_reason" ] || tuns_reason="sing-box rejected the config (no detail captured)"
-    echo "WARN: sing-box rejects the saved config — tunnel pointers cleared (Gemini/OpenAI stay direct). Reason: $tuns_reason"
-    tun_write_status 0 config-invalid "$tuns_reason" "$tuns_proto" "$tuns_transport" "$tuns_security" ""
-    tuns_clear_pointers
-    systemctl stop tun-singbox.service >/dev/null 2>&1 || true
-    exit 0
-  fi
-
-  # (c) systemd unit. Unlike 13d's unit it embeds NO secret (the
-  # credential lives in the 600 config file), so default perms.
-  unit_changed=0
+  # (b) systemd unit — written ONCE for the whole walk (it embeds
+  # no secret and does not depend on which candidate is running;
+  # the credential lives in the 600 config file).
   tuns_unit_tmp="$(mktemp)"
   cat > "$tuns_unit_tmp" <<EOF
 [Unit]
@@ -570,7 +749,7 @@ Type=simple
 User=$APP_USER
 Group=$APP_USER
 WorkingDirectory=$TUNSB_HOME
-ExecStart=$tuns_bin run -c $conf_dst
+ExecStart=$tuns_bin run -c $TUNSB_HOME/config.json
 Restart=on-failure
 RestartSec=5
 MemoryMax=512M
@@ -582,44 +761,135 @@ WantedBy=multi-user.target
 EOF
   if [ ! -f "$TUNSB_UNIT" ] || ! cmp -s "$tuns_unit_tmp" "$TUNSB_UNIT"; then
     cat "$tuns_unit_tmp" > "$TUNSB_UNIT"
-    unit_changed=1
   fi
   rm -f "$tuns_unit_tmp"
   systemctl daemon-reload
   systemctl enable tun-singbox.service >/dev/null 2>&1 || true
-  if [ "$conf_changed" -eq 1 ] || [ "$unit_changed" -eq 1 ] \
-     || ! systemctl is-active --quiet tun-singbox.service; then
+
+  # (c) THE WALK (build 192): for each planned candidate —
+  # render, install, let sing-box judge the config, start the
+  # unit, and only trust the node when real traffic answers
+  # through the proxy. First candidate carrying traffic wins.
+  conf_src="$APP_DIR/$TUNSB_CONF"
+  conf_dst="$TUNSB_HOME/config.json"
+  won=0
+  win_idx="" win_label="" win_country="" win_sha=""
+  win_proto="" win_transport="" win_security=""
+  tried=0
+  all_invalid=1
+  last_kind="" last_reason=""
+  last_label="" last_proto="" last_transport="" last_security=""
+  seen_shas=""
+  for idx in $order; do
+    if [ "$cand_mode" = "walk" ]; then
+      c_label="$(tuns_cand_field "$idx" label)"
+      c_proto="$(tuns_cand_field "$idx" proto)"
+      c_transport="$(tuns_cand_field "$idx" transport)"
+      c_security="$(tuns_cand_field "$idx" security)"
+      case "$(tuns_render "$idx")" in
+        OK) ;;
+        *) reason="candidate could not be rendered"
+           tun_attempt_add "$idx" "$c_label" "$c_proto" "$c_transport" "$c_security" config-invalid "$reason"
+           tried=$((tried+1))
+           last_kind="config-invalid"; last_reason="$reason"
+           last_label="$c_label"; last_proto="$c_proto"
+           last_transport="$c_transport"; last_security="$c_security"
+           continue ;;
+      esac
+    else
+      c_label="$(tgba_env_get VT_TUNNEL_LABEL)"
+      read -r c_proto c_transport c_security <<< "$(tun_triple "$conf_src")"
+    fi
+    conf_sha="$(sha256sum "$conf_src" 2>/dev/null | cut -d' ' -f1)"
+    if [ -n "$conf_sha" ]; then
+      case " $seen_shas " in
+        *" $conf_sha "*) continue ;;  # same node twice in one subscription
+      esac
+      seen_shas="$seen_shas $conf_sha"
+    fi
+    tried=$((tried+1))
+    last_label="$c_label"; last_proto="$c_proto"
+    last_transport="$c_transport"; last_security="$c_security"
+
+    cp "$conf_src" "$conf_dst"
+    chmod 600 "$conf_dst" 2>/dev/null || true
+    chown "$APP_USER:$APP_USER" "$conf_dst" 2>/dev/null || true
+    tuns_check_out="$("$tuns_bin" check -c "$conf_dst" 2>&1)"
+    if [ $? -ne 0 ]; then
+      # sing-box prints log-prefixed lines (FATAL[...] ...); the
+      # failure line itself is the diagnosis, so select it (not
+      # a tail window) before sanitizing (build 190).
+      tuns_reason="$(printf '%s' "$tuns_check_out" | grep -iE 'fatal|fail|error' | tail -n 1 | tun_sanitize)"
+      if [ -z "$tuns_reason" ]; then
+        tuns_reason="$(printf '%s' "$tuns_check_out" | tail -n 1 | tun_sanitize)"
+      fi
+      [ -n "$tuns_reason" ] || tuns_reason="sing-box rejected the config (no detail captured)"
+      tun_attempt_add "$idx" "$c_label" "$c_proto" "$c_transport" "$c_security" config-invalid "$tuns_reason"
+      last_kind="config-invalid"; last_reason="$tuns_reason"
+      continue
+    fi
+    all_invalid=0
+
     systemctl restart tun-singbox.service || echo "WARN: tun-singbox failed to start."
     sleep 2
-  fi
+    if ! systemctl is-active --quiet tun-singbox.service; then
+      tuns_reason="$(journalctl -u tun-singbox.service -n 5 --no-pager -o cat 2>/dev/null | tail -n 2 | tun_sanitize)"
+      [ -n "$tuns_reason" ] || tuns_reason="service failed to start"
+      tun_attempt_add "$idx" "$c_label" "$c_proto" "$c_transport" "$c_security" unit-failed "$tuns_reason"
+      last_kind="unit-failed"; last_reason="$tuns_reason"
+      continue
+    fi
 
-  # (d) point the app at the tunnel ONLY when it is really up and
-  # carrying traffic: one lightweight egress check THROUGH the
-  # proxy (the mixed inbound speaks HTTP proxy, so the build-189
-  # check is unchanged); the country it reports is what the
-  # Admin card shows.
-  if systemctl is-active --quiet tun-singbox.service; then
-    tuns_trace="$(curl -fsS --max-time 25 --proxy "http://127.0.0.1:${TUNSB_PORT}" \
+    # Egress: one lightweight check THROUGH the proxy (the mixed
+    # inbound speaks HTTP proxy); the country it reports is what
+    # the Admin card shows. Per-attempt timeout is short — the
+    # walk is bounded (<= 6 attempts).
+    tuns_trace="$(curl -fsS --max-time 12 --proxy "http://127.0.0.1:${TUNSB_PORT}" \
                   https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
     tuns_country="$(printf '%s' "$tuns_trace" | grep -E '^loc=' | head -1 | cut -d= -f2 | tr -d ' \r' | cut -c1-2)"
     if [ -n "$tuns_trace" ] && [ -n "$tuns_country" ]; then
-      tuns_env_set VT_TUNNEL_PROXY "http://127.0.0.1:${TUNSB_PORT}"
-      tuns_env_set VT_TUNNEL_COUNTRY "$tuns_country"
-      tuns_env_set VT_TUNNEL_CONF_SHA "$conf_sha"
-      tun_write_status 1 "" "" "$tuns_proto" "$tuns_transport" "$tuns_security" "$tuns_country"
-      echo "VPN tunnel: live on 127.0.0.1:${TUNSB_PORT} — egress country ${tuns_country}; Gemini/OpenAI will use it."
-      exit 0
+      tun_attempt_add "$idx" "$c_label" "$c_proto" "$c_transport" "$c_security" ok ""
+      won=1
+      win_idx="$idx"; win_label="$c_label"; win_country="$tuns_country"
+      win_sha="$conf_sha"
+      win_proto="$c_proto"; win_transport="$c_transport"; win_security="$c_security"
+      break
     fi
-    tuns_clear_pointers
-    tun_write_status 0 egress-failed "no answer through the local proxy — node unreachable or subscription expired" "$tuns_proto" "$tuns_transport" "$tuns_security" ""
-    echo "WARN: tunnel egress check failed (node down?) — tunnel pointers cleared; Gemini/OpenAI stay direct."
-    exit 1
+    tuns_reason="no answer through the local proxy — node unreachable or subscription expired"
+    tun_attempt_add "$idx" "$c_label" "$c_proto" "$c_transport" "$c_security" egress-failed "$tuns_reason"
+    last_kind="egress-failed"; last_reason="$tuns_reason"
+  done
+
+  # (d) verdict.
+  if [ "$won" -eq 1 ]; then
+    tuns_env_set VT_TUNNEL_PROXY "http://127.0.0.1:${TUNSB_PORT}"
+    tuns_env_set VT_TUNNEL_COUNTRY "$win_country"
+    tuns_env_set VT_TUNNEL_CONF_SHA "$win_sha"
+    if [ "$cand_mode" = "walk" ]; then
+      # Persist the winner so the card names the LIVE node and
+      # the next walk tries it first (build 192).
+      tuns_env_set VT_TUNNEL_LABEL "$win_label"
+      tuns_env_set VT_TUNNEL_NODE_IDX "$win_idx"
+    fi
+    tun_write_status 1 "" "" "$win_label" "$win_proto" "$win_transport" "$win_security" "$win_country" "$tried" "$cand_total"
+    echo "VPN tunnel: live on 127.0.0.1:${TUNSB_PORT} — node ${win_label} (egress country ${win_country}); Gemini/OpenAI will use it."
+    exit 0
   fi
-  tuns_reason="$(journalctl -u tun-singbox.service -n 5 --no-pager -o cat 2>/dev/null | tail -n 2 | tun_sanitize)"
-  [ -n "$tuns_reason" ] || tuns_reason="service failed to start"
+
   tuns_clear_pointers
-  tun_write_status 0 unit-failed "$tuns_reason" "$tuns_proto" "$tuns_transport" "$tuns_security" ""
-  echo "WARN: tun-singbox is not active; tunnel pointers cleared (Gemini/OpenAI stay direct)."
+  tun_write_status 0 "$last_kind" "$last_reason" "$last_label" "$last_proto" "$last_transport" "$last_security" "" "$tried" "$cand_total"
+  if [ "$all_invalid" -eq 1 ] && [ "$tried" -gt 0 ]; then
+    # Deterministic: sing-box rejected every candidate outright
+    # — re-testing buys nothing (build 190 terminal rule).
+    systemctl stop tun-singbox.service >/dev/null 2>&1 || true
+    echo "WARN: sing-box rejects the saved config — tunnel pointers cleared (Gemini/OpenAI stay direct). Reason: $last_reason"
+    exit 0
+  fi
+  if [ "$last_kind" = "unit-failed" ]; then
+    echo "WARN: tun-singbox is not active; tunnel pointers cleared (Gemini/OpenAI stay direct)."
+  else
+    echo "WARN: tunnel egress check failed (node down?) — tunnel pointers cleared; Gemini/OpenAI stay direct."
+  fi
   exit 1
 )
 
@@ -641,9 +911,10 @@ act_tg_inputs_sha() {
 
 act_tun_inputs_sha() {
   # Inputs: the saved link line (the card's value — a re-save with
-  # a new node changes it) + the rendered sing-box config the
-  # section consumes (its re-render output). Keyed on both so the
-  # first build-191 run fires on the owner's build-190 state
+  # a new node changes it) + the rendered sing-box config on disk
+  # (the build-191 re-render output; since build 192, the
+  # failover walk's winning render). Keyed on both so the first
+  # build-191 run fires on the owner's build-190 state
   # (old marker, xray-era config) and re-renders + activates with
   # no re-save.
   { grep -E '^[[:space:]]*VT_TUNNEL_LINK_B64[[:space:]]*=' "$APP_DIR/.env" 2>/dev/null || true

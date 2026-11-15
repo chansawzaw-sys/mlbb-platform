@@ -1623,6 +1623,7 @@ async function loadTunState() {
       : (d.up
           ? "✅ Tunnel တက်နေတယ်" + (d.country ? " (exit: " + d.country + ")" : "")
             + (d.label ? " · node: " + d.label : "")
+            + (d.tried > 1 && d.nodes ? " · node " + d.tried + "/" + d.nodes + " မြောက် မှ အဆင်ပြေ" : "")
             + (d.gemini_ok ? " — Gemini ဦးဆောင်" : "")
             + tunNotes
           : (d.fail_kind
@@ -1630,6 +1631,7 @@ async function loadTunState() {
                          : d.fail_kind === "egress-failed" ? "node ကို ဆက်သွယ်လို့ မရပါ"
                          : "tunnel service တက်မလာပါ")
                 + (d.fail_reason ? ": " + d.fail_reason : "")
+                + (d.tried && d.nodes ? " · node " + d.tried + "/" + d.nodes + " ခု စမ်းပြီး" : "")
                 + (d.label ? " · node: " + d.label : "")
               : "⏳ ထည့်ပြီးသား" + (d.label ? " (node: " + d.label + ")" : "")
                 + " — Tunnel က နောက် update မှာ တက်လာမယ်")
@@ -2170,6 +2172,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 191</p>
+<p class="hint" id="buildTag" style="text-align:center">build 192</p>
 </body>
 </html>

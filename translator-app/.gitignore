@@ -6,10 +6,16 @@ __pycache__/
 
 # Secrets — never commit
 .env
+# Build 192 .env write lock + atomic-write temp files
+.env.lock
+.env.tmp.*
 # Rendered tunnel client configs (node credential) — xray-era
 # (builds 189/190) and the sing-box config (build 191)
 tun-xray.json
 tun-singbox.json
+# Build 192 failover candidates cache (subscription body — a
+# credential like the config)
+tun-candidates.cache
 # Build 190 runtime state: tunnel activation diagnosis + markers
 tun-status.json
 .settings-activated.tg.sha
