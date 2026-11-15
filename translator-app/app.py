@@ -2298,7 +2298,7 @@ def telegram_api_delete():
 # V2Ray subscription here (a vless:// or vmess:// share link, or
 # a subscription URL); pipeline/tunnel.py parses it at save time
 # into an xray client config (tun-xray.json in the app dir,
-# chmod 600), and the deploy bootstrap (§13e) runs xray-core
+# chmod 600), and deploy/activate-settings.sh runs xray-core
 # with it: one HTTP proxy inbound on 127.0.0.1, used ONLY by the
 # Gemini/OpenAI clients, only after an egress check through the
 # proxy has passed (VT_TUNNEL_PROXY + VT_TUNNEL_CONF_SHA in

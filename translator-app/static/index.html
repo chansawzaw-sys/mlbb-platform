@@ -1606,14 +1606,28 @@ async function loadTunState() {
       return;
     }
     setPill("tunPill", d.configured);
+    // Build 190: the selection notes must be visible, not
+    // silent — an SG node skipped for the no-encryption rule,
+    // and a saved node xray will refuse outright.
+    const tunNotes =
+      (d.skipped_sg ? " — ⚠️ SG node (" + d.skipped_sg + ") ကို encryption မပါလို့ ကျော်ပြီး တခြား node ရွေးထားတယ်" : "")
+      + (d.insecure ? " — ⚠️ ရွေးထားတဲ့ node က encryption မပါတဲ့ vless မို့ xray က လက်ခံမှာ မဟုတ်ပါ — node/subscription အသစ် လိုပါတယ်" : "");
     $("tunState").textContent = !d.configured
       ? "❌ မထည့်ရသေး (Gemini/OpenAI တိုက်ရိုက် ပိတ်ထိနေဆဲ)"
       : (d.up
           ? "✅ Tunnel တက်နေတယ်" + (d.country ? " (exit: " + d.country + ")" : "")
             + (d.label ? " · node: " + d.label : "")
             + (d.gemini_ok ? " — Gemini ဦးဆောင်" : "")
-          : "⏳ ထည့်ပြီးသား" + (d.label ? " (node: " + d.label + ")" : "")
-            + " — Tunnel က နောက် update မှာ တက်လာမယ်");
+            + tunNotes
+          : (d.fail_kind
+              ? "❌ " + (d.fail_kind === "config-invalid" ? "config မှာ ပြဿနာ"
+                         : d.fail_kind === "egress-failed" ? "node ကို ဆက်သွယ်လို့ မရပါ"
+                         : "xray service တက်မလာပါ")
+                + (d.fail_reason ? ": " + d.fail_reason : "")
+                + (d.label ? " · node: " + d.label : "")
+              : "⏳ ထည့်ပြီးသား" + (d.label ? " (node: " + d.label + ")" : "")
+                + " — Tunnel က နောက် update မှာ တက်လာမယ်")
+            + tunNotes);
     $("tunCard").classList.add("show");
   } catch (e) { $("tunState").textContent = "?"; }
 }
@@ -1628,6 +1642,8 @@ $("tunSave").onclick = async () => {
   $("tunInput").value = "";
   loadTunState();
   alert("သိမ်းပြီးပြီ — ရွေးထားတဲ့ node: " + (d.label || "?")
+    + (d.skipped_sg ? "\n⚠️ SG node (" + d.skipped_sg + ") ကို encryption မပါလို့ ကျော်ခဲ့တယ်" : "")
+    + (d.insecure ? "\n⚠️ ဒီ node က encryption မပါတဲ့ vless မို့ xray က လက်ခံမှာ မဟုတ်ပါ — node/subscription အသစ် လိုပါတယ်" : "")
     + " — နောက် update (၁၅ မိနစ် အတွင်း) မှာ tunnel တက်လာပြီး စစ်ပြီးရင် Gemini ဦးဆောင် ဖြစ်သွားမယ်");
 };
 $("tunDel").onclick = async () => {
@@ -2149,6 +2165,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 189</p>
+<p class="hint" id="buildTag" style="text-align:center">build 190</p>
 </body>
 </html>

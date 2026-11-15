@@ -93,6 +93,17 @@ git pull
 AFTER="$(git rev-parse HEAD)"
 if [ "$BEFORE" = "$AFTER" ]; then
   echo "Already up to date ($AFTER)."
+  # Build 190: an Admin card save (Telegram API credentials, VPN
+  # node) must take effect WITHOUT waiting for a code deploy —
+  # before this, the no-change exit below skipped the bootstrap
+  # entirely, so saved settings stayed inert until an unrelated
+  # code push happened. The activation script is marker-gated
+  # (a fast no-op when no card save is pending), fail-safe, and
+  # restarts only its own units (tg-bot-api / tun-xray), never
+  # the translator app.
+  if [ -f "$APP/deploy/activate-settings.sh" ]; then
+    APP_DIR="$APP" bash "$APP/deploy/activate-settings.sh" || true
+  fi
   log_tick "tick ok (no change)"
   exit 0
 fi
