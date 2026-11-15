@@ -1618,6 +1618,15 @@ async function loadTunState() {
     // no-encryption refusal note is gone.)
     const tunNotes =
       (d.skipped_sg ? " — ⚠️ SG node (" + d.skipped_sg + ") ကို သုံးလို့ မရတဲ့ ပုံစံ မို့ ကျော်ပြီး တခြား node ရွေးထားတယ်" : "");
+    // Build 195: the server's full candidate list (labels
+    // only), so the owner can compare it with his phone app's
+    // node list at a glance — first 6 + "+N" when longer.
+    const tunNodes =
+      (d.candidates && d.candidates.length
+        ? " · nodes: " + d.candidates.slice(0, 6).join(" · ")
+          + (d.candidates.length > 6
+             ? " · +" + (d.candidates.length - 6) : "")
+        : "");
     $("tunState").textContent = !d.configured
       ? "❌ မထည့်ရသေး (Gemini/OpenAI တိုက်ရိုက် ပိတ်ထိနေဆဲ)"
       : (d.up
@@ -1625,6 +1634,7 @@ async function loadTunState() {
             + (d.label ? " · node: " + d.label : "")
             + (d.tried > 1 && d.nodes ? " · node " + d.tried + "/" + d.nodes + " မြောက် မှ အဆင်ပြေ" : "")
             + (d.gemini_ok ? " — Gemini ဦးဆောင်" : "")
+            + tunNodes
             + tunNotes
           : (d.fail_kind
               ? "❌ " + (d.fail_kind === "config-invalid" ? "config မှာ ပြဿနာ"
@@ -1635,6 +1645,7 @@ async function loadTunState() {
                 + (d.label ? " · node: " + d.label : "")
               : "⏳ ထည့်ပြီးသား" + (d.label ? " (node: " + d.label + ")" : "")
                 + " — Tunnel က နောက် update မှာ တက်လာမယ်")
+            + tunNodes
             + tunNotes);
     $("tunCard").classList.add("show");
   } catch (e) { $("tunState").textContent = "?"; }
@@ -2200,6 +2211,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 194</p>
+<p class="hint" id="buildTag" style="text-align:center">build 195</p>
 </body>
 </html>

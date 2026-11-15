@@ -98,6 +98,23 @@ now raises instead of falling through to a plain-tcp render
 — a config sing-box would validate that is wrong on the
 wire.
 
+Build 195: subscription fetch rotation. Even with
+httpupgrade known, the live walk still failed: the card
+showed exactly 2 candidates, the first labelled "Happ",
+while the owner's phone app — fetching the SAME
+subscription URL — lists Singapore 3 / Singapore 2 / Thai
+/ Thai 2. The reseller panel serves different bodies by
+User-Agent: recognised proxy-app UAs get the full node
+list, a generic UA gets a reduced one. _fetch_subscription
+therefore fetches the URL with a sequence of client
+User-Agents (Happ, v2rayNG, Streisand, sing-box, and the
+pre-195 default last), counts the usable candidates each
+body yields, and keeps the best body (ties go to the
+earliest UA). The winning UA's NAME (never the URL or the
+body) is recorded with the save bookkeeping, and status()
+exposes the full ordered candidate label list so the owner
+can compare the server's list with his phone's at a glance.
+
 Supported node formats: vless and vmess share links with
 tcp / ws / grpc / h2 / httpupgrade transports and none / tls
 / reality security (the shapes real subscriptions
@@ -147,6 +164,7 @@ _ENV_COUNTRY = "VT_TUNNEL_COUNTRY"
 _ENV_SHA = "VT_TUNNEL_CONF_SHA"
 _ENV_SKIPSG = "VT_TUNNEL_SKIPPED_SG"
 _ENV_NODE_IDX = "VT_TUNNEL_NODE_IDX"  # build 192: failover winner
+_ENV_FETCH_UA = "VT_TUNNEL_FETCH_UA"  # build 195: winning UA name
 
 _STATUS_NAME = "tun-status.json"
 
@@ -591,36 +609,102 @@ def _select_node(text):
             _pick_notes(ordered[0], skipped_sg))
 
 
+# Build 195: reseller panels serve DIFFERENT subscription
+# bodies by User-Agent — recognised proxy apps get the full
+# node list, a generic UA gets a reduced one (live evidence:
+# the server's fetch saw 2 candidates headed by a node
+# labelled "Happ" while the owner's phone app, fetching the
+# same URL, listed Singapore 3 / Singapore 2 / Thai /
+# Thai 2). The fetch therefore rotates through the client
+# UAs below — app UAs first, the pre-195 default LAST — and
+# keeps the body yielding the most usable candidates. Only
+# UA names ever leave this module (bookkeeping / status);
+# the URL and bodies never do.
+_SUB_UAS = (
+    ("Happ", "Happ/1.9.0"),
+    ("v2rayNG", "v2rayNG/1.9.5"),
+    ("Streisand", "Streisand/1.0"),
+    ("sing-box", "sing-box/1.14.4"),
+    ("default", "v2rayNG/1.9.5 (video-translator tunnel setup)"),
+)
+
+
+def _subscription_scan_text(body):
+    """A fetched subscription body -> the text the share
+    links are scanned from: the body itself when it already
+    carries links, else its base64 decoding, else the body
+    unchanged (the candidate scan then raises its own
+    owner-facing error on it). Exactly the pre-195 _scan_text
+    handling of a fetched body."""
+    if _LINK_RE.search(body or ""):
+        return body
+    decoded = _b64_loose(body)
+    if decoded:
+        return decoded.decode("utf-8", "replace")
+    return body
+
+
+def _count_usable(text):
+    """How many usable candidates a scan text yields (0 when
+    the scan raises) — the fetch rotation's only score."""
+    try:
+        ordered, _skipped = _candidates_from_text(text)
+        return len(ordered)
+    except ValueError:
+        return 0
+
+
 def _fetch_subscription(url):
-    """GET a subscription URL and return its body as text.
-    Deliberately DIRECT (no proxy): at save time there may be no
-    tunnel yet, and subscription hosts are not the blocked party.
-    The URL itself is a credential — never logged, never put in
-    an exception message."""
+    """GET a subscription URL and return (scan_text,
+    ua_name, candidate_count): the best body across the
+    _SUB_UAS rotation (build 195) — "best" = most usable
+    candidates, ties to the earliest UA in the list.
+    Deliberately DIRECT (no proxy): at save time there may be
+    no tunnel yet, and subscription hosts are not the blocked
+    party. The URL itself is a credential — never logged,
+    never put in an exception message. When EVERY fetch
+    fails, raises the same owner-facing Burmese error the
+    single-fetch version raised; when fetches succeed but no
+    body yields a usable node, the best (first-winning) body
+    is still returned and the candidate scan downstream
+    raises its own error — the pre-195 behaviour either way.
+    """
     try:
         import requests
     except Exception:
         raise ValueError("subscription URL ကို ဖတ်လို့ မရပါ — "
                          "link မှန်ရဲ့လား စစ်ပေးပါ")
-    try:
-        resp = requests.get(
-            url, timeout=30,
-            headers={"User-Agent": "v2rayNG/1.9.5 "
-                                   "(video-translator tunnel setup)"})
-        resp.raise_for_status()
-    except Exception:
+    best = None  # (count, scan_text, ua_name)
+    for ua_name, ua in _SUB_UAS:
+        try:
+            resp = requests.get(url, timeout=30,
+                                headers={"User-Agent": ua})
+            resp.raise_for_status()
+        except Exception:
+            continue
+        text = _subscription_scan_text(resp.text or "")
+        count = _count_usable(text)
+        # Strictly-greater wins: on a tie the EARLIER UA in
+        # _SUB_UAS keeps the lead, so every UA is always tried
+        # (a later body may carry strictly more nodes).
+        if best is None or count > best[0]:
+            best = (count, text, ua_name)
+    if best is None:
         raise ValueError("subscription URL ကို ဖတ်လို့ မရပါ — "
                          "link မှန်ရဲ့လား စစ်ပေးပါ")
-    return resp.text or ""
+    count, text, ua_name = best
+    return text, ua_name, count
 
 
 def _scan_text(raw):
-    """Whatever the owner pasted -> (text_to_scan, kind): the
-    plain text the share links are scanned from, and how the
-    input arrived. A subscription URL is fetched ONCE, here;
-    callers that need the same resolution again (the build-192
-    failover walk) reuse this text via the candidates cache
-    instead of fetching again.
+    """Whatever the owner pasted -> (text_to_scan, kind,
+    fetch_ua): the plain text the share links are scanned
+    from, how the input arrived, and — for a fetched
+    subscription — the NAME of the User-Agent whose body won
+    the build-195 rotation (None for pastes). A subscription
+    URL is fetched ONCE, here; callers that need the same
+    resolution again (the build-192 failover walk) reuse this
+    text via the candidates cache instead of fetching again.
 
     kind: "link" (one or more share links pasted directly),
     "subscription" (an http(s) URL that was fetched), or
@@ -630,25 +714,19 @@ def _scan_text(raw):
         raise ValueError("အရင် link သို့မဟုတ် subscription URL ထည့်ပါ")
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     if len(lines) == 1 and lines[0].startswith(_SUPPORTED):
-        return lines[0], "link"
+        return lines[0], "link", None
     # A lone http(s) URL is a subscription to fetch — checked
     # BEFORE the link-list branch, which would otherwise eat it
     # (a URL contains "://" too).
     if re.fullmatch(r"https?://\S+", raw):
-        body = _fetch_subscription(raw)
-        if _LINK_RE.search(body or ""):
-            return body, "subscription"
-        decoded = _b64_loose(body)
-        if decoded:
-            return decoded.decode("utf-8", "replace"), "subscription"
-        # Nothing scannable either way: let the candidate scan
-        # raise its own owner-facing error on the raw body.
-        return body, "subscription"
+        text, ua_name, _count = _fetch_subscription(raw)
+        return text, "subscription", ua_name
     if lines and all("://" in ln for ln in lines):
-        return raw, "link"
+        return raw, "link", None
     decoded = _b64_loose(raw)
     if decoded:
-        return decoded.decode("utf-8", "replace"), "subscription-paste"
+        return decoded.decode("utf-8", "replace"), \
+            "subscription-paste", None
     raise ValueError("ပုံစံ မမှန်ပါ — vless:// / vmess:// link, "
                      "subscription URL, သို့မဟုတ် subscription "
                      "စာသား ထည့်ပါ")
@@ -656,8 +734,10 @@ def _scan_text(raw):
 
 def _resolve_candidates(raw):
     """Full resolution of a paste: (ordered_candidates,
-    kind, skipped_sg, scan_text). ordered_candidates is the
-    _candidates_from_text list of (node, label, raw_link)."""
+    kind, skipped_sg, scan_text, fetch_ua). ordered_candidates
+    is the _candidates_from_text list of (node, label,
+    raw_link); fetch_ua is the build-195 winning UA name for
+    a fetched subscription, else None."""
     raw = (raw or "").strip()
     if not raw:
         raise ValueError("အရင် link သို့မဟုတ် subscription URL ထည့်ပါ")
@@ -666,10 +746,10 @@ def _resolve_candidates(raw):
         # The single-link fast path keeps the parser's own
         # precise error messages (the pre-192 behaviour).
         node, label = parse_share_link(lines[0])
-        return [(node, label, lines[0])], "link", "", lines[0]
-    text, kind = _scan_text(raw)
+        return [(node, label, lines[0])], "link", "", lines[0], None
+    text, kind, fetch_ua = _scan_text(raw)
     ordered, skipped_sg = _candidates_from_text(text)
-    return ordered, kind, skipped_sg, text
+    return ordered, kind, skipped_sg, text, fetch_ua
 
 
 def resolve_input(raw):
@@ -678,7 +758,8 @@ def resolve_input(raw):
     input arrived, how many parseable nodes the input offered,
     and the selection notes (skipped SG label, chosen triple)
     from _pick_notes."""
-    ordered, kind, skipped_sg, _text = _resolve_candidates(raw)
+    ordered, kind, skipped_sg, _text, _ua = \
+        _resolve_candidates(raw)
     node, label, _link = ordered[0]
     return node, label, kind, len(ordered), \
         _pick_notes(ordered[0], skipped_sg)
@@ -758,8 +839,14 @@ def _resolve_saved():
     if raw_bytes is None:
         raise ValueError("သိမ်းထားတဲ့ link ကို decode လုပ်လို့ မရပါ")
     raw = raw_bytes.decode("utf-8", "replace")
-    ordered, kind, skipped_sg, text = _resolve_candidates(raw)
+    ordered, kind, skipped_sg, text, fetch_ua = \
+        _resolve_candidates(raw)
     _write_cache(b64, text)
+    if fetch_ua:
+        # A re-resolution fetched the subscription (the cache
+        # was missing/stale): the winning UA name is part of
+        # the save bookkeeping (build 195).
+        _env_set(_ENV_FETCH_UA, fetch_ua)
     return ordered, kind, skipped_sg
 
 
@@ -853,7 +940,8 @@ def save_link(raw):
     ValueError with an owner-facing Burmese message; on ANY
     failure nothing is written (a previously working config
     is never clobbered by a bad paste)."""
-    ordered, kind, skipped_sg, text = _resolve_candidates(raw)
+    ordered, kind, skipped_sg, text, fetch_ua = \
+        _resolve_candidates(raw)
     node, label, _link = ordered[0]
     notes = _pick_notes(ordered[0], skipped_sg)
     _write_conf(node)
@@ -862,6 +950,11 @@ def save_link(raw):
         (raw or "").strip().encode("utf-8")).decode("ascii")
     _env_set(_ENV_LINK, link_b64)
     _env_set(_ENV_LABEL, label.replace("\n", " "))
+    # Build 195: for a fetched subscription, record WHICH
+    # client User-Agent's body won the rotation (the name
+    # only — never the URL or the body). A direct link /
+    # pasted body clears it: no fetch happened.
+    _env_set(_ENV_FETCH_UA, fetch_ua or "")
     # The SG node skipped for format reasons (label only — a
     # remark, not a credential) is persisted so the card keeps
     # showing the skip after a page reload.
@@ -876,6 +969,7 @@ def save_link(raw):
     _drop_verified_pointers()
     return {"label": label, "kind": kind, "nodes": len(ordered),
             "skipped_sg": notes["skipped_sg"],
+            "fetch_ua": fetch_ua,
             **notes["triple"]}
 
 
@@ -920,7 +1014,7 @@ def clear():
     _remove_status_file()
     for key in (_ENV_LINK, _ENV_LABEL, _ENV_PROXY,
                 _ENV_COUNTRY, _ENV_SHA, _ENV_SKIPSG,
-                _ENV_NODE_IDX):
+                _ENV_NODE_IDX, _ENV_FETCH_UA):
         _env_set(key, "")
 
 
@@ -1004,7 +1098,14 @@ def status():
     script's last attempt failed — `fail_kind` / `fail_reason`
     from tun-status.json (sanitized structural text written by
     deploy/activate-settings.sh; the file carries no addresses
-    or ids by construction)."""
+    or ids by construction).
+
+    Build 195: `candidates` — the full ordered candidate
+    LABEL list (labels only, resolved from the saved input
+    via the candidates cache; absent when the saved input no
+    longer resolves) — and `fetch_ua`, the name of the
+    User-Agent whose subscription body won the fetch
+    rotation ("" when the input was pasted, not fetched)."""
     conf_saved = configured()
     up = verified()
     st = {"configured": conf_saved,
@@ -1013,10 +1114,20 @@ def status():
           "country": _env_get(_ENV_COUNTRY) if up else "",
           "port": PROXY_PORT,
           "engine": ENGINE,
-          "skipped_sg": _env_get(_ENV_SKIPSG) if conf_saved else ""}
+          "skipped_sg": _env_get(_ENV_SKIPSG) if conf_saved else "",
+          "fetch_ua": _env_get(_ENV_FETCH_UA) if conf_saved else ""}
     triple = _disk_triple() if conf_saved else None
     if triple:
         st.update(triple)
+    if conf_saved:
+        try:
+            res = _resolve_saved()
+            if res:
+                ordered, _kind, _skip = res
+                st["candidates"] = [label
+                                    for _n, label, _l in ordered]
+        except Exception:
+            pass
     try:
         diag = json.loads(_status_path().read_text(encoding="utf-8"))
         if isinstance(diag, dict):
