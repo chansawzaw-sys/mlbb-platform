@@ -548,7 +548,20 @@ let logoId = null;
 let logoPos = {x: 1, y: 0};          // 0..1 across travel range (W-logoW, H-logoH)
 let blur = null;                      // {x,y,w,h} normalized
 
+/* Voice styles (build 200): chip ids are style keys from the
+   shared table in pipeline.tts — the two my-MM voices, each in
+   မူလ / pitch-variant styles. The fallback list mirrors
+   /api/voices so the picker still works if the fetch fails. */
+const VOICE_STYLES_FALLBACK = [
+  {id: "thiha", label: "Thiha (မူလ)"},
+  {id: "thiha-deep", label: "Thiha အသံနက်"},
+  {id: "thiha-light", label: "Thiha အသံပါး"},
+  {id: "nilar", label: "Nilar (မူလ)"},
+  {id: "nilar-deep", label: "Nilar အသံနက်"},
+  {id: "nilar-high", label: "Nilar အသံမြင့်"}];
+let voiceList = VOICE_STYLES_FALLBACK;
 function voiceChips(vs) {
+  voiceList = vs;
   $("voiceChips").innerHTML = vs.map(v =>
     `<button class="chip${v.id === W.voice ? " on" : ""}" data-voice="${v.id}">${v.label}</button>`).join("");
   $("voiceChips").querySelectorAll(".chip").forEach(c => c.onclick = () => {
@@ -557,8 +570,7 @@ function voiceChips(vs) {
   });
 }
 fetch("/api/voices").then(r => r.json()).then(voiceChips).catch(() =>
-  voiceChips([{id: "my-MM-NilarNeural", label: "အမျိုးသမီး (Nilar)"},
-              {id: "my-MM-ThihaNeural", label: "အမျိုးသား (Thiha)"}]));
+  voiceChips(VOICE_STYLES_FALLBACK));
 
 /* ---------------- preview ---------------- */
 $("previewBtn").onclick = async () => {
@@ -729,7 +741,7 @@ stage.addEventListener("pointercancel", onUp);
    voice/speed steps, dub-only skips the subtitle step. */
 const W = { step: 1, mode: "both", aspect: "", aspectStyle: "blur",
             blurChoice: null, place: "box", subSize: 100, color: "white",
-            logoChoice: null, voice: "my-MM-ThihaNeural", speed: 1.3,
+            logoChoice: null, voice: "thiha", speed: 1.3,
             quality: "hd", pvFailed: false };
 const WIZ_NAMES = {1: "လင့်ခ်", 2: "Preview", 3: "ဝါး", 4: "စာတန်း",
                    5: "Logo", 6: "အသံ", 7: "အရှိန်", 8: "အကျဉ်းချုပ်"};
@@ -836,7 +848,7 @@ function wizSummaryRender() {
       + " · အရွယ် " + W.subSize + "% · အရောင် " + W.color);
   lines.push("🏷 Logo: " + (logoId && W.logoChoice === "yes" ? "ထည့်မယ်" : "မထည့်ဘူး"));
   if (W.mode !== "subs") {
-    lines.push("🎙 အသံ: " + (W.voice.includes("Nilar") ? "Nilar (မ)" : "Thiha (ကျား)"));
+    lines.push("🎙 အသံ: " + ((voiceList.find(v => v.id === W.voice) || {}).label || W.voice));
     lines.push("⏩ အရှိန်: " + Number(W.speed).toFixed(1) + "×");
   }
   lines.push(mins
@@ -902,7 +914,7 @@ $("go").onclick = async () => {
     size_pct: 18, opacity: 70, saturation: 100};
   const res = await fetch("/api/jobs", {method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({url, mode: W.mode,
-                          voice: W.voice, font: $("font").value,
+                          voice_style: W.voice, font: $("font").value,
                           voice_rate: 0, voice_pitch: 0,
                           speed_cap: W.speed, quality: W.quality,
                           subs: {size_pct: W.subSize,
@@ -2215,6 +2227,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 199</p>
+<p class="hint" id="buildTag" style="text-align:center">build 200</p>
 </body>
 </html>

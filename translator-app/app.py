@@ -2,10 +2,10 @@
 
 Run:  .venv/bin/python app.py        (PORT env, default 8611)
 UI:   http://localhost:8611/
-API:  POST /api/jobs {url, mode: subs|dub|both, voice}
+API:  POST /api/jobs {url, mode: subs|dub|both, voice_style}
       GET  /api/jobs/<id>            job state + step list
       GET  /api/jobs/<id>/download   finished .mp4
-      GET  /api/voices               available my-MM voices
+      GET  /api/voices               voice styles (build 200)
 """
 import hashlib
 import json
@@ -50,7 +50,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 199"
+BUILD_TAG = "build 200"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1175,7 +1175,10 @@ def _tg_pick_rows(flow):
     return rows
 
 
-_TG_VOICES = {"nilar": "my-MM-NilarNeural", "thiha": "my-MM-ThihaNeural"}
+# Build 200: the bot voice step offers the same six voice STYLES
+# as the web wizard, from the one shared table in pipeline.tts —
+# the callback suffix IS the style key ("v:" + key), stored on the
+# flow and resolved to (voice, pitch, rate) at job creation.
 
 
 _TG_SUB_COLORS = ("white", "yellow", "blue", "green", "red", "black")
@@ -1184,9 +1187,11 @@ _TG_SUB_COLORS = ("white", "yellow", "blue", "green", "red", "black")
 def _tg_voice_step(chat_id, flow):
     from pipeline import telegram_send as tg
     flow["step"] = "voice"
-    tg.send_message(chat_id, "အသံ ရွေးပေးပါ",
-                    buttons=[[("🎙 Nilar (မ)", "v:nilar"),
-                              ("🎙 Thiha (ကျား)", "v:thiha")]])
+    styles = tts.VOICE_STYLES
+    rows = [[("🎙 " + s["label"], "v:" + s["key"])
+             for s in styles[i:i + 2]]
+            for i in range(0, len(styles), 2)]
+    tg.send_message(chat_id, "အသံ ရွေးပေးပါ", buttons=rows)
 
 
 def _tg_quality_step(chat_id, flow):
@@ -1277,7 +1282,7 @@ def _tg_start_flow_job(chat_id, flow):
     job, err = _new_job({"url": flow.get("url")
                          or "https://telegram.org/file",
                          "mode": flow.get("mode") or "both",
-                         "voice": flow.get("voice"),
+                         "voice_style": flow.get("voice_style"),
                          "subs": ({"color": flow["sub_color"]}
                                   if flow.get("sub_color") else None),
                          "speed_cap": flow.get("speed_cap") or 1.3,
@@ -1490,10 +1495,10 @@ def _on_tg_callback(cq):
         _tg_start_flow_job(chat_id, flow)
         return
     if data.startswith("v:") and flow.get("step") == "voice":
-        voice = _TG_VOICES.get(data[2:])
-        if not voice:
+        style = tts.STYLE_BY_KEY.get(data[2:])
+        if not style:
             return
-        flow["voice"] = voice
+        flow["voice_style"] = style["key"]
         flow["step"] = "speed"
         tg.send_message(chat_id, "အသံ အရှိန် ရွေးပေးပါ",
                         buttons=[[("1.0×", "s:1.0"),
@@ -1840,20 +1845,14 @@ def api_version():
 
 @app.get("/api/voices")
 def voices():
-    try:
-        import asyncio
-        import edge_tts
-        proxy = (os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
-                 or os.environ.get("http_proxy") or None)
-        vs = asyncio.run(edge_tts.list_voices(proxy=proxy))
-        mine = [{"id": v["ShortName"],
-                 "label": ("အမျိုးသမီး (Nilar)" if "Nilar" in v["ShortName"] else "အမျိုးသား (Thiha)")}
-                for v in vs if v["Locale"] == "my-MM"]
-        if mine:
-            return jsonify(mine)
-    except Exception:
-        pass
-    return jsonify([{"id": v, "label": v} for v in tts.FALLBACK_VOICES])
+    # Build 200: the picker offers voice STYLES from the one
+    # shared table in pipeline.tts (the two my-MM voices × three
+    # pitch variants) — ids are style keys, resolved to a real
+    # voice + pitch at job creation. Static on purpose: the table
+    # IS the catalogue, so the picker works even when the live
+    # edge-tts voice list cannot be reached.
+    return jsonify([{"id": s["key"], "label": s["label"]}
+                    for s in tts.VOICE_STYLES])
 
 
 def _public_url_ok(url):
@@ -3318,7 +3317,6 @@ def _new_job(data):
     when its worker starts."""
     url = (data.get("url") or "").strip()
     mode = data.get("mode") or "both"
-    voice = data.get("voice") or tts.DEFAULT_VOICE
     font = data.get("font") or "noto"
     subs = _build_subs(data)
     # Voice tuning: percent speed (-50..+100) and Hz pitch (-50..+50);
@@ -3331,6 +3329,30 @@ def _new_job(data):
         voice_pitch = max(-50, min(50, int(data.get("voice_pitch") or 0)))
     except (TypeError, ValueError):
         voice_pitch = 0
+    # Voice style (build 200): the job carries a STYLE key
+    # (voice_style, or the voice field holding a key) resolved
+    # through the one shared table in pipeline.tts — six styles:
+    # the two my-MM voices × မူလ/±8Hz pitch variants. A chosen
+    # style's preset pitch/rate are authoritative (both surfaces
+    # send the tuning knobs as 0). A legacy plain voice id still
+    # works: it means that voice's မူလ variant and the explicit
+    # tuning knobs above keep applying, exactly as before. An
+    # unknown value fails safe to the product default style
+    # (Thiha မူလ). No voice at all keeps the historical default
+    # (tts.DEFAULT_VOICE, မူလ variant, knobs applying).
+    style_in = data.get("voice_style") or data.get("voice")
+    if style_in and str(style_in).strip() in tts.STYLE_BY_KEY:
+        style = tts.resolve_style(style_in)
+        voice = style["voice"]
+        voice_style = style["key"]
+        voice_rate, voice_pitch = style["rate"], style["pitch"]
+    elif style_in:
+        style = tts.resolve_style(style_in)
+        voice = style["voice"]
+        voice_style = style["key"]
+    else:
+        voice = tts.DEFAULT_VOICE
+        voice_style = tts.resolve_style(voice)["key"]
     # Dub speed cap: how far the retime step may speed speech up to
     # fit its window before it must freeze the frame instead
     # (owner's control, 1.0 = never speed up, up to 4.0).
@@ -3353,7 +3375,8 @@ def _new_job(data):
         return None, "mode မမှန်ပါ"
     job = {
         "id": uuid.uuid4().hex[:12], "url": url, "mode": mode,
-        "voice": voice, "font": font, "subs": subs,
+        "voice": voice, "voice_style": voice_style,
+        "font": font, "subs": subs,
         "voice_rate": voice_rate, "voice_pitch": voice_pitch,
         "speed_cap": speed_cap, "quality": quality,
         "fx": _build_fx(data), "source_path": None,

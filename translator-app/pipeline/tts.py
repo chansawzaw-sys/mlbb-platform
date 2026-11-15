@@ -41,6 +41,59 @@ FALLBACK_VOICES = ["my-MM-NilarNeural", "my-MM-ThihaNeural"]
 # i.e. exactly the previous behaviour. Ranges are edge-tts's own limits:
 # rate -50%..+100%, pitch -50Hz..+50Hz.
 
+VOICE_THIHA = "my-MM-ThihaNeural"
+VOICE_NILAR = "my-MM-NilarNeural"
+
+# Voice styles (build 200): the dub-voice picker on BOTH surfaces
+# (web wizard + Telegram bot) offers STYLES, not raw voices — the
+# two my-MM voices (Microsoft's whole Burmese catalogue), each in
+# three pitch variants. The pitch step is ±8Hz, well inside the
+# ±50Hz tuning clamp; rate stays 0 because speaking speed is the
+# separate retime speed-cap knob, not a voice trait. This table is
+# the ONE shared source: jobs carry the style KEY, and job creation
+# resolves it here to the (voice, pitch, rate) the synth path
+# consumes.
+VOICE_STYLES = [
+    {"key": "thiha", "label": "Thiha (မူလ)",
+     "voice": VOICE_THIHA, "pitch": 0, "rate": 0},
+    {"key": "thiha-deep", "label": "Thiha အသံနက်",
+     "voice": VOICE_THIHA, "pitch": -8, "rate": 0},
+    {"key": "thiha-light", "label": "Thiha အသံပါး",
+     "voice": VOICE_THIHA, "pitch": 8, "rate": 0},
+    {"key": "nilar", "label": "Nilar (မူလ)",
+     "voice": VOICE_NILAR, "pitch": 0, "rate": 0},
+    {"key": "nilar-deep", "label": "Nilar အသံနက်",
+     "voice": VOICE_NILAR, "pitch": -8, "rate": 0},
+    {"key": "nilar-high", "label": "Nilar အသံမြင့်",
+     "voice": VOICE_NILAR, "pitch": 8, "rate": 0},
+]
+STYLE_BY_KEY = {s["key"]: s for s in VOICE_STYLES}
+# The product default the owner settled on: Thiha, original pitch.
+DEFAULT_STYLE = "thiha"
+
+
+def resolve_style(value):
+    """Resolve a style key OR a legacy plain voice id to a preset
+    dict {key, label, voice, pitch, rate} (a copy — callers may not
+    mutate the table). A plain voice id maps to that voice's မူလ
+    (original) variant; anything unknown or empty fails safe to
+    DEFAULT_STYLE."""
+    if value:
+        v = str(value).strip()
+        hit = STYLE_BY_KEY.get(v)
+        if hit:
+            return dict(hit)
+        for s in VOICE_STYLES:
+            if s["voice"] == v and s["pitch"] == 0:
+                return dict(s)
+    return dict(STYLE_BY_KEY[DEFAULT_STYLE])
+
+
+def style_label(value):
+    """Display label for a style key / plain voice id (pickers,
+    summaries) — resolves through the same table."""
+    return resolve_style(value)["label"]
+
 
 def _clamp(value, lo, hi):
     try:
