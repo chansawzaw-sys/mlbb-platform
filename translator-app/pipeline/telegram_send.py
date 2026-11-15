@@ -21,6 +21,7 @@ How Telegram bots work, and why this module is shaped this way:
 Recipients persist in .tg_recipients.json in the app dir (survives
 app updates like .env does; never in git).
 """
+import fcntl
 import json
 import os
 import re
@@ -206,9 +207,46 @@ def is_recipient(chat_id):
     return str(chat_id) in store.get("users", {})
 
 
+def _poll_lock_path():
+    return _root() / ".tg_poll.lock"
+
+
 def poll_once():
     """One getUpdates pass: register anyone who talked to the bot and
-    greet first-timers. Returns how many updates were consumed."""
+    greet first-timers. Returns how many updates were consumed.
+
+    Build 199 (bot spam bursts 2026-11-15, twice in one day): two
+    defences wrap the pass. (1) A cross-process flock serialises
+    poll cycles — during a restart overlap two app processes could
+    otherwise work the same backlog and dispatch every update
+    twice; while the lock is held this call is a no-op. (2) A
+    persisted dispatch watermark (store["seen_max"], in
+    _poll_once_inner) means an already-dispatched update is never
+    dispatched again, even if Telegram re-delivers it — e.g. the
+    API endpoint flipping between the local Bot API server and the
+    cloud across a restart."""
+    try:
+        lf = open(_poll_lock_path(), "a+")
+    except Exception:
+        lf = None  # lock file unusable: poll anyway rather than never
+    if lf is not None:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lf.close()
+            return 0  # another poller is mid-cycle; skip this pass
+    try:
+        return _poll_once_inner()
+    finally:
+        if lf is not None:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lf.close()
+
+
+def _poll_once_inner():
     tok = token()
     if not tok:
         return 0
@@ -227,15 +265,28 @@ def poll_once():
     LAST_POLL["at"] = time.time()
     LAST_POLL["error"] = ""
     updates = data.get("result") or []
+    seen_max = store.get("seen_max", 0)
+    fresh = []
     new_users = []
     start_chats = set()
     for u in updates:
+        # The offset advances past EVERY update, re-delivered or
+        # not, so Telegram stops offering it...
+        store["offset"] = max(store.get("offset", 0), u["update_id"] + 1)
+        if u["update_id"] <= seen_max:
+            # ...but only never-dispatched updates are collected.
+            # The watermark is written with the store save below,
+            # BEFORE any greeting or handler runs
+            # (mark-before-dispatch), so even a crash mid-dispatch
+            # can never re-dispatch them.
+            continue
+        seen_max = u["update_id"]
+        fresh.append(u)
         _t = (u.get("message") or {}).get("text") or ""
         if _t.startswith("/start"):
             _c = (u.get("message") or {}).get("chat") or {}
             if _c.get("id"):
                 start_chats.add(str(_c["id"]))
-        store["offset"] = max(store.get("offset", 0), u["update_id"] + 1)
         msg = u.get("message") or {}
         if not msg and u.get("callback_query"):
             # a button tap also counts as contact: register the tapper
@@ -256,6 +307,7 @@ def poll_once():
             }
             new_users.append(cid)
         store["users"][cid]["last_seen"] = time.time()
+    store["seen_max"] = seen_max
     if updates:
         with _LOCK:
             _save_store(store)
@@ -267,12 +319,12 @@ def poll_once():
         except Exception:
             pass  # registration stands even if the greeting fails
     if MESSAGE_HANDLER:
-        for u in updates:
+        for u in fresh:
             msg = u.get("message")
             if msg:
                 _dispatch(MESSAGE_HANDLER, msg)
     if CALLBACK_HANDLER:
-        for u in updates:
+        for u in fresh:
             cq = u.get("callback_query")
             if cq:
                 _dispatch(CALLBACK_HANDLER, cq)
@@ -316,10 +368,31 @@ def _dispatch(handler, payload):
     threading.Thread(target=_run, daemon=True).start()
 
 
+# Build 199: outgoing duplicate guard. If any redelivery path
+# still reaches a handler, the handler must not re-send the
+# identical wizard text to the same chat seconds later — that
+# repeat WAS the user-visible spam. A suppressed send returns the
+# CACHED result of the original send, because two callers do use
+# the return value: app.py's blur-piece picker stores
+# res["message_id"] so later taps can edit that picker message,
+# and the cached id is exactly the message really on screen.
+# Keyed on (chat_id, text) only — buttons/keyboard do not make a
+# repeat a different message. Delivery sends (send_video /
+# send_document / send_photo) are NOT guarded.
+_SENT_GUARD = {}
+_SENT_GUARD_LOCK = threading.Lock()
+_SENT_GUARD_WINDOW = 20.0
+
+
 def send_message(chat_id, text, buttons=None, keyboard=None):
     tok = token()
     if not tok:
         raise RuntimeError("telegram bot token မရှိပါ")
+    key = (str(chat_id), text)
+    with _SENT_GUARD_LOCK:
+        hit = _SENT_GUARD.get(key)
+        if hit and time.time() - hit[0] < _SENT_GUARD_WINDOW:
+            return hit[1]
     params = {"chat_id": str(chat_id), "text": text}
     if buttons:
         params["reply_markup"] = _markup(buttons)
@@ -327,7 +400,15 @@ def send_message(chat_id, text, buttons=None, keyboard=None):
         params["reply_markup"] = json.dumps({
             "keyboard": [[{"text": t} for t in row] for row in keyboard],
             "resize_keyboard": True})
-    return _call(tok, "sendMessage", **params)
+    result = _call(tok, "sendMessage", **params)
+    with _SENT_GUARD_LOCK:
+        _SENT_GUARD[key] = (time.time(), result)
+        if len(_SENT_GUARD) > 512:  # opportunistic prune
+            cutoff = time.time() - _SENT_GUARD_WINDOW
+            for k in [k for k, v in _SENT_GUARD.items()
+                      if v[0] < cutoff]:
+                _SENT_GUARD.pop(k, None)
+    return result
 
 
 def edit_message(chat_id, message_id, text, buttons=None):
