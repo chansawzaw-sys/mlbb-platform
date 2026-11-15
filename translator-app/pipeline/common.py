@@ -1,7 +1,13 @@
 """Shared ffmpeg/ffprobe helpers."""
+import contextlib
+import contextvars
 import json
+import os
 import shutil
+import signal
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 _HAS_NICE = shutil.which("nice") is not None
@@ -125,19 +131,155 @@ def target_maxrate_k(input_mp4, cap_k=2500):
         return 1800
 
 
+# --- Job-scoped process tracking (build 204, audit V09) ------------------
+# Cancellation used to be a flag the worker noticed at the next step
+# boundary: a running ffmpeg kept encoding to completion (or to its
+# own — sometimes absent — timeout) after the user cancelled. Now
+# run() registers every child it spawns under the job whose worker
+# thread is executing it, and app.py's cancel path terminates those
+# process GROUPS on request. The job id travels in a ContextVar set
+# by the job worker (app.py _worker/_worker2) for the whole run:
+# every pipeline phase executes synchronously on that thread (the
+# TTS fallback pool is the one exception — its per-segment calls
+# are short network/convert steps, and the long encodes all happen
+# on the worker thread). Anything spawned outside a job context —
+# startup probes, request-thread thumbnails, CLI use — is never
+# registered and behaves exactly as before.
+_JOB_CONTEXT = contextvars.ContextVar("vt_job_id", default=None)
+
+
+@contextlib.contextmanager
+def job_context(job_id):
+    """Mark this thread's subprocesses as belonging to `job_id`
+    for the duration of the block (app.py's job workers)."""
+    token = _JOB_CONTEXT.set(job_id)
+    try:
+        yield
+    finally:
+        _JOB_CONTEXT.reset(token)
+
+
+def current_job_id():
+    return _JOB_CONTEXT.get()
+
+
+_JOB_PROCS = {}  # job_id -> set of live Popen objects
+_JOB_PROCS_LOCK = threading.Lock()
+
+
+def _register_proc(job_id, proc):
+    with _JOB_PROCS_LOCK:
+        _JOB_PROCS.setdefault(job_id, set()).add(proc)
+
+
+def _unregister_proc(job_id, proc):
+    with _JOB_PROCS_LOCK:
+        procs = _JOB_PROCS.get(job_id)
+        if procs is not None:
+            procs.discard(proc)
+            if not procs:
+                _JOB_PROCS.pop(job_id, None)
+
+
+def job_processes(job_id):
+    """Snapshot of the job's currently registered processes."""
+    with _JOB_PROCS_LOCK:
+        return list(_JOB_PROCS.get(job_id) or ())
+
+
+def _signal_group(proc, sig):
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def terminate_job_processes(job_id, grace=5.0):
+    """Stop every process registered under `job_id`: SIGTERM to
+    each process GROUP (run() spawns with start_new_session=True,
+    so each child leads its own group and its children die with
+    it), up to `grace` seconds to exit, then SIGKILL. Returns how
+    many processes were signalled. Other jobs' processes are never
+    touched — the registry is keyed by job id."""
+    procs = job_processes(job_id)
+    live = [p for p in procs if p.poll() is None]
+    for p in live:
+        _signal_group(p, signal.SIGTERM)
+    deadline = time.monotonic() + max(0.0, grace)
+    for p in live:
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            break
+        try:
+            p.wait(timeout=remain)
+        except Exception:
+            pass
+    stubborn = [p for p in live if p.poll() is None]
+    for p in stubborn:
+        _signal_group(p, signal.SIGKILL)
+    for p in stubborn:
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            pass
+    return len(live)
+
+
+# Default deadline for run() callers that pass no timeout of their
+# own (build 204, audit V09). retime's explicit ceilings top out at
+# 1800 s; 3600 s leaves generous headroom over the longest
+# legitimate encode while guaranteeing no child can run forever.
+DEFAULT_RUN_TIMEOUT = 3600
+
+
 def run(cmd, **kw):
     """Run a command, raise RuntimeError with stderr tail on failure.
 
     ffmpeg runs under `nice` so a long encode can never starve the
     rest of this small shared server (the MLBB app lives on it too);
-    the encode still gets every idle cycle, it just yields politely."""
+    the encode still gets every idle cycle, it just yields politely.
+
+    Build 204 (audit V09): the child is spawned in its own session
+    (its own process group) and, when a job context is active,
+    registered under that job so cancellation can terminate the
+    whole group at once. A caller that passes no `timeout` gets
+    DEFAULT_RUN_TIMEOUT; a timeout raises subprocess.TimeoutExpired
+    exactly as subprocess.run did (retime's canary fallback depends
+    on that), after the timed-out group has been killed."""
     if cmd and cmd[0] == "ffmpeg" and _HAS_NICE:
         cmd = ["nice", "-n", "8"] + [str(c) for c in cmd]
-    p = subprocess.run(cmd, capture_output=True, text=True, **kw)
-    if p.returncode != 0:
-        tail = (p.stderr or p.stdout or "")[-2000:]
+    timeout = kw.pop("timeout", None)
+    if timeout is None:
+        timeout = DEFAULT_RUN_TIMEOUT
+    job_id = _JOB_CONTEXT.get()
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True,
+                         start_new_session=True, **kw)
+    if job_id:
+        _register_proc(job_id, p)
+    try:
+        stdout, stderr = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _signal_group(p, signal.SIGKILL)
+        try:
+            p.communicate(timeout=10)
+        except Exception:
+            pass
+        raise
+    except BaseException:
+        # The waiting thread itself was interrupted: do not leave
+        # the child running unsupervised behind us.
+        if p.poll() is None:
+            _signal_group(p, signal.SIGKILL)
+        raise
+    finally:
+        if job_id:
+            _unregister_proc(job_id, p)
+    done = subprocess.CompletedProcess(cmd, p.returncode, stdout, stderr)
+    if done.returncode != 0:
+        tail = (done.stderr or done.stdout or "")[-2000:]
         raise RuntimeError(f"command failed ({' '.join(str(c) for c in cmd[:4])}...):\n{tail}")
-    return p
+    return done
 
 
 def probe_duration(path):

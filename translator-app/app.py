@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -33,8 +34,9 @@ from pipeline import download as dl_mod
 from pipeline import envfile
 from pipeline import fx as fx_mod
 from pipeline import run_job, tts
-from pipeline.common import (encode_threads, probe_duration, run as sh,
-                             set_active_jobs_provider)
+from pipeline.common import (encode_threads, job_context, probe_duration,
+                             run as sh, set_active_jobs_provider,
+                             terminate_job_processes)
 
 ROOT = Path(__file__).resolve().parent
 JOBS_DIR = ROOT / "jobs"
@@ -50,7 +52,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 203"
+BUILD_TAG = "build 204"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -63,10 +65,70 @@ STEP_LABELS = {
 }
 
 
+# ---------- durable job state (build 204, audit V10 + V09) ----------
+# _save used to truncate job.json in place, unlocked, while three
+# writer classes (worker progress, the 45 s heartbeat, route
+# handlers) raced on it: readers routinely parsed a half-written
+# file — _all_jobs silently skipped the job (it vanished from the
+# UI) and _load_job 500'd. Now each job's saves serialise on a
+# per-job lock and land via a unique temp file in the same
+# directory + os.replace (the envfile.py build-192 pattern), so a
+# reader sees the old snapshot or the new one, never a torn one.
+# The tombstone set is the V09 half: once a job's files are
+# cleaned up, a late save from a still-unwinding worker must not
+# resurrect job.json (and the job) behind the cleanup.
+_SAVE_LOCKS = {}
+_SAVE_LOCKS_GUARD = threading.Lock()
+_DELETED_JOBS = {}  # jid -> True, insertion-ordered; capped below
+_DELETED_CAP = 4096
+
+
+def _save_lock(jid):
+    with _SAVE_LOCKS_GUARD:
+        lk = _SAVE_LOCKS.get(jid)
+        if lk is None:
+            lk = _SAVE_LOCKS[jid] = threading.Lock()
+        return lk
+
+
+def _tombstone(jid):
+    """Mark a job deleted: future _save calls for it no-op.
+    Called at the TOP of _cleanup_job, before any file is removed,
+    so the check-then-write window in _save stays closed."""
+    _DELETED_JOBS[jid] = True
+    while len(_DELETED_JOBS) > _DELETED_CAP:
+        _DELETED_JOBS.pop(next(iter(_DELETED_JOBS)), None)
+
+
+def _tombstoned(jid):
+    return jid in _DELETED_JOBS
+
+
 def _save(job):
-    p = JOBS_DIR / job["id"] / "job.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+    jid = job["id"]
+    if _tombstoned(jid):
+        return
+    with _save_lock(jid):
+        # Re-check under the lock: cleanup tombstones first and
+        # then drains this lock, so a save that was queued behind
+        # an in-flight cleanup still lands nowhere.
+        if _tombstoned(jid):
+            return
+        data = json.dumps(job, ensure_ascii=False, indent=2)
+        d = JOBS_DIR / jid
+        d.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(d), prefix=".job-",
+                                   suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(data)
+            os.replace(tmp, d / "job.json")
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 class JobCancelled(Exception):
@@ -177,6 +239,17 @@ def _backup_loop():
     names = ["users.db", ".env", ".tg_recipients.json",
              ".translate_good", ".tg_daily.json"]
     while True:
+        try:
+            # Build 204 (audit V11): the periodic re-run of the
+            # disk recovery pass (its operative run is at startup;
+            # in a single-process app disk-only jobs can only
+            # appear across a restart, so this is a safety net —
+            # and it keeps the dormant sweep below seeing every
+            # job that exists, exactly as the old disk-scanning
+            # _all_jobs did).
+            _scan_disk_jobs()
+        except Exception:
+            pass
         try:
             dest = ROOT / "backups" / time.strftime("%Y-%m-%d")
             dest.mkdir(parents=True, exist_ok=True)
@@ -1585,8 +1658,13 @@ def _job_dispatcher():
                 if jid in _TG_PENDING:
                     _TG_PENDING.remove(jid)
                 target = _worker2 if kind == "rerun" else _worker
-                threading.Thread(target=target, args=(job,),
-                                 daemon=True).start()
+                wt = threading.Thread(target=target, args=(job,),
+                                      daemon=True)
+                # Build 204 (audit V09): registered BEFORE start
+                # so a cancel landing in this window still finds
+                # the thread and waits for it (see _stop_and_cleanup).
+                _WORKER_THREADS[jid] = wt
+                wt.start()
                 if job.get("tg_chat_id"):
                     threading.Thread(target=_tg_progress, args=(job,),
                                      daemon=True).start()
@@ -1595,7 +1673,28 @@ def _job_dispatcher():
         time.sleep(2)
 
 
+# Worker threads by job id (build 204, audit V09): the cancel
+# path waits for the job's worker to actually exit before its
+# files are removed. Entries are set by the dispatcher just
+# before the thread starts and dropped here in _cleanup_job.
+_WORKER_THREADS = {}
+
+
 def _cleanup_job(jid):
+    # Build 204 (audit V09/V10): tombstone FIRST — from this
+    # moment every late _save for this job is a no-op, so a
+    # still-unwinding worker cannot resurrect job.json behind
+    # the rmtree below — then drain the per-job save lock so an
+    # in-flight save finishes (into the still-existing dir)
+    # before any file is removed.
+    _tombstone(jid)
+    _lk = _save_lock(jid)
+    with _lk:
+        pass
+    with _SAVE_LOCKS_GUARD:
+        if _SAVE_LOCKS.get(jid) is _lk:
+            _SAVE_LOCKS.pop(jid, None)
+    _WORKER_THREADS.pop(jid, None)
     CLEANUP_TIMERS.pop(jid, None)
     job = JOBS.pop(jid, None)
     url = (job or {}).get("url")
@@ -1756,6 +1855,15 @@ def _enforce_done_cap(job):
 
 
 def _finish(job):
+    # Build 204 (audit V09): a cancel that landed after the last
+    # progress boundary (i.e. during the final phase, with no
+    # further progress call to raise JobCancelled) must not flip
+    # the job to done — and must not charge it. Settle as
+    # cancelled instead; _cancelled refunds/no-ops the charge
+    # exactly as for a boundary cancel.
+    if job.get("cancel_requested"):
+        _cancelled(job)
+        return
     # Build 186 (audit fix #1) moved the small copy OFF this path
     # into a background thread; build 198 removes the finish-time
     # copy entirely — it is generated lazily on the first ?v=small
@@ -1806,34 +1914,49 @@ def _worker(job):
     edit the text afterwards and re-render (see job_review)."""
     workdir = JOBS_DIR / job["id"]
     threading.Thread(target=_heartbeat, args=(job,), daemon=True).start()
-    try:
-        job["status"] = "running"
-        _save(job)
-        run_job.run_phase1(workdir, job["url"], source_path=job.get("source_path"),
-                           progress=_progress_fn(job),
-                           style="subs" if job["mode"] == "subs" else "dub",
-                           quality=job.get("quality") or "hd")
-        _quote_for_job(job)
-        _run_phase2(job)
-        _finish(job)
-    except JobCancelled:
-        _cancelled(job)
-    except Exception as e:  # surface the real error to the UI
-        _fail(job, e)
+    # Build 204 (audit V09): the whole run executes under this
+    # job's process context — every subprocess the pipeline spawns
+    # from this thread is registered to the job, so a cancel can
+    # terminate the actual work (see pipeline.common.run).
+    with job_context(job["id"]):
+        try:
+            job["status"] = "running"
+            _save(job)
+            run_job.run_phase1(workdir, job["url"], source_path=job.get("source_path"),
+                               progress=_progress_fn(job),
+                               style="subs" if job["mode"] == "subs" else "dub",
+                               quality=job.get("quality") or "hd")
+            _quote_for_job(job)
+            _run_phase2(job)
+            _finish(job)
+        except JobCancelled:
+            _cancelled(job)
+        except Exception as e:
+            # A failure CAUSED by the cancel path (its ffmpeg was
+            # terminated mid-flight) is a cancellation, not an
+            # error — never flip a cancelled job to "error".
+            if job.get("cancel_requested"):
+                _cancelled(job)
+            else:
+                _fail(job, e)  # surface the real error to the UI
 
 
 def _worker2(job):
     """Re-render phase 2 from the current (possibly edited) segments."""
     threading.Thread(target=_heartbeat, args=(job,), daemon=True).start()
-    try:
-        job["status"] = "running"
-        _save(job)
-        _run_phase2(job)
-        _finish(job)
-    except JobCancelled:
-        _cancelled(job)
-    except Exception as e:
-        _fail(job, e)
+    with job_context(job["id"]):
+        try:
+            job["status"] = "running"
+            _save(job)
+            _run_phase2(job)
+            _finish(job)
+        except JobCancelled:
+            _cancelled(job)
+        except Exception as e:
+            if job.get("cancel_requested"):
+                _cancelled(job)
+            else:
+                _fail(job, e)
 
 
 @app.get("/")
@@ -3721,23 +3844,48 @@ def _job_view(job):
 
 
 def _all_jobs():
-    """In-memory jobs merged with any persisted on disk. A job that
-    exists only on disk cannot be running (the process that ran it is
-    gone), so a disk-only 'active' status is healed to error rather
-    than lying to the UI — and blocking the gate — forever."""
-    out = {}
-    for p in JOBS_DIR.glob("*/job.json"):
+    """Every job this process knows, newest first.
+
+    Build 204 (audit V11): the in-memory JOBS index is
+    authoritative for reads. The pre-204 version globbed and
+    parsed EVERY job.json on disk on every call — list views,
+    the latest-job poll, the daily-count admission check, the
+    done-cap enforcement — and the "read" mutated: it healed
+    disk-only jobs, re-armed their cleanup timers and deleted
+    expired ones inline. That recovery work now lives in
+    _scan_disk_jobs(), which runs once at startup and again from
+    the daily backup loop; this function is a pure memory read
+    (owner filtering, ordering and queue_pos are computed by the
+    callers/_job_view exactly as before)."""
+    res = list(JOBS.values())
+    res.sort(key=lambda j: j.get("created_at") or 0, reverse=True)
+    return res
+
+
+def _scan_disk_jobs():
+    """Recovery pass over jobs/ — the disk half of the pre-204
+    _all_jobs, run at startup and from the periodic backup loop
+    instead of on every list request.
+
+    A job that exists only on disk cannot be running (the process
+    that ran it is gone), so a disk-only 'active' status is healed
+    to error rather than lying to the UI — and blocking the gate —
+    forever. Finished disk-only jobs are loaded and whatever is
+    left of their retention window is re-armed (cleanup timers
+    are in-memory, so a restart would otherwise strand them);
+    one whose window already passed is deleted at once. Jobs
+    already in memory are this process's own and are skipped —
+    in a single-process app, disk-only jobs can only appear
+    across a restart."""
+    for p in sorted(JOBS_DIR.glob("*/job.json")):
         try:
             j = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if j.get("id"):
-            out[j["id"]] = j
-    for jid, j in JOBS.items():
-        out[jid] = j
-    res = []
-    for jid, j in out.items():
-        if jid not in JOBS and j.get("status") in ("queued", "running"):
+        jid = j.get("id")
+        if not jid or jid in JOBS or _tombstoned(jid):
+            continue
+        if j.get("status") in ("queued", "running"):
             j["status"] = "error"
             j["error"] = "server ပြန်စ၍ ရပ်သွား"
             j["finished_at"] = j.get("finished_at") or time.time()
@@ -3748,24 +3896,23 @@ def _all_jobs():
                 # A queued bot job died with the restart — the
                 # customer must be TOLD, not left waiting forever.
                 _tg_error_async(j)
-        elif jid not in JOBS and j.get("status") in ("done", "error") \
-                and jid not in CLEANUP_TIMERS:
-            # Cleanup timers are in-memory: after a restart, re-arm
-            # whatever is left of this job's retention window (and
-            # delete at once when it already passed).
-            fin = j.get("finished_at") or j.get("created_at") or time.time()
-            remain = _job_retention(j) - (time.time() - float(fin))
-            if remain <= 0:
-                _cleanup_job(jid)
-                continue
-            t = threading.Timer(remain, _cleanup_job, args=(jid,))
-            t.daemon = True
-            t.start()
-            CLEANUP_TIMERS[jid] = t
-            j["cleanup_at"] = time.time() + remain
-        res.append(j)
-    res.sort(key=lambda j: j.get("created_at") or 0, reverse=True)
-    return res
+        elif j.get("status") in ("done", "error"):
+            JOBS[jid] = j
+            if jid not in CLEANUP_TIMERS:
+                fin = j.get("finished_at") or j.get("created_at") or time.time()
+                remain = _job_retention(j) - (time.time() - float(fin))
+                if remain <= 0:
+                    _cleanup_job(jid)
+                    continue
+                t = threading.Timer(remain, _cleanup_job, args=(jid,))
+                t.daemon = True
+                t.start()
+                CLEANUP_TIMERS[jid] = t
+                j["cleanup_at"] = time.time() + remain
+        else:
+            # cancelled / waiting_review / anything else: load
+            # as-is so listings match the pre-204 read exactly.
+            JOBS[jid] = j
 
 
 @app.get("/api/jobs")
@@ -3805,6 +3952,10 @@ def get_job(jid):
 def _load_job(jid):
     job = JOBS.get(jid)
     if not job:
+        if _tombstoned(jid):
+            # Build 204: deleted jobs stay deleted — never reload
+            # a directory cleanup already removed (or is removing).
+            return None
         p = JOBS_DIR / jid / "job.json"
         if not p.exists():
             return None
@@ -3924,6 +4075,38 @@ def stream_job(jid):
     return send_file(out, as_attachment=False, conditional=True)
 
 
+def _stop_and_cleanup(job):
+    """Build 204 (audit V09) — the active half of a cancel, run on
+    its own thread so the DELETE request returns at once:
+    terminate the job's registered process groups (SIGTERM, grace,
+    SIGKILL — see pipeline.common.terminate_job_processes), wait
+    — bounded — for the worker thread to actually exit, and only
+    then remove the files. If the worker somehow never exits (a
+    long in-process step with no subprocess to kill), the files
+    are LEFT for delete_job's 300 s failsafe rather than deleted
+    under a live writer; the tombstone in _cleanup_job plus the
+    cancel guards in _worker/_finish keep the state stable
+    either way."""
+    jid = job["id"]
+    try:
+        terminate_job_processes(jid, grace=5.0)
+    except Exception:
+        pass
+    wt = _WORKER_THREADS.get(jid)
+    if wt is not None and wt is not threading.current_thread():
+        wt.join(timeout=30)
+        # A step that spawned its process just as the first sweep
+        # passed gets the same treatment before files are touched.
+        try:
+            terminate_job_processes(jid, grace=2.0)
+        except Exception:
+            pass
+        wt.join(timeout=10)
+        if wt.is_alive():
+            return
+    _cleanup_job(jid)
+
+
 @app.delete("/api/jobs/<jid>")
 def delete_job(jid):
     """Delete a job and all its files right now (the user asked for no
@@ -3932,11 +4115,16 @@ def delete_job(jid):
     if not job or not _owns(_current_user(), job):
         return jsonify({"error": "job မတွေ့ပါ"}), 404
     if job["status"] in ("queued", "running"):
-        # Stop it instead of refusing: the worker checks cancel_requested
-        # at every step boundary and unwinds; a failsafe timer removes
-        # the files even if a step never returns.
+        # Stop it instead of refusing. Build 204 (audit V09): the
+        # cancel no longer waits for the next step boundary — the
+        # job's running processes are terminated immediately and
+        # the files are removed once the worker has exited. The
+        # 300 s timer remains as a failsafe if a step never
+        # returns at all.
         job["cancel_requested"] = True
         _save(job)
+        threading.Thread(target=_stop_and_cleanup, args=(job,),
+                         daemon=True).start()
         t = threading.Timer(300, _cleanup_job, args=(jid,))
         t.daemon = True
         t.start()
@@ -4085,7 +4273,7 @@ def _startup_sweep():
     """Remove leftovers from before a restart — honouring each job's
     own retention window (bot jobs are promised 24h; the old flat
     1-hour sweep broke that promise on every restart). Queued/running
-    leftovers are left for the load-time heal in _all_jobs."""
+    leftovers are left for the heal in _scan_disk_jobs (build 204)."""
     now = time.time()
     # Build 203 (audit V08): preview dirs an active job still
     # references survive the sweep, exactly as in _cleanup_job.
@@ -4126,6 +4314,14 @@ def _startup_sweep():
 
 try:
     _startup_sweep()
+except Exception:
+    pass
+
+try:
+    # Build 204 (audit V11): the one startup recovery pass over
+    # disk jobs (heal / re-arm / expire) that _all_jobs used to
+    # redo on every list request.
+    _scan_disk_jobs()
 except Exception:
     pass
 
