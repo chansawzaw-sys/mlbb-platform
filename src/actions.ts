@@ -1,5 +1,5 @@
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
-import { and, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import * as schema from "./schema";
 
 function getDb(ctx: Ctx) {
@@ -10921,17 +10921,106 @@ export const Actions = {
         };
       }
       const s = await getSettingsMap(db);
-      const all = await db.select().from(schema.players);
-      const matchRows = await db.select().from(schema.matches);
-      const reportRows = await db
-        .select()
+      // F11: the dashboard aggregates run in SQL. This handler used to load
+      // EVERY player, match, transaction, purchase request and withdraw
+      // request and count/sum in JS — a cost that grows with lifetime money
+      // and match volume on every admin dashboard load. Every figure below
+      // is the same value the JS aggregation produced: the case/when sums
+      // mirror the original filter/reduce expressions exactly, including
+      // the UTC-day boundary for "today" (top-ups are coin-denominated —
+      // kyat actually received is off-platform; fees come from the
+      // platform_fee ledger rows written at match settlement) and the
+      // 2-minute presence window behind isOnline (a NULL last_seen_at
+      // makes the comparison NULL, i.e. not online, exactly like the JS).
+      // Migration 0025 indexes the filtered columns. The bounded lists
+      // (activity / terms / backups) below are unchanged.
+      const dayStart = new Date();
+      dayStart.setUTCHours(0, 0, 0, 0);
+      const dayStartMs = dayStart.getTime();
+      const onlineCutoffMs = Date.now() - ONLINE_WINDOW_MS;
+      const [playerAgg] = await db
+        .select({
+          total: sql<number>`count(*)`,
+          online: sql<number>`coalesce(sum(case when ${schema.players.lastSeenAt} >= ${onlineCutoffMs} then 1 else 0 end), 0)`,
+        })
+        .from(schema.players);
+      const [matchAgg] = await db
+        .select({
+          active: sql<number>`coalesce(sum(case when ${schema.matches.status} in ('ready_check', 'live', 'result_pending', 'disputed') then 1 else 0 end), 0)`,
+          disputed: sql<number>`coalesce(sum(case when ${schema.matches.status} = 'disputed' then 1 else 0 end), 0)`,
+        })
+        .from(schema.matches);
+      const [reportAgg] = await db
+        .select({ open: sql<number>`count(*)` })
         .from(schema.reports)
         .where(eq(schema.reports.status, "open"));
-      const ticketRows = await db
-        .select()
+      const [ticketAgg] = await db
+        .select({ open: sql<number>`count(*)` })
         .from(schema.tickets)
         .where(eq(schema.tickets.status, "open"));
-      const txnRows = await db.select().from(schema.transactions);
+      const [txnAgg] = await db
+        .select({
+          total: sql<number>`count(*)`,
+          totalFees: sql<number>`coalesce(sum(case when ${schema.transactions.type} = 'platform_fee' then ${schema.transactions.amount} else 0 end), 0)`,
+          feesToday: sql<number>`coalesce(sum(case when ${schema.transactions.type} = 'platform_fee' and ${schema.transactions.createdAt} >= ${dayStartMs} then ${schema.transactions.amount} else 0 end), 0)`,
+        })
+        .from(schema.transactions);
+      const [purchaseAgg] = await db
+        .select({
+          todayCount: sql<number>`coalesce(sum(case when ${schema.purchaseRequests.status} = 'approved' and ${schema.purchaseRequests.decidedAt} >= ${dayStartMs} then 1 else 0 end), 0)`,
+          todayCoins: sql<number>`coalesce(sum(case when ${schema.purchaseRequests.status} = 'approved' and ${schema.purchaseRequests.decidedAt} >= ${dayStartMs} then ${schema.purchaseRequests.coins} else 0 end), 0)`,
+          pending: sql<number>`coalesce(sum(case when ${schema.purchaseRequests.status} = 'pending' then 1 else 0 end), 0)`,
+        })
+        .from(schema.purchaseRequests);
+      const [withdrawAgg] = await db
+        .select({
+          todayCount: sql<number>`coalesce(sum(case when ${schema.withdrawRequests.status} = 'paid' and ${schema.withdrawRequests.decidedAt} >= ${dayStartMs} then 1 else 0 end), 0)`,
+          todayKyat: sql<number>`coalesce(sum(case when ${schema.withdrawRequests.status} = 'paid' and ${schema.withdrawRequests.decidedAt} >= ${dayStartMs} then ${schema.withdrawRequests.netKyat} else 0 end), 0)`,
+          pending: sql<number>`coalesce(sum(case when ${schema.withdrawRequests.status} = 'pending' then 1 else 0 end), 0)`,
+          kpayTotal: sql<number>`coalesce(sum(case when ${schema.withdrawRequests.status} = 'paid' and ${schema.withdrawRequests.method} = 'kpay' then ${schema.withdrawRequests.netKyat} else 0 end), 0)`,
+          kpayCount: sql<number>`coalesce(sum(case when ${schema.withdrawRequests.status} = 'paid' and ${schema.withdrawRequests.method} = 'kpay' then 1 else 0 end), 0)`,
+          waveTotal: sql<number>`coalesce(sum(case when ${schema.withdrawRequests.status} = 'paid' and ${schema.withdrawRequests.method} = 'wave' then ${schema.withdrawRequests.netKyat} else 0 end), 0)`,
+          waveCount: sql<number>`coalesce(sum(case when ${schema.withdrawRequests.status} = 'paid' and ${schema.withdrawRequests.method} = 'wave' then 1 else 0 end), 0)`,
+        })
+        .from(schema.withdrawRequests);
+      // Duplicate (mlbb_id, server_id) pairs: an aggregate gate first —
+      // in the normal case (no duplicates) ZERO player rows are read.
+      // Only when a duplicated trimmed pair exists do we fetch the narrow
+      // pair columns (id order, the same order the old full-table scan
+      // produced) and run the original grouping below. The SQL trim set
+      // is exactly the ECMAScript String.prototype.trim character set,
+      // so the gate and the fetch filter agree with the JS trim in the
+      // grouping.
+      const pairTrimChars = sql.raw(
+        `' ' || char(9) || char(10) || char(11) || char(12) || char(13) || char(160) || char(5760) || char(8192) || char(8193) || char(8194) || char(8195) || char(8196) || char(8197) || char(8198) || char(8199) || char(8200) || char(8201) || char(8202) || char(8232) || char(8233) || char(8239) || char(8287) || char(12288) || char(65279)`,
+      );
+      const trimId = sql`trim(${schema.players.mlbbId}, ${pairTrimChars})`;
+      const trimZone = sql`trim(${schema.players.serverId}, ${pairTrimChars})`;
+      const dupGate = await db
+        .select({ n: sql<number>`count(*)` })
+        .from(schema.players)
+        .groupBy(trimId, trimZone)
+        .having(sql`count(*) > 1 and ${trimId} != '' and ${trimZone} != ''`)
+        .limit(1);
+      const pairRows =
+        dupGate.length > 0
+          ? await db
+              .select({
+                id: schema.players.id,
+                name: schema.players.name,
+                gameName: schema.players.gameName,
+                mlbbId: schema.players.mlbbId,
+                serverId: schema.players.serverId,
+              })
+              .from(schema.players)
+              .where(sql`${trimId} != '' and ${trimZone} != ''`)
+              .orderBy(asc(schema.players.id))
+          : [];
+      const suspiciousRows = await db
+        .select()
+        .from(schema.players)
+        .where(eq(schema.players.suspicious, 1))
+        .orderBy(asc(schema.players.id));
       const act = await db
         .select()
         .from(schema.activityLog)
@@ -10950,55 +11039,35 @@ export const Actions = {
       return {
         settings: settingsOut(s, true),
         health: {
-          total_players: all.length,
-          online_players: all.filter((p) => isOnline(p)).length,
-          active_matches: matchRows.filter((m) =>
-            ["ready_check", "live", "result_pending", "disputed"].includes(m.status),
-          ).length,
-          pending_disputes: matchRows.filter((m) => m.status === "disputed").length,
-          pending_reports: reportRows.length,
-          open_tickets: ticketRows.length,
-          total_transactions: txnRows.length,
-          total_fees: txnRows
-            .filter((t) => t.type === "platform_fee")
-            .reduce((a, t) => a + t.amount, 0),
+          total_players: Number(playerAgg?.total ?? 0),
+          online_players: Number(playerAgg?.online ?? 0),
+          active_matches: Number(matchAgg?.active ?? 0),
+          pending_disputes: Number(matchAgg?.disputed ?? 0),
+          pending_reports: Number(reportAgg?.open ?? 0),
+          open_tickets: Number(ticketAgg?.open ?? 0),
+          total_transactions: Number(txnAgg?.total ?? 0),
+          total_fees: Number(txnAgg?.totalFees ?? 0),
           db_status: "OK",
         },
-        payout_split: await (async () => {
-          const paidW = (await db.select().from(schema.withdrawRequests))
-            .filter((w) => w.status === "paid");
-          const agg = (method: string) => {
-            const rowsM = paidW.filter((w) => w.method === method);
-            return { total_kyat: rowsM.reduce((a, w) => a + w.netKyat, 0), count: rowsM.length };
-          };
-          return { kpay: agg("kpay"), wave: agg("wave") };
-        })(),
-        money: await (async () => {
-          // Today's money summary (UTC day). Top-ups are coin-denominated
-          // (kyat actually received is off-platform); fees come from the
-          // platform_fee ledger rows written at match settlement.
-          const dayStart = new Date();
-          dayStart.setUTCHours(0, 0, 0, 0);
-          const purchases = await db.select().from(schema.purchaseRequests);
-          const withdrawals = await db.select().from(schema.withdrawRequests);
-          const approvedToday = purchases.filter(
-            (r) => r.status === "approved" && r.decidedAt && r.decidedAt >= dayStart,
-          );
-          const paidToday = withdrawals.filter(
-            (w) => w.status === "paid" && w.decidedAt && w.decidedAt >= dayStart,
-          );
-          return {
-            topups_today_count: approvedToday.length,
-            topups_today_coins: approvedToday.reduce((a, r) => a + r.coins, 0),
-            withdrawals_today_count: paidToday.length,
-            withdrawals_today_kyat: paidToday.reduce((a, w) => a + w.netKyat, 0),
-            fees_today_coins: txnRows
-              .filter((t) => t.type === "platform_fee" && t.createdAt >= dayStart)
-              .reduce((a, t) => a + t.amount, 0),
-            pending_topups: purchases.filter((r) => r.status === "pending").length,
-            pending_withdrawals: withdrawals.filter((w) => w.status === "pending").length,
-          };
-        })(),
+        payout_split: {
+          kpay: {
+            total_kyat: Number(withdrawAgg?.kpayTotal ?? 0),
+            count: Number(withdrawAgg?.kpayCount ?? 0),
+          },
+          wave: {
+            total_kyat: Number(withdrawAgg?.waveTotal ?? 0),
+            count: Number(withdrawAgg?.waveCount ?? 0),
+          },
+        },
+        money: {
+          topups_today_count: Number(purchaseAgg?.todayCount ?? 0),
+          topups_today_coins: Number(purchaseAgg?.todayCoins ?? 0),
+          withdrawals_today_count: Number(withdrawAgg?.todayCount ?? 0),
+          withdrawals_today_kyat: Number(withdrawAgg?.todayKyat ?? 0),
+          fees_today_coins: Number(txnAgg?.feesToday ?? 0),
+          pending_topups: Number(purchaseAgg?.pending ?? 0),
+          pending_withdrawals: Number(withdrawAgg?.pending ?? 0),
+        },
         activity: act.map((a) => ({
           id: a.id,
           actor: a.actor,
@@ -11006,10 +11075,11 @@ export const Actions = {
           created_at: iso(a.createdAt) ?? "",
         })),
         duplicate_pairs: (() => {
-          // Group the already-loaded players by their trimmed filled pair
-          // (same semantics as pairOwner) and keep only groups of 2+.
+          // Group the pair-carrying players (fetched above only when the
+          // aggregate gate found a duplicate) by their trimmed filled
+          // pair (same semantics as pairOwner) and keep only groups of 2+.
           const byPair = new Map<string, { mlbb_id: string; server_id: string; players: { id: number; name: string; game_name: string }[] }>();
-          for (const pl of all) {
+          for (const pl of pairRows) {
             const id = (pl.mlbbId ?? "").trim();
             const zone = (pl.serverId ?? "").trim();
             if (!id || !zone) continue;
@@ -11020,7 +11090,7 @@ export const Actions = {
           }
           return [...byPair.values()].filter((g) => g.players.length > 1);
         })(),
-        suspicious_players: await (async () => { const arr = []; for (const pl of all.filter((p) => p.suspicious === 1)) arr.push({ ...(await playerOutAsync(ctx, pl)), role: effectiveRole(pl) }); return arr; })(),
+        suspicious_players: await (async () => { const arr = []; for (const pl of suspiciousRows) arr.push({ ...(await playerOutAsync(ctx, pl)), role: effectiveRole(pl) }); return arr; })(),
         terms_history: termsHist.map((t) => ({
           id: t.id,
           kind: t.kind,

@@ -44,6 +44,54 @@ sqlite.exec("PRAGMA journal_mode = WAL");
 sqlite.exec("PRAGMA foreign_keys = ON");
 const db = drizzle(sqlite, { schema });
 
+// --- F12: restore-safety warning for migration 0012 ----------------------
+// Migration 0012 is a historic one-time PURGE (owner order 2026-10-28): it
+// deletes every player except the fixed-Gmail Owner and wipes their money
+// history. It is data-only and correctly recorded as applied on the
+// production lineage, so it never re-runs there — but a RESTORED BACKUP
+// whose migration journal predates 0012 will replay it on this boot and
+// destroy that backup's accounts. This block is a WARNING ONLY: it never
+// blocks boot and never skips a migration. If the database below is a
+// restored backup whose data post-dates the real purge, stop the server
+// and run the restore guard first (deploy-tools/restore-guard.ts — see
+// relaunch/RUNBOOK.md, "Restore safety (F12)").
+{
+  const WHEN_0012 = 1793700000000;
+  const tableExists = (name: string) =>
+    (
+      sqlite
+        .query("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name = ?")
+        .get(name) as { n: number }
+    ).n > 0;
+  if (tableExists("players") && tableExists("__drizzle_migrations")) {
+    const lastMig = sqlite
+      .query("SELECT created_at FROM __drizzle_migrations ORDER BY created_at DESC LIMIT 1")
+      .get() as { created_at: number } | null;
+    const playerCount = (
+      sqlite.query("SELECT COUNT(*) AS n FROM players").get() as { n: number }
+    ).n;
+    if (lastMig && Number(lastMig.created_at) < WHEN_0012 && playerCount > 0) {
+      console.warn(
+        [
+          "************************************************************",
+          "[mlbb-standalone] *** RESTORE SAFETY WARNING (F12) ***",
+          `[mlbb-standalone] This database's migration journal predates migration 0012`,
+          `[mlbb-standalone] (purge_non_owner_players) but the players table is NOT empty`,
+          `[mlbb-standalone] (${playerCount} players). Boot is about to replay migration 0012,`,
+          "[mlbb-standalone] which DELETES every player except the fixed-Gmail Owner and",
+          "[mlbb-standalone] wipes their matches, transactions and requests.",
+          "[mlbb-standalone] If this database is a RESTORED BACKUP whose data post-dates",
+          "[mlbb-standalone] the real 2026-10-28 purge, STOP THIS SERVER NOW and run the",
+          "[mlbb-standalone] restore guard before booting again:",
+          "[mlbb-standalone]   bun deploy-tools/restore-guard.ts <app.db> --confirm --backup-out <copy>",
+          "[mlbb-standalone] See relaunch/RUNBOOK.md — Restore safety (F12).",
+          "************************************************************",
+        ].join("\n"),
+      );
+    }
+  }
+}
+
 // --- Batch 14 fix: boot-safety reconciliation for migration 0017 --------
 // The first Batch 14 deploy crash-looped: migration 0017's CREATE UNIQUE
 // INDEX can never succeed on production data (legacy duplicate

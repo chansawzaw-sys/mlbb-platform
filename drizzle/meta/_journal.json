@@ -169,6 +169,13 @@
       "when": 1795400202000,
       "tag": "0024_transactions_code_unique",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1795400302000,
+      "tag": "0025_dashboard_indexes",
+      "breakpoints": true
     }
   ]
 }
