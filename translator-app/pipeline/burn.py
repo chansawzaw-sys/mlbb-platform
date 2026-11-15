@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 from .common import (FONTS_DIR, encode_threads, ensure_fonts,
-                     probe_streams, run, target_maxrate_k)
+                     probe_streams, run, target_maxrate_k, video_fps)
 
 # Subtitle FONT CHOICES — all Myanmar UNICODE fonts bundled in assets/fonts.
 # Every one was verified to cover the full Myanmar block (U+1000–109F) and to
@@ -362,6 +362,30 @@ def video_size(input_mp4):
     raise RuntimeError(f"no video stream in {input_mp4}")
 
 
+# Build 201: the dub path's chunk graphs have always ended in
+# "fps=30,format=yuv420p" (retime.py), but the subtitle path's
+# final encode kept the source rate — a 60fps source cost ~2x
+# the frames to encode for nothing the viewer can use. Cap it
+# with the SAME filter, but CONDITIONALLY: only when the probed
+# input rate is above 30. At or under 30fps the fps filter
+# would duplicate frames up to 30 (a 24/25fps source must keep
+# its native rate and frame count), and when the rate cannot
+# be probed the encode stays byte-for-byte the old one.
+_FPS_CAP = "fps=30,format=yuv420p"
+
+
+def _fps_cap(input_mp4):
+    """True when this burn's input runs above 30fps and its
+    final encode must cap to 30fps (build 201). Probes the
+    file burn() was actually handed: the source for subtitle
+    jobs (native rate — the cap bites), the retimed file for
+    the classic both-jobs finalize (already 30fps from the
+    retime graphs — no-op — except a passthrough copy, which
+    carries the native rate and is capped here too)."""
+    fps = video_fps(input_mp4)
+    return fps is not None and fps > 30.0
+
+
 def _fonts_dir():
     """The directory libass should load the Myanmar fonts from.
 
@@ -470,7 +494,13 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
             if logo_path:
                 cmd += ["-i", str(logo_path)]
             mr = target_maxrate_k(input_mp4, cap_k)
-            cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]",
+            out_label = _out
+            if _fps_cap(input_mp4):
+                # Build 201: cap AFTER the burn (subtitles are
+                # rendered per kept frame; timing is preserved).
+                filters = filters + [f"{_out}{_FPS_CAP}[vfinal]"]
+                out_label = "[vfinal]"
+            cmd += ["-filter_complex", ";".join(filters), "-map", out_label,
                     "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
                     "-crf", "24", "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
                     "-c:a", "copy", "-threads", str(encode_threads()),
@@ -480,6 +510,8 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
     ass_path, fonts_dir, _w, _h = _prepare_ass(
         input_mp4, srt_path, font, subs, blur_box, fx)
     vf = _ass_filter(ass_path, fonts_dir)
+    if _fps_cap(input_mp4):
+        vf += "," + _FPS_CAP
     mr = target_maxrate_k(input_mp4, cap_k)
     run(["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4), "-vf", vf,
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",

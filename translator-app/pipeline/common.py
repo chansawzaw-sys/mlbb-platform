@@ -153,6 +153,30 @@ def probe_streams(path):
     return json.loads(p.stdout)["streams"]
 
 
+def video_fps(path):
+    """Probed frame rate (float) of the first video stream in
+    `path`, or None when it cannot be determined (build 201).
+    r_frame_rate arrives as a fraction string ("30000/1001"); a
+    zero denominator, a zero/garbled value or any probe failure
+    means 'unknown' — callers must treat None as 'keep the
+    previous behaviour exactly'."""
+    try:
+        for s in probe_streams(path):
+            if s.get("codec_type") == "video":
+                raw = str(s.get("r_frame_rate") or "").strip()
+                if "/" in raw:
+                    num, den = raw.split("/", 1)
+                    den = float(den)
+                    if not den:
+                        return None
+                    return float(num) / den
+                val = float(raw)
+                return val if val > 0 else None
+    except Exception:
+        return None
+    return None
+
+
 def fmt_ts(seconds):
     """SRT timestamp."""
     seconds = max(0.0, float(seconds))

@@ -34,7 +34,8 @@ import sys
 from pathlib import Path
 
 from .common import (encode_threads, load_segments, probe_duration, run,
-                     save_segments, target_maxrate_k, write_srt)
+                     save_segments, target_maxrate_k, video_fps,
+                     write_srt)
 
 MAX_SPEED = 1.30
 MIN_VSLOW = 0.80   # legacy stat only; the plan no longer floors at it
@@ -271,7 +272,21 @@ def _video_passthrough_merged(src, dub_wav, spec, cap_k=2500,
     encoded was a bit-exact copy of this same source). Raises on
     a spec shape it cannot re-root; encode failures propagate to
     the caller's classic fallback, exactly like _video_merged."""
-    filters = _reroot_finalize(spec["filters"])
+    # Build 201: hanging the graph straight off the source also
+    # bypassed the chunk graphs' fps=30 tail, so a 60fps source
+    # was encoded at full rate here. Cap CONDITIONALLY, exactly
+    # like burn: only when the probed source rate is above 30 —
+    # the finalize graph is re-rooted at a capped copy of the
+    # source stream; at/under 30fps (or unprobeable) the command
+    # is byte-for-byte build 198's.
+    filters = None
+    src_fps = video_fps(src)
+    if src_fps is not None and src_fps > 30.0:
+        rooted = _reroot_finalize(spec["filters"], root="[vfps]")
+        if rooted is not None:
+            filters = ["[0:v]fps=30,format=yuv420p[vfps]"] + rooted
+    if filters is None:
+        filters = _reroot_finalize(spec["filters"])
     if filters is None:
         raise RuntimeError("finalize spec cannot be re-rooted")
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src),
