@@ -31,6 +31,7 @@ ensure_system_ca()
 
 from pipeline import accounts
 from pipeline import download as dl_mod
+from pipeline import elevenlabs_tts
 from pipeline import envfile
 from pipeline import fx as fx_mod
 from pipeline import run_job, tts
@@ -52,7 +53,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 204"
+BUILD_TAG = "build 205"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1271,7 +1272,27 @@ def _tg_voice_step(chat_id, flow):
     rows = [[("🎙 " + s["label"], "v:" + s["key"])
              for s in styles[i:i + 2]]
             for i in range(0, len(styles), 2)]
+    # Build 205: ElevenLabs premium voices join the step ONLY
+    # when the owner configured a key + registry (picker_entries
+    # is empty otherwise). Their callback is "e:<voice_id>" —
+    # distinct from the "v:<style>" buttons — and the stored pick
+    # is the same "el:<voice_id>" value the web wizard sends.
+    for e in elevenlabs_tts.picker_entries():
+        rows.append([("🌟 " + e["label"]
+                      + f" ({e['rate']} credits/မိနစ်)",
+                      "e:" + elevenlabs_tts.voice_id_of(e["id"]))])
     tg.send_message(chat_id, "အသံ ရွေးပေးပါ", buttons=rows)
+
+
+def _tg_speed_step(chat_id, flow):
+    from pipeline import telegram_send as tg
+    flow["step"] = "speed"
+    tg.send_message(chat_id, "အသံ အရှိန် ရွေးပေးပါ",
+                    buttons=[[("1.0×", "s:1.0"),
+                              ("1.3× ပုံမှန်", "s:1.3"),
+                              ("1.5×", "s:1.5")],
+                             [("2×", "s:2.0"), ("3×", "s:3.0"),
+                              ("4×", "s:4.0")]])
 
 
 def _tg_quality_step(chat_id, flow):
@@ -1337,6 +1358,11 @@ def _tg_start_flow_job(chat_id, flow):
                             " web page ထဲမှာ ဝင်ပြီး ပြင်ပေးပါ 🙏")
             return
         need = flow.get("minutes") or 1
+        if elevenlabs_tts.is_el_voice(flow.get("voice_style")):
+            # Build 205: ElevenLabs premium voices bill at the
+            # admin-set per-minute rate — the same quote math as
+            # the web surface.
+            need *= elevenlabs_tts.credits_per_min()
         if (acct["credits"] or 0) < need:
             _TG_FLOW.pop(chat_id, None)
             tg.send_message(chat_id,
@@ -1579,13 +1605,18 @@ def _on_tg_callback(cq):
         if not style:
             return
         flow["voice_style"] = style["key"]
-        flow["step"] = "speed"
-        tg.send_message(chat_id, "အသံ အရှိန် ရွေးပေးပါ",
-                        buttons=[[("1.0×", "s:1.0"),
-                                  ("1.3× ပုံမှန်", "s:1.3"),
-                                  ("1.5×", "s:1.5")],
-                                 [("2×", "s:2.0"), ("3×", "s:3.0"),
-                                  ("4×", "s:4.0")]])
+        _tg_speed_step(chat_id, flow)
+        return
+    if data.startswith("e:") and flow.get("step") == "voice":
+        # Build 205: an ElevenLabs premium tap. The voice must
+        # still be in the owner's registry (it may have been
+        # removed after these buttons were sent) — a stale tap is
+        # ignored, never substituted with a free voice.
+        entry = elevenlabs_tts.find_voice(data[2:])
+        if not entry:
+            return
+        flow["voice_style"] = "el:" + entry["id"]
+        _tg_speed_step(chat_id, flow)
         return
     if data.startswith("s:") and flow.get("step") == "speed":
         try:
@@ -1735,11 +1766,24 @@ def _job_minutes(job):
         return 1
 
 
+def _credits_per_min_for(job):
+    """Per-minute credit rate for a job (build 205): an
+    ElevenLabs premium voice bills at the admin-set
+    ELEVENLABS_CREDITS_PER_MIN (default 2); every other voice —
+    and subtitles-only jobs, whose voice is never premium — is
+    the standard 1 credit per started minute."""
+    if elevenlabs_tts.is_el_voice(job.get("voice")):
+        return elevenlabs_tts.credits_per_min()
+    return 1
+
+
 def _quote_for_job(job):
     """Admission check after phase 1 (the duration is known): a
-    non-admin account must COVER 1 credit per started minute — but
-    nothing is deducted here. Owner rule (2026-11-09): credits move
-    only when the video is actually produced; a job that fails or is
+    non-admin account must COVER the job's credits — started
+    minutes × its per-minute rate (1 standard; the admin-set
+    premium rate for ElevenLabs voices, build 205) — but nothing
+    is deducted here. Owner rule (2026-11-09): credits move only
+    when the video is actually produced; a job that fails or is
     cancelled is never charged."""
     uid = job.get("user_id")
     if not uid:
@@ -1749,16 +1793,22 @@ def _quote_for_job(job):
         return
     minutes = _job_minutes(job)
     job["quote_minutes"] = minutes
+    # Build 205: the quote is in CREDITS — minutes × the job's
+    # per-minute rate (premium ElevenLabs voices cost more than
+    # the standard 1/minute). quote_minutes stays on the record
+    # as the duration figure; quote_credits is what moves.
+    needed = minutes * _credits_per_min_for(job)
+    job["quote_credits"] = needed
     _save(job)
-    if (user["credits"] or 0) < minutes:
+    if (user["credits"] or 0) < needed:
         raise RuntimeError(
-            f"credit မလောက်ပါ — ဒီ video အတွက် {minutes} credits "
+            f"credit မလောက်ပါ — ဒီ video အတွက် {needed} credits "
             f"လိုပါတယ်, လက်ကျန် {user['credits']} credits ပဲ ရှိပါတယ်")
 
 
 def _charge_for_job(job):
     """Success-only charge, called from _finish once the video
-    exists: deduct the quoted minutes. If the balance dropped below
+    exists: deduct the quoted credits. If the balance dropped below
     the quote after admission (a concurrent job spent it), take what
     is there and record the shortfall — the finished video is still
     delivered. Admin and anonymous jobs are never charged."""
@@ -1768,7 +1818,11 @@ def _charge_for_job(job):
     user = accounts.get_user(uid)
     if not user or user["role"] == "admin":
         return
-    minutes = job.get("quote_minutes") or _job_minutes(job)
+    # Build 205: charge the quoted CREDITS (minutes × rate).
+    # quote_credits is set by _quote_for_job on every fresh run;
+    # the fallbacks keep pre-205 records (minutes only) exact.
+    minutes = job.get("quote_credits") or job.get("quote_minutes") \
+        or _job_minutes(job) * _credits_per_min_for(job)
     paid = minutes
     if not accounts.charge(uid, minutes, job["id"]):
         paid = max(0, min(user["credits"] or 0, minutes))
@@ -1998,8 +2052,14 @@ def voices():
     # voice + pitch at job creation. Static on purpose: the table
     # IS the catalogue, so the picker works even when the live
     # edge-tts voice list cannot be reached.
-    return jsonify([{"id": s["key"], "label": s["label"]}
-                    for s in tts.VOICE_STYLES])
+    out = [{"id": s["key"], "label": s["label"]}
+           for s in tts.VOICE_STYLES]
+    # Build 205: ElevenLabs premium voices join the picker ONLY
+    # when the owner has configured a key + registry
+    # (picker_entries() is empty otherwise), so an unconfigured
+    # install returns exactly the build-200 payload.
+    out += elevenlabs_tts.picker_entries()
+    return jsonify(out)
 
 
 def _public_url_ok(url):
@@ -2480,6 +2540,89 @@ def xkiro_key_save():
 def xkiro_key_delete():
     _env_remove("XKIRO_API_KEY")
     return jsonify({"ok": True, "configured": False})
+
+
+# ---------- ElevenLabs premium voices (build 205) ----------
+# The owner's ElevenLabs key + voice registry live in .env
+# exactly like the other keys (chmod 600, never in git). The key
+# value is NEVER returned — only whether one is configured. Voice
+# ids + display names are not secrets and ARE returned, but only
+# through these /api/settings/* routes, which the accounts guard
+# restricts to admins; customers never see them here (they see
+# the names alone, in the picker, and only when configured).
+
+@app.get("/api/settings/elevenlabs")
+def elevenlabs_status():
+    return jsonify({
+        "configured": elevenlabs_tts.key_configured(),
+        "model": elevenlabs_tts.get_model(),
+        "credits_per_min": elevenlabs_tts.credits_per_min(),
+        "voices": elevenlabs_tts.get_voices()})
+
+
+@app.post("/api/settings/elevenlabs-key")
+def elevenlabs_key_save():
+    data = request.get_json(force=True) or {}
+    key = (data.get("key") or "").strip()
+    ok_format = key.startswith("sk_") and 20 <= len(key) <= 200 \
+        and all(ch.isalnum() or ch in "._-" for ch in key)
+    if not ok_format:
+        return jsonify({"error": "key မမှန်ပါ — ElevenLabs key (sk_ နဲ့ စတာ) ဖြစ်ရပါမယ်"}), 400
+    _env_write("ELEVENLABS_API_KEY", key)
+    return jsonify({"ok": True, "configured": True})
+
+
+@app.delete("/api/settings/elevenlabs-key")
+def elevenlabs_key_delete():
+    _env_remove("ELEVENLABS_API_KEY")
+    return jsonify({"ok": True, "configured": False})
+
+
+@app.post("/api/settings/elevenlabs")
+def elevenlabs_save():
+    data = request.get_json(force=True) or {}
+    model = data.get("model")
+    if model not in elevenlabs_tts.MODELS:
+        return jsonify({"error": "model မမှန်ပါ"}), 400
+    try:
+        rate = int(data.get("credits_per_min"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "credit နှုန်း မမှန်ပါ"}), 400
+    if not 1 <= rate <= 100:
+        return jsonify({"error": "credit နှုန်း 1–100 အတွင်း ဖြစ်ရပါမယ်"}), 400
+    _env_write("ELEVENLABS_MODEL", model)
+    _env_write("ELEVENLABS_CREDITS_PER_MIN", str(rate))
+    return jsonify({"ok": True, "model": model,
+                    "credits_per_min": rate})
+
+
+@app.post("/api/settings/elevenlabs-voices")
+def elevenlabs_voice_add():
+    data = request.get_json(force=True) or {}
+    vid = (data.get("id") or "").strip()
+    name = (data.get("name") or "").strip()
+    if not vid or len(vid) > 64 \
+            or not all(ch.isalnum() or ch in "_-" for ch in vid):
+        return jsonify({"error": "Voice ID မမှန်ပါ"}), 400
+    if not name or len(name) > 60:
+        return jsonify({"error": "အသံ နာမည် ထည့်ပါ (အများဆုံး 60 လုံး)"}), 400
+    voices = [v for v in elevenlabs_tts.get_voices()
+              if v["id"] != vid]
+    voices.append({"id": vid, "name": name})
+    _env_write("ELEVENLABS_VOICES",
+               json.dumps(voices, ensure_ascii=False))
+    return jsonify({"ok": True, "voices": voices})
+
+
+@app.delete("/api/settings/elevenlabs-voices")
+def elevenlabs_voice_remove():
+    data = request.get_json(force=True, silent=True) or {}
+    vid = (data.get("id") or "").strip()
+    voices = [v for v in elevenlabs_tts.get_voices()
+              if v["id"] != vid]
+    _env_write("ELEVENLABS_VOICES",
+               json.dumps(voices, ensure_ascii=False))
+    return jsonify({"ok": True, "voices": voices})
 
 
 # ---------- Telegram delivery (commercial direction) ----------
@@ -3712,7 +3855,23 @@ def _new_job(data):
     # (Thiha မူလ). No voice at all keeps the historical default
     # (tts.DEFAULT_VOICE, မူလ variant, knobs applying).
     style_in = data.get("voice_style") or data.get("voice")
-    if style_in and str(style_in).strip() in tts.STYLE_BY_KEY:
+    el_entry = None
+    if style_in and elevenlabs_tts.is_el_voice(str(style_in).strip()):
+        # Build 205: an ElevenLabs premium pick ("el:<voice_id>").
+        # It must still be in the owner's registry — a removed
+        # voice refuses the job HERE with a clear message instead
+        # of failing mid-render, and it NEVER falls back to an
+        # edge-tts style: the customer picked (and pays a premium
+        # for) THIS voice.
+        el_entry = elevenlabs_tts.find_voice(
+            elevenlabs_tts.voice_id_of(str(style_in).strip()))
+        if el_entry is None:
+            return None, ("ရွေးထားတဲ့ ElevenLabs အသံ မရှိတော့ပါ — "
+                          "အသံ ပြန်ရွေးပေးပါ")
+        voice = "el:" + el_entry["id"]
+        voice_style = voice
+        voice_rate, voice_pitch = 0, 0
+    elif style_in and str(style_in).strip() in tts.STYLE_BY_KEY:
         style = tts.resolve_style(style_in)
         voice = style["voice"]
         voice_style = style["key"]
@@ -3757,6 +3916,12 @@ def _new_job(data):
         "steps": [{"key": k, "label": STEP_LABELS[k], "state": "pending"}
                   for k in run_job.steps_for_mode(mode)],
     }
+    if el_entry is not None:
+        # Build 205: record the premium engine + the display name
+        # on the job itself (the segments record the same facts
+        # per segment at synthesis time).
+        job["tts_engine"] = "elevenlabs"
+        job["voice_name"] = el_entry["name"]
     return job, None
 
 
@@ -3817,9 +3982,10 @@ def create_job():
                 probe_duration(job["source_path"]) / 60.0))
         except Exception:
             _mins = None
-        if _mins and (me["credits"] or 0) < _mins:
+        _need = _mins * _credits_per_min_for(job) if _mins else None
+        if _need and (me["credits"] or 0) < _need:
             return jsonify({
-                "error": f"credit မလောက်ပါ — ဒီ video အတွက် {_mins} "
+                "error": f"credit မလောက်ပါ — ဒီ video အတွက် {_need} "
                          f"credits လိုပါတယ်, လက်ကျန် {me['credits']} "
                          "credits ပဲ ရှိပါတယ်"}), 400
     JOBS[job["id"]] = job

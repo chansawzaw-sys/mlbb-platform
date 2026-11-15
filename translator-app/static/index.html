@@ -277,6 +277,34 @@
     </div>
   </div>
 
+  <div class="card" id="elCard">
+    <h3 style="margin-top:0">🌟 ElevenLabs အသံ (Premium dub အသံ)</h3>
+    <div class="keyPill" id="elPill">…</div>
+    <p class="hint">ElevenLabs API key ထည့်ပြီး အသံ တွေကို Voice ID နဲ့ မှတ်ပုံတင်ထားရင် customer တွေ dub အသံ ရွေးတဲ့နေရာမှာ <b>🌟 Premium</b> အဖွဲ့ အနေနဲ့ ပေါ်မယ် (key သို့မဟုတ် အသံ မရှိရင် လုံးဝ မပေါ်ပါ)။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="elState">…</span></p>
+    <p class="hint">💡 တန်ဖိုး အသစ် ထည့်ပြီး သိမ်းရင် အဟောင်း ကို အစားထိုး ပြီးသား — အရင် ဖျက်စရာ မလိုပါ။ (သိမ်းထားတဲ့ တန်ဖိုးကို လုံခြုံရေး အရ ပြန်မပြပါ)</p>
+    <input type="password" id="elInput" placeholder="ElevenLabs key (sk_ နဲ့ စတယ်) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+    <div class="row">
+      <button class="ghost" id="elSave">Key သိမ်းမယ်</button>
+      <button class="ghost" id="elDel">Key ဖျက်မယ်</button>
+    </div>
+    <p class="hint">Model:
+      <select id="elModel">
+        <option value="eleven_v4_turbo">v4 Turbo (မြန် · ဈေးသက်သာ)</option>
+        <option value="eleven_v4">v4 (အရည်အသွေး အမြင့်ဆုံး)</option>
+      </select>
+    </p>
+    <p class="hint">Premium အသံ နှုန်း (credits / မိနစ်):
+      <input id="elRate" type="number" min="1" max="100" inputmode="numeric" style="width:90px;padding:8px;border-radius:8px;box-sizing:border-box">
+      <button class="ghost" id="elCfgSave">Model/နှုန်း သိမ်းမယ်</button>
+    </p>
+    <div id="elVoiceList"></div>
+    <input type="text" id="elVoiceName" placeholder="အသံ နာမည် (customer မြင်ရမယ် — ဥပမာ ကိုလတ်)" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-top:6px">
+    <input type="text" id="elVoiceId" placeholder="Voice ID (ElevenLabs ထဲက)" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-top:6px">
+    <div class="row">
+      <button class="ghost" id="elVoiceAdd">အသံ ထည့်မယ်</button>
+    </div>
+  </div>
+
   <div class="card" id="asCard">
     <h3 style="margin-top:0">📜 Apps Script (အခမဲ့ ဘာသာပြန် လမ်း)</h3>
     <div class="keyPill" id="asPill">…</div>
@@ -562,8 +590,20 @@ const VOICE_STYLES_FALLBACK = [
 let voiceList = VOICE_STYLES_FALLBACK;
 function voiceChips(vs) {
   voiceList = vs;
-  $("voiceChips").innerHTML = vs.map(v =>
+  /* Build 205: ElevenLabs premium entries (premium:true) render
+     as their own labelled group under the free styles, with the
+     per-minute credit rate on the group header. With no premium
+     entries the markup is exactly the build-200 chips. */
+  const std = vs.filter(v => !v.premium);
+  const prem = vs.filter(v => v.premium);
+  let html = std.map(v =>
     `<button class="chip${v.id === W.voice ? " on" : ""}" data-voice="${v.id}">${v.label}</button>`).join("");
+  if (prem.length) {
+    html += `<div class="hint" style="flex-basis:100%;margin:4px 0 0">🌟 ElevenLabs Premium (${prem[0].rate} credits/မိနစ်)</div>`
+      + prem.map(v =>
+        `<button class="chip${v.id === W.voice ? " on" : ""}" data-voice="${v.id}">🌟 ${v.label}</button>`).join("");
+  }
+  $("voiceChips").innerHTML = html;
   $("voiceChips").querySelectorAll(".chip").forEach(c => c.onclick = () => {
     $("voiceChips").querySelectorAll(".chip").forEach(x => x.classList.remove("on"));
     c.classList.add("on"); W.voice = c.dataset.voice;
@@ -847,12 +887,15 @@ function wizSummaryRender() {
     lines.push("🔤 စာတန်း: " + ({box: "အကွက်ထဲမှာ", bottom: "အောက်ခြေ", top: "အပေါ်"})[W.place]
       + " · အရွယ် " + W.subSize + "% · အရောင် " + W.color);
   lines.push("🏷 Logo: " + (logoId && W.logoChoice === "yes" ? "ထည့်မယ်" : "မထည့်ဘူး"));
+  const selVoice = voiceList.find(v => v.id === W.voice) || {};
+  const voiceRate = selVoice.premium ? (selVoice.rate || 2) : 1;
   if (W.mode !== "subs") {
-    lines.push("🎙 အသံ: " + ((voiceList.find(v => v.id === W.voice) || {}).label || W.voice));
+    lines.push("🎙 အသံ: " + (selVoice.premium ? "🌟 " : "")
+      + (selVoice.label || W.voice));
     lines.push("⏩ အရှိန်: " + Number(W.speed).toFixed(1) + "×");
   }
   lines.push(mins
-    ? "💳 ကုန်ကျ ခန့်မှန်း: " + mins + " credits (မအောင်မြင်ရင် မဖြတ်ပါ)"
+    ? "💳 ကုန်ကျ ခန့်မှန်း: " + (mins * voiceRate) + " credits (မအောင်မြင်ရင် မဖြတ်ပါ)"
       + (ME && ME.role === "admin" ? " — admin မို့ မဖြတ်ပါ" : "")
     : "💳 ကုန်ကျ: video အရှည် အလိုက်, 1 မိနစ် 1 credit (မအောင်မြင်ရင် မဖြတ်ပါ)");
   $("wizSummary").textContent = lines.join("\n");
@@ -1370,6 +1413,81 @@ $("xkDel").onclick = async () => {
   alert("ဖျက်ပြီးပါပြီ");
 };
 loadXkState();
+
+/* ---------------- ElevenLabs settings (build 205) ---------------- */
+function elVoiceListRender(voices) {
+  $("elVoiceList").innerHTML = (voices || []).map(v =>
+    `<div class="row" style="align-items:center;gap:8px">
+       <span>🌟 ${v.name} <span class="hint">(${v.id})</span></span>
+       <button class="ghost" data-el-del="${v.id}">ဖျက်မယ်</button>
+     </div>`).join("");
+  $("elVoiceList").querySelectorAll("[data-el-del]").forEach(b =>
+    b.onclick = async () => {
+      const res = await fetch("/api/settings/elevenlabs-voices",
+        {method: "DELETE", headers: {"Content-Type": "application/json"},
+         body: JSON.stringify({id: b.dataset.elDel})});
+      const d = await res.json();
+      if (!res.ok) { alert(d.error || "ဖျက်လို့ မရပါ"); return; }
+      elVoiceListRender(d.voices);
+    });
+}
+async function loadElState() {
+  try {
+    const r = await fetch("/api/settings/elevenlabs");
+    const d = await r.json();
+    // Owner-only card, same rule as the Gemini card: any non-OK
+    // or field-less response (a customer's 403) keeps it hidden.
+    if (!r.ok || !("configured" in d)) {
+      $("elCard").classList.remove("show");
+      return;
+    }
+    $("elState").textContent = d.configured ? "✅ ထည့်ပြီးသား" : "❌ မထည့်ရသေး";
+    setPill("elPill", d.configured);
+    $("elModel").value = d.model;
+    $("elRate").value = d.credits_per_min;
+    elVoiceListRender(d.voices);
+    $("elCard").classList.add("show");
+  } catch (e) { $("elState").textContent = "?"; }
+}
+$("elSave").onclick = async () => {
+  const key = $("elInput").value.trim();
+  if (!key) { alert("key အရင် ထည့်ပါ"); return; }
+  const res = await fetch("/api/settings/elevenlabs-key", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({key})});
+  const d = await res.json();
+  if (!res.ok) { alert(d.error || "သိမ်းလို့ မရပါ"); return; }
+  $("elInput").value = "";
+  loadElState();
+  alert("သိမ်းပြီးပြီ — Premium အသံ တွေ picker မှာ ပေါ်လာမယ်");
+};
+$("elDel").onclick = async () => {
+  await fetch("/api/settings/elevenlabs-key", {method: "DELETE"});
+  loadElState();
+  alert("ဖျက်ပြီးပါပြီ");
+};
+$("elCfgSave").onclick = async () => {
+  const res = await fetch("/api/settings/elevenlabs", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({model: $("elModel").value,
+                          credits_per_min: Number($("elRate").value)})});
+  const d = await res.json();
+  if (!res.ok) { alert(d.error || "သိမ်းလို့ မရပါ"); return; }
+  loadElState();
+  alert("သိမ်းပြီးပြီ");
+};
+$("elVoiceAdd").onclick = async () => {
+  const name = $("elVoiceName").value.trim();
+  const id = $("elVoiceId").value.trim();
+  if (!name || !id) { alert("နာမည် နဲ့ Voice ID နှစ်ခုလုံး ထည့်ပါ"); return; }
+  const res = await fetch("/api/settings/elevenlabs-voices", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({id, name})});
+  const d = await res.json();
+  if (!res.ok) { alert(d.error || "ထည့်လို့ မရပါ"); return; }
+  $("elVoiceName").value = ""; $("elVoiceId").value = "";
+  elVoiceListRender(d.voices);
+  alert("ထည့်ပြီးပြီ");
+};
+loadElState();
 
 /* ---------------- Apps Script settings ---------------- */
 async function loadAsState() {
@@ -2227,6 +2345,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 204</p>
+<p class="hint" id="buildTag" style="text-align:center">build 205</p>
 </body>
 </html>

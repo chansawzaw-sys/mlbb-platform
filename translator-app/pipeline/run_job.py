@@ -9,7 +9,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import burn, download, fx as fx_mod, retime, transcribe, translate_segments, tts
+from . import burn, download, elevenlabs_tts, fx as fx_mod, retime, transcribe, translate_segments, tts
 from .common import maxrate_cap_k
 
 ALL_STEPS = ["download", "transcribe", "translate", "tts", "retime", "finalize"]
@@ -172,7 +172,16 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
         return final
 
     mark("tts", "running", voice)
-    tts.synthesize(workdir, voice, rate=voice_rate, pitch=voice_pitch)
+    if elevenlabs_tts.is_el_voice(voice):
+        # Build 205: an ElevenLabs premium pick ("el:<voice_id>")
+        # synthesizes through the owner's registry instead of the
+        # free edge-tts path. Any failure raises out of here and
+        # fails the job loudly — a premium pick is NEVER silently
+        # re-voiced with a free voice.
+        elevenlabs_tts.synthesize(
+            workdir, elevenlabs_tts.voice_id_of(voice))
+    else:
+        tts.synthesize(workdir, voice, rate=voice_rate, pitch=voice_pitch)
     mark("tts", "done")
 
     def _make_finalize(plan):
