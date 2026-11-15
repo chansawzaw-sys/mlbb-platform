@@ -1392,6 +1392,332 @@ async function notify(
   }
 }
 
+/* ---------- F01: atomic, retry-safe wallet money cores ----------
+ * Wallet decisions used to run as claim -> stale-read -> absolute
+ * balance write -> separate ledger insert, all autocommitted: two
+ * concurrent approvals could overwrite each other's increment, and a
+ * crash between steps left a decided request with partial money.
+ *
+ * Every money-moving decision core below is a GENERATOR that yields
+ * drizzle statement builders; a driver executes them:
+ *   - bun:sqlite (standalone production): the native transaction is
+ *     SYNCHRONOUS, so the driver runs the core inside
+ *     db.transaction(...) executing each builder synchronously
+ *     (.all()). Any fault — including an injected RAISE(ABORT) —
+ *     rolls the whole decision back: claim, balance mutation and
+ *     ledger commit together or not at all.
+ *   - libsql (Muse artifact runtime): the same core is driven with
+ *     awaited builders inside db.transaction(async ...), a real
+ *     transaction on that surface too.
+ *   - a hypothetical surface with no transaction API at all: the
+ *     statements run in sequence (the atomic guarded arithmetic and
+ *     the claim guard still apply) and the decide-entry RESUME RULE
+ *     restores exactly-once: a decision that finds its request
+ *     already claimed/decided but with NO ledger row for the
+ *     request's txn_code completes the missing credit + ledger
+ *     instead of refusing. Decision ledger rows carry the request's
+ *     txn_code (migration 0024 makes transactions.code unique),
+ *     which is what makes that lookup exact.
+ * Notifications / logAct / Telegram always run AFTER the core
+ * commits, so their failure can never undo or duplicate money. */
+
+type MoneyGen<T> = Generator<(h: any) => any, T, any>;
+
+type MoneyCoreResult =
+  | { kind: "done"; nb: number | null }
+  | { kind: "lost" }
+  | { kind: "insufficient" }
+  | { kind: "abort"; abort: string };
+
+/** A core returns { abort } for a business refusal discovered only
+ *  inside the core (e.g. the player row vanished). Transactional
+ *  drivers throw this inside the transaction to force a rollback,
+ *  then translate it back into the result outside. */
+class MoneyAbort extends Error {
+  result: MoneyCoreResult;
+  constructor(result: MoneyCoreResult) {
+    super("money core abort");
+    this.result = result;
+  }
+}
+
+function isAbortResult(r: unknown): r is { kind: "abort"; abort: string } {
+  return (
+    !!r &&
+    typeof r === "object" &&
+    (r as { kind?: unknown }).kind === "abort" &&
+    typeof (r as { abort?: unknown }).abort === "string"
+  );
+}
+
+type MoneySurface = "bun-tx" | "libsql-tx" | "plain";
+
+function moneySurface(db: Db): MoneySurface {
+  const anyDb = db as any;
+  // bun:sqlite's Database client exposes prepare(); the libsql
+  // client does not. That is the reliable discriminator between the
+  // two runtimes this file executes on.
+  if (
+    anyDb.$client &&
+    typeof anyDb.$client.prepare === "function" &&
+    typeof anyDb.transaction === "function"
+  )
+    return "bun-tx";
+  if (typeof anyDb.transaction === "function") return "libsql-tx";
+  return "plain";
+}
+
+function driveMoneySync<T>(db: Db, core: MoneyGen<T>): T {
+  try {
+    return (db as any).transaction((tx: any) => {
+      let r = core.next();
+      while (!r.done) {
+        const b = r.value(tx);
+        // bun-sqlite builders are lazy: .all()/.run() execute them
+        // synchronously, inside the native transaction.
+        const out =
+          b && typeof b.all === "function"
+            ? b.all()
+            : b && typeof b.run === "function"
+              ? b.run()
+              : b;
+        r = core.next(out);
+      }
+      if (isAbortResult(r.value)) throw new MoneyAbort(r.value);
+      return r.value;
+    });
+  } catch (e) {
+    if (e instanceof MoneyAbort) return e.result as T;
+    throw e;
+  }
+}
+
+async function driveMoneyAsync<T>(
+  db: Db,
+  makeCore: () => MoneyGen<T>,
+  useTx: boolean,
+): Promise<T> {
+  const step = async (h: any): Promise<T> => {
+    const core = makeCore();
+    let r = core.next();
+    while (!r.done) r = core.next(await r.value(h));
+    if (isAbortResult(r.value)) throw new MoneyAbort(r.value);
+    return r.value;
+  };
+  try {
+    if (!useTx) return await step(db);
+    // libsql write transactions are single-writer: two money cores
+    // racing on the artifact surface can meet SQLITE_BUSY at BEGIN,
+    // before anything was applied. Re-drive a FRESH core after a
+    // short backoff (bounded); any other error propagates at once.
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      try {
+        return await (db as any).transaction(async (tx: any) => step(tx));
+      } catch (e) {
+        if (e instanceof MoneyAbort) throw e;
+        lastErr = e;
+        const tag =
+          String((e as { code?: unknown })?.code ?? "") +
+          " " +
+          String((e as { message?: unknown })?.message ?? e);
+        if (!/SQLITE_BUSY|database is locked/i.test(tag)) throw e;
+        await new Promise((res) => setTimeout(res, 15 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
+  } catch (e) {
+    if (e instanceof MoneyAbort) return e.result as T;
+    throw e;
+  }
+}
+
+/** Run a money core atomically on whatever surface this process has. */
+function runMoneyCore<T>(db: Db, makeCore: () => MoneyGen<T>): Promise<T> {
+  const surface = moneySurface(db);
+  if (surface === "bun-tx")
+    return Promise.resolve(driveMoneySync(db, makeCore()));
+  return withMoneyLock(() =>
+    driveMoneyAsync(db, makeCore, surface === "libsql-tx"),
+  );
+}
+
+// Money cores on the ASYNC surface are serialized process-wide:
+// embedded libsql is single-writer, and concurrent write
+// transactions on one client fail with SQLITE_BUSY (at BEGIN or
+// COMMIT) instead of queueing. Money decisions are low-frequency,
+// and the cores never call back into runMoneyCore, so a simple
+// promise chain is a safe mutex. The bun surface needs no lock:
+// its driver is fully synchronous and cannot interleave.
+let moneyChain: Promise<unknown> = Promise.resolve();
+function withMoneyLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = moneyChain.then(fn, fn);
+  moneyChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+/** The resume rule's lookup: does the ledger already carry this
+ *  decision's operation key? */
+async function txnExistsByCode(db: Db, code: string): Promise<boolean> {
+  if (!code) return false;
+  const rows = await db
+    .select({ id: schema.transactions.id })
+    .from(schema.transactions)
+    .where(eq(schema.transactions.code, code))
+    .limit(1);
+  return rows.length > 0;
+}
+
+/** Purchase approval: claim (pending -> approved, stamping the
+ *  operation code) + DB-arithmetic credit + ledger row carrying the
+ *  same code — one atomic unit. With alreadyClaimed the claim step
+ *  is skipped (resume of a decision whose claim already committed). */
+function* purchaseApproveCore(args: {
+  reqId: number;
+  playerId: number;
+  coins: number;
+  code: string;
+  decidedByName: string;
+  note: string;
+  alreadyClaimed?: boolean;
+}): MoneyGen<MoneyCoreResult> {
+  if (!args.alreadyClaimed) {
+    const claimed: any[] = yield (h: any) =>
+      h
+        .update(schema.purchaseRequests)
+        .set({
+          status: "approved",
+          decidedBy: args.decidedByName,
+          decidedAt: new Date(),
+          txnCode: args.code,
+          rejectReason: "",
+        })
+        .where(
+          and(
+            eq(schema.purchaseRequests.id, args.reqId),
+            eq(schema.purchaseRequests.status, "pending"),
+          ),
+        )
+        .returning({ id: schema.purchaseRequests.id });
+    if (claimed.length === 0) return { kind: "lost" };
+  }
+  const credited: any[] = yield (h: any) =>
+    h
+      .update(schema.players)
+      .set({ balance: sql`${schema.players.balance} + ${args.coins}` })
+      .where(eq(schema.players.id, args.playerId))
+      .returning({ balance: schema.players.balance });
+  if (credited.length === 0) return { kind: "abort", abort: "Buyer မတွေ့ပါ" };
+  const nb = credited[0].balance as number;
+  yield (h: any) =>
+    h.insert(schema.transactions).values({
+      code: args.code,
+      playerId: args.playerId,
+      type: "purchase",
+      amount: args.coins,
+      balanceAfter: nb,
+      note: args.note,
+    });
+  return { kind: "done", nb };
+}
+
+/** Shared refund core for withdraw / diamond decisions and the 24h
+ *  expiry sweep: claim (unless claimSet is null = already claimed)
+ *  + DB-arithmetic re-credit + ledger row keyed by the request's own
+ *  txn_code. A vanished player row keeps the legacy semantics: the
+ *  claim stands, no money moves (done with nb = null). */
+function* refundCore(args: {
+  table: "withdraw" | "diamond";
+  reqId: number;
+  playerId: number;
+  amount: number;
+  claimSet: Record<string, unknown> | null;
+  ledgerCode: string;
+  ledgerType: string;
+  ledgerNote: string;
+}): MoneyGen<MoneyCoreResult> {
+  const table: any =
+    args.table === "withdraw"
+      ? schema.withdrawRequests
+      : schema.diamondOrders;
+  if (args.claimSet) {
+    const claimed: any[] = yield (h: any) =>
+      h
+        .update(table)
+        .set(args.claimSet)
+        .where(and(eq(table.id, args.reqId), eq(table.status, "pending")))
+        .returning({ id: table.id });
+    if (claimed.length === 0) return { kind: "lost" };
+  }
+  const credited: any[] = yield (h: any) =>
+    h
+      .update(schema.players)
+      .set({ balance: sql`${schema.players.balance} + ${args.amount}` })
+      .where(eq(schema.players.id, args.playerId))
+      .returning({ balance: schema.players.balance });
+  if (credited.length === 0) return { kind: "done", nb: null };
+  const nb = credited[0].balance as number;
+  yield (h: any) =>
+    h.insert(schema.transactions).values({
+      code: args.ledgerCode,
+      playerId: args.playerId,
+      type: args.ledgerType,
+      amount: args.amount,
+      balanceAfter: nb,
+      note: args.ledgerNote,
+    });
+  return { kind: "done", nb };
+}
+
+/** Withdrawal creation: guarded atomic decrement + request insert +
+ *  ledger row as one unit. The bag reports progress so the caller
+ *  can run the legacy M1+L5 compensation on a non-transactional
+ *  surface (on a transactional surface a failure rolls the debit
+ *  back by itself and the bag is ignored). */
+function* withdrawCreateCore(args: {
+  playerId: number;
+  coins: number;
+  insertValues: Record<string, unknown>;
+  ledgerCode: string;
+  ledgerNote: string;
+  bag: { debited: boolean; inserted: boolean; requestId: number };
+}): MoneyGen<MoneyCoreResult> {
+  const dec: any[] = yield (h: any) =>
+    h
+      .update(schema.players)
+      .set({ balance: sql`${schema.players.balance} - ${args.coins}` })
+      .where(
+        and(
+          eq(schema.players.id, args.playerId),
+          gte(schema.players.balance, args.coins),
+        ),
+      )
+      .returning({ balance: schema.players.balance });
+  if (dec.length === 0) return { kind: "insufficient" };
+  args.bag.debited = true;
+  const nb = dec[0].balance as number;
+  const ins: any[] = yield (h: any) =>
+    h
+      .insert(schema.withdrawRequests)
+      .values(args.insertValues)
+      .returning({ id: schema.withdrawRequests.id });
+  args.bag.inserted = true;
+  args.bag.requestId = ins[0]?.id ?? 0;
+  yield (h: any) =>
+    h.insert(schema.transactions).values({
+      code: args.ledgerCode,
+      playerId: args.playerId,
+      type: "withdraw",
+      amount: -args.coins,
+      balanceAfter: nb,
+      note: args.ledgerNote,
+    });
+  return { kind: "done", nb };
+}
+
 /* ---------- Batch 20: Web Push (VAPID + RFC 8291 aes128gcm) ----------
  * Hand-rolled Web Push sender on the global WebCrypto API only — no
  * node:crypto imports, no new dependencies, so this file runs unchanged
@@ -2470,32 +2796,24 @@ async function expireMoneyRequestsInternal(db: Db): Promise<number> {
     .where(eq(schema.withdrawRequests.status, "pending"));
   for (const w of staleWithdrawals) {
     if (w.createdAt >= cutoff) continue;
-    const upd = await db
-      .update(schema.withdrawRequests)
-      .set({ status: "expired", decidedBy: "system (24h expiry)", decidedAt: new Date() })
-      .where(
-        and(
-          eq(schema.withdrawRequests.id, w.id),
-          eq(schema.withdrawRequests.status, "pending"),
-        ),
-      )
-      .returning({ id: schema.withdrawRequests.id });
-    if (upd.length === 0) continue;
-    const p = await getPlayer(db, w.playerId);
-    if (p) {
-      const nb = p.balance + w.coins;
-      await db
-        .update(schema.players)
-        .set({ balance: nb })
-        .where(eq(schema.players.id, p.id));
-      await addTxn(db, {
-        playerId: p.id,
-        type: "withdraw_refund",
+    // F01: claim + refund + ledger as one atomic money core.
+    const res = await runMoneyCore(db, () =>
+      refundCore({
+        table: "withdraw",
+        reqId: w.id,
+        playerId: w.playerId,
         amount: w.coins,
-        balanceAfter: nb,
-        note: `Withdraw #${w.id} expired (24h) — coins refunded`,
-      });
-    }
+        claimSet: {
+          status: "expired",
+          decidedBy: "system (24h expiry)",
+          decidedAt: new Date(),
+        },
+        ledgerCode: w.txnCode || uid("TXN"),
+        ledgerType: "withdraw_refund",
+        ledgerNote: `Withdraw #${w.id} expired (24h) — coins refunded`,
+      }),
+    );
+    if (res.kind === "lost") continue;
     await notify(db, {
       playerId: w.playerId,
       type: "wallet",
@@ -2511,33 +2829,25 @@ async function expireMoneyRequestsInternal(db: Db): Promise<number> {
     .where(eq(schema.diamondOrders.status, "pending"));
   for (const o of staleDiamond) {
     if (o.createdAt >= cutoff) continue;
-    const upd = await db
-      .update(schema.diamondOrders)
-      .set({ status: "expired", decidedBy: "system (24h expiry)", decidedAt: new Date() })
-      .where(
-        and(
-          eq(schema.diamondOrders.id, o.id),
-          eq(schema.diamondOrders.status, "pending"),
-        ),
-      )
-      .returning({ id: schema.diamondOrders.id });
-    if (upd.length === 0) continue;
-    // Coins were deducted at order time — an expired order refunds in full.
-    const p = await getPlayer(db, o.playerId);
-    if (p) {
-      const nb = p.balance + o.priceCoins;
-      await db
-        .update(schema.players)
-        .set({ balance: nb })
-        .where(eq(schema.players.id, p.id));
-      await addTxn(db, {
-        playerId: p.id,
-        type: "diamond_refund",
+    // Coins were deducted at order time — an expired order refunds in
+    // full. F01: claim + refund + ledger as one atomic money core.
+    const res = await runMoneyCore(db, () =>
+      refundCore({
+        table: "diamond",
+        reqId: o.id,
+        playerId: o.playerId,
         amount: o.priceCoins,
-        balanceAfter: nb,
-        note: `Diamond order #${o.id} expired (24h) — coins refunded`,
-      });
-    }
+        claimSet: {
+          status: "expired",
+          decidedBy: "system (24h expiry)",
+          decidedAt: new Date(),
+        },
+        ledgerCode: o.txnCode || uid("TXN"),
+        ledgerType: "diamond_refund",
+        ledgerNote: `Diamond order #${o.id} expired (24h) — coins refunded`,
+      }),
+    );
+    if (res.kind === "lost") continue;
     await notify(db, {
       playerId: o.playerId,
       type: "wallet",
@@ -4085,10 +4395,49 @@ async function decidePurchaseInternal(
     .limit(1);
   const req = rows[0];
   if (!req) return fail("Request မတွေ့ပါ");
+  // Post-commit side effects of an approval, shared by the fresh path
+  // and the resume path below. Runs only after the money core has
+  // committed, so a failure here can never undo or duplicate money.
+  const finishApprove = async (buyerName: string, nb: number, code: string) => {
+    await notify(db, { playerId: req.playerId, type: "wallet", title: "Coin ရောက်ပါပြီ 🪙", body: `${req.coins} coins ထည့်ပြီးပါပြီ။ Balance: ${nb} (Txn ${code})` });
+    await logAct(db, decidedByName, `Purchase request #${req.id} approved: +${req.coins} coins to ${buyerName} (${code})`);
+    ctx.invalidateQueries();
+    return { ok: true, error: "", txn_code: code };
+  };
   if (req.status === "expired")
     return fail("ဒီ request က သက်တမ်းကုန်ပြီးသားပါ — ဆုံးဖြတ်လို့ မရပါ");
-  if (req.status !== "pending")
+  if (req.status !== "pending") {
+    // F01 resume rule: an approval whose claim committed but whose
+    // credit + ledger never landed (only possible off the
+    // transactional surfaces, or from a pre-F01 crash) is completed
+    // exactly once here instead of refused — keyed by the ledger
+    // lookup on the request's txn_code. If the ledger row exists the
+    // decision fully landed and the refusal below stands.
+    if (
+      decision === "approve" &&
+      req.status === "approved" &&
+      req.txnCode &&
+      !(await txnExistsByCode(db, req.txnCode))
+    ) {
+      const buyer = await getPlayer(db, req.playerId);
+      if (!buyer) return fail("Buyer မတွေ့ပါ");
+      const res = await runMoneyCore(db, () =>
+        purchaseApproveCore({
+          reqId: req.id,
+          playerId: req.playerId,
+          coins: req.coins,
+          code: req.txnCode,
+          decidedByName,
+          note: `${req.label} — အတည်ပြုပြီး (request #${req.id}, by ${decidedByName})`,
+          alreadyClaimed: true,
+        }),
+      );
+      if (isAbortResult(res)) return fail(res.abort);
+      if (res.kind === "done" && res.nb !== null)
+        return finishApprove(buyer.name, res.nb, req.txnCode);
+    }
     return fail("ဒီ request ကို ဆုံးဖြတ်ပြီးသားပါ — နှစ်ခါ credit မဖြစ်ပါ");
+  }
   if (decision === "reject") {
     const upd = await db
       .update(schema.purchaseRequests)
@@ -4116,32 +4465,30 @@ async function decidePurchaseInternal(
     ctx.invalidateQueries();
     return { ok: true, error: "", txn_code: "" };
   }
-  // Atomic claim first (pending -> approved) so a double-click, a second
-  // admin, or a Telegram tap can never credit twice.
-  const code = uid("TXN");
-  const upd = await db
-    .update(schema.purchaseRequests)
-    .set({ status: "approved", decidedBy: decidedByName, decidedAt: new Date(), txnCode: code, rejectReason: "" })
-    .where(
-      and(
-        eq(schema.purchaseRequests.id, req.id),
-        eq(schema.purchaseRequests.status, "pending"),
-      ),
-    )
-    .returning({ id: schema.purchaseRequests.id });
-  if (upd.length === 0) return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ — နှစ်ခါ credit မဖြစ်ပါ");
+  // F01: claim + DB-arithmetic credit + ledger as ONE atomic money
+  // core, so a double-click, a second admin, or a Telegram tap can
+  // never credit twice, concurrent approvals can never overwrite
+  // each other, and a crash can never leave partial money behind.
+  // The buyer existence check stays BEFORE the claim (a missing
+  // buyer must not leave a claimed-but-unpaid request behind).
   const buyer = await getPlayer(db, req.playerId);
   if (!buyer) return fail("Buyer မတွေ့ပါ");
-  const nb = buyer.balance + req.coins;
-  await db.update(schema.players).set({ balance: nb }).where(eq(schema.players.id, buyer.id));
-  await db.insert(schema.transactions).values({
-    code, playerId: buyer.id, type: "purchase", amount: req.coins,
-    balanceAfter: nb, note: `${req.label} — အတည်ပြုပြီး (request #${req.id}, by ${decidedByName})`,
-  });
-  await notify(db, { playerId: buyer.id, type: "wallet", title: "Coin ရောက်ပါပြီ 🪙", body: `${req.coins} coins ထည့်ပြီးပါပြီ။ Balance: ${nb} (Txn ${code})` });
-  await logAct(db, decidedByName, `Purchase request #${req.id} approved: +${req.coins} coins to ${buyer.name} (${code})`);
-  ctx.invalidateQueries();
-  return { ok: true, error: "", txn_code: code };
+  const code = uid("TXN");
+  const res = await runMoneyCore(db, () =>
+    purchaseApproveCore({
+      reqId: req.id,
+      playerId: req.playerId,
+      coins: req.coins,
+      code,
+      decidedByName,
+      note: `${req.label} — အတည်ပြုပြီး (request #${req.id}, by ${decidedByName})`,
+    }),
+  );
+  if (isAbortResult(res)) return fail(res.abort);
+  if (res.kind === "lost")
+    return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ — နှစ်ခါ credit မဖြစ်ပါ");
+  if (res.kind !== "done" || res.nb === null) return fail("Buyer မတွေ့ပါ");
+  return finishApprove(buyer.name, res.nb, code);
 }
 
 async function decideWithdrawInternal(
@@ -4162,8 +4509,45 @@ async function decideWithdrawInternal(
   if (!w) return fail("Withdraw request မတွေ့ပါ");
   if (w.status === "expired")
     return fail("ဒီ withdraw က သက်တမ်းကုန်ပြီး coin ပြန်အမ်းပြီးသားပါ");
-  if (w.status !== "pending")
+  if (w.status !== "pending") {
+    // F01 resume rule: a rejection whose claim committed but whose
+    // refund + ledger never landed (only possible off the
+    // transactional surfaces, or from a pre-F01 crash) is completed
+    // exactly once here instead of refused — keyed by the ledger
+    // lookup on the request's txn_code. If the ledger row exists the
+    // refund fully landed and the refusal below stands.
+    if (
+      decision === "reject" &&
+      w.status === "rejected" &&
+      w.txnCode &&
+      !(await txnExistsByCode(db, w.txnCode))
+    ) {
+      const res = await runMoneyCore(db, () =>
+        refundCore({
+          table: "withdraw",
+          reqId: w.id,
+          playerId: w.playerId,
+          amount: w.coins,
+          claimSet: null,
+          ledgerCode: w.txnCode,
+          ledgerType: "withdraw_refund",
+          ledgerNote: `Withdraw #${w.id} rejected — coins refunded${w.reason ? ` (${w.reason})` : ""}`,
+        }),
+      );
+      if (res.kind === "done") {
+        await notify(db, {
+          playerId: w.playerId,
+          type: "wallet",
+          title: "ငွေထုတ် တောင်းဆိုချက် ပယ်ချခံရပါတယ်",
+          body: `Withdraw #${w.id} (${w.coins} coins) ကို admin က ပယ်ချပြီး coin အပြည့် ပြန်အမ်းပြီးပါပြီ။${w.reason ? `\nအကြောင်းရင်း: ${w.reason}` : ""}`,
+        });
+        await logAct(db, decidedByName, `Withdraw #${w.id} rejected — refunded ${w.coins} coins${w.reason ? ` — ${w.reason}` : ""}`);
+        ctx.invalidateQueries();
+        return { ok: true, error: "" };
+      }
+    }
     return fail("ဒီ withdraw ကို ဆုံးဖြတ်ပြီးသားပါ — နှစ်ခါ ရွှေ့လို့ မရပါ");
+  }
   if (decision === "paid") {
     const upd = await db
       .update(schema.withdrawRequests)
@@ -4186,35 +4570,26 @@ async function decideWithdrawInternal(
     ctx.invalidateQueries();
     return { ok: true, error: "" };
   }
-  // Reject: claim first, then refund the deducted coins exactly once.
-  const upd = await db
-    .update(schema.withdrawRequests)
-    .set({
-      status: "rejected",
-      decidedBy: decidedByName,
-      decidedAt: new Date(),
-      reason: (reason ?? "").slice(0, 300),
-    })
-    .where(
-      and(
-        eq(schema.withdrawRequests.id, w.id),
-        eq(schema.withdrawRequests.status, "pending"),
-      ),
-    )
-    .returning({ id: schema.withdrawRequests.id });
-  if (upd.length === 0) return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ");
-  const p = await getPlayer(db, w.playerId);
-  if (p) {
-    const nb = p.balance + w.coins;
-    await db.update(schema.players).set({ balance: nb }).where(eq(schema.players.id, p.id));
-    await addTxn(db, {
-      playerId: p.id,
-      type: "withdraw_refund",
+  // Reject: claim + refund + ledger as ONE atomic money core (F01) —
+  // the deducted coins are refunded exactly once, or not at all.
+  const res = await runMoneyCore(db, () =>
+    refundCore({
+      table: "withdraw",
+      reqId: w.id,
+      playerId: w.playerId,
       amount: w.coins,
-      balanceAfter: nb,
-      note: `Withdraw #${w.id} rejected — coins refunded${reason ? ` (${reason})` : ""}`,
-    });
-  }
+      claimSet: {
+        status: "rejected",
+        decidedBy: decidedByName,
+        decidedAt: new Date(),
+        reason: (reason ?? "").slice(0, 300),
+      },
+      ledgerCode: w.txnCode || uid("TXN"),
+      ledgerType: "withdraw_refund",
+      ledgerNote: `Withdraw #${w.id} rejected — coins refunded${reason ? ` (${reason})` : ""}`,
+    }),
+  );
+  if (res.kind === "lost") return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ");
   await notify(db, {
     playerId: w.playerId,
     type: "wallet",
@@ -4249,8 +4624,45 @@ async function decideDiamondOrderInternal(
   if (!o) return fail("Diamond order မတွေ့ပါ");
   if (o.status === "expired")
     return fail("ဒီ order က သက်တမ်းကုန်ပြီး coin ပြန်အမ်းပြီးသားပါ");
-  if (o.status !== "pending")
+  if (o.status !== "pending") {
+    // F01 resume rule: a rejection whose claim committed but whose
+    // refund + ledger never landed (only possible off the
+    // transactional surfaces, or from a pre-F01 crash) is completed
+    // exactly once here instead of refused — keyed by the ledger
+    // lookup on the order's txn_code. If the ledger row exists the
+    // refund fully landed and the refusal below stands.
+    if (
+      decision === "reject" &&
+      o.status === "rejected" &&
+      o.txnCode &&
+      !(await txnExistsByCode(db, o.txnCode))
+    ) {
+      const res = await runMoneyCore(db, () =>
+        refundCore({
+          table: "diamond",
+          reqId: o.id,
+          playerId: o.playerId,
+          amount: o.priceCoins,
+          claimSet: null,
+          ledgerCode: o.txnCode,
+          ledgerType: "diamond_refund",
+          ledgerNote: `Diamond order #${o.id} rejected — coins refunded${o.rejectReason ? ` (${o.rejectReason})` : ""}`,
+        }),
+      );
+      if (res.kind === "done") {
+        await notify(db, {
+          playerId: o.playerId,
+          type: "wallet",
+          title: "💎 Diamond order ပယ်ချခံရပါတယ်",
+          body: `Diamond order #${o.id} (${o.packageName} — ${o.diamonds} 💎) ကို admin က ပယ်ချပြီး 🪙 ${o.priceCoins} coin အပြည့် ပြန်အမ်းပြီးပါပြီ။${o.rejectReason ? `\nအကြောင်းရင်း: ${o.rejectReason}` : ""}`,
+        });
+        await logAct(db, decidedByName, `Diamond order #${o.id} rejected — refunded ${o.priceCoins} coins${o.rejectReason ? ` — ${o.rejectReason}` : ""}`);
+        ctx.invalidateQueries();
+        return { ok: true, error: "" };
+      }
+    }
     return fail("ဒီ order ကို ဆုံးဖြတ်ပြီးသားပါ — နှစ်ခါ ရွှေ့လို့ မရပါ");
+  }
   if (decision === "fulfill") {
     const upd = await db
       .update(schema.diamondOrders)
@@ -4273,35 +4685,26 @@ async function decideDiamondOrderInternal(
     ctx.invalidateQueries();
     return { ok: true, error: "" };
   }
-  // Reject: claim first, then refund the deducted coins exactly once.
-  const upd = await db
-    .update(schema.diamondOrders)
-    .set({
-      status: "rejected",
-      decidedBy: decidedByName,
-      decidedAt: new Date(),
-      rejectReason: (reason ?? "").slice(0, 300),
-    })
-    .where(
-      and(
-        eq(schema.diamondOrders.id, o.id),
-        eq(schema.diamondOrders.status, "pending"),
-      ),
-    )
-    .returning({ id: schema.diamondOrders.id });
-  if (upd.length === 0) return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ");
-  const p = await getPlayer(db, o.playerId);
-  if (p) {
-    const nb = p.balance + o.priceCoins;
-    await db.update(schema.players).set({ balance: nb }).where(eq(schema.players.id, p.id));
-    await addTxn(db, {
-      playerId: p.id,
-      type: "diamond_refund",
+  // Reject: claim + refund + ledger as ONE atomic money core (F01) —
+  // the deducted coins are refunded exactly once, or not at all.
+  const res = await runMoneyCore(db, () =>
+    refundCore({
+      table: "diamond",
+      reqId: o.id,
+      playerId: o.playerId,
       amount: o.priceCoins,
-      balanceAfter: nb,
-      note: `Diamond order #${o.id} rejected — coins refunded${reason ? ` (${reason})` : ""}`,
-    });
-  }
+      claimSet: {
+        status: "rejected",
+        decidedBy: decidedByName,
+        decidedAt: new Date(),
+        rejectReason: (reason ?? "").slice(0, 300),
+      },
+      ledgerCode: o.txnCode || uid("TXN"),
+      ledgerType: "diamond_refund",
+      ledgerNote: `Diamond order #${o.id} rejected — coins refunded${reason ? ` (${reason})` : ""}`,
+    }),
+  );
+  if (res.kind === "lost") return fail("တခြားသူ အရင် ဆုံးဖြတ်သွားပါပြီ");
   await notify(db, {
     playerId: o.playerId,
     type: "wallet",
@@ -7564,58 +7967,55 @@ export const Actions = {
       const net = gross - fee;
       // Coins are deducted (locked) up-front; a reject/expiry refunds them
       // exactly, a "paid" decision keeps them deducted.
-      // M1+L5: the deduction is a GUARDED atomic decrement (it lands only
-      // if the CURRENT balance still covers it — a stale read can never
-      // overdraw), and the request row is inserted only after the
-      // deduction; if the insert fails, the decrement is compensated.
+      // F01: the guarded atomic decrement (M1: it lands only if the
+      // CURRENT balance still covers it — a stale read can never
+      // overdraw), the request insert and the ledger row now commit
+      // as ONE money core — previously the ledger write was a third
+      // separate op. On a transactional surface any failure rolls the
+      // whole unit back; on a non-transactional one the legacy M1+L5
+      // compensation still applies (debit landed, insert did not ->
+      // re-credit), driven by the core's progress bag.
       const code = uid("TXN");
-      const dec = await db
-        .update(schema.players)
-        .set({ balance: sql`${schema.players.balance} - ${args.coins}` })
-        .where(
-          and(
-            eq(schema.players.id, p.id),
-            gte(schema.players.balance, args.coins),
-          ),
-        )
-        .returning({ balance: schema.players.balance });
-      if (dec.length === 0)
-        return fail(`Balance မလုံလောက်ပါ — သုံးနိုင်သော coin: ${p.balance.toLocaleString()} (Insufficient balance)`);
-      const nb = dec[0]!.balance;
-      let ins: { id: number }[];
+      const bag = { debited: false, inserted: false, requestId: 0 };
+      let res: MoneyCoreResult;
       try {
-        ins = await db
-          .insert(schema.withdrawRequests)
-          .values({
+        res = await runMoneyCore(db, () =>
+          withdrawCreateCore({
             playerId: p.id,
             coins: args.coins,
-            rateKyat: rate,
-            grossKyat: gross,
-            feePercent: feePct,
-            feeKyat: fee,
-            netKyat: net,
-            method: args.method,
-            payoutPhone: phone,
-            payoutAccountName: acctName,
-            status: "pending",
-            txnCode: code,
-          })
-          .returning({ id: schema.withdrawRequests.id });
+            insertValues: {
+              playerId: p.id,
+              coins: args.coins,
+              rateKyat: rate,
+              grossKyat: gross,
+              feePercent: feePct,
+              feeKyat: fee,
+              netKyat: net,
+              method: args.method,
+              payoutPhone: phone,
+              payoutAccountName: acctName,
+              status: "pending",
+              txnCode: code,
+            },
+            ledgerCode: uid("TXN"),
+            ledgerNote: `Withdraw request — ${args.coins} coins → ${net.toLocaleString()} ကျပ် (${args.method === "wave" ? "Wave" : "KPay"} ${phone})`,
+            bag,
+          }),
+        );
       } catch (e) {
-        await db
-          .update(schema.players)
-          .set({ balance: sql`${schema.players.balance} + ${args.coins}` })
-          .where(eq(schema.players.id, p.id));
+        if (moneySurface(db) === "plain" && bag.debited && !bag.inserted) {
+          await db
+            .update(schema.players)
+            .set({ balance: sql`${schema.players.balance} + ${args.coins}` })
+            .where(eq(schema.players.id, p.id));
+        }
         throw e;
       }
-      const requestId = ins[0]?.id ?? 0;
-      await addTxn(db, {
-        playerId: p.id,
-        type: "withdraw",
-        amount: -args.coins,
-        balanceAfter: nb,
-        note: `Withdraw request — ${args.coins} coins → ${net.toLocaleString()} ကျပ် (${args.method === "wave" ? "Wave" : "KPay"} ${phone})`,
-      });
+      if (res.kind === "insufficient")
+        return fail(`Balance မလုံလောက်ပါ — သုံးနိုင်သော coin: ${p.balance.toLocaleString()} (Insufficient balance)`);
+      if (res.kind !== "done")
+        return fail("ငွေထုတ် တောင်းဆိုချက် မအောင်မြင်ပါ — ပြန်ကြိုးစားပါ");
+      const requestId = bag.requestId;
       const ownerRow = (await db.select().from(schema.players))
         .find((x) => isFixedAdminEmail(x.email));
       if (ownerRow) {
