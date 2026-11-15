@@ -53,7 +53,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 209"
+BUILD_TAG = "build 210"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -4247,7 +4247,10 @@ def create_job():
 def _job_view(job):
     view = {k: job.get(k) for k in
             ("id", "url", "mode", "status", "current", "error", "tg",
-             "created_at", "updated_at", "finished_at", "cleanup_at")}
+             "created_at", "updated_at", "finished_at", "cleanup_at",
+             # Build 210: studio (Text-to-Voice) jobs share this
+             # listing — the UI labels them from these fields.
+             "type", "voice_label", "duration")}
     if job.get("status") == "queued":
         # 1-based place among waiting jobs, so the UI/bot can SAY
         # "you are in the queue" instead of looking stuck (build 180).
@@ -4450,6 +4453,12 @@ def _job_output_path(jid):
     or pointless generation falls back to the full master, so
     the main download always delivers a video."""
     jdir = JOBS_DIR / jid
+    # Build 210: a Text-to-Voice studio job's output is audio —
+    # output.mp3 with no output.mp4 beside it. Serve it under the
+    # same download/stream routes (and the same ownership check).
+    mp3 = jdir / "output.mp3"
+    if mp3.exists() and not (jdir / "output.mp4").exists():
+        return mp3, f"myanmar-{jid}.mp3"
     if request.args.get("v") == "small":
         small = jdir / "output_small.mp4"
         if not small.exists():
@@ -4548,6 +4557,261 @@ def delete_job(jid):
         old_timer.cancel()
     _cleanup_job(jid)
     return jsonify({"ok": True})
+
+
+# ---------- Text-to-Voice studio (build 210) ----------
+# Burma-Voice-style studio: the customer types (or SRT-imports)
+# Burmese text, picks any voice from the same library the dub
+# wizard uses, and gets one mp3. Synthesis reuses the dub
+# engines verbatim — the text is chunked into a segments_my.json
+# in the job folder and pipeline.tts / pipeline.elevenlabs_tts
+# synthesize it exactly like a dub (same contracts, same loud
+# failure doctrine: an ElevenLabs failure is NEVER silently
+# re-voiced with edge-tts). The record is a job (type "tts"),
+# so the per-account 24h retention (_schedule_cleanup), the
+# jobs listing and the download/stream routes serve it like
+# any other job. Charge-on-success only, mirroring
+# _charge_for_job: the quoted estimate is checked up front
+# (admins exempt), the actual charge is ceil(actual output
+# minutes) x the voice's per-minute rate, taken only once the
+# mp3 exists; a failure charges zero.
+
+TTS_TEXT_CAP = 5000          # characters, per studio request
+TTS_CHARS_PER_MIN = 700      # estimate basis (matches the UI)
+TTS_CHUNK_CHARS = 450        # per-engine-call chunk ceiling
+TTS_SPEEDS = (0.8, 1.0, 1.2, 1.5)
+
+
+def _tts_chunks(text, limit=TTS_CHUNK_CHARS):
+    """Split studio text into engine-sized chunks: sentence
+    boundaries first (Burmese ။, !, ?, …, and '.'+space), then
+    greedy packing up to `limit` chars; a single over-long
+    sentence is hard-split at a space when one is near."""
+    parts = [p.strip() for p in
+             re.split(r"(?<=[။!?…])\s*|\n+|(?<=\.)\s+", text)]
+    parts = [p for p in parts if p]
+    units = []
+    for p in parts:
+        while len(p) > limit:
+            cut = p.rfind(" ", 0, limit)
+            if cut < limit // 2:
+                cut = limit
+            units.append(p[:cut].strip())
+            p = p[cut:].strip()
+        if p:
+            units.append(p)
+    chunks, cur = [], ""
+    for u in units:
+        if cur and len(cur) + 1 + len(u) > limit:
+            chunks.append(cur)
+            cur = u
+        else:
+            cur = f"{cur} {u}".strip() if cur else u
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _tts_estimate_credits(text, rate):
+    """Up-front estimate, the same math the studio UI shows:
+    minutes = chars / 700, billed per STARTED minute."""
+    return max(1, math.ceil(len(text) / TTS_CHARS_PER_MIN)) * rate
+
+
+def _tts_charge(job, due):
+    """Success-only studio charge — _charge_for_job's exact
+    semantics for a job whose quote is computed at finish time
+    (from the real output duration): take the full amount, or
+    what is there plus a recorded shortfall; admins and
+    anonymous jobs are never charged."""
+    uid = job.get("user_id")
+    if not uid or job.get("charged_minutes"):
+        return
+    user = accounts.get_user(uid)
+    if not user or user["role"] == "admin":
+        return
+    paid = due
+    if not accounts.charge(uid, due, job["id"]):
+        paid = max(0, min(user["credits"] or 0, due))
+        if paid:
+            accounts.charge(uid, paid, job["id"])
+        if paid < due:
+            job["charge_shortfall"] = due - paid
+    job["charged_minutes"] = paid
+
+
+def _tts_view(job):
+    return {"id": job["id"], "type": "tts",
+            "status": job.get("status"), "error": job.get("error"),
+            "voice": job.get("voice"),
+            "voice_label": job.get("voice_label"),
+            "chars": job.get("chars"), "speed": job.get("speed"),
+            "duration": job.get("duration"),
+            "charged": job.get("charged_minutes"),
+            "created_at": job.get("created_at"),
+            "finished_at": job.get("finished_at"),
+            "download": f"/api/jobs/{job['id']}/download",
+            "stream": f"/api/jobs/{job['id']}/stream"}
+
+
+def _run_tts_job(job, text, speed):
+    """Synthesize + assemble + charge one studio job. Raises on
+    any failure (the caller records the error; nothing has been
+    charged at that point)."""
+    from pipeline.common import load_segments, save_segments
+    workdir = JOBS_DIR / job["id"]
+    workdir.mkdir(parents=True, exist_ok=True)
+    segs, t = [], 0.0
+    for chunk in _tts_chunks(text):
+        # Nominal window per chunk (only used by the free
+        # engine's FAILED-silent last resort to keep a timeline;
+        # the real durations are measured per file afterwards).
+        dur = max(1.0, len(chunk) * 60.0 / TTS_CHARS_PER_MIN)
+        segs.append({"start": round(t, 3),
+                     "end": round(t + dur, 3), "text_my": chunk})
+        t += dur
+    save_segments(segs, workdir / "segments_my.json")
+    if job.get("tts_engine") == "elevenlabs":
+        elevenlabs_tts.synthesize(
+            workdir, elevenlabs_tts.voice_id_of(job["voice"]))
+    else:
+        style = tts.resolve_style(job["voice_style"])
+        # The studio speed rides the existing tuning machinery:
+        # edge-tts rate percent (0.8x -> -20%, 1.5x -> +50%),
+        # added to the style's own preset rate (0 today).
+        rate_pct = style["rate"] + int(round((speed - 1.0) * 100))
+        tts.synthesize(workdir, voice=style["voice"],
+                       rate=rate_pct, pitch=style["pitch"])
+    segs = load_segments(workdir / "segments_my.json")
+    files = [s["tts_file"] for s in segs if s.get("tts_file")]
+    if not files:
+        raise RuntimeError(
+            "အသံ ထုတ်တာ မရပါ — TTS service တွေ ခဏ အလုပ်မလုပ်ပါ။ "
+            "ခဏနေမှ ပြန်စမ်းပါ (credit လုံးဝ မဖြတ်ပါ)")
+    listfile = workdir / "concat.txt"
+    listfile.write_text("".join(f"file '{p}'\n" for p in files),
+                        encoding="utf-8")
+    out = workdir / "output.mp3"
+    cmd = ["ffmpeg", "-y", "-v", "error", "-f", "concat",
+           "-safe", "0", "-i", str(listfile)]
+    if job.get("tts_engine") == "elevenlabs" and speed != 1.0:
+        # ElevenLabs has no rate knob; the retime machinery's
+        # atempo does the same job on the assembled audio.
+        cmd += ["-filter:a", f"atempo={speed}"]
+    cmd += ["-c:a", "libmp3lame", "-q:a", "3", str(out)]
+    sh(cmd)
+    dur = probe_duration(out)
+    job["duration"] = round(dur, 3)
+    job["output_size"] = out.stat().st_size
+    minutes = max(1, math.ceil(dur / 60.0))
+    rate = elevenlabs_tts.credits_per_min() \
+        if job.get("tts_engine") == "elevenlabs" else 1
+    job["quote_minutes"] = minutes
+    job["quote_credits"] = minutes * rate
+    _tts_charge(job, minutes * rate)
+    job["status"] = "done"
+    job["finished_at"] = time.time()
+    _save(job)
+    _schedule_cleanup(job)
+
+
+@app.post("/api/tts")
+def create_tts():
+    user = _current_user()
+    data = request.get_json(force=True, silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "စာသား အရင် ထည့်ပါ"}), 400
+    if len(text) > TTS_TEXT_CAP:
+        return jsonify({"error":
+                        f"စာသား အရှည်ဆုံး {TTS_TEXT_CAP} လုံး ပဲ "
+                        "ရပါတယ် — လျှော့ပြီး ပြန်စမ်းပါ"}), 400
+    try:
+        speed = float(data.get("speed") or 1.0)
+    except (TypeError, ValueError):
+        speed = 1.0
+    if speed not in TTS_SPEEDS:
+        speed = 1.0
+    # Voice resolution mirrors _new_job exactly (builds 200 /
+    # 205 / 206): an ElevenLabs pick must still be registered
+    # and the caller must pass the access gate; a style key
+    # resolves through the shared table; anything else fails
+    # safe to the product default style.
+    voice_in = data.get("voice")
+    el_entry = None
+    if voice_in and elevenlabs_tts.is_el_voice(str(voice_in).strip()):
+        el_entry = elevenlabs_tts.find_voice(
+            elevenlabs_tts.voice_id_of(str(voice_in).strip()))
+        if el_entry is None:
+            return jsonify({"error":
+                            "ရွေးထားတဲ့ ElevenLabs အသံ မရှိတော့ပါ — "
+                            "အသံ ပြန်ရွေးပေးပါ"}), 400
+        if user is not None \
+                and not elevenlabs_tts.elevenlabs_allowed(user):
+            return jsonify({"error":
+                            "ဒီ Premium အသံ က အခု စမ်းသပ်ဆဲ "
+                            "ဖြစ်လို့ သတ်မှတ်ထားတဲ့ account တွေ ပဲ "
+                            "သုံးလို့ရပါသေးတယ် — မကြာခင် အားလုံး "
+                            "အတွက် ဖွင့်ပေးပါမယ်"}), 403
+        voice = "el:" + el_entry["id"]
+        voice_style = voice
+        voice_label = el_entry["name"]
+        rate = elevenlabs_tts.credits_per_min()
+    else:
+        style = tts.resolve_style(voice_in)
+        voice = style["voice"]
+        voice_style = style["key"]
+        voice_label = style["label"]
+        rate = 1
+    # Admission: a non-admin account must cover the ESTIMATE
+    # (started minutes x rate) before any synthesis runs —
+    # nothing is deducted here; the real charge lands on
+    # success, from the measured duration.
+    uid = user["id"] if user else None
+    if uid and user["role"] != "admin":
+        acct = accounts.get_user(uid)
+        est = _tts_estimate_credits(text, rate)
+        if acct and (acct["credits"] or 0) < est:
+            return jsonify({"error":
+                            f"credit မလောက်ပါ — ဒီ အသံ အတွက် "
+                            f"ခန့်မှန်း {est} credits လိုပါတယ်, "
+                            f"လက်ကျန် {acct['credits']} credits ပဲ "
+                            "ရှိပါတယ်"}), 400
+    now = time.time()
+    job = {"id": uuid.uuid4().hex[:12], "type": "tts",
+           "url": None, "mode": "tts",
+           "voice": voice, "voice_style": voice_style,
+           "voice_label": voice_label,
+           "text": text, "chars": len(text), "speed": speed,
+           "user_id": uid, "status": "running", "current": "tts",
+           "error": None, "created_at": now, "updated_at": now,
+           "finished_at": None, "steps": []}
+    if el_entry is not None:
+        job["tts_engine"] = "elevenlabs"
+        job["voice_name"] = el_entry["name"]
+    JOBS[job["id"]] = job
+    _save(job)
+    try:
+        _run_tts_job(job, text, speed)
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)[-1500:]
+        job["finished_at"] = time.time()
+        _save(job)
+        _schedule_cleanup(job)
+        return jsonify({"error": job["error"]}), 500
+    return jsonify(_tts_view(job))
+
+
+@app.get("/api/tts/history")
+def tts_history():
+    """The caller's studio outputs, newest first — the studio's
+    🕘 list. Ownership is the same _owns() rule as every other
+    job surface."""
+    user = _current_user()
+    mine = [j for j in _all_jobs()
+            if j.get("type") == "tts" and _owns(user, j)]
+    return jsonify({"items": [_tts_view(j) for j in mine[:20]]})
 
 
 # ---------- text-only export + bulk text input ----------

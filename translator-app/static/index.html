@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ဗီဒီယို မြန်မာဘာသာပြန်</title>
 <link rel="manifest" href="/static/manifest.webmanifest" crossorigin="use-credentials">
-<meta name="theme-color" content="#f6efdd">
+<meta name="theme-color" content="#101013">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -14,65 +14,70 @@
 <link rel="icon" type="image/png" sizes="192x192" href="/static/icon-192.png">
 <style>
   * { box-sizing: border-box; }
+  /* Build 210: Burma-Voice-style dark theme — near-black
+     background, dark cards, light text, ONE accent (#2b5cff,
+     the same blue the selected states already used). */
   body { font-family: "Noto Sans Myanmar", system-ui, sans-serif; margin: 0;
-         background: #f6efdd; color: #33302a; padding: 16px; }
+         background: #101013; color: #f2f1ec; padding: 16px; }
   .wrap { max-width: 560px; margin: 0 auto; }
   h1 { font-size: 20px; margin: 8px 0 4px; }
-  p.sub { color: #6f6650; font-size: 13px; margin: 0 0 16px; line-height: 1.6; }
+  p.sub { color: #a3a3ab; font-size: 13px; margin: 0 0 16px; line-height: 1.6; }
   label { display: block; font-size: 14px; margin: 14px 0 6px; }
   input[type=url], select { width: 100%; padding: 12px; border-radius: 10px;
-    border: 1px solid #cbbd97; background: #fffdf8; color: #33302a; font-size: 15px; }
+    border: 1px solid #3a3a41; background: #232329; color: #f2f1ec; font-size: 15px; }
+  input, textarea { background: #232329; color: #f2f1ec;
+    border: 1px solid #3a3a41; font-family: inherit; }
   .modes { display: flex; gap: 8px; }
   .modes label { flex: 1; margin: 0; }
   .modes input { display: none; }
   .modes span { display: block; text-align: center; padding: 12px 4px; border-radius: 10px;
-    border: 1px solid #cbbd97; background: #fffdf8; font-size: 14px; cursor: pointer; }
-  .modes input:checked + span { background: #2b5cff; border-color: #2b5cff; font-weight: 700; }
+    border: 1px solid #3a3a41; background: #232329; font-size: 14px; cursor: pointer; }
+  .modes input:checked + span { background: #2b5cff; border-color: #2b5cff; color: #fff; font-weight: 700; }
   button { width: 100%; margin-top: 18px; padding: 14px; border: 0; border-radius: 12px;
-    background: #e9c767; color: #33302a; font-size: 16px; font-weight: 700; cursor: pointer; }
+    background: #2b5cff; color: #fff; font-size: 16px; font-weight: 700; cursor: pointer; }
   button:disabled { opacity: .5; }
-  button.ghost { background: #f3ead3; color: #3d382f; border: 1px solid #cbbd97; }
-  .card { margin-top: 20px; background: #fffaf1; border: 1px solid #ddd0b2;
+  button.ghost { background: #232329; color: #e9e7e0; border: 1px solid #3a3a41; }
+  .card { margin-top: 20px; background: #1a1a1e; border: 1px solid #2e2e34;
     border-radius: 12px; padding: 14px; display: none; }
   .card.show { display: block; }
-  .step { display: flex; gap: 8px; align-items: center; padding: 7px 0; font-size: 14px; color: #655c47; }
+  .step { display: flex; gap: 8px; align-items: center; padding: 7px 0; font-size: 14px; color: #a7a5ad; }
   .jobrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid #ffffff14; font-size: 14px; flex-wrap: wrap; }
   .jobrow button, .tgpick button { width: auto; margin-top: 0; padding: 8px 12px; font-size: 13.5px; border-radius: 9px; }
   .jobitem { display: block; }
   .jobitem .jhead { display: flex; gap: 6px; align-items: center; }
   .jobitem .jurl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .jobitem .jmeta { color: #655c47; font-size: 12.5px; margin-top: 2px; }
+  .jobitem .jmeta { color: #a7a5ad; font-size: 12.5px; margin-top: 2px; }
   .jobitem .jbtns { display: flex; gap: 6px; margin-top: 8px; }
   .jobitem .jbtns button { flex: 1; }
   /* ---------- API usage board boxes (build 141) ---------- */
   .apiGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
   .keyPill { font-weight: 700; padding: 7px 10px; border-radius: 8px;
-    margin: 2px 0 8px; background: #e7dbc0; color: #4a443a; }
+    margin: 2px 0 8px; background: #2a2a30; color: #cfcfd4; }
   .keyPill.ok { background: #14532d; color: #bbf7d0; }
   .keyPill.no { background: #4a3436; color: #fecaca; }
-  .apiBox { background: #efe5cb; border: 1px solid #ddd0b2; border-radius: 10px;
+  .apiBox { background: #232329; border: 1px solid #303036; border-radius: 10px;
     padding: 12px; text-align: center; }
-  .apiBox .an { color: #655c47; font-size: 12.5px; }
-  .apiBox .ac { font-size: 24px; font-weight: 700; color: #33302a; margin-top: 3px; }
-  .apiBox .ac small { font-size: 12.5px; font-weight: 400; color: #655c47; }
-  .apiBox .ad { color: #655c47; font-size: 11.5px; margin-top: 6px; line-height: 1.6; }
+  .apiBox .an { color: #a3a3ab; font-size: 12.5px; }
+  .apiBox .ac { font-size: 24px; font-weight: 700; color: #f2f1ec; margin-top: 3px; }
+  .apiBox .ac small { font-size: 12.5px; font-weight: 400; color: #a3a3ab; }
+  .apiBox .ad { color: #a3a3ab; font-size: 11.5px; margin-top: 6px; line-height: 1.6; }
   /* ---------- QR display box (build 143) ---------- */
-  .qrBox { background: #efe5cb; border: 1px solid #ddd0b2; border-radius: 10px;
+  .qrBox { background: #232329; border: 1px solid #303036; border-radius: 10px;
     padding: 12px; text-align: center; margin-top: 8px; }
   .qrBox img { max-width: 200px; border-radius: 8px; }
-  .qrBox .an { color: #655c47; font-size: 12.5px; margin-bottom: 8px; }
-  .apiTotal { background: #efe5cb; border: 1px solid #2b5cff; border-radius: 10px;
+  .qrBox .an { color: #a3a3ab; font-size: 12.5px; margin-bottom: 8px; }
+  .apiTotal { background: #232329; border: 1px solid #2b5cff; border-radius: 10px;
     padding: 12px; text-align: center; margin-top: 8px; }
-  .apiTotal .an { color: #655c47; font-size: 13px; }
-  .apiTotal .ac { font-size: 26px; font-weight: 700; color: #33302a; margin-top: 3px; }
-  .apiTotal .ac small { font-size: 13px; font-weight: 400; color: #655c47; }
-  .step.running { color: #2b5cff; }
+  .apiTotal .an { color: #a3a3ab; font-size: 13px; }
+  .apiTotal .ac { font-size: 26px; font-weight: 700; color: #f2f1ec; margin-top: 3px; }
+  .apiTotal .ac small { font-size: 13px; font-weight: 400; color: #a3a3ab; }
+  .step.running { color: #7ea6ff; }
   .step.done { color: #7dd87d; }
   .step.error { color: #ff8080; }
   .err { color: #ff9a9a; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
   a.dl { display: block; text-align: center; margin-top: 12px; padding: 13px; border-radius: 10px;
     background: #2fbf71; color: #fff; font-weight: 700; text-decoration: none; }
-  a.dlFull { background: #f3ead3; color: #3d382f; border: 1px solid #cbbd97;
+  a.dlFull { background: #232329; color: #e9e7e0; border: 1px solid #3a3a41;
     font-weight: 600; }
   video { width: 100%; border-radius: 10px; margin-top: 12px; background: #000; }
   /* ---------- editor ---------- */
@@ -98,29 +103,29 @@
     text-shadow: -2px 0 0 #000, 2px 0 0 #000, 0 -2px 0 #000, 0 2px 0 #000,
       -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000, 2px 2px 0 #000,
       0 3px 7px rgba(0,0,0,.65); }
-  .hint { font-size: 12px; color: #6f6650; line-height: 1.7; margin: 8px 0 0; }
-  ::placeholder { color: #968a6d; opacity: 1; }
+  .hint { font-size: 12px; color: #a3a3ab; line-height: 1.7; margin: 8px 0 0; }
+  ::placeholder { color: #75737d; opacity: 1; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; }
   .row button { flex: 1; width: auto; margin-top: 8px; padding: 9px 4px; font-size: 13px; }
   .row a.dlbtn { flex: 1 1 40%; text-align: center; margin-top: 8px; padding: 9px 4px;
-    font-size: 13px; border-radius: 10px; background: #f3ead3; color: #3d382f;
-    border: 1px solid #cbbd97; text-decoration: none; }
-  input[type=range] { width: 100%; accent-color: #e9c767; }
-  .val { color: #9a7b1e; font-size: 12px; }
+    font-size: 13px; border-radius: 10px; background: #232329; color: #e9e7e0;
+    border: 1px solid #3a3a41; text-decoration: none; }
+  input[type=range] { width: 100%; accent-color: #2b5cff; }
+  .val { color: #9db8ff; font-size: 12px; }
   /* ---------- review step ---------- */
-  .revItem { border-top: 1px solid #ddd0b2; padding: 10px 0; }
+  .revItem { border-top: 1px solid #303036; padding: 10px 0; }
   .revItem:first-child { border-top: 0; }
-  .revTime { font-size: 12px; color: #3e7d4e; margin-bottom: 3px; }
-  .revEn { font-size: 13px; color: #655c47; line-height: 1.5; margin-bottom: 6px; }
-  .revMy { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #cbbd97;
-    background: #fffdf8; color: #33302a; font-size: 16px; line-height: 1.6;
+  .revTime { font-size: 12px; color: #7dd87d; margin-bottom: 3px; }
+  .revEn { font-size: 13px; color: #a3a3ab; line-height: 1.5; margin-bottom: 6px; }
+  .revMy { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #3a3a41;
+    background: #232329; color: #f2f1ec; font-size: 16px; line-height: 1.6;
     font-family: inherit; resize: vertical; }
-  input[type=file] { width: 100%; color: #57503f; font-size: 13px; }
+  input[type=file] { width: 100%; color: #b9b7ae; font-size: 13px; }
   h3 { font-size: 15px; margin: 18px 0 2px; }
   .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 12px; }
   .chip { width: auto; margin-top: 0; padding: 10px 14px; border-radius: 999px;
-          background: #f3ead3; color: #3d382f; border: 1px solid #cbbd97; font-size: 14px; }
-  .chip.on { background: #2b5cff; border-color: #2b5cff; font-weight: 700; }
+          background: #232329; color: #e9e7e0; border: 1px solid #3a3a41; font-size: 14px; }
+  .chip.on { background: #2b5cff; border-color: #2b5cff; color: #fff; font-weight: 700; }
   /* ---------- voice library (build 207; tabbed sheet + overflow
      fix in build 208) ---------- */
   /* Build 208 overflow fix: .vlib-row is a flex ITEM of .chips
@@ -135,32 +140,32 @@
   .vlib-handle { flex-basis: 100%; min-width: 0; display: flex;
     justify-content: center; margin: 2px 0 0; }
   .vlib-handle span { width: 44px; height: 4px; border-radius: 2px;
-    background: #d8cba6; display: block; }
+    background: #3d3d44; display: block; }
   .vlib-search { width: 100%; min-width: 0; flex-basis: 100%;
     padding: 10px 12px; border-radius: 10px;
-    border: 1px solid #cbbd97; background: #fffdf8; color: #33302a;
+    border: 1px solid #3a3a41; background: #232329; color: #f2f1ec;
     font-size: 15px; margin: 6px 0 4px; font-family: inherit;
     box-sizing: border-box; }
-  .vlib-tabs { display: flex; gap: 6px; background: #efe5cb;
-    border: 1px solid #ddd0b2; padding: 4px; border-radius: 999px;
+  .vlib-tabs { display: flex; gap: 6px; background: #232329;
+    border: 1px solid #303036; padding: 4px; border-radius: 999px;
     margin: 8px 0 4px; flex-basis: 100%; min-width: 0; }
   .vlib-tab { flex: 1 1 0; min-width: 0; width: auto; margin: 0;
     padding: 9px 4px; border-radius: 999px; background: transparent;
-    border: 0; font-size: 13.5px; font-weight: 600; color: #6f6650;
+    border: 0; font-size: 13.5px; font-weight: 600; color: #a3a3ab;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     font-family: inherit; cursor: pointer; }
-  .vlib-tab.on { background: #fffdf8; color: #33302a;
-    box-shadow: 0 1px 3px rgba(60,50,20,.25); }
-  .vlib-group { font-weight: 700; margin: 12px 0 6px; color: #57503f;
+  .vlib-tab.on { background: #3d3d44; color: #fff;
+    box-shadow: 0 1px 3px rgba(0,0,0,.45); }
+  .vlib-group { font-weight: 700; margin: 12px 0 6px; color: #c9c7cf;
     flex-basis: 100%; min-width: 0; }
   .vlib-note { flex-basis: 100%; min-width: 0; font-size: 12.5px;
-    color: #6f6650; line-height: 1.7; margin: 6px 0; }
+    color: #a3a3ab; line-height: 1.7; margin: 6px 0; }
   .vlib-row { display: flex; align-items: center; gap: 10px; padding: 10px;
-    border: 1px solid #cbbd97; border-radius: 12px; background: #fffdf8;
+    border: 1px solid #33333a; border-radius: 12px; background: #232329;
     margin: 0 0 8px; cursor: pointer; flex-basis: 100%; min-width: 0; }
   .vlib-row.on { background: #2b5cff; border-color: #2b5cff; color: #fff; }
   .vlib-ava { width: 38px; height: 38px; border-radius: 50%; flex: 0 0 auto;
-    background: #e9c767; color: #3d382f; display: flex; align-items: center;
+    background: #2b5cff; color: #fff; display: flex; align-items: center;
     justify-content: center; font-weight: 700; font-size: 17px; }
   .vlib-main { flex: 1; min-width: 0; overflow: hidden; }
   .vlib-name { font-weight: 700; white-space: nowrap; overflow: hidden;
@@ -168,15 +173,89 @@
   .vlib-desc { font-size: 12.5px; opacity: .78; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; }
   .vlib-play { width: auto; margin: 0; padding: 8px 13px; border-radius: 999px;
-    flex: 0 0 auto; background: #f3ead3; color: #3d382f;
-    border: 1px solid #cbbd97; font-size: 14px; }
+    flex: 0 0 auto; background: #2c2c31; color: #eee;
+    border: 1px solid #3a3a41; font-size: 14px; }
+  /* ---------- app shell (build 210): top bar + sidebar + views ---------- */
+  #topbar { position: sticky; top: 0; z-index: 40; background: #101013;
+    display: flex; align-items: center; gap: 10px; padding: 8px 0 10px;
+    border-bottom: 1px solid #232329; }
+  #menuBtn { width: auto; margin: 0; padding: 8px 12px; font-size: 19px;
+    background: transparent; border: 0; color: #f2f1ec; }
+  .tb-title { flex: 1; min-width: 0; font-size: 17px; font-weight: 700;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #avatarBtn { width: 38px; height: 38px; border-radius: 50%; margin: 0;
+    padding: 0; flex: 0 0 auto; background: #2b5cff; color: #fff;
+    font-size: 16px; font-weight: 700; border: 0; }
+  #sbScrim { position: fixed; inset: 0; background: rgba(0,0,0,.55);
+    z-index: 59; display: none; }
+  #sidebar { position: fixed; top: 0; left: 0; bottom: 0; z-index: 60;
+    width: 272px; max-width: 84vw; background: #16161a;
+    border-right: 1px solid #2a2a30; padding: 16px 12px;
+    transform: translateX(-105%); transition: transform .22s ease;
+    display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
+  #sidebar.open { transform: translateX(0); }
+  .sb-head { font-size: 16px; font-weight: 700; padding: 2px 8px 14px; }
+  .sb-item { width: 100%; margin: 0; padding: 12px; text-align: left;
+    background: transparent; border: 0; border-radius: 10px;
+    color: #e9e7e0; font-size: 15px; font-weight: 600;
+    display: flex; align-items: center; gap: 8px; }
+  .sb-item.on { background: #2b2b31; }
+  .sb-sec { color: #8b8b93; font-size: 12.5px; margin: 14px 8px 4px; }
+  .badge { margin-left: auto; background: #2b2b31; color: #b9b7ae;
+    border: 1px solid #3a3a41; font-size: 11px; font-weight: 700;
+    padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+  h3 .badge { margin-left: 8px; vertical-align: 2px; }
+  .sb-foot { margin-top: auto; background: #1f1f24;
+    border: 1px solid #2e2e34; border-radius: 12px; padding: 12px; }
+  .sb-foot .bal { font-size: 14px; margin-bottom: 8px; }
+  .sb-foot button { margin-top: 0; padding: 11px; font-size: 14px; }
+  /* ---------- Text-to-Voice studio (build 210) ---------- */
+  #ttsText { width: 100%; box-sizing: border-box; padding: 12px;
+    border-radius: 12px; font-size: 16px; line-height: 1.7; resize: vertical; }
+  .tts-voicerow { display: flex; gap: 8px; align-items: stretch; margin-top: 12px; }
+  #ttsVoiceChip { flex: 1; min-width: 0; width: auto; margin: 0;
+    display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+    background: #232329; border: 1px solid #3a3a41; border-radius: 12px;
+    color: #f2f1ec; font-size: 15px; text-align: left; }
+  #ttsVoiceChip .vlib-ava { width: 34px; height: 34px; font-size: 15px; }
+  #ttsVoiceName { flex: 1; min-width: 0; font-weight: 700; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+  #ttsHistBtn { width: auto; margin: 0; padding: 9px 14px; font-size: 17px;
+    background: #232329; border: 1px solid #3a3a41; border-radius: 12px; }
+  #ttsHist { margin-top: 10px; }
+  #ttsSheetScrim { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 69; }
+  #ttsSheet { position: fixed; left: 0; right: 0; bottom: 0; z-index: 70;
+    background: #16161a; border-top: 1px solid #2e2e34;
+    border-radius: 16px 16px 0 0; padding: 8px 14px 18px;
+    max-height: 80vh; overflow-y: auto; }
+  #ttsSheetBody { margin: 0; }
+  #ttsAudio { width: 100%; margin-top: 12px; }
+  .tts-poor { color: #ff8080; font-size: 13px; margin-top: 6px; }
 </style>
 </head>
 <body>
+<div id="sbScrim"></div>
+<nav id="sidebar">
+  <div class="sb-head">🎬 ဗီဒီယို မြန်မာဘာသာပြန်</div>
+  <button class="sb-item" data-view="clone">🎙 အသံ Clone <span class="badge">မကြာမီ</span></button>
+  <button class="sb-item" data-view="studio">✍️ စာသားမှ အသံ</button>
+  <div class="sb-sec">အကြောင်းအရာ</div>
+  <button class="sb-item" data-view="recap">📝 Recap <span class="badge">မကြာမီ</span></button>
+  <button class="sb-item on" data-view="dub">🎬 အသံထပ်</button>
+  <button class="sb-item" data-view="account">👤 အကောင့်</button>
+  <div class="sb-foot">
+    <div class="bal" id="sbBalance">💳 — credits</div>
+    <button id="sbTopup">💰 ငွေဖြည့်ရန်</button>
+  </div>
+</nav>
 <div class="wrap">
-  <h1>🎬 ဗီဒီယို မြန်မာဘာသာပြန်</h1>
-  <p class="sub">ဗီဒီယိုလင့်ခ် ထည့်ရုံနဲ့ — စာသားထုတ် → မြန်မာပြန် → စာတန်းထိုး (ရုပ်ရှင်ပုံစံ) / အသံထွက် အစအဆုံးလုပ်ပေးမယ်။ အသံကို အချိန်ကိုက်အောင် အမြန်ညှိ၊ အသံ ရှည်ရင် ပုံကို နှေးပြီး ဆက်ပြောပေးမယ်။</p>
+  <header id="topbar">
+    <button id="menuBtn" aria-label="menu">☰</button>
+    <div class="tb-title">🎬 ဗီဒီယို မြန်မာဘာသာပြန်</div>
+    <button id="avatarBtn" aria-label="account">👤</button>
+  </header>
 
+  <div class="view" id="view-account" style="display:none">
   <div class="card show" id="accountCard">
     <h3 style="margin-top:0">👤 အကောင့်</h3>
     <div id="authOut">
@@ -438,6 +517,11 @@
     </div>
   </div>
 
+  </div><!-- /view-account -->
+
+  <div class="view" id="view-dub">
+  <p class="sub">ဗီဒီယိုလင့်ခ် ထည့်ရုံနဲ့ — စာသားထုတ် → မြန်မာပြန် → စာတန်းထိုး (ရုပ်ရှင်ပုံစံ) / အသံထွက် အစအဆုံးလုပ်ပေးမယ်။ အသံကို အချိန်ကိုက်အောင် အမြန်ညှိ၊ အသံ ရှည်ရင် ပုံကို နှေးပြီး ဆက်ပြောပေးမယ်။</p>
+
   <div class="card show" id="wizCard">
     <div id="wizProg" class="hint" style="margin-bottom:8px"></div>
 
@@ -595,7 +679,7 @@
     <a class="dl dlFull" id="dlFull" style="display:none">🎞 မူရင်း အရည်အပြည့် ဒေါင်းလုပ်</a>
     <p class="hint" id="dlHint" style="display:none">ဒေါင်းနှိပ်ရင် တိုးတက်မှု % ပြပြီး ဖုန်း Downloads folder ထဲ တန်းဝင်ပါတယ်</p>
     <div id="dlProg" style="display:none;margin:8px 0">
-      <div style="background:#eee1c2;border-radius:6px;height:10px;overflow:hidden">
+      <div style="background:#33333a;border-radius:6px;height:10px;overflow:hidden">
         <div id="dlBar" style="background:#57b25e;height:100%;width:0%"></div>
       </div>
       <p class="hint" id="dlPct" style="margin:4px 0 0"></p>
@@ -636,7 +720,63 @@
     <button id="revGo">✏️ ပြင်ပြီး ပြန်လုပ်မယ်</button>
     <button class="ghost" id="revSkip">ပိတ်မယ်</button>
   </div>
+  </div><!-- /view-dub -->
 
+  <div class="view" id="view-studio" style="display:none">
+    <div class="card show">
+      <h3 style="margin-top:0">✍️ စာသားမှ အသံ</h3>
+      <textarea id="ttsText" rows="7" maxlength="6000" placeholder="အသံပြောင်းချင်တဲ့စာကို ဒီနေရာမှာ ရိုက်ထည့်ပါ"></textarea>
+      <div class="tts-voicerow">
+        <button id="ttsVoiceChip">
+          <span class="vlib-ava" id="ttsVoiceAva">T</span>
+          <span id="ttsVoiceName">Thiha · ပုံမှန်</span>
+          <span>▾</span>
+        </button>
+        <button id="ttsHistBtn" title="မှတ်တမ်း">🕘</button>
+      </div>
+      <div id="ttsHist" style="display:none"></div>
+      <div class="chips" style="margin-top:12px">
+        <button class="chip" data-tspeed="0.8">0.8×</button>
+        <button class="chip on" data-tspeed="1.0">1.0×</button>
+        <button class="chip" data-tspeed="1.2">1.2×</button>
+        <button class="chip" data-tspeed="1.5">1.5×</button>
+        <button class="chip" id="ttsSrtBtn">📄 SRT ဖတ်</button>
+        <button class="chip" id="ttsClear">🧹 ရှင်းလင်း</button>
+      </div>
+      <p class="hint" style="margin-top:0">⏩ အမြန်နှုန်း ရွေးပါ — SRT ဖိုင် (.srt / .txt) ဖတ်ထည့်လို့လည်း ရပါတယ်</p>
+      <input type="file" id="ttsFile" accept=".srt,.txt" style="display:none">
+      <p class="hint" id="ttsEst">0.0 မိနစ် · အသံ ~0:00 လောက် ထွက်မယ်</p>
+      <p class="tts-poor" id="ttsPoor" style="display:none">ခရက်ဒစ် မလုံလောက်ပါ</p>
+      <p class="err" id="ttsErr"></p>
+      <button id="ttsGo" disabled>🔊 အသံ ထုတ်မယ်</button>
+      <div id="ttsResult" style="display:none">
+        <audio id="ttsAudio" controls preload="metadata"></audio>
+        <a class="dl" id="ttsDl" download>⬇️ အသံ ဒေါင်းလုပ် (.mp3)</a>
+        <p class="hint" id="ttsCharged"></p>
+      </div>
+    </div>
+  </div><!-- /view-studio -->
+
+  <div class="view" id="view-clone" style="display:none">
+    <div class="card show">
+      <h3 style="margin-top:0">🎙 အသံ Clone <span class="badge">မကြာမီ</span></h3>
+      <p class="hint">ကိုယ့် အသံကို နမူနာ အသံဖိုင် သွင်းထားရုံနဲ့ ကိုယ်ပိုင် clone အသံ တစ်ခု ဖန်တီးပေးမယ့် အပိုင်းပါ — ဖန်တီးပြီးသား clone တွေက အသံ ရွေးတဲ့နေရာက «ကိုယ်ပိုင် အသံများ» tab ထဲမှာ ပေါ်လာပြီး၊ အသံထပ် နဲ့ စာသားမှ အသံ နှစ်ခုလုံးမှာ သုံးနိုင်ပါမယ်။</p>
+      <p class="hint">ပြင်ဆင်နေဆဲ ဖြစ်လို့ မကြာခင် ဖွင့်ပေးပါမယ်။ အခုအတွက် အသင့်သုံး အသံတွေနဲ့ 🌟 Premium အသံတွေကို သုံးနိုင်ပါတယ်။</p>
+    </div>
+  </div><!-- /view-clone -->
+
+  <div class="view" id="view-recap" style="display:none">
+    <div class="card show">
+      <h3 style="margin-top:0">📝 Recap <span class="badge">မကြာမီ</span></h3>
+      <p class="hint">ဗီဒီယိုလင့်ခ် ထည့်လိုက်ရုံနဲ့ ဇာတ်လမ်းကို အစအဆုံး ပြန်ပြောပြတဲ့ recap ဗီဒီယို — မြန်မာ အသံထွက် + စာတန်း အပါ — အလိုအလျောက် ထုတ်ပေးမယ့် အပိုင်းပါ။</p>
+      <p class="hint">ပြင်ဆင်နေဆဲ ဖြစ်လို့ မကြာခင် ဖွင့်ပေးပါမယ်။ အခုအတွက် လင့်ခ်ကနေ စာတန်းထိုး / အသံထွက် လုပ်တဲ့ «အသံထပ်» အပိုင်းကို သုံးနိုင်ပါတယ်။</p>
+    </div>
+  </div><!-- /view-recap -->
+
+</div>
+<div id="ttsSheetWrap" style="display:none">
+  <div id="ttsSheetScrim"></div>
+  <div id="ttsSheet"><div class="chips" id="ttsSheetBody"></div></div>
 </div>
 <script src="https://accounts.google.com/gsi/client" async></script>
 <script>
@@ -720,6 +860,12 @@ function voiceRow(v) {
    everyone until the self-serve Voice Clone build lands, so
    the tab shows its empty note. Search filters within the
    active tab only. */
+/* Build 210: the sheet renders into a HOST element — the
+   wizard step-6 container by default, or the studio's
+   bottom-sheet overlay while the studio has it open. One
+   renderer, one shared selection (W.voice), two surfaces. */
+let sheetHost = null;    // null = the wizard's #voiceChips
+let sheetOnPick = null;  // studio hook: runs after a row pick
 function voiceChips(vs) {
   voiceList = vs;
   const f = voiceFilter.trim().toLowerCase();
@@ -755,20 +901,22 @@ function voiceChips(vs) {
     if (!shown.length)
       html += `<p class="vlib-note">ရှာတာ မတွေ့ပါ — တခြား စာလုံး စမ်းကြည့်ပါ</p>`;
   }
-  $("voiceChips").innerHTML = html;
-  const si = $("voiceSearch");
+  const host = sheetHost || $("voiceChips");
+  host.innerHTML = html;
+  const si = host.querySelector(".vlib-search");
   si.oninput = () => {
     voiceFilter = si.value;
     const pos = si.selectionStart;
     voiceChips(voiceList);
-    const n = $("voiceSearch");
-    n.focus(); try { n.setSelectionRange(pos, pos); } catch (e) {}
+    const n = (sheetHost || $("voiceChips")).querySelector(".vlib-search");
+    if (n) { n.focus(); try { n.setSelectionRange(pos, pos); } catch (e) {} }
   };
-  $("voiceChips").querySelectorAll(".vlib-tab").forEach(b =>
+  host.querySelectorAll(".vlib-tab").forEach(b =>
     b.onclick = () => { stopPreview(); voiceTab = b.dataset.vtab; voiceChips(voiceList); });
-  $("voiceChips").querySelectorAll(".vlib-row").forEach(r =>
-    r.onclick = () => { stopPreview(); W.voice = r.dataset.voice; voiceChips(voiceList); });
-  $("voiceChips").querySelectorAll(".vlib-play").forEach(b =>
+  host.querySelectorAll(".vlib-row").forEach(r =>
+    r.onclick = () => { stopPreview(); W.voice = r.dataset.voice; voiceChips(voiceList);
+      if (sheetOnPick) sheetOnPick(); });
+  host.querySelectorAll(".vlib-play").forEach(b =>
     b.onclick = (ev) => {
       ev.stopPropagation();
       const v = voiceList.concat(myVoiceList).find(x => x.id === b.dataset.preview);
@@ -778,7 +926,173 @@ function voiceChips(vs) {
 fetch("/api/voices").then(r => r.json()).then(d => {
   myVoiceList = (d && d.mine) || [];
   voiceChips((d && d.voices) || d || VOICE_STYLES_FALLBACK);
+  renderTtsVoiceChip();
 }).catch(() => voiceChips(VOICE_STYLES_FALLBACK));
+
+/* ---------------- app shell (build 210) ----------------
+   Burma-Voice-style shell: top bar (☰ + title + account
+   avatar), a slide-in sidebar with the product menu, and
+   SPA-style views. The dub view is the pre-210 page, untouched
+   inside its container. */
+let curView = "dub";
+function closeSidebar() {
+  $("sidebar").classList.remove("open");
+  $("sbScrim").style.display = "none";
+}
+function showView(name) {
+  curView = name;
+  ["dub", "studio", "clone", "recap", "account"].forEach(v =>
+    $("view-" + v).style.display = v === name ? "" : "none");
+  document.querySelectorAll(".sb-item").forEach(b =>
+    b.classList.toggle("on", b.dataset.view === name));
+  closeSidebar();
+  window.scrollTo(0, 0);
+  if (name === "studio") { renderTtsVoiceChip(); ttsEstimate(); }
+}
+$("menuBtn").onclick = () => {
+  $("sidebar").classList.add("open");
+  $("sbScrim").style.display = "";
+};
+$("sbScrim").onclick = closeSidebar;
+$("avatarBtn").onclick = () => showView("account");
+document.querySelectorAll(".sb-item").forEach(b =>
+  b.onclick = () => showView(b.dataset.view));
+$("sbTopup").onclick = () => {
+  showView("account");
+  if (ME && $("payBlock").style.display === "none") $("payToggle").click();
+};
+
+/* ---------------- Text-to-Voice studio (build 210) ---------- */
+let ttsSpeed = 1.0, ttsBusy = false;
+function curVoiceEntry() {
+  return voiceList.concat(myVoiceList).find(v => v.id === W.voice)
+    || voiceList[0] || {};
+}
+function renderTtsVoiceChip() {
+  const v = curVoiceEntry();
+  if (!v) return;
+  $("ttsVoiceAva").textContent =
+    (v.name || v.label || "?").trim().charAt(0).toUpperCase();
+  $("ttsVoiceName").textContent = (v.name || v.label || "")
+    + (v.tag ? " · " + v.tag : "") + (v.premium ? " 🌟" : "");
+}
+function ttsEstimate() {
+  const text = $("ttsText").value;
+  const chars = text.length;
+  const mins = chars / 700;
+  const v = curVoiceEntry();
+  const rate = v && v.premium ? (v.rate || 2) : 1;
+  const cost = chars ? Math.max(1, Math.ceil(mins)) * rate : 0;
+  $("ttsEst").textContent = mins.toFixed(1) + " မိနစ် · အသံ ~"
+    + mmss(Math.round(mins * 60)) + " လောက် ထွက်မယ်"
+    + (chars ? " · ကုန်ကျ ~" + cost + " credits" : "");
+  const over = chars > 5000;
+  $("ttsErr").textContent = over
+    ? "စာသား အရှည်ဆုံး ၅,၀၀၀ လုံး ပဲ ရပါတယ် — လျှော့ပြီး ပြန်စမ်းပါ" : "";
+  const poor = !!(ME && ME.role !== "admin" && chars && !over
+                  && cost > (ME.credits || 0));
+  $("ttsPoor").style.display = poor ? "" : "none";
+  $("ttsGo").disabled = !chars || over || poor || ttsBusy;
+}
+$("ttsText").addEventListener("input", ttsEstimate);
+document.querySelectorAll("[data-tspeed]").forEach(c => c.onclick = () => {
+  document.querySelectorAll("[data-tspeed]").forEach(x =>
+    x.classList.remove("on"));
+  c.classList.add("on");
+  ttsSpeed = Number(c.dataset.tspeed);
+});
+$("ttsClear").onclick = () => {
+  $("ttsText").value = ""; $("ttsErr").textContent = ""; ttsEstimate();
+};
+/* SRT import: cue numbers + timing lines are stripped, the
+   spoken text (tags removed) lands in the box. A .txt loads
+   as-is. */
+function srtToText(s) {
+  return s.replace(/\r/g, "").split("\n")
+    .map(l => l.trim())
+    .filter(l => l && !/^\d+$/.test(l) && !/-->/.test(l))
+    .map(l => l.replace(/<[^>]+>/g, "").trim())
+    .filter(Boolean)
+    .join("\n");
+}
+$("ttsSrtBtn").onclick = () => $("ttsFile").click();
+$("ttsFile").onchange = async () => {
+  const f = $("ttsFile").files[0];
+  if (!f) return;
+  const raw = await f.text();
+  $("ttsText").value = /\.srt$/i.test(f.name) ? srtToText(raw) : raw;
+  $("ttsFile").value = "";
+  ttsEstimate();
+};
+/* The voice chip opens the SAME library sheet as the wizard
+   (build 208) in a bottom-sheet overlay; the pick is shared
+   (W.voice) and closes the sheet. */
+function closeTtsSheet() {
+  $("ttsSheetWrap").style.display = "none";
+  stopPreview();
+}
+$("ttsVoiceChip").onclick = () => {
+  sheetHost = $("ttsSheetBody");
+  sheetOnPick = () => { closeTtsSheet(); renderTtsVoiceChip(); ttsEstimate(); };
+  $("ttsSheetWrap").style.display = "";
+  voiceChips(voiceList);
+};
+$("ttsSheetScrim").onclick = closeTtsSheet;
+$("ttsHistBtn").onclick = () => {
+  const box = $("ttsHist");
+  const open = box.style.display === "none";
+  box.style.display = open ? "" : "none";
+  if (open) loadTtsHistory();
+};
+async function loadTtsHistory() {
+  try {
+    const d = await (await fetch("/api/tts/history")).json();
+    const items = d.items || [];
+    $("ttsHist").innerHTML = items.length ? items.map(h =>
+      `<div class="jobrow"><span>🎙 ${escHtml(h.voice_label || "")} · `
+      + (h.duration ? mmss(h.duration) + " · " : "")
+      + `${new Date((h.created_at || 0) * 1000).toLocaleDateString("en-GB")}</span>`
+      + (h.status === "done"
+          ? `<span><button class="ghost" onclick="ttsPlayHist('${h.id}')">▶ နားထောင်</button> `
+            + `<a href="${h.download}" download>⬇️</a></span>`
+          : `<span>${h.status === "error" ? "❌" : "🔄"}</span>`)
+      + `</div>`).join("")
+      : '<p class="hint">မှတ်တမ်း မရှိသေးပါ</p>';
+  } catch (e) {}
+}
+window.ttsPlayHist = function (id) {
+  $("ttsResult").style.display = "";
+  $("ttsAudio").src = "/api/jobs/" + id + "/stream";
+  $("ttsDl").href = "/api/jobs/" + id + "/download";
+  $("ttsCharged").textContent = "";
+  $("ttsAudio").play().catch(() => {});
+};
+$("ttsGo").onclick = async () => {
+  const text = $("ttsText").value.trim();
+  if (!text || ttsBusy) return;
+  ttsBusy = true; ttsEstimate();
+  $("ttsErr").textContent = "";
+  $("ttsGo").textContent = "🔄 အသံ ထုတ်နေပြီ… ခဏစောင့်ပါ";
+  try {
+    const res = await fetch("/api/tts", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({text, voice: W.voice, speed: ttsSpeed})});
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error || "အသံ ထုတ်လို့ မရပါ");
+    $("ttsResult").style.display = "";
+    $("ttsAudio").src = d.stream;
+    $("ttsDl").href = d.download;
+    $("ttsCharged").textContent = "✅ ရပြီ — " + (d.voice_label || "")
+      + " · " + mmss(d.duration || 0)
+      + (d.charged ? " · " + d.charged + " credits ဖြတ်ပြီး"
+                    : " · credit မဖြတ်ပါ");
+    if ($("ttsHist").style.display !== "none") loadTtsHistory();
+    loadMe();   // refresh the balance everywhere
+  } catch (e) { $("ttsErr").textContent = e.message; }
+  ttsBusy = false;
+  $("ttsGo").textContent = "🔊 အသံ ထုတ်မယ်";
+  ttsEstimate();
+};
 
 /* ---------------- preview ---------------- */
 $("previewBtn").onclick = async () => {
@@ -1035,6 +1349,11 @@ function wizShow() {
     + " — " + WIZ_NAMES[W.step];
   $("stageWrap").style.display =
     (previewId && W.step >= 2 && W.step <= 5) ? "" : "none";
+  if (W.step === 6) {
+    // Build 210: entering the wizard's voice step reclaims the
+    // shared library sheet from the studio overlay.
+    sheetHost = null; sheetOnPick = null; voiceChips(voiceList);
+  }
   $("wizBack").style.display = idx > 0 ? "" : "none";
   $("wizNext").style.display = idx < seq.length - 1 ? "" : "none";
   if (W.step === 4) placeRefresh();
@@ -1306,6 +1625,36 @@ async function poll(id) {
     notifyUser(job);
     loadJobs();
   }
+  if (job.type === "tts") {
+    // Build 210: a studio job has no steps/video — render its
+    // own done state (mp3 download; the player lives in the
+    // studio view's history).
+    $("steps").innerHTML = `<div class="step ${
+      job.status === "done" ? "done" : job.status === "error" ? "error" : "running"}">${
+      job.status === "done" ? "✅ အသံ ရပြီ"
+        : job.status === "error" ? "❌ အသံ ထုတ်တာ မရပါ"
+        : "🔄 အသံ ထုတ်နေဆဲ…"}</div>`;
+    if (job.status === "done") {
+      clearInterval(timer);
+      $("go").disabled = false;
+      currentJobId = id;
+      $("dl").href = "/api/jobs/" + id + "/download";
+      $("dl").textContent = "⬇️ အသံ ဒေါင်းလုပ် (.mp3)";
+      $("dl").style.display = "block";
+      $("dlFull").style.display = "none";
+      $("dlHint").style.display = "none";
+      $("preview").style.display = "none";
+      $("jobDl").style.display = "none";
+      $("cleanupNote").style.display = "block";
+      $("doneBtns").style.display = "flex";
+      $("editBtn").style.display = "none";
+    } else if (job.status === "error" || job.status === "cancelled") {
+      clearInterval(timer); $("go").disabled = false;
+      $("err").textContent = job.error || "";
+    }
+    return;
+  }
+  $("editBtn").style.display = "";
   $("steps").innerHTML =
     (job.status === "queued"
       ? `<div class="step running">⏳ တန်းစီ စောင့်နေပါတယ်` +
@@ -1415,10 +1764,14 @@ async function loadJobs() {
         else if (j.tg.state === "sent") parts.push("📨 " + (j.tg.to ? "@" + j.tg.to : "") + " ဆီ ပို့ပြီး ✓");
         else if (j.tg.state === "failed") parts.push("📨 ပို့မရ ❌");
       }
-      const tgBtn = j.status === "done"
+      const tgBtn = j.status === "done" && j.type !== "tts"
         ? `<button class="ghost" onclick="tgPick('${j.id}')">📨 TG</button>` : "";
+      const title = j.type === "tts"
+        ? "🎙 " + escHtml(j.voice_label || "စာသားမှ အသံ")
+          + (j.duration ? " · " + mmss(j.duration) : "")
+        : shortUrl(j.url);
       return `<div class="jobrow jobitem">` +
-        `<div class="jhead">${ST_ICON[j.status] || "•"} <span class="jurl">${shortUrl(j.url)}</span></div>` +
+        `<div class="jhead">${ST_ICON[j.status] || "•"} <span class="jurl">${title}</span></div>` +
         (parts.length ? `<div class="jmeta">${parts.join(" · ")}</div>` : "") +
         `<div class="jbtns">${tgBtn}<button class="ghost" onclick="attachJob('${j.id}')">ကြည့်</button>` +
         `<button class="ghost" onclick="delJob('${j.id}','${j.status}')">ဖျက်</button></div></div>` +
@@ -1642,7 +1995,7 @@ loadXkState();
 /* ---------------- ElevenLabs settings (build 205) ---------------- */
 function elVoiceListRender(voices) {
   $("elVoiceList").innerHTML = (voices || []).map(v =>
-    `<div style="border-top:1px solid #ddd0b2;padding:8px 0">
+    `<div style="border-top:1px solid #303036;padding:8px 0">
        <div>🌟 <b>${v.name}</b>${v.tag ? " · " + v.tag : ""} <span class="hint">(${v.id})</span></div>
        ${v.desc ? `<div class="hint">${v.desc}</div>` : ""}
        <div class="hint">${v.preview ? "🔊 preview ရှိ" : "🔇 preview မရှိသေး"}</div>
@@ -2252,6 +2605,17 @@ async function loadMe() {
     // back here.
     const needSetup = !!(ME && ME.needs_setup && ME.role !== "admin");
     $("setupCard").classList.toggle("show", needSetup);
+    // Build 210 shell: avatar + sidebar balance follow the
+    // session; a logged-out visitor on an accounts-enforced
+    // install lands on the account view (the login form),
+    // exactly where the pre-shell page put it.
+    $("avatarBtn").textContent = ME
+      ? (ME.username || "?").trim().charAt(0).toUpperCase() : "👤";
+    $("sbBalance").textContent = ME
+      ? "💳 " + ME.credits + " credits · 👤 " + ME.username
+      : "👤 login မဝင်ရသေး";
+    if (!ME && r.enforced) showView("account");
+    else if (needSetup) showView("account");
     if (ME) {
       $("wizCard").classList.toggle("show", !needSetup);
       $("jobsCard").classList.toggle("show", !needSetup);
@@ -2593,6 +2957,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 209</p>
+<p class="hint" id="buildTag" style="text-align:center">build 210</p>
 </body>
 </html>
