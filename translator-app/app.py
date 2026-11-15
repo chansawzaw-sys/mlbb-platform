@@ -53,7 +53,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 208"
+BUILD_TAG = "build 209"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -2508,8 +2508,33 @@ def _build_fx(data):
     """Normalize the editor payload into the fx dict run_job/pipeline.fx eats."""
     fx_in = data.get("fx") or {}
     fx = {}
+    # Build 209: multi-region blur. fx_in["blur_boxes"] (a list,
+    # count capped in _new_job) normalizes into fx["blur_boxes"],
+    # and fx["blur"] mirrors box #1 — the primary — so the
+    # subtitle-placement rule (build 123) and every pre-209
+    # reader keep working unchanged. Entries that fail to parse
+    # or have no area are dropped. Without a list, the legacy
+    # single fx_in["blur"] path below is byte-identical to
+    # build 208.
+    boxes = []
+    if isinstance(fx_in.get("blur_boxes"), list):
+        for b in fx_in["blur_boxes"]:
+            if not isinstance(b, dict):
+                continue
+            try:
+                box = {"x": float(b["x"]), "y": float(b["y"]),
+                       "w": float(b["w"]), "h": float(b["h"]),
+                       "strength": float(b.get("strength") or 20)}
+            except (KeyError, TypeError, ValueError):
+                continue
+            if box["w"] <= 0 or box["h"] <= 0:
+                continue
+            boxes.append(box)
     blur = fx_in.get("blur")
-    if blur:
+    if boxes:
+        fx["blur_boxes"] = boxes
+        fx["blur"] = boxes[0]
+    elif blur:
         fx["blur"] = {"x": float(blur["x"]), "y": float(blur["y"]),
                       "w": float(blur["w"]), "h": float(blur["h"]),
                       "strength": float(blur.get("strength") or 20)}
@@ -4115,6 +4140,14 @@ def _new_job(data, user=None):
         return None, "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"
     if mode not in ("subs", "dub", "both"):
         return None, "mode မမှန်ပါ"
+    # Build 209: at most MAX_BLUR_BOXES blur regions per job —
+    # refused here, before the job (and any charge) exists, in
+    # the same style as the validations above.
+    _boxes_in = (data.get("fx") or {}).get("blur_boxes")
+    if isinstance(_boxes_in, list) \
+            and len(_boxes_in) > fx_mod.MAX_BLUR_BOXES:
+        return None, ("ဝါးမည့် အကွက် အများဆုံး ၅ ခု ပဲ ရပါတယ်"
+                      " — အကွက် လျှော့ပြီး ပြန်စမ်းပါ")
     job = {
         "id": uuid.uuid4().hex[:12], "url": url, "mode": mode,
         "voice": voice, "voice_style": voice_style,

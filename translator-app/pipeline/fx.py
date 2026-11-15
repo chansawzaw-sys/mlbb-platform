@@ -7,7 +7,9 @@ coordinates, so they are resolution-independent:
   logo = {"path","pos_x","pos_y",      # pos = 0..1 across the *travel range*
           "size_pct","opacity","saturation"}   # (W - logo_w), (H - logo_h)
 
-Blur: crop the region -> gblur -> overlay back at the same spot (whole video).
+Blur: crop the region -> gblur -> overlay back at the same spot (whole
+video). Build 209: fx may carry "blur_boxes" (a list of such rects, up
+to MAX_BLUR_BOXES) — every region is blurred; fx["blur"] mirrors box #1.
 Logo: scale to size_pct of video width, set alpha = opacity, adjust
 saturation (100 = original colour, 0 = greyscale/faded), overlay at pos.
 
@@ -31,11 +33,17 @@ ASPECT_DIMS = {"9:16": (720, 1280), "16:9": (1280, 720),
                "1:1": (960, 960), "4:5": (864, 1080)}
 ASPECT_STYLES = ("blur", "black", "crop")
 
+# Build 209: a job may blur up to this many regions at once
+# (multi-line / multi-spot burned-in captions). Enforced at job
+# creation in app.py; fx["blur"] always mirrors box #1.
+MAX_BLUR_BOXES = 5
+
 
 def has_fx(fx):
     if not fx:
         return False
-    return (bool(fx.get("blur")) or bool(fx.get("blur_pieces"))
+    return (bool(fx.get("blur")) or bool(fx.get("blur_boxes"))
+            or bool(fx.get("blur_pieces"))
             or bool(fx.get("logo", {}).get("path"))
             or (fx.get("aspect") or {}).get("ratio") in ASPECT_DIMS)
 
@@ -77,20 +85,33 @@ def filter_chain(fx, vw, vh, start="[0:v]", logo="[1:v]"):
             f"[pb{i}][pblur{i}]overlay=x='main_w*{bx}':y='main_h*{by}'"
             f":enable='between(t,{t0:.2f},{t1:.2f})'[pv{i}]")
         cur = f"[pv{i}]"
-    blur = None if pieces else fx.get("blur")
-    if blur:
-        bx = min(max(float(blur["x"]), 0.0), 0.99)
-        by = min(max(float(blur["y"]), 0.0), 0.99)
-        bw = min(max(float(blur["w"]), 0.01), 1.0 - bx)
-        bh = min(max(float(blur["h"]), 0.01), 1.0 - by)
-        sigma = float(blur.get("strength") or 20)
+    # Whole-video blur boxes (build 209: a LIST — fx["blur_boxes"]
+    # when the job carries several regions, else the single
+    # fx["blur"] of every pre-209 job and the bot). Each box is
+    # the same crop -> gblur -> overlay at the same spot; boxes
+    # apply in order, so overlapping boxes simply blur twice
+    # (the union) and can never break the encode. When pieces
+    # exist they replace the boxes, exactly as before.
+    boxes = [] if pieces else (
+        fx.get("blur_boxes")
+        or ([fx["blur"]] if fx.get("blur") else []))
+    for i, box in enumerate(boxes):
+        try:
+            bx = min(max(float(box["x"]), 0.0), 0.99)
+            by = min(max(float(box["y"]), 0.0), 0.99)
+            bw = min(max(float(box["w"]), 0.01), 1.0 - bx)
+            bh = min(max(float(box["h"]), 0.01), 1.0 - by)
+            sigma = float(box.get("strength") or 20)
+        except (KeyError, TypeError, ValueError):
+            continue
         # crop dims must be even for yuv420p
-        filters.append(f"{cur}split=2[fxbase][fxcrop]")
+        filters.append(f"{cur}split=2[bx{i}a][bx{i}b]")
         filters.append(
-            f"[fxcrop]crop=w='trunc(iw*{bw}/2)*2':h='trunc(ih*{bh}/2)*2'"
-            f":x='iw*{bx}':y='ih*{by}',gblur=sigma={sigma:.1f}[fxblurred]")
-        filters.append(f"[fxbase][fxblurred]overlay=x='main_w*{bx}':y='main_h*{by}'[vfx]")
-        cur = "[vfx]"
+            f"[bx{i}b]crop=w='trunc(iw*{bw}/2)*2':h='trunc(ih*{bh}/2)*2'"
+            f":x='iw*{bx}':y='ih*{by}',gblur=sigma={sigma:.1f}[bx{i}r]")
+        filters.append(
+            f"[bx{i}a][bx{i}r]overlay=x='main_w*{bx}':y='main_h*{by}'[bx{i}o]")
+        cur = f"[bx{i}o]"
     if logo_path:
         size_pct = float(logo_cfg.get("size_pct") or 18)
         opacity = min(max(float(logo_cfg.get("opacity", 70)) / 100.0, 0.0), 1.0)

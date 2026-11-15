@@ -82,9 +82,16 @@
   #frameImg { width: 100%; display: block; pointer-events: none; }
   #logoEl { position: absolute; display: none; cursor: grab; touch-action: none;
     filter: drop-shadow(0 1px 2px rgba(0,0,0,.5)); }
-  #blurRect { position: absolute; display: none; border: 2px dashed #ffd34d;
+  /* blur boxes (build 209: up to 5 regions, numbered; the
+     selected one gets a solid orange border) */
+  .blurBox { position: absolute; border: 2px dashed #ffd34d;
     background: rgba(255,211,77,.15); backdrop-filter: blur(7px);
     -webkit-backdrop-filter: blur(7px); cursor: move; touch-action: none; }
+  .blurBox.sel { border-style: solid; border-color: #ff9f1a; }
+  .blurBox .bnum { position: absolute; top: 0; left: 0; pointer-events: none;
+    background: #ffd34d; color: #33302a; font-size: 11px; font-weight: 700;
+    line-height: 1.5; padding: 0 6px; border-radius: 0 0 6px 0; }
+  .blurBox.sel .bnum { background: #ff9f1a; }
   #subSample { position: absolute; left: 50%; transform: translateX(-50%);
     display: none; text-align: center; font-weight: 700; color: #fff;
     line-height: 1.4; pointer-events: none; overflow-wrap: break-word;
@@ -439,7 +446,6 @@
       <input type="range" id="scrub" min="0" max="10" step="0.1" value="2">
       <div id="stage">
         <img id="frameImg" alt="preview frame">
-        <div id="blurRect"></div>
         <img id="logoEl" alt="logo">
         <div id="subSample">နမူနာ စာတန်း</div>
       </div>
@@ -486,9 +492,13 @@
 
     <div class="wstep" data-step="3" style="display:none">
       <label style="margin-top:0">🌫️ မူရင်းစာ ဝါးရန်</label>
-      <p class="hint">ဝါးချင်တဲ့ နေရာကို အပေါ်က ပုံပေါ်မှာ လက်နဲ့ ဆွဲပြီး အကွက် ဆွဲပါ (အကွက်ဟောင်း ထဲ ဆွဲရင် ရွေ့တယ်)။ မဝါးချင်ရင် «မဝါးဘူး» နှိပ်ပါ</p>
+      <p class="hint">ဝါးချင်တဲ့ နေရာကို အပေါ်က ပုံပေါ်မှာ လက်နဲ့ ဆွဲပြီး အကွက် ဆွဲပါ (အကွက်ထဲ ဆွဲရင် ရွေ့တယ်)။ အကွက် <b>အများဆုံး ၅ ခု</b> ထိ ထားနိုင်တယ် — စာကြောင်း အများကြီး / အပေါ်+အောက် နှစ်နေရာ ပါတဲ့ video တွေ အတွက်။ အကွက် တစ်ခုခုကို ထိရင် ရွေးပြီး ပြင်/ဖျက် လုပ်နိုင်တယ် (နံပါတ် ပါတဲ့ အကွက်က အဓိက အကွက် — စာတန်း ကို အကွက် ၁ ထဲမှာ ထိုးပါမယ်)။ မဝါးချင်ရင် «မဝါးဘူး» နှိပ်ပါ</p>
       <div class="row">
-        <button class="ghost" id="blurClear">အကွက် ဖျက်မယ်</button>
+        <button class="ghost" id="blurAdd">➕ နောက်ထပ် အကွက် ထည့်</button>
+        <button class="ghost" id="blurDel">🗑 ရွေးထားတဲ့ အကွက် ဖျက်</button>
+      </div>
+      <div class="row">
+        <button class="ghost" id="blurClear">အကွက် အကုန် ဖျက်မယ်</button>
         <button class="ghost" id="blurSkip">မဝါးဘူး</button>
       </div>
       <p class="hint" id="blurState"></p>
@@ -638,7 +648,10 @@ let timer = null;
 let previewId = null, previewDur = 0, previewUrl = null;
 let logoId = null;
 let logoPos = {x: 1, y: 0};          // 0..1 across travel range (W-logoW, H-logoH)
-let blur = null;                      // {x,y,w,h} normalized
+let blurBoxes = [];                   // build 209: up to 5 boxes {x,y,w,h} normalized
+let selBox = -1;                      // selected box index (-1 = none)
+let blur = null;                      // the SELECTED box (=== blurBoxes[selBox]) or null
+const primaryBlur = () => blurBoxes[0] || null;  // box #1: subtitle placement (build 123)
 
 /* Voice styles (build 200): chip ids are style keys from the
    shared table in pipeline.tts — the two my-MM voices, each in
@@ -802,7 +815,7 @@ $("frameImg").onload = () => { layoutLogo(); layoutBlur(); layoutSubs(); };
 
 /* ---------------- editor geometry ---------------- */
 const stage = $("stage"), frameImg = $("frameImg"),
-      logoEl = $("logoEl"), blurRect = $("blurRect");
+      logoEl = $("logoEl");
 function stageSize() { return {w: stage.clientWidth, h: stage.clientHeight}; }
 function relPos(e) {
   const r = frameImg.getBoundingClientRect();
@@ -820,12 +833,30 @@ function layoutLogo() {
   logoEl.style.filter = "saturate(1)";
 }
 function layoutBlur() {
-  if (!blur) { blurRect.style.display = "none"; return; }
+  stage.querySelectorAll(".blurBox").forEach(el => el.remove());
   const {w, h} = stageSize();
-  blurRect.style.display = "block";
-  blurRect.style.left = (blur.x * w) + "px"; blurRect.style.top = (blur.y * h) + "px";
-  blurRect.style.width = (blur.w * w) + "px"; blurRect.style.height = (blur.h * h) + "px";
-  blurRect.style.backdropFilter = "blur(6px)";
+  blurBoxes.forEach((b, i) => {
+    const d = document.createElement("div");
+    d.className = "blurBox" + (i === selBox ? " sel" : "");
+    d.dataset.idx = i;
+    d.style.left = (b.x * w) + "px"; d.style.top = (b.y * h) + "px";
+    d.style.width = (b.w * w) + "px"; d.style.height = (b.h * h) + "px";
+    const n = document.createElement("span");
+    n.className = "bnum"; n.textContent = i + 1;
+    d.appendChild(n);
+    stage.insertBefore(d, logoEl);   // stacking: frame < boxes < logo < subs
+  });
+  updateBlurUi();
+}
+/* Step-3 control state + count line (build 209). */
+function updateBlurUi() {
+  const add = $("blurAdd"), del = $("blurDel");
+  if (add) add.disabled = blurBoxes.length >= 5;
+  if (del) del.disabled = selBox < 0;
+  if (W.blurChoice === "yes" && blurBoxes.length)
+    $("blurState").textContent = "✅ အကွက် " + blurBoxes.length
+      + " ခု ရှိတယ် (အများဆုံး ၅)" + (selBox >= 0
+        ? " — ရွေးထားတာ: အကွက် " + (selBox + 1) : "");
 }
 
 /* subtitle sample follows the wizard choices (placement / size /
@@ -838,10 +869,11 @@ function layoutSubs() {
   el.style.color = W.color === "black" ? "#000" : W.color;
   el.style.textShadow = W.color === "black"
     ? "0 0 3px #fff, 0 0 3px #fff" : "0 0 3px #000, 0 0 3px #000";
-  if (W.place === "box" && blur) {
+  const pb = primaryBlur();
+  if (W.place === "box" && pb) {
     const {w, h} = stageSize();
-    el.style.left = (blur.x * w) + "px"; el.style.width = (blur.w * w) + "px";
-    el.style.top = (blur.y * h) + "px"; el.style.bottom = "auto";
+    el.style.left = (pb.x * w) + "px"; el.style.width = (pb.w * w) + "px";
+    el.style.top = (pb.y * h) + "px"; el.style.bottom = "auto";
     el.style.transform = "none";
   } else {
     el.style.left = "50%"; el.style.width = "95%";
@@ -870,10 +902,32 @@ document.querySelectorAll("[data-corner]").forEach(b => b.onclick = () => {
   const [x, y] = b.dataset.corner.split(",").map(Number);
   logoPos = {x, y}; layoutLogo();
 });
-$("blurClear").onclick = () => { blur = null; W.blurChoice = null;
-  layoutBlur(); $("blurState").textContent = ""; wizGate(); };
-$("blurSkip").onclick = () => { blur = null; W.blurChoice = "no";
-  layoutBlur(); $("blurState").textContent = "မဝါးဘူး ရွေးထားတယ်"; wizGate(); };
+function clearBoxes(choice, msg) {
+  blurBoxes = []; selBox = -1; blur = null; W.blurChoice = choice;
+  layoutBlur(); layoutSubs(); $("blurState").textContent = msg; wizGate();
+}
+$("blurClear").onclick = () => clearBoxes(null, "");
+$("blurSkip").onclick = () => clearBoxes("no", "မဝါးဘူး ရွေးထားတယ်");
+$("blurAdd").onclick = () => {
+  if (blurBoxes.length >= 5) {
+    $("blurState").textContent = "အကွက် အများဆုံး ၅ ခု ပဲ ရပါတယ်";
+    return;
+  }
+  // A fresh band in the lower third (caption country); the user
+  // drags it wherever the text actually is.
+  blurBoxes.push({x: 0.05, y: 0.62, w: 0.9, h: 0.16});
+  selBox = blurBoxes.length - 1; blur = blurBoxes[selBox];
+  W.blurChoice = "yes";
+  layoutBlur(); layoutSubs(); wizGate();
+};
+$("blurDel").onclick = () => {
+  if (selBox < 0) return;
+  blurBoxes.splice(selBox, 1);
+  selBox = Math.min(selBox, blurBoxes.length - 1);
+  blur = selBox >= 0 ? blurBoxes[selBox] : null;
+  if (!blurBoxes.length) W.blurChoice = null;
+  layoutBlur(); layoutSubs(); wizGate();
+};
 $("logoSkip").onclick = () => { logoId = null; W.logoChoice = "no";
   logoEl.style.display = "none";
   $("logoState").textContent = "Logo မထည့်ဘူး ရွေးထားတယ်"; wizGate(); };
@@ -886,11 +940,23 @@ function onDown(e) {
   if (W.step === 5 && e.target === logoEl && logoId) {
     const {w, h} = stageSize();
     drag = {kind: "logo", dx: p.x * w - logoEl.offsetLeft, dy: p.y * h - logoEl.offsetTop};
-  } else if (W.step === 3 && e.target === blurRect && blur) {
+  } else if (W.step === 3 && e.target.classList
+             && e.target.classList.contains("blurBox")) {
+    // Tap a box: select it, then dragging moves it (build 209).
+    selBox = Number(e.target.dataset.idx);
+    blur = blurBoxes[selBox];
+    layoutBlur(); layoutSubs();
     drag = {kind: "blur-move", dx: p.x - blur.x, dy: p.y - blur.y};
   } else if (W.step === 3 && (e.target === stage || e.target === frameImg)) {
+    if (blurBoxes.length >= 5) {
+      $("blurState").textContent = "အကွက် အများဆုံး ၅ ခု ပဲ ရပါတယ် — အရင် တစ်ခု ဖျက်ပါ";
+      return;
+    }
+    // Dragging empty stage draws a NEW box and selects it.
     drag = {kind: "blur-draw", sx: p.x, sy: p.y};
     blur = {x: p.x, y: p.y, w: 0, h: 0};
+    blurBoxes.push(blur);
+    selBox = blurBoxes.length - 1;
   }
   if (drag) { stage.setPointerCapture(e.pointerId); e.preventDefault(); }
 }
@@ -916,11 +982,14 @@ function onMove(e) {
 function onUp() {
   if (drag && drag.kind === "blur-draw") {
     if (blur && (blur.w < 0.02 || blur.h < 0.02)) {
-      blur = null; layoutBlur();
+      // Too small to be a box: drop it again (build 209).
+      blurBoxes.splice(selBox, 1);
+      selBox = Math.min(selBox, blurBoxes.length - 1);
+      blur = selBox >= 0 ? blurBoxes[selBox] : null;
+      layoutBlur(); layoutSubs();
     } else if (blur) {
       W.blurChoice = "yes";
-      $("blurState").textContent = "✅ အကွက် ရှိတယ် — နောက် ဆက်ပါ";
-      wizGate();
+      layoutBlur(); layoutSubs(); wizGate();
     }
   }
   drag = null;
@@ -1019,7 +1088,7 @@ $("wizSpeed").oninput = () => {
 };
 function placeRefresh() {
   const boxChip = document.querySelector('#placeChips [data-place="box"]');
-  if (!blur) {
+  if (!blurBoxes.length) {
     if (W.place === "box") { W.place = "bottom"; syncChips("placeChips", "place", "bottom"); }
     boxChip.style.opacity = ".4"; boxChip.style.pointerEvents = "none";
     $("placeNote").textContent = "ဝါး အကွက် မရှိလို့ «အကွက်ထဲမှာ» ရွေးလို့ မရပါ — အောက်/အပေါ် ရွေးပါ";
@@ -1036,7 +1105,7 @@ function wizSummaryRender() {
     "🎞 ပုံစံ: " + ({subs: "စာတန်းထိုး", dub: "အသံထွက်", both: "နှစ်မျိုးလုံး"})[W.mode]
       + (W.aspect ? " · Frame " + W.aspect + " (" + W.aspectStyle + ")" : " · Frame မူရင်း"),
     "📺 အရည်: " + ({hd: "အကြည် HD (မူရင်း)", 720: "720p", 480: "480p"})[W.quality],
-    "🌫 ဝါး: " + (blur && W.blurChoice === "yes" ? "ဝါးမယ်" : "မဝါးဘူး"),
+    "🌫 ဝါး: " + (blurBoxes.length && W.blurChoice === "yes" ? "ဝါးမယ် (" + blurBoxes.length + " ကွက်)" : "မဝါးဘူး"),
   ];
   if (W.mode !== "dub")
     lines.push("🔤 စာတန်း: " + ({box: "အကွက်ထဲမှာ", bottom: "အောက်ခြေ", top: "အပေါ်"})[W.place]
@@ -1063,7 +1132,7 @@ wizShow();
    all and starts from zero. */
 function resetForNewLink() {
   previewId = null; previewUrl = null; previewDur = 0;
-  blur = null; logoId = null; logoPos = {x: 1, y: 0};
+  blurBoxes = []; selBox = -1; blur = null; logoId = null; logoPos = {x: 1, y: 0};
   currentJobId = null; reviewJobId = null; reviewShownFor = null;
   clearInterval(timer);
   $("frameImg").removeAttribute("src");
@@ -1096,7 +1165,7 @@ $("go").onclick = async () => {
   const url = $("url").value.trim();
   if (!url) { alert("လင့်ခ် အရင်ထည့်ပါ"); return; }
   if (previewId && url !== previewUrl) {
-    previewId = null; blur = null; logoId = null;  // stale editor state
+    previewId = null; blurBoxes = []; selBox = -1; blur = null; logoId = null;  // stale editor state
   }
   $("go").disabled = true; $("err").textContent = "";
   $("reviewCard").classList.remove("show"); reviewShownFor = null;
@@ -1106,7 +1175,8 @@ $("go").onclick = async () => {
   $("card").style.display = "block"; $("steps").innerHTML = "စတင်နေပြီ…";
   const fx = {};
   if (W.aspect) fx.aspect = {ratio: W.aspect, style: W.aspectStyle};
-  if (blur && W.blurChoice === "yes") fx.blur = {...blur, strength: 25};
+  if (blurBoxes.length && W.blurChoice === "yes")
+    fx.blur_boxes = blurBoxes.map(b => ({...b, strength: 25}));
   if (logoId && W.logoChoice === "yes") fx.logo = {
     logo_id: logoId, pos_x: logoPos.x, pos_y: logoPos.y,
     size_pct: 18, opacity: 70, saturation: 100};
@@ -2523,6 +2593,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 208</p>
+<p class="hint" id="buildTag" style="text-align:center">build 209</p>
 </body>
 </html>
