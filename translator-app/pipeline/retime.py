@@ -33,8 +33,8 @@ Writes retimed.mp4, dub.wav, segments_retimed.json, subs_retimed.srt
 import sys
 from pathlib import Path
 
-from .common import (load_segments, probe_duration, run, save_segments,
-                     target_maxrate_k, write_srt)
+from .common import (encode_threads, load_segments, probe_duration, run,
+                     save_segments, target_maxrate_k, write_srt)
 
 MAX_SPEED = 1.30
 MIN_VSLOW = 0.80   # legacy stat only; the plan no longer floors at it
@@ -196,17 +196,18 @@ def _video_single_pass(src, chunks, out, cap_k=2500, timeout=1800):
     the chunked path, exactly like any other encode failure."""
     filters, _label = _video_graph(chunks)
     mr = target_maxrate_k(src, cap_k)
-    # Build 193: "-threads 2" on every libx264 encode in the
-    # pipeline (here, _video_merged, _video_chunked, burn, fx and
-    # the app.py shrink/small-copy) — with up to four jobs on a
-    # 4-core box, an uncapped encode per job starved the web
-    # server sharing the process; two threads per encode leaves
-    # the web tier headroom while jobs still overlap.
+    # Build 193 capped every libx264 encode in the pipeline at
+    # "-threads 2" (here, _video_merged, _video_chunked, burn, fx
+    # and the app.py shrink/small-copy) — with up to four jobs on
+    # a 4-core box, an uncapped encode per job starved the web
+    # server sharing the process. Build 198: the cap is adaptive
+    # (common.encode_threads) — 4 threads when this is the only
+    # active job, still exactly 2 whenever 2+ jobs are active.
     run(["ffmpeg", "-y", "-v", "error", "-i", str(src),
          "-filter_complex", ";".join(filters), "-map", "[outv]",
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
          "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-         "-threads", "2", str(out)],
+         "-threads", str(encode_threads()), str(out)],
         timeout=timeout)
 
 
@@ -232,7 +233,58 @@ def _video_merged(src, chunks, dub_wav, spec, cap_k=2500, timeout=1800):
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
             "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
             "-c:a", "aac", "-b:a", "96k", "-shortest",
-            "-threads", "2", str(spec["output"])]
+            "-threads", str(encode_threads()), str(spec["output"])]
+    run(cmd, timeout=timeout)
+
+
+def _reroot_finalize(filters, root="[0:v]"):
+    """Re-root a finalize graph (built by run_job's make_finalize
+    for the retime concat label "[outv]") at a different input
+    label. Exactly one filter in the chain CONSUMES the start
+    label — the blur/pieces split, the logo overlay, or the bare
+    ass filter — and it carries the label as its prefix; rewrite
+    that one prefix. Returns None when no filter consumes the
+    label (a spec shape this merge does not understand — the
+    caller falls back to the classic flow rather than guessing)."""
+    out = []
+    done = False
+    for f in filters:
+        if not done and f.startswith("[outv]"):
+            out.append(root + f[len("[outv]"):])
+            done = True
+        else:
+            out.append(f)
+    return out if done else None
+
+
+def _video_passthrough_merged(src, dub_wav, spec, cap_k=2500,
+                              timeout=1200):
+    """Build 198: passthrough plans (the retime is a timeline
+    identity — every chunk kept its original duration) used to
+    stream-copy the picture into an intermediate retimed.mp4 and
+    let run_job's classic finalize decode + encode THAT. The
+    finalize graph is timestamp-global, so on an identity plan it
+    can hang straight off the source stream instead: re-rooted at
+    [0:v], it runs as the job's ONE encode with the dub muxed in
+    the same pass, at the finalize stage's own settings (crf 24 —
+    the classic burn's settings; the picture the classic flow
+    encoded was a bit-exact copy of this same source). Raises on
+    a spec shape it cannot re-root; encode failures propagate to
+    the caller's classic fallback, exactly like _video_merged."""
+    filters = _reroot_finalize(spec["filters"])
+    if filters is None:
+        raise RuntimeError("finalize spec cannot be re-rooted")
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src),
+           "-i", str(dub_wav)]
+    if spec.get("logo_path"):
+        cmd += ["-i", str(spec["logo_path"])]
+    mr = target_maxrate_k(src, cap_k)
+    cmd += ["-filter_complex", ";".join(filters),
+            "-map", spec["out_label"], "-map", "1:a",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+            "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
+            "-c:a", "aac", "-b:a", "96k", "-shortest",
+            "-threads", str(encode_threads()), str(spec["output"])]
     run(cmd, timeout=timeout)
 
 
@@ -290,7 +342,7 @@ def _video_chunked(src, chunks, cdir, out, cap_k=2500):
              "-i", str(src), "-vf", _piece_vf(c, dur), "-an",
              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
              "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-             "-threads", "2", str(vout)], timeout=1200)
+             "-threads", str(encode_threads()), str(vout)], timeout=1200)
         vlist.append(vout)
     lst = cdir / "vlist_fb.txt"
     lst.write_text("".join(f"file '{f.resolve()}'\n" for f in vlist),
@@ -453,10 +505,37 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None):
     canary_failed = False
     n_chunks = len(chunks)
     if passthrough:
-        plan["video_path"] = "passthrough"
-        run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-i", str(dub_wav),
-             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
-             "-shortest", str(workdir / "retimed.mp4")], timeout=1200)
+        # Build 198: when a finalize graph exists (mode=both, or
+        # dub with fx), run it as ONE encode straight off the
+        # source — the plan is a timeline identity, so the graph's
+        # [outv] root is the source stream itself — instead of a
+        # stream-copy into an intermediate retimed.mp4 that the
+        # classic finalize then decoded again. The spec is built
+        # OUTSIDE the try (a spec error fails loudly, exactly as
+        # in the merged path below); only an encode failure falls
+        # back to the classic copy-mux + finalize. Dub without fx
+        # has no finalize graph: the copy-mux below already IS
+        # the finished file's cheapest form (zero encodes).
+        spec = make_finalize(plan) if make_finalize is not None \
+            else None
+        if spec is not None:
+            try:
+                _video_passthrough_merged(src, dub_wav, spec, cap_k)
+                merged = True
+                plan["final_merged"] = True
+                plan["final_output"] = str(spec["output"])
+                plan["video_path"] = "passthrough_merged"
+            except Exception:
+                merged = False
+                try:
+                    Path(spec["output"]).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        if not merged:
+            plan["video_path"] = "passthrough"
+            run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-i", str(dub_wav),
+                 "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
+                 "-shortest", str(workdir / "retimed.mp4")], timeout=1200)
     else:
         spec = None
         if make_finalize is not None and n_chunks <= CANARY_MAX_CHUNKS:

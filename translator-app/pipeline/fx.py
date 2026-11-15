@@ -17,7 +17,7 @@ import json
 import sys
 from pathlib import Path
 
-from .common import probe_streams, run, target_maxrate_k
+from .common import encode_threads, probe_streams, run, target_maxrate_k
 
 
 def video_size(path):
@@ -149,7 +149,8 @@ def apply_effects(input_mp4, output_mp4, fx, cap_k=2500):
     cmd += ["-filter_complex", ";".join(filters), "-map", cur, "-map", "0:a?",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
             "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-            "-c:a", "copy", "-threads", "2", str(output_mp4)]
+            "-c:a", "copy", "-threads", str(encode_threads()),
+            str(output_mp4)]
     run(cmd)
     return output_mp4
 

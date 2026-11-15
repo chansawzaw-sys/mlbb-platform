@@ -54,6 +54,46 @@ def ensure_system_ca():
             pass
 
 
+# --- Adaptive encode threads (build 198) -----------------------------------
+# Build 193 capped every libx264 encode at a literal "-threads 2"
+# so up to four concurrent jobs on the 4-core box could not starve
+# the web server sharing it. The cap was unconditional, though: a
+# job running ALONE also got only 2 of the 4 cores. The job manager
+# (app.py) registers its active-worker count here at startup; an
+# encode built while this process's job is the only active one may
+# use all 4 threads, and the moment 2+ jobs are active the build-193
+# cap of 2 applies again — so the no-oversubscription property is
+# unchanged exactly when it matters. Standalone CLI use (no
+# provider registered) is a single job by definition.
+_ACTIVE_JOBS_PROVIDER = None
+
+
+def set_active_jobs_provider(fn):
+    """Register the job manager's active-job counter (app.py calls
+    this once at startup with its _active_worker_count)."""
+    global _ACTIVE_JOBS_PROVIDER
+    _ACTIVE_JOBS_PROVIDER = fn
+
+
+def active_job_count():
+    """Jobs actually RUNNING right now (queued jobs do not count —
+    the provider's contract, mirroring app.py's worker_started
+    rule). 1 when no provider is registered (standalone CLI)."""
+    fn = _ACTIVE_JOBS_PROVIDER
+    if fn is not None:
+        try:
+            return max(0, int(fn()))
+        except Exception:
+            pass
+    return 1
+
+
+def encode_threads():
+    """libx264 -threads for an encode built at this moment: 4 when
+    this is the only active job, else the build-193 cap of 2."""
+    return 4 if active_job_count() <= 1 else 2
+
+
 def maxrate_cap_k(quality):
     """Encode maxrate ceiling (kbps) for a job's download quality
     (build 167). "hd" jobs fetched the original rendition on the

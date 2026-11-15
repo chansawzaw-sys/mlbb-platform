@@ -16,8 +16,8 @@ import re
 import sys
 from pathlib import Path
 
-from .common import (FONTS_DIR, ensure_fonts, probe_streams, run,
-                     target_maxrate_k)
+from .common import (FONTS_DIR, encode_threads, ensure_fonts,
+                     probe_streams, run, target_maxrate_k)
 
 # Subtitle FONT CHOICES — all Myanmar UNICODE fonts bundled in assets/fonts.
 # Every one was verified to cover the full Myanmar block (U+1000–109F) and to
@@ -473,7 +473,8 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
             cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]",
                     "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
                     "-crf", "24", "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-                    "-c:a", "copy", "-threads", "2", str(output_mp4)]
+                    "-c:a", "copy", "-threads", str(encode_threads()),
+                    str(output_mp4)]
             run(cmd)
             return output_mp4
     ass_path, fonts_dir, _w, _h = _prepare_ass(
@@ -483,7 +484,8 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
     run(["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4), "-vf", vf,
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
          "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-         "-c:a", "copy", "-threads", "2", str(output_mp4)])
+         "-c:a", "copy", "-threads", str(encode_threads()),
+         str(output_mp4)])
     return output_mp4
 
 

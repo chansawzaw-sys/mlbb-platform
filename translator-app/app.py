@@ -33,7 +33,8 @@ from pipeline import download as dl_mod
 from pipeline import envfile
 from pipeline import fx as fx_mod
 from pipeline import run_job, tts
-from pipeline.common import probe_duration, run as sh
+from pipeline.common import (encode_threads, probe_duration, run as sh,
+                             set_active_jobs_provider)
 
 ROOT = Path(__file__).resolve().parent
 JOBS_DIR = ROOT / "jobs"
@@ -49,7 +50,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 197"
+BUILD_TAG = "build 198"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -238,6 +239,13 @@ def _active_worker_count():
                and j.get("status") in ("queued", "running"))
 
 
+# Build 198: the pipeline's adaptive encode-thread helper reads
+# its active-job count from here — a libx264 encode built while
+# one job runs alone gets 4 threads; with 2+ active jobs every
+# encode is back to the build-193 cap of 2.
+set_active_jobs_provider(_active_worker_count)
+
+
 def _enqueue_job(job, kind="main"):
     """Park a job for the dispatcher (build 180). Submissions are
     never refused for concurrency: they wait here, in order, until
@@ -276,13 +284,16 @@ def _tg_shrink_for_send(out, dest, budget=47_000_000):
         vf = f"scale={tw}:{th}"
         total_k = budget * 8 / dur / 1000.0 * 0.94
         video_k = int(max(220, total_k - 96))
-        # Build 193: "-threads 2" caps this encode's CPU so a
+        # Build 193 capped this encode's CPU ("-threads 2") so a
         # small-copy/shrink pass cannot starve the web server
-        # sharing the box (same cap in retime/burn/fx).
+        # sharing the box (same cap in retime/burn/fx). Build 198:
+        # the cap is adaptive (common.encode_threads) — 4 threads
+        # when no other job is active, still 2 with 2+ active.
         sh(["ffmpeg", "-y", "-v", "error", "-i", str(out), "-vf", vf,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
             "-maxrate", f"{video_k}k", "-bufsize", f"{2 * video_k}k",
-            "-c:a", "aac", "-b:a", "96k", "-threads", "2",
+            "-c:a", "aac", "-b:a", "96k",
+            "-threads", str(encode_threads()),
             str(dest)], timeout=1800)
         if dest.exists() and dest.stat().st_size <= tg.MAX_BYTES:
             return dest
@@ -303,22 +314,31 @@ def _small_budget(dur):
 
 
 def _ensure_small_copy(job):
-    """Build 179: every finished job also gets a compact copy,
-    output_small.mp4, made with the Telegram shrink's exact recipe
-    (480p-class box, x264 ultrafast/crf 26, duration-capped bitrate,
-    AAC 96k) but budgeted for download speed instead of the bot's
-    50 MB cap. The done-state's main download button serves this
-    copy; the full master stays one tap away (?v=full). Lives in
-    the job dir, so the 24h retention and the newest-2-per-
-    account cap (both whole-dir deletes) cover it — no orphans.
-    Failure is non-fatal: the job still finishes with the full
-    file only and the UI falls back to a single button."""
+    """Build 179: a finished job's compact copy, output_small.mp4,
+    made with the Telegram shrink's exact recipe (480p-class box,
+    x264 ultrafast/crf 26, duration-capped bitrate, AAC 96k) but
+    budgeted for download speed instead of the bot's 50 MB cap.
+    The done-state's main download button serves this copy; the
+    full master stays one tap away (?v=full). Lives in the job
+    dir, so the 24h retention and the newest-2-per-account cap
+    (both whole-dir deletes) cover it — no orphans.
+
+    Build 198: LAZY — nothing calls this at finish time any more
+    (build 186 already had it off the _finish path, in a
+    background thread; now it is not made at all until asked).
+    The only caller is _small_on_demand, on the first ?v=small
+    download/stream request. Every exit that produces NO copy
+    stamps job["small_na"] so later taps serve the full master
+    immediately instead of re-running a doomed encode; _finish
+    clears the stamp for a fresh render. Failure is non-fatal,
+    exactly as before: the full file always remains downloadable."""
     jdir = JOBS_DIR / job["id"]
     out = jdir / "output.mp4"
     small = jdir / "output_small.mp4"
     try:
         job.pop("small", None)
         if not out.exists():
+            job["small_na"] = True
             return
         full_size = out.stat().st_size
         job["output_size"] = full_size
@@ -327,13 +347,15 @@ def _ensure_small_copy(job):
         got = _tg_shrink_for_send(
             out, small, budget=_small_budget(probe_duration(out)))
         if not got or not small.exists():
+            job["small_na"] = True
             return
         ssize = small.stat().st_size
         # A "compact" copy that barely shrinks the master (short or
-        # low-res sources) is pointless weight: drop it; the UI
-        # shows just the full download, labelled with its size.
+        # low-res sources) is pointless weight: drop it; the route
+        # then serves the full download for this job's taps.
         if ssize >= full_size * 0.9:
             small.unlink(missing_ok=True)
+            job["small_na"] = True
             return
         w = h = None
         from pipeline.common import probe_streams
@@ -342,9 +364,60 @@ def _ensure_small_copy(job):
                 w, h = int(s["width"]), int(s["height"])
                 break
         job["small"] = {"size": ssize, "w": w, "h": h}
+        job.pop("small_na", None)
     except Exception:
+        job["small_na"] = True
         try:
             small.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+_SMALL_LOCKS = {}
+_SMALL_LOCKS_GUARD = threading.Lock()
+
+
+def _small_lock(jid):
+    with _SMALL_LOCKS_GUARD:
+        return _SMALL_LOCKS.setdefault(jid, threading.Lock())
+
+
+def _small_on_demand(jid):
+    """Build 198: generate the compact copy on FIRST demand (the
+    ?v=small download/stream routes), synchronously under the
+    per-job lock — the copy is a 480p ultrafast encode, seconds
+    even for a long video, and the lock means concurrent first
+    taps share ONE generation instead of racing two encodes.
+    Never raises: any failure leaves the job stamped small_na
+    and the routes fall back to the full master, so the main
+    download can never be broken by the copy. The generation's
+    seconds are recorded in the job's timings, as the build-186
+    background thread recorded them."""
+    job = JOBS.get(jid)
+    if job is None or job.get("status") != "done" \
+            or job.get("small_na"):
+        return
+    with _small_lock(jid):
+        small = JOBS_DIR / jid / "output_small.mp4"
+        if small.exists() or job.get("small_na"):
+            return
+        t0 = time.time()
+        try:
+            _ensure_small_copy(job)
+        except Exception:
+            job["small_na"] = True
+        try:
+            secs = round(time.time() - t0, 1)
+            job["small_copy_s"] = secs
+            job.setdefault("phase_s", {})["small_copy"] = secs
+        except Exception:
+            pass
+        # Guarded save, as the old background thread did: the job
+        # dir may have been reaped meanwhile (retention /
+        # newest-2 cap) — never resurrect a deleted job.
+        try:
+            if (JOBS_DIR / jid).exists() and JOBS.get(jid) is job:
+                _save(job)
         except Exception:
             pass
 
@@ -1653,61 +1726,26 @@ def _enforce_done_cap(job):
             _cleanup_job(old["id"])
 
 
-def _small_copy_async(job):
-    """Build 186 (audit fix #1): the compact download copy is made
-    AFTER the job has flipped to done, in this background thread.
-    Build 179 ran the whole extra 480p encode synchronously inside
-    _finish, so every customer waited out a second full encode
-    before the done state (and its download button) appeared. The
-    encode itself (_ensure_small_copy) is unchanged; when it
-    lands, the job gains job["small"] and the done state's
-    fast-download button appears on the page's normal refresh
-    (the page also keeps polling briefly while small_pending is
-    set). Telegram delivery is unaffected — it never read the
-    small copy: it shrinks its own output_tg.mp4, or sends the
-    full file over the local Bot API (build 184). The encode's
-    seconds are recorded in the job's timings (audit fix #7), and
-    small_pending always clears — even on failure — so neither
-    the UI nor a timing report waits on a copy that never comes."""
-    t0 = time.time()
-    try:
-        _ensure_small_copy(job)
-    except Exception:
-        pass
-    try:
-        secs = round(time.time() - t0, 1)
-        job["small_copy_s"] = secs
-        job.setdefault("phase_s", {})["small_copy"] = secs
-    except Exception:
-        pass
-    job["small_pending"] = False
-    # Guarded save: the job dir may have been reaped meanwhile
-    # (retention / newest-2 cap) — never resurrect a deleted job
-    # by recreating its folder around a lone job.json.
-    try:
-        if (JOBS_DIR / job["id"]).exists() \
-                and JOBS.get(job["id"]) is job:
-            _save(job)
-    except Exception:
-        pass
-
-
 def _finish(job):
-    # Build 186 (audit fix #1): the small copy moved OFF this
-    # path (see _small_copy_async) — _finish now only settles the
-    # charge and flips the job to done. Any small copy left from
-    # a previous render of this job is stale for the new output,
-    # so its metadata is dropped here, synchronously; the fresh
-    # copy replaces the file itself when the background encode
-    # lands.
+    # Build 186 (audit fix #1) moved the small copy OFF this path
+    # into a background thread; build 198 removes the finish-time
+    # copy entirely — it is generated lazily on the first ?v=small
+    # request (_small_on_demand), so a job nobody downloads costs
+    # no second encode at all. _finish now only settles the charge
+    # and flips the job to done. Any small copy left from a
+    # previous render of this job is stale for the new output, so
+    # its metadata (and any lazy-generation verdict) is dropped
+    # here, synchronously; the stale FILE is replaced by the next
+    # on-demand generation.
     job.pop("small", None)
+    job.pop("small_na", None)
     _out = JOBS_DIR / job["id"] / "output.mp4"
     try:
         if _out.exists():
             job["output_size"] = _out.stat().st_size
     except Exception:
         pass
-    job["small_pending"] = True
+    job["small_pending"] = False
     _charge_for_job(job)
     job["charge_settled"] = True
     job["status"] = "done"
@@ -1718,8 +1756,6 @@ def _finish(job):
     _enforce_done_cap(job)
     _tg_deliver_async(job)
     _web_tg_autosend(job)
-    threading.Thread(target=_small_copy_async, args=(job,),
-                     daemon=True).start()
 
 
 def _cancelled(job):
@@ -3568,10 +3604,16 @@ def _job_output_path(jid):
     serves the compact copy when the job has one; anything else —
     including no parameter, which is what older clients and the
     Telegram 'full quality on the web' pointer rely on — serves
-    the full master."""
+    the full master. Build 198: the copy is LAZY — a ?v=small
+    request for a job that has none yet generates it on the spot
+    (seconds; _small_on_demand never raises), and only a failed
+    or pointless generation falls back to the full master, so
+    the main download always delivers a video."""
     jdir = JOBS_DIR / jid
     if request.args.get("v") == "small":
         small = jdir / "output_small.mp4"
+        if not small.exists():
+            _small_on_demand(jid)
         if small.exists():
             return small, f"myanmar-{jid}-small.mp4"
     return jdir / "output.mp4", f"myanmar-{jid}.mp4"
