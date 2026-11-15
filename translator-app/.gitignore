@@ -6,8 +6,10 @@ __pycache__/
 
 # Secrets — never commit
 .env
-# Rendered xray client config for the build-189 tunnel (node credential)
+# Rendered tunnel client configs (node credential) — xray-era
+# (builds 189/190) and the sing-box config (build 191)
 tun-xray.json
+tun-singbox.json
 # Build 190 runtime state: tunnel activation diagnosis + markers
 tun-status.json
 .settings-activated.tg.sha

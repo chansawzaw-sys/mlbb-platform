@@ -514,7 +514,7 @@ def translate_segments(workdir, style="subs"):
     report = {"batch": {}, "chain": {}, "fill": {}}
     # 0-lead. Gemini FIRST while its probe verdict is green
     # (build 189): direct Gemini is location-blocked from this
-    # VPS, but through the owner's VPN tunnel (xray on loopback,
+    # VPS, but through the owner's VPN tunnel (sing-box on loopback,
     # used ONLY by the Gemini/OpenAI clients) it answers — and
     # the app probe, which exercises the same tunneled client,
     # proves it before any job trusts it. Green probe -> Gemini

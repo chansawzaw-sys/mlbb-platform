@@ -508,7 +508,8 @@ echo "Auto-update timer installed (checks GitHub every 15 min)."
 # The Telegram Local API (was §13d) and the VPN tunnel (was §13e)
 # sections now live in deploy/activate-settings.sh. Both are driven
 # by values the owner saves in Admin cards (TG_API_ID / TG_API_HASH;
-# the parsed tun-xray.json), and a card save must take effect on the
+# the saved tunnel link, rendered to tun-singbox.json), and a card
+# save must take effect on the
 # next auto-update tick EVEN WHEN no code changed — apply-update.sh
 # used to exit at "Already up to date" before any bootstrap ran,
 # which left saved settings inert until an unrelated code deploy
@@ -517,7 +518,7 @@ echo "Auto-update timer installed (checks GitHub every 15 min)."
 # here as well keeps full deploys behaving exactly as before. The
 # script is marker-gated and idempotent (back-to-back runs are
 # no-ops), is fail-safe by construction, and restarts only its own
-# units (tg-bot-api / tun-xray) — never the translator app.
+# units (tg-bot-api / tun-singbox) — never the translator app.
 if [ -f "$APP_DIR/deploy/activate-settings.sh" ]; then
   APP_DIR="$APP_DIR" APP_USER="$APP_USER" \
     bash "$APP_DIR/deploy/activate-settings.sh" \

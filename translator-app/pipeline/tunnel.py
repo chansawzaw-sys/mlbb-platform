@@ -1,4 +1,5 @@
-"""VPN tunnel for the region-blocked engines — build 189.
+"""VPN tunnel for the region-blocked engines — build 189,
+engine swapped to sing-box in build 191.
 
 Direct Gemini is LOCATION-blocked and direct OpenAI is
 territory-blocked from this VPS (builds 164/168): Google/OpenAI
@@ -7,10 +8,14 @@ Kong. The owner already owns a V2Ray subscription, so instead of
 moving the server, ONLY the Gemini and OpenAI API calls leave
 through a tunnel:
 
-  * xray-core (the standard V2Ray client) runs on the server —
-    installed and supervised by deploy/activate-settings.sh
-    (the build-189 bootstrap §13e, extracted in build 190) —
-    with ONE inbound: an HTTP proxy on 127.0.0.1:18119.
+  * sing-box (build 191; builds 189/190 used xray-core) runs on
+    the server — installed and supervised by
+    deploy/activate-settings.sh (the build-189 bootstrap §13e,
+    extracted in build 190) — with ONE inbound: a mixed
+    SOCKS/HTTP proxy on 127.0.0.1:18119. "Mixed" keeps the
+    build-189 contract byte-for-byte: VT_TUNNEL_PROXY stays
+    http://127.0.0.1:18119, which `requests` and curl speak as
+    an HTTP proxy, and the same port also answers SOCKS5.
   * pipeline/gemini_translate.py and pipeline/openai_translate.py
     pass that proxy to `requests` EXPLICITLY, per call, and only
     while the tunnel is verified up (see proxy_url()). Nothing
@@ -19,63 +24,74 @@ through a tunnel:
     Telegram all keep the direct route, and there is no OS-level
     route change of any kind.
 
+Why the engine swap (build 191): xray-core v26 hard-refuses to
+build a config whose VLESS node has no TLS/REALITY encryption
+and points at a public address ("vless without TLS or other
+encryption is prohibited unless the server address is a
+private...") — diagnosed live on the owner's server, where the
+reseller subscription's usable nodes are exactly that shape and
+no encrypted alternative exists in it. sing-box accepts plain
+vless nodes, so the tunnel renders sing-box configs now; every
+other part of the contract (port, proxy URL, verification
+handshake, .env pointers) is unchanged.
+
 Owner flow (mirrors the build-184 Telegram Local API card): the
 owner pastes a node into the Admin card — a vless:// or vmess://
 share link, several links, a subscription URL, or a pasted
 subscription body. THIS module parses it (at save time, in the
-app) into a ready-to-run xray client config written to
-tun-xray.json in the app dir (chmod 600; server state like
+app) into a ready-to-run sing-box client config written to
+tun-singbox.json in the app dir (chmod 600; server state like
 users.db — never in git, survives the no-delete deploys). The
 raw paste is kept base64'd in .env (VT_TUNNEL_LINK_B64, chmod
 600) so the save can be re-done; it is NEVER returned by any
 endpoint and never logged — status endpoints expose only
 booleans, the node label and the exit country.
 
-Verification handshake with the activation script: after xray is
-up AND an egress check through the proxy has answered, the
-bootstrap writes VT_TUNNEL_PROXY + VT_TUNNEL_COUNTRY +
-VT_TUNNEL_CONF_SHA (the sha256 of the config it verified) into
-.env. proxy_url() below honours VT_TUNNEL_PROXY only while the
-sha still matches the config on disk — so the moment the owner
-saves a DIFFERENT node, the old tunnel stops being trusted
-until the bootstrap has verified the new one, and deleting the
-settings (clear()) removes the pointers at once.
+The activation script can also ask this module to re-render the
+config from the saved link (`python3 -m pipeline.tunnel
+rerender`, build 191): that is how a saved link picked under an
+older build's selection rules — or rendered for the retired
+xray engine — becomes a current sing-box config on the next
+activation run, with no owner re-save.
+
+Verification handshake with the activation script: after
+sing-box is up AND an egress check through the proxy has
+answered, the script writes VT_TUNNEL_PROXY + VT_TUNNEL_COUNTRY
++ VT_TUNNEL_CONF_SHA (the sha256 of the config it verified)
+into .env. proxy_url() below honours VT_TUNNEL_PROXY only while
+the sha still matches the config on disk — so the moment the
+owner saves a DIFFERENT node, the old tunnel stops being
+trusted until the script has verified the new one, and deleting
+the settings (clear()) removes the pointers at once.
 
 Supported node formats: vless and vmess share links with
 tcp / ws / grpc / h2 transports and none / tls / reality
 security (the shapes real subscriptions overwhelmingly use).
 Shadowsocks / trojan links and kcp / quic / xhttp transports
-are recognised but NOT supported. Node selection from a
-subscription (the owner's purchase is a reseller subscription
-URL with nodes in many countries): a node whose remark names
-Singapore (SG) wins — that is the owner's exit and a
-Gemini/OpenAI-supported country; otherwise the first usable
+are recognised but NOT supported. Two xray-only shapes have no
+sing-box equivalent and degrade to plain tcp silently: tcp
+"http" header camouflage and reality spiderX. Node selection
+from a subscription (the owner's purchase is a reseller
+subscription URL with nodes in many countries): a node whose
+remark names Singapore (SG) wins — that is the owner's exit and
+a Gemini/OpenAI-supported country; otherwise the first usable
 node is taken and its label is shown on the Admin card so a
-wrong-country pick is never silent.
+wrong-country pick is never silent. When an SG node exists but
+cannot be used (unsupported format) and a non-SG node wins
+instead, the SG node's label is recorded and shown on the card
+(skipped_sg).
 
-Build 190: node usability now mirrors the rule xray-core
-itself enforces when it builds a config (diagnosed live on
-the owner's server: "infra/conf: vless without TLS or other
-encryption is prohibited unless the server address is a
-private..."). A VLESS node with no encryption at all — no
-TLS/REALITY stream security and no VLESS encryption — pointing
-at a PUBLIC address can never run, so selection treats it as
-unusable and prefers, in order: SG + encrypted, SG usable,
-first encrypted, first usable. When the SG favourite is
-skipped for this rule the skip is recorded (label only) and
-shown on the card; when EVERY node is like that the save
-still succeeds with the first node, flagged `insecure` so
-the card can say plainly that xray will refuse it. The
-bootstrap's own diagnosis of the last activation attempt
-(tun-status.json — sanitized, structural only) is merged
-into status() as fail_kind / fail_reason.
+The activation script's own diagnosis of the last attempt
+(tun-status.json — sanitized, structural only, carries the
+engine name since build 191) is merged into status() as
+fail_kind / fail_reason.
 """
 import base64
 import hashlib
-import ipaddress
 import json
 import os
 import re
+import sys
 import urllib.parse
 from pathlib import Path
 
@@ -83,7 +99,9 @@ from .common import PROJECT_ROOT
 
 PROXY_PORT = 18119
 PROXY_URL = f"http://127.0.0.1:{PROXY_PORT}"
-CONF_NAME = "tun-xray.json"
+CONF_NAME = "tun-singbox.json"
+LEGACY_CONF_NAME = "tun-xray.json"  # builds 189/190; removed on sight
+ENGINE = "sing-box"
 
 _ENV_LINK = "VT_TUNNEL_LINK_B64"
 _ENV_LABEL = "VT_TUNNEL_LABEL"
@@ -100,12 +118,18 @@ _UUID_RE = re.compile(
 _LINK_RE = re.compile(r"(?:vless|vmess|ss|trojan)://[^\s\"'<>]+")
 _SUPPORTED = ("vless://", "vmess://")
 _TRANSPORTS = ("tcp", "ws", "grpc", "h2")
+_VMESS_SECURITIES = ("auto", "aes-128-gcm", "chacha20-poly1305",
+                     "none", "zero")
 
 
 # ---------------- storage paths / .env ----------------
 
 def _conf_path():
     return PROJECT_ROOT / CONF_NAME
+
+
+def _legacy_conf_path():
+    return PROJECT_ROOT / LEGACY_CONF_NAME
 
 
 def _env_path():
@@ -151,11 +175,12 @@ def _conf_sha():
 
 
 def _status_path():
-    """The bootstrap's diagnosis of the last tunnel activation
-    (build 190): written by deploy/activate-settings.sh, holds
-    only a failure kind + a SANITIZED structural reason + the
-    node's protocol/transport/security triple — no addresses,
-    no ids, no config contents, by construction."""
+    """The activation script's diagnosis of the last tunnel
+    activation (build 190): written by
+    deploy/activate-settings.sh, holds only a failure kind + a
+    SANITIZED structural reason + the node's
+    protocol/transport/security triple + the engine name — no
+    addresses, no ids, no config contents, by construction."""
     return PROJECT_ROOT / _STATUS_NAME
 
 
@@ -166,7 +191,23 @@ def _remove_status_file():
         pass
 
 
+def _remove_legacy_conf():
+    """The xray-era rendered config (builds 189/190) must not
+    linger: nothing reads it any more, and it carries the node
+    credential."""
+    try:
+        _legacy_conf_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 # ---------------- share-link parsing ----------------
+# Parsers produce a NEUTRAL node dict; render_config() turns it
+# into the sing-box outbound. Node fields: proto, address, port,
+# uuid, flow, encryption, packet_encoding (vless), alter_id,
+# vmess_security (vmess), transport, security, sni, host, path,
+# service_name, fingerprint, alpn, public_key, short_id,
+# allow_insecure.
 
 def _b64_loose(text):
     """Base64-decode tolerating the urlsafe alphabet, missing
@@ -189,14 +230,14 @@ def _clean_label(raw, fallback):
     return (label or fallback)[:80]
 
 
-def _stream_settings(network, security, *, sni="", host_header="",
-                     path="", service_name="", fingerprint="",
-                     alpn="", public_key="", short_id="", spider_x="",
-                     allow_insecure=False, header_type=""):
-    """The streamSettings block shared by the vless/vmess
-    outbounds. Raises ValueError for transports/security this
-    build does not implement (kcp/quic/xhttp, unknown security) —
-    the caller then tries the next subscription node."""
+def _node_base(network, security, *, sni="", host_header="",
+               path="", service_name="", fingerprint="",
+               alpn="", public_key="", short_id="",
+               allow_insecure=False):
+    """Validate + normalise the transport/security half of a
+    node. Raises ValueError for transports/security this build
+    does not implement (kcp/quic/xhttp, unknown security) — the
+    caller then tries the next subscription node."""
     net = (network or "tcp").lower()
     if net in ("http", "h2"):
         net = "h2"
@@ -207,47 +248,15 @@ def _stream_settings(network, security, *, sni="", host_header="",
     sec = (security or "none").lower()
     if sec not in ("none", "", "tls", "reality"):
         raise ValueError(f"security '{security}' မရသေးပါ")
-    ss = {"network": net, "security": sec or "none"}
-    if net == "ws":
-        ws = {"path": path or "/"}
-        if host_header:
-            ws["headers"] = {"Host": host_header}
-        ss["wsSettings"] = ws
-    elif net == "grpc":
-        ss["grpcSettings"] = {"serviceName": service_name or "",
-                              "multiMode": False}
-    elif net == "h2":
-        h2 = {"path": path or "/"}
-        hosts = [h.strip() for h in (host_header or "").split(",")
-                 if h.strip()]
-        if hosts:
-            h2["host"] = hosts
-        ss["httpSettings"] = h2
-    elif net == "tcp" and (header_type or "").lower() == "http":
-        req = {"path": [path or "/"]}
-        if host_header:
-            req["headers"] = {"Host": [host_header]}
-        ss["tcpSettings"] = {"header": {"type": "http",
-                                        "request": req}}
-    if sec == "tls":
-        tls = {"serverName": sni or host_header or "",
-               "allowInsecure": bool(allow_insecure)}
-        if fingerprint:
-            tls["fingerprint"] = fingerprint
-        if alpn:
-            tls["alpn"] = [a.strip() for a in alpn.split(",")
-                           if a.strip()]
-        ss["tlsSettings"] = tls
-    elif sec == "reality":
-        if not public_key:
-            raise ValueError("reality node မှာ public key (pbk) မပါပါ")
-        ss["realitySettings"] = {
-            "serverName": sni or "",
-            "fingerprint": fingerprint or "chrome",
-            "publicKey": public_key,
-            "shortId": short_id or "",
-            "spiderX": spider_x or ""}
-    return ss
+    if sec == "reality" and not public_key:
+        raise ValueError("reality node မှာ public key (pbk) မပါပါ")
+    return {"transport": net, "security": sec or "none",
+            "sni": sni or "", "host": host_header or "",
+            "path": path or "", "service_name": service_name or "",
+            "fingerprint": fingerprint or "", "alpn": alpn or "",
+            "public_key": public_key or "",
+            "short_id": short_id or "",
+            "allow_insecure": bool(allow_insecure)}
 
 
 def _parse_vless(link):
@@ -261,11 +270,7 @@ def _parse_vless(link):
         raise ValueError("vless link မှာ server address/port မမှန်ပါ")
     q = {k: v[0] for k, v in
          urllib.parse.parse_qs(u.query).items()}
-    user = {"id": uuid,
-            "encryption": (q.get("encryption") or "none").lower()}
-    if q.get("flow"):
-        user["flow"] = q["flow"]
-    stream = _stream_settings(
+    node = _node_base(
         q.get("type") or "tcp", q.get("security") or "none",
         sni=q.get("sni") or q.get("peer") or "",
         host_header=q.get("host") or "",
@@ -275,17 +280,18 @@ def _parse_vless(link):
         alpn=q.get("alpn") or "",
         public_key=q.get("pbk") or "",
         short_id=q.get("sid") or "",
-        spider_x=urllib.parse.unquote(q.get("spx") or ""),
-        allow_insecure=(q.get("allowInsecure") or "") in ("1", "true"),
-        header_type=q.get("headerType") or "")
-    outbound = {
-        "tag": "proxy", "protocol": "vless",
-        "settings": {"vnext": [{"address": host, "port": int(port),
-                                "users": [user]}]},
-        "streamSettings": stream}
+        allow_insecure=(q.get("allowInsecure") or "") in ("1", "true"))
+    node.update({
+        "proto": "vless", "address": host, "port": int(port),
+        "uuid": uuid,
+        "encryption": (q.get("encryption") or "none").lower(),
+        "flow": q.get("flow") or "",
+        "packet_encoding": (q.get("packetEncoding")
+                            or q.get("packet-encoding") or "").lower(),
+        "alter_id": 0, "vmess_security": "auto"})
     label = _clean_label(urllib.parse.unquote(u.fragment or ""),
                          f"vless {host}")
-    return outbound, label
+    return node, label
 
 
 def _parse_vmess(link):
@@ -307,8 +313,7 @@ def _parse_vmess(link):
         raise ValueError("vmess link မှာ UUID မမှန်ပါ")
     if not host or not (1 <= port <= 65535):
         raise ValueError("vmess link မှာ server address/port မမှန်ပါ")
-    user = {"id": uuid, "alterId": aid, "security": "auto"}
-    stream = _stream_settings(
+    node = _node_base(
         obj.get("net") or "tcp",
         "tls" if (obj.get("tls") or "") else "none",
         sni=obj.get("sni") or "",
@@ -317,19 +322,20 @@ def _parse_vmess(link):
         service_name=obj.get("path") or "",
         fingerprint=obj.get("fp") or "",
         alpn=obj.get("alpn") or "",
-        allow_insecure=False,
-        header_type=obj.get("type") or "")
-    outbound = {
-        "tag": "proxy", "protocol": "vmess",
-        "settings": {"vnext": [{"address": host, "port": port,
-                                "users": [user]}]},
-        "streamSettings": stream}
+        allow_insecure=False)
+    scy = (obj.get("scy") or "auto").lower()
+    node.update({
+        "proto": "vmess", "address": host, "port": port,
+        "uuid": uuid, "encryption": "none", "flow": "",
+        "packet_encoding": "",
+        "alter_id": aid,
+        "vmess_security": scy if scy in _VMESS_SECURITIES else "auto"})
     label = _clean_label(obj.get("ps") or "", f"vmess {host}")
-    return outbound, label
+    return node, label
 
 
 def parse_share_link(link):
-    """One vless:// or vmess:// link -> (outbound, label).
+    """One vless:// or vmess:// link -> (node, label).
     Raises ValueError (Burmese, owner-facing) on anything this
     build cannot run."""
     link = (link or "").strip()
@@ -341,6 +347,98 @@ def parse_share_link(link):
                      "(ss/trojan မရသေးပါ)")
 
 
+def node_triple(node):
+    """The node's protocol / transport / security — the only
+    node facts ever shown for diagnosis (build 190). Never an
+    address, never an id."""
+    return {"proto": (node.get("proto") or "").lower(),
+            "transport": (node.get("transport") or "tcp").lower(),
+            "security": (node.get("security") or "none").lower()}
+
+
+# ---------------- sing-box rendering ----------------
+
+def render_outbound(node):
+    """The sing-box outbound for one parsed node."""
+    ob = {"type": node["proto"], "tag": "proxy",
+          "server": node["address"], "server_port": node["port"],
+          "uuid": node["uuid"]}
+    if node["proto"] == "vless":
+        if node.get("flow"):
+            ob["flow"] = node["flow"]
+        enc = (node.get("encryption") or "none").lower()
+        if enc not in ("", "none"):
+            ob["encryption"] = node["encryption"]
+        if node.get("packet_encoding") in ("xudp", "packetaddr"):
+            ob["packet_encoding"] = node["packet_encoding"]
+    else:  # vmess carries its own AEAD security + alterId
+        ob["alter_id"] = int(node.get("alter_id") or 0)
+        ob["security"] = node.get("vmess_security") or "auto"
+    net = node.get("transport") or "tcp"
+    if net == "ws":
+        ws = {"type": "ws", "path": node.get("path") or "/"}
+        if node.get("host"):
+            ws["headers"] = {"Host": node["host"]}
+        ob["transport"] = ws
+    elif net == "grpc":
+        ob["transport"] = {"type": "grpc",
+                           "service_name": node.get("service_name") or ""}
+    elif net == "h2":
+        h2 = {"type": "http", "path": node.get("path") or "/"}
+        hosts = [h.strip() for h in (node.get("host") or "").split(",")
+                 if h.strip()]
+        if hosts:
+            h2["host"] = hosts
+        ob["transport"] = h2
+    # tcp: no transport block (sing-box default). The xray-era
+    # tcp "http" header camouflage has no sing-box equivalent
+    # and is dropped (plain tcp) — see the module docstring.
+    sec = node.get("security") or "none"
+    if sec == "tls":
+        tls = {"enabled": True, "insecure": bool(node.get("allow_insecure"))}
+        # SNI fallback: the first Host value (the host field can
+        # be a comma list for h2 — a list is not a valid SNI).
+        sni = node.get("sni") or ""
+        if not sni and node.get("host"):
+            sni = node["host"].split(",")[0].strip()
+        if sni:
+            tls["server_name"] = sni
+        if node.get("alpn"):
+            tls["alpn"] = [a.strip() for a in node["alpn"].split(",")
+                           if a.strip()]
+        if node.get("fingerprint"):
+            tls["utls"] = {"enabled": True,
+                           "fingerprint": node["fingerprint"]}
+        ob["tls"] = tls
+    elif sec == "reality":
+        tls = {"enabled": True,
+               "utls": {"enabled": True,
+                        "fingerprint": node.get("fingerprint") or "chrome"},
+               "reality": {"enabled": True,
+                           "public_key": node.get("public_key") or "",
+                           "short_id": node.get("short_id") or ""}}
+        if node.get("sni"):
+            tls["server_name"] = node["sni"]
+        ob["tls"] = tls
+    return ob
+
+
+def render_config(node):
+    """The full sing-box client config: ONE local mixed
+    (SOCKS + HTTP) inbound on loopback, the owner's node as the
+    only outbound (no routing rules — the local proxy is
+    reachable only from this machine and is used only by the
+    two engine clients)."""
+    return {
+        "log": {"level": "warn", "timestamp": True},
+        "inbounds": [{
+            "type": "mixed", "tag": "tun-in", "listen": "127.0.0.1",
+            "listen_port": PROXY_PORT}],
+        "outbounds": [render_outbound(node)]}
+
+
+# ---------------- selection / input resolution ----------------
+
 # The owner's exit country is Singapore (Gemini + OpenAI both
 # support it), and a reseller subscription mixes nodes from
 # many countries — so selection prefers a node whose remark
@@ -348,135 +446,86 @@ def parse_share_link(link):
 _SG_RE = re.compile(r"singapore|(?<![a-z])sg(?![a-z])", re.IGNORECASE)
 
 
-def _node_security(outbound):
-    ss = outbound.get("streamSettings") or {}
-    return (ss.get("security") or "none").lower()
-
-
-def node_triple(outbound):
-    """The node's protocol / transport / security — the only
-    node facts ever shown for diagnosis (build 190). Never an
-    address, never an id."""
-    ss = outbound.get("streamSettings") or {}
-    return {"proto": (outbound.get("protocol") or "").lower(),
-            "transport": (ss.get("network") or "tcp").lower(),
-            "security": _node_security(outbound)}
-
-
-def _node_encrypted(outbound):
-    """(has_encryption, is_vless). VMess carries its own AEAD
-    encryption, so it always counts as encrypted; a VLESS node
-    is encrypted when its stream security is tls/reality or
-    its VLESS encryption field is set to something real."""
-    proto = (outbound.get("protocol") or "").lower()
-    if proto != "vless":
-        return True, False
-    if _node_security(outbound) in ("tls", "reality"):
-        return True, True
-    try:
-        user = outbound["settings"]["vnext"][0]["users"][0]
-        enc = (user.get("encryption") or "none").lower()
-    except Exception:
-        enc = "none"
-    return enc not in ("", "none"), True
-
-
-def _host_is_private(host):
-    """True only for a literal private / loopback / link-local
-    IP. A hostname is NOT a private address (xray's rule is
-    about the address itself), so it counts as public."""
-    try:
-        ip = ipaddress.ip_address((host or "").strip())
-    except ValueError:
-        return False
-    return ip.is_private or ip.is_loopback or ip.is_link_local
-
-
-def _xray_usable(outbound):
-    """Mirror of the rule xray-core enforces at config build
-    (build 190, diagnosed live): a VLESS node with no
-    encryption at all may only point at a private address —
-    to a public server xray refuses to build the config.
-    Everything else this parser accepts is buildable."""
-    encrypted, is_vless = _node_encrypted(outbound)
-    if encrypted or not is_vless:
-        return True
-    try:
-        host = outbound["settings"]["vnext"][0]["address"] or ""
-    except Exception:
-        host = ""
-    return _host_is_private(host)
+def _link_label_hint(link):
+    """Best-effort remark for a link we could NOT use (an
+    unsupported scheme, or a parse failure): the #fragment for
+    vless/ss/trojan, the `ps` field for vmess. Label only —
+    remarks are not credentials."""
+    frag = ""
+    if "#" in link:
+        frag = urllib.parse.unquote(link.split("#", 1)[1]).strip()
+    if frag:
+        return _clean_label(frag, "")
+    if link.startswith("vmess://"):
+        raw = _b64_loose(link[len("vmess://"):].split("#")[0])
+        if raw:
+            try:
+                return _clean_label(
+                    json.loads(raw.decode("utf-8")).get("ps") or "", "")
+            except Exception:
+                return ""
+    return ""
 
 
 def _pick_notes(chosen, skipped_sg):
-    outbound = chosen[0]
+    node = chosen[0]
     return {"skipped_sg": skipped_sg,
-            "insecure": not _xray_usable(outbound),
-            "triple": node_triple(outbound)}
+            "triple": node_triple(node)}
 
 
 def _select_node(text):
     """Scan a body of text (a subscription payload, decoded or
     not) for share links and choose the node to run.
 
-    Preference order (build 190): SG + encrypted, then any SG
-    node xray can build, then the first encrypted node, then
-    the first buildable node. A node xray can NEVER build
-    (vless with no encryption to a public address) is skipped
-    entirely while any buildable node exists — and when the
-    SG favourite is skipped for exactly that rule, its label
-    is recorded in the notes so the card can say so. When NO
-    buildable node exists, the first parseable node is still
-    chosen (the save must not hard-fail) and flagged
-    `insecure` in the notes: xray will refuse it, and the
-    card says a different node/subscription is needed.
-    Returns (outbound, label, raw_link, node_count, notes)."""
+    Preference order (build 191): the first usable SG node,
+    else the first usable node. "Usable" = a vless/vmess link
+    this build can parse and render — sing-box accepts plain
+    (unencrypted-transport) nodes, so the build-190 xray
+    encryption mirror no longer applies. When an SG node
+    exists in the input but cannot be used (an unsupported
+    scheme like ss/trojan, or a parse failure) and a non-SG
+    node wins instead, the SG node's label is recorded in the
+    notes so the card can say it was skipped and why.
+    Returns (node, label, raw_link, node_count, notes)."""
     links = _LINK_RE.findall(text or "")
     if not links:
         raise ValueError("link မတွေ့ပါ — vless:// သို့မဟုတ် vmess:// "
                          "ပါတဲ့ စာသား ဖြစ်ရပါမယ်")
     parsed = []
     errs = []
+    skipped_sg = ""
     for link in links:
         if not link.startswith(_SUPPORTED):
+            if not skipped_sg:
+                lab = _link_label_hint(link)
+                if lab and _SG_RE.search(lab):
+                    skipped_sg = lab
             continue
         try:
-            outbound, label = parse_share_link(link)
-            parsed.append((outbound, label, link))
+            node, label = parse_share_link(link)
+            parsed.append((node, label, link))
         except ValueError as e:
             errs.append(str(e))
+            if not skipped_sg:
+                lab = _link_label_hint(link)
+                if lab and _SG_RE.search(lab):
+                    skipped_sg = lab
     if not parsed:
         if errs:
             raise ValueError("သုံးလို့ရတဲ့ node မတွေ့ပါ — " + errs[0])
         raise ValueError("vless/vmess node မတွေ့ပါ — ဒီ subscription မှာ "
                          "ss/trojan ပဲ ရှိနေပါတယ် (မရသေးပါ)")
-
-    def _sg(p):
-        return bool(_SG_RE.search(p[1] or ""))
-
-    def _enc(p):
-        return _node_encrypted(p[0])[0]
-
-    skipped_sg = ""
-    for p in parsed:
-        if _sg(p) and not _xray_usable(p[0]):
-            skipped_sg = p[1]
-            break
-    usable = [p for p in parsed if _xray_usable(p[0])]
-    pool = usable if usable else parsed
     chosen = None
-    for pred in (lambda p: _sg(p) and _enc(p),
-                 lambda p: _sg(p),
-                 lambda p: _enc(p),
-                 lambda p: True):
-        for p in pool:
-            if pred(p):
-                chosen = p
-                break
-        if chosen is not None:
+    for p in parsed:
+        if _SG_RE.search(p[1] or ""):
+            chosen = p
             break
-    outbound, label, link = chosen
-    return (outbound, label, link, len(parsed),
+    if chosen is None:
+        chosen = parsed[0]
+    else:
+        skipped_sg = ""  # an SG node DID win — nothing was skipped
+    node, label, link = chosen
+    return (node, label, link, len(parsed),
             _pick_notes(chosen, skipped_sg))
 
 
@@ -486,7 +535,11 @@ def _fetch_subscription(url):
     tunnel yet, and subscription hosts are not the blocked party.
     The URL itself is a credential — never logged, never put in
     an exception message."""
-    import requests
+    try:
+        import requests
+    except Exception:
+        raise ValueError("subscription URL ကို ဖတ်လို့ မရပါ — "
+                         "link မှန်ရဲ့လား စစ်ပေးပါ")
     try:
         resp = requests.get(
             url, timeout=30,
@@ -500,11 +553,10 @@ def _fetch_subscription(url):
 
 
 def resolve_input(raw):
-    """Whatever the owner pasted -> (outbound, label, kind,
-    nodes, notes): the chosen node's outbound + label, how the
-    input arrived, how many parseable nodes the input offered,
-    and the build-190 selection notes (skipped SG label,
-    insecure flag, chosen triple) from _pick_notes.
+    """Whatever the owner pasted -> (node, label, kind, nodes,
+    notes): the chosen node + label, how the input arrived, how
+    many parseable nodes the input offered, and the selection
+    notes (skipped SG label, chosen triple) from _pick_notes.
 
     kind: "link" (one or more share links pasted directly),
     "subscription" (an http(s) URL that was fetched), or
@@ -514,104 +566,140 @@ def resolve_input(raw):
         raise ValueError("အရင် link သို့မဟုတ် subscription URL ထည့်ပါ")
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     if len(lines) == 1 and lines[0].startswith(_SUPPORTED):
-        outbound, label = parse_share_link(lines[0])
-        chosen = (outbound, label, lines[0])
-        return outbound, label, "link", 1, _pick_notes(chosen, "")
+        node, label = parse_share_link(lines[0])
+        chosen = (node, label, lines[0])
+        return node, label, "link", 1, _pick_notes(chosen, "")
     # A lone http(s) URL is a subscription to fetch — checked
     # BEFORE the link-list branch, which would otherwise eat it
     # (a URL contains "://" too).
     if re.fullmatch(r"https?://\S+", raw):
         body = _fetch_subscription(raw)
         try:
-            outbound, label, _l, nodes, notes = _select_node(body)
-            return outbound, label, "subscription", nodes, notes
+            node, label, _l, nodes, notes = _select_node(body)
+            return node, label, "subscription", nodes, notes
         except ValueError:
             decoded = _b64_loose(body)
             if decoded:
-                outbound, label, _l, nodes, notes = _select_node(
+                node, label, _l, nodes, notes = _select_node(
                     decoded.decode("utf-8", "replace"))
-                return outbound, label, "subscription", nodes, notes
+                return node, label, "subscription", nodes, notes
             raise
     if lines and all("://" in ln for ln in lines):
-        outbound, label, _link, nodes, notes = _select_node(raw)
-        return outbound, label, "link", nodes, notes
+        node, label, _link, nodes, notes = _select_node(raw)
+        return node, label, "link", nodes, notes
     decoded = _b64_loose(raw)
     if decoded:
-        outbound, label, _l, nodes, notes = _select_node(
+        node, label, _l, nodes, notes = _select_node(
             decoded.decode("utf-8", "replace"))
-        return outbound, label, "subscription-paste", nodes, notes
+        return node, label, "subscription-paste", nodes, notes
     raise ValueError("ပုံစံ မမှန်ပါ — vless:// / vmess:// link, "
                      "subscription URL, သို့မဟုတ် subscription "
                      "စာသား ထည့်ပါ")
 
 
-def render_config(outbound):
-    """The full xray client config: ONE local HTTP inbound on
-    loopback, the owner's node as the only outbound (no routing
-    rules — the local proxy is reachable only from this machine
-    and is used only by the two engine clients)."""
-    return {
-        "log": {"loglevel": "warning"},
-        "inbounds": [{
-            "tag": "tun-in", "listen": "127.0.0.1",
-            "port": PROXY_PORT, "protocol": "http",
-            "settings": {}}],
-        "outbounds": [outbound]}
-
-
 # ---------------- save / clear / status ----------------
 
-def save_link(raw):
-    """Validate + parse the owner's paste, persist the rendered
-    config (tun-xray.json, chmod 600) and the bookkeeping .env
-    lines. Returns {"label": ..., "kind": ..., "nodes": ...,
-    "skipped_sg": ..., "insecure": ..., **triple}. Raises
-    ValueError with an owner-facing Burmese message; on ANY
-    failure nothing is written (a previously working config
-    is never clobbered by a bad paste)."""
-    outbound, label, kind, nodes, notes = resolve_input(raw)
-    conf = render_config(outbound)
+def _write_conf(node):
+    """Render + persist the sing-box config (chmod 600). Returns
+    True when the bytes on disk changed. The rendered config
+    must round-trip as JSON before it may replace the live one."""
+    conf = render_config(node)
     text = json.dumps(conf, ensure_ascii=False, indent=1)
-    # Sanity: the rendered config must round-trip as JSON before
-    # it is allowed to replace the live one.
     json.loads(text)
     p = _conf_path()
+    try:
+        if p.read_text(encoding="utf-8") == text:
+            return False
+    except Exception:
+        pass
     p.write_text(text, encoding="utf-8")
     try:
         os.chmod(p, 0o600)
     except Exception:
         pass
-    _env_set(_ENV_LINK, base64.b64encode(
-        (raw or "").strip().encode("utf-8")).decode("ascii"))
-    _env_set(_ENV_LABEL, label.replace("\n", " "))
-    # Build 190: the SG node skipped for the no-encryption rule
-    # (label only — a remark, not a credential) is persisted so
-    # the card keeps showing the skip after a page reload.
-    _env_set(_ENV_SKIPSG,
-             (notes["skipped_sg"] or "").replace("\n", " "))
-    # A new config is by definition NOT the verified one: drop
-    # the verified pointers at once (the bootstrap re-adds them
-    # after it has the new node up and egress-checked). The old
-    # node's activation diagnosis is dropped with them — it
-    # described a config that no longer exists.
+    return True
+
+
+def _drop_verified_pointers():
+    """A changed config is by definition NOT the verified one:
+    drop the verified pointers at once (the activation script
+    re-adds them after it has the new node up and
+    egress-checked). The old node's activation diagnosis is
+    dropped with them — it described a config that no longer
+    exists."""
     _env_set(_ENV_PROXY, "")
     _env_set(_ENV_COUNTRY, "")
     _env_set(_ENV_SHA, "")
     _remove_status_file()
+
+
+def save_link(raw):
+    """Validate + parse the owner's paste, persist the rendered
+    sing-box config (tun-singbox.json, chmod 600) and the
+    bookkeeping .env lines. Returns {"label": ..., "kind": ...,
+    "nodes": ..., "skipped_sg": ..., **triple}. Raises
+    ValueError with an owner-facing Burmese message; on ANY
+    failure nothing is written (a previously working config
+    is never clobbered by a bad paste)."""
+    node, label, kind, nodes, notes = resolve_input(raw)
+    _write_conf(node)
+    _remove_legacy_conf()
+    _env_set(_ENV_LINK, base64.b64encode(
+        (raw or "").strip().encode("utf-8")).decode("ascii"))
+    _env_set(_ENV_LABEL, label.replace("\n", " "))
+    # The SG node skipped for format reasons (label only — a
+    # remark, not a credential) is persisted so the card keeps
+    # showing the skip after a page reload.
+    _env_set(_ENV_SKIPSG,
+             (notes["skipped_sg"] or "").replace("\n", " "))
+    _drop_verified_pointers()
     return {"label": label, "kind": kind, "nodes": nodes,
             "skipped_sg": notes["skipped_sg"],
-            "insecure": notes["insecure"],
             **notes["triple"]}
 
 
+def rerender_from_saved():
+    """Re-render tun-singbox.json from the link stored in .env
+    (build 191) — invoked by deploy/activate-settings.sh as
+    `python3 -m pipeline.tunnel rerender`, so a link saved
+    under an older build (an xray-format render, or an older
+    selection) becomes a current sing-box config on the next
+    activation run WITHOUT the owner re-saving. Refreshes the
+    label / skipped-SG bookkeeping to the fresh selection, and
+    when the rendered bytes change, drops the verified pointers
+    exactly like a fresh save (the activation re-verifies
+    before anything trusts the tunnel again). Returns True
+    when a saved link exists and rendered (or was already
+    current); False when no link is saved. Raises ValueError
+    when the saved input no longer resolves."""
+    b64 = _env_get(_ENV_LINK)
+    if not b64:
+        return False
+    raw_bytes = _b64_loose(b64)
+    if raw_bytes is None:
+        raise ValueError("သိမ်းထားတဲ့ link ကို decode လုပ်လို့ မရပါ")
+    raw = raw_bytes.decode("utf-8", "replace")
+    node, label, _kind, _nodes, notes = resolve_input(raw)
+    changed = _write_conf(node)
+    _remove_legacy_conf()
+    _env_set(_ENV_LABEL, label.replace("\n", " "))
+    _env_set(_ENV_SKIPSG,
+             (notes["skipped_sg"] or "").replace("\n", " "))
+    if changed:
+        _drop_verified_pointers()
+    return True
+
+
 def clear():
-    """Forget the tunnel completely: config file gone, every
+    """Forget the tunnel completely: config files gone, every
     VT_TUNNEL_* pointer gone (the engines go direct at once);
-    the bootstrap stops/disables the xray unit on its next run."""
+    the activation script stops/disables the tunnel unit on
+    its next run."""
     try:
         _conf_path().unlink(missing_ok=True)
     except Exception:
         pass
+    _remove_legacy_conf()
     _remove_status_file()
     for key in (_ENV_LINK, _ENV_LABEL, _ENV_PROXY,
                 _ENV_COUNTRY, _ENV_SHA, _ENV_SKIPSG):
@@ -629,9 +717,9 @@ def configured():
 
 
 def verified():
-    """The bootstrap has THIS config up and egress-checked: a
-    proxy pointer exists AND its recorded sha matches the
-    config currently on disk."""
+    """The activation script has THIS config up and
+    egress-checked: a proxy pointer exists AND its recorded
+    sha matches the config currently on disk."""
     if not _env_get(_ENV_PROXY):
         return False
     sha = _conf_sha()
@@ -641,7 +729,7 @@ def verified():
 def proxy_url():
     """The local proxy URL the engine clients must use, or ""
     when the tunnel is not verified up. Read live on every call
-    (like the API keys), so a bootstrap verification — or a
+    (like the API keys), so an activation verification — or a
     teardown — takes effect without an app restart."""
     if not verified():
         return ""
@@ -659,30 +747,44 @@ def requests_proxies():
     return {"http": url, "https": url}
 
 
-def _disk_node():
-    """(triple, xray_usable) of the config currently on disk,
-    or (None, False) when there is none / it is unreadable."""
+def _disk_triple():
+    """The triple of the config currently on disk, read from
+    the sing-box shape, or None when there is none / it is
+    unreadable. Transport/security are reported in the same
+    vocabulary as node_triple() (sing-box's http transport is
+    h2; TLS-with-reality reports "reality")."""
     try:
         conf = json.loads(_conf_path().read_text(encoding="utf-8"))
-        outbound = (conf.get("outbounds") or [{}])[0]
-        return node_triple(outbound), _xray_usable(outbound)
+        ob = (conf.get("outbounds") or [{}])[0]
+        transport = ((ob.get("transport") or {}).get("type")
+                     or "tcp").lower()
+        if transport == "http":
+            transport = "h2"
+        tls = ob.get("tls") or {}
+        if (tls.get("reality") or {}).get("enabled"):
+            security = "reality"
+        elif tls.get("enabled"):
+            security = "tls"
+        else:
+            security = "none"
+        return {"proto": (ob.get("type") or "").lower(),
+                "transport": transport, "security": security}
     except Exception:
-        return None, False
+        return None
 
 
 def status():
     """Admin-card status: booleans + label + exit country ONLY.
     Never the link, the config, or any node credential.
 
-    Build 190 adds: the chosen node's triple (proto /
-    transport / security), `insecure` when the saved node is
-    one xray will refuse (vless, no encryption, public
-    address), `skipped_sg` (label of the SG node skipped for
-    that rule, "" when none), and — when the bootstrap's last
-    activation attempt failed — `fail_kind` / `fail_reason`
-    from tun-status.json (sanitized structural text written
-    by deploy/activate-settings.sh; the file carries no
-    addresses or ids by construction)."""
+    Also carries: the engine name (build 191), the chosen
+    node's triple (proto / transport / security), `skipped_sg`
+    (label of an SG node skipped for format reasons while a
+    non-SG node won, "" when none), and — when the activation
+    script's last attempt failed — `fail_kind` / `fail_reason`
+    from tun-status.json (sanitized structural text written by
+    deploy/activate-settings.sh; the file carries no addresses
+    or ids by construction)."""
     conf_saved = configured()
     up = verified()
     st = {"configured": conf_saved,
@@ -690,18 +792,19 @@ def status():
           "up": up,
           "country": _env_get(_ENV_COUNTRY) if up else "",
           "port": PROXY_PORT,
-          "skipped_sg": _env_get(_ENV_SKIPSG) if conf_saved else "",
-          "insecure": False}
-    triple, usable = _disk_node() if conf_saved else (None, False)
+          "engine": ENGINE,
+          "skipped_sg": _env_get(_ENV_SKIPSG) if conf_saved else ""}
+    triple = _disk_triple() if conf_saved else None
     if triple:
         st.update(triple)
-        st["insecure"] = not usable
     try:
         diag = json.loads(_status_path().read_text(encoding="utf-8"))
         if isinstance(diag, dict):
             for key in ("proto", "transport", "security"):
                 if diag.get(key):
                     st[key] = diag[key]
+            if diag.get("engine"):
+                st["engine"] = diag["engine"]
             if not diag.get("ok"):
                 st["fail_kind"] = diag.get("kind") or ""
                 st["fail_reason"] = diag.get("reason") or ""
@@ -711,5 +814,17 @@ def status():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "rerender":
+        # Build 191: the activation script's re-render entry
+        # point. Tokens only on stdout — never the link, never
+        # node details. Exit: 0 rendered/current, 2 no saved
+        # link, 1 saved link no longer resolves.
+        try:
+            done = rerender_from_saved()
+        except ValueError:
+            print("RERENDER_FAIL")
+            sys.exit(1)
+        print("RERENDER_OK" if done else "RERENDER_NOLINK")
+        sys.exit(0 if done else 2)
     print("tunnel configured:", configured(),
           "| verified up:", verified(), "| status:", status())

@@ -235,6 +235,7 @@
     <h3 style="margin-top:0">🔑 Gemini key (ဘာသာပြန် အတွက်)</h3>
     <div class="keyPill" id="keyPill">…</div>
     <p class="hint">Key ရှိရင် ဘာသာပြန် <b>မြန်ပြီး အရည်အသွေး ကောင်း</b>တယ်။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="keyState">…</span></p>
+    <p class="hint">💡 တန်ဖိုး အသစ် ထည့်ပြီး သိမ်းရင် အဟောင်း ကို အစားထိုး ပြီးသား — အရင် ဖျက်စရာ မလိုပါ။ (သိမ်းထားတဲ့ တန်ဖိုးကို လုံခြုံရေး အရ ပြန်မပြပါ)</p>
     <input type="password" id="keyInput" placeholder="Gemini key (AQ. / AIza နဲ့ စတယ်) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <div class="row">
       <button class="ghost" id="keySave">သိမ်းမယ်</button>
@@ -246,6 +247,7 @@
     <h3 style="margin-top:0">🧠 OpenAI key (ဘာသာပြန် engine — အဓိက)</h3>
     <div class="keyPill" id="oaPill">…</div>
     <p class="hint">OpenAI credit နဲ့ ဘာသာပြန်ရင် <b>စိတ်ချရပြီး ဈေး အလွန် သက်သာ</b>တယ် (video တစ်ခု ~$0.002)။ Key ရှိရင် ဒီ engine ကို အရင် သုံးတယ်။ <b>Chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ, server ထဲမှာပဲ သိမ်းတယ်, ပြန်လည်း မပြပါ။ အခြေအနေ: <span id="oaState">…</span></p>
+    <p class="hint">💡 တန်ဖိုး အသစ် ထည့်ပြီး သိမ်းရင် အဟောင်း ကို အစားထိုး ပြီးသား — အရင် ဖျက်စရာ မလိုပါ။ (သိမ်းထားတဲ့ တန်ဖိုးကို လုံခြုံရေး အရ ပြန်မပြပါ)</p>
     <input type="password" id="oaInput" placeholder="OpenAI key (sk- နဲ့ စတယ်) ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <div class="row">
       <button class="ghost" id="oaSave">သိမ်းမယ်</button>
@@ -302,6 +304,7 @@
     <h3 style="margin-top:0">📡 Telegram Local API (ဖိုင် အကြီး တိုက်ရိုက် ပို့ရန်)</h3>
     <div class="keyPill" id="tgApiPill">…</div>
     <p class="hint">Cloud Telegram API က bot ပို့တာ <b>50MB</b> ပဲ ခွင့်ပြုတယ် — ဖိုင် ကြီးရင် ချုံ့ ထားတဲ့ မူပွား ပဲ chat ထဲ ရောက်တယ်။ <b>my.telegram.org</b> က ရတဲ့ <b>api_id + api_hash</b> ကို ဒီမှာ ထည့်ရင် နောက် update မှာ ဒီ server ပေါ်မှာပဲ Local Bot API server တက်လာပြီး bot က <b>2GB အထိ</b> ဖိုင်တွေကို chat ထဲ တိုက်ရိုက် ပို့နိုင်မယ်။ ဒီ ၂ ခုကို <b>chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ။ အခြေအနေ: <span id="tgApiState">…</span></p>
+    <p class="hint">💡 တန်ဖိုး အသစ် ထည့်ပြီး သိမ်းရင် အဟောင်း ကို အစားထိုး ပြီးသား — အရင် ဖျက်စရာ မလိုပါ။ (သိမ်းထားတဲ့ တန်ဖိုးကို လုံခြုံရေး အရ ပြန်မပြပါ)</p>
     <input type="text" id="tgApiIdInput" inputmode="numeric" placeholder="api_id (ဂဏန်း သက်သက်)" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <input type="password" id="tgApiHashInput" placeholder="api_hash ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-top:6px">
     <div class="row">
@@ -314,6 +317,7 @@
     <h3 style="margin-top:0">🌐 VPN Tunnel (Gemini / OpenAI အတွက်)</h3>
     <div class="keyPill" id="tunPill">…</div>
     <p class="hint">Gemini နဲ့ OpenAI က ဒီ server ရှိတဲ့ <b>Hong Kong</b> ကို ပိတ်ထားလို့ တိုက်ရိုက် သုံးလို့ မရပါ။ ဆရာ့ V2Ray subscription က <b>vless://</b> သို့မဟုတ် <b>vmess://</b> link (သို့) <b>subscription URL</b> ကို ဒီမှာ ထည့်ရင် နောက် update မှာ ဒီ server ပေါ်မှာ tunnel တက်လာပြီး <b>အဲဒီ engine ၂ ခုပဲ</b> tunnel ကနေ သွားမယ် — <b>ကျန်တာ အကုန် (download, Telegram, OpenRouter…) မူလ လမ်းအတိုင်း</b>ပဲ။ Tunnel တက်ပြီး စစ်ပြီး ဖြစ်ရင် Gemini က ဘာသာပြန် မှာ <b>ဦးဆောင်</b> ဖြစ်သွားမယ်။ Subscription ထဲမှာ node အများကြီး ပါရင် <b>Singapore (SG)</b> node ကို အရင် ရွေးပေးမယ် — ရွေးထားတဲ့ node နာမည်ကို အောက်က အခြေအနေ မှာ အမြဲ ပြထားတယ်။ ဒီ link ကို <b>chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ။ အခြေအနေ: <span id="tunState">…</span></p>
+    <p class="hint">💡 Link အသစ် ထည့်ပြီး သိမ်းရင် အဟောင်း ကို အစားထိုး ပြီးသား — အရင် ဖျက်စရာ မလိုပါ။ (သိမ်းထားတဲ့ link ကို လုံခြုံရေး အရ ပြန်မပြပါ)</p>
     <textarea id="tunInput" rows="3" placeholder="vless://… သို့မဟုတ် vmess://… သို့မဟုတ် subscription URL ကို ဒီမှာ ထည့်ပါ" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box"></textarea>
     <div class="row">
       <button class="ghost" id="tunSave">သိမ်းမယ်</button>
@@ -325,6 +329,7 @@
     <h3 style="margin-top:0">🔐 Google login (တစ်ချက် နှိပ် ဝင်ရန်)</h3>
     <div class="keyPill" id="googlePill">…</div>
     <p class="hint">Google Client ID ထည့်ရင် customer တွေ <b>Google နဲ့ တစ်ချက် နှိပ်</b> ပြီး ဝင်လို့ရမယ် (username/password လည်း ဒီအတိုင်း ရှိမယ်)။ Client ID ကို <b>chat ထဲ လုံးဝ မပို့ပါနဲ့</b> — ဒီ page ထဲမှာပဲ ထည့်ပါ။ အခြေအနေ: <span id="googleState">…</span></p>
+    <p class="hint">💡 တန်ဖိုး အသစ် ထည့်ပြီး သိမ်းရင် အဟောင်း ကို အစားထိုး ပြီးသား — အရင် ဖျက်စရာ မလိုပါ။ (သိမ်းထားတဲ့ တန်ဖိုးကို လုံခြုံရေး အရ ပြန်မပြပါ)</p>
     <input type="text" id="googleInput" placeholder="Client ID (…apps.googleusercontent.com)" autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
     <div class="row">
       <button class="ghost" id="googleSave">သိမ်းမယ်</button>
@@ -1606,12 +1611,13 @@ async function loadTunState() {
       return;
     }
     setPill("tunPill", d.configured);
-    // Build 190: the selection notes must be visible, not
-    // silent — an SG node skipped for the no-encryption rule,
-    // and a saved node xray will refuse outright.
+    // The selection note must be visible, not silent — an SG
+    // node skipped because its format is unsupported, while a
+    // non-SG node was picked instead. (Build 191: sing-box
+    // accepts plain vless nodes, so the old build-190
+    // no-encryption refusal note is gone.)
     const tunNotes =
-      (d.skipped_sg ? " — ⚠️ SG node (" + d.skipped_sg + ") ကို encryption မပါလို့ ကျော်ပြီး တခြား node ရွေးထားတယ်" : "")
-      + (d.insecure ? " — ⚠️ ရွေးထားတဲ့ node က encryption မပါတဲ့ vless မို့ xray က လက်ခံမှာ မဟုတ်ပါ — node/subscription အသစ် လိုပါတယ်" : "");
+      (d.skipped_sg ? " — ⚠️ SG node (" + d.skipped_sg + ") ကို သုံးလို့ မရတဲ့ ပုံစံ မို့ ကျော်ပြီး တခြား node ရွေးထားတယ်" : "");
     $("tunState").textContent = !d.configured
       ? "❌ မထည့်ရသေး (Gemini/OpenAI တိုက်ရိုက် ပိတ်ထိနေဆဲ)"
       : (d.up
@@ -1622,7 +1628,7 @@ async function loadTunState() {
           : (d.fail_kind
               ? "❌ " + (d.fail_kind === "config-invalid" ? "config မှာ ပြဿနာ"
                          : d.fail_kind === "egress-failed" ? "node ကို ဆက်သွယ်လို့ မရပါ"
-                         : "xray service တက်မလာပါ")
+                         : "tunnel service တက်မလာပါ")
                 + (d.fail_reason ? ": " + d.fail_reason : "")
                 + (d.label ? " · node: " + d.label : "")
               : "⏳ ထည့်ပြီးသား" + (d.label ? " (node: " + d.label + ")" : "")
@@ -1642,8 +1648,7 @@ $("tunSave").onclick = async () => {
   $("tunInput").value = "";
   loadTunState();
   alert("သိမ်းပြီးပြီ — ရွေးထားတဲ့ node: " + (d.label || "?")
-    + (d.skipped_sg ? "\n⚠️ SG node (" + d.skipped_sg + ") ကို encryption မပါလို့ ကျော်ခဲ့တယ်" : "")
-    + (d.insecure ? "\n⚠️ ဒီ node က encryption မပါတဲ့ vless မို့ xray က လက်ခံမှာ မဟုတ်ပါ — node/subscription အသစ် လိုပါတယ်" : "")
+    + (d.skipped_sg ? "\n⚠️ SG node (" + d.skipped_sg + ") ကို သုံးလို့ မရတဲ့ ပုံစံ မို့ ကျော်ခဲ့တယ်" : "")
     + " — နောက် update (၁၅ မိနစ် အတွင်း) မှာ tunnel တက်လာပြီး စစ်ပြီးရင် Gemini ဦးဆောင် ဖြစ်သွားမယ်");
 };
 $("tunDel").onclick = async () => {
@@ -2165,6 +2170,6 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(function () {});
 }
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 190</p>
+<p class="hint" id="buildTag" style="text-align:center">build 191</p>
 </body>
 </html>

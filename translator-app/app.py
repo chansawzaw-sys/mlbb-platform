@@ -2297,9 +2297,11 @@ def telegram_api_delete():
 # caller's IP country. The owner pastes a node from his own
 # V2Ray subscription here (a vless:// or vmess:// share link, or
 # a subscription URL); pipeline/tunnel.py parses it at save time
-# into an xray client config (tun-xray.json in the app dir,
-# chmod 600), and deploy/activate-settings.sh runs xray-core
-# with it: one HTTP proxy inbound on 127.0.0.1, used ONLY by the
+# into a sing-box client config (tun-singbox.json in the app dir,
+# chmod 600; builds 189/190 rendered for xray-core, which refuses
+# plain vless nodes — build 191 swapped the engine to sing-box),
+# and deploy/activate-settings.sh runs sing-box with it: one
+# mixed SOCKS/HTTP proxy inbound on 127.0.0.1, used ONLY by the
 # Gemini/OpenAI clients, only after an egress check through the
 # proxy has passed (VT_TUNNEL_PROXY + VT_TUNNEL_CONF_SHA in
 # .env — written by the bootstrap, never from this UI). The

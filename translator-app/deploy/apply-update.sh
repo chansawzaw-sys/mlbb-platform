@@ -99,7 +99,7 @@ if [ "$BEFORE" = "$AFTER" ]; then
   # entirely, so saved settings stayed inert until an unrelated
   # code push happened. The activation script is marker-gated
   # (a fast no-op when no card save is pending), fail-safe, and
-  # restarts only its own units (tg-bot-api / tun-xray), never
+  # restarts only its own units (tg-bot-api / tun-singbox), never
   # the translator app.
   if [ -f "$APP/deploy/activate-settings.sh" ]; then
     APP_DIR="$APP" bash "$APP/deploy/activate-settings.sh" || true
