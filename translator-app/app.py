@@ -50,7 +50,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 202"
+BUILD_TAG = "build 203"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1092,6 +1092,13 @@ def _tg_flow_prepare(chat_id):
         else:
             if not _public_url_ok(flow["url"]):
                 raise RuntimeError("ဒီ လင့်ခ် ကို သုံးလို့ မရပါ")
+            # Build 203 (audit V08): the bot prepare deliberately
+            # stays on the LEGACY URL-only key — it downloads
+            # before the customer picks a quality, and the entry
+            # doubles as the job's source via the _preview_quality
+            # gate in _tg_submit. Web previews read this entry
+            # through make_preview's legacy read path; the
+            # tg-file: entries above are keyed the same way.
             pid, pdir = _preview_dir(flow["url"])
             pdir.mkdir(parents=True, exist_ok=True)
             src = pdir / "source.mp4"
@@ -1592,16 +1599,33 @@ def _cleanup_job(jid):
     CLEANUP_TIMERS.pop(jid, None)
     job = JOBS.pop(jid, None)
     url = (job or {}).get("url")
+    source_path = (job or {}).get("source_path")
     if not url:
         try:
             meta = json.loads((JOBS_DIR / jid / "job.json").read_text(encoding="utf-8"))
             url = meta.get("url")
+            source_path = source_path or meta.get("source_path")
         except Exception:
             url = None
     shutil.rmtree(JOBS_DIR / jid, ignore_errors=True)
+    # Build 203 (audit V08): drop EVERY preview entry this job's
+    # URL owns — the legacy dir plus each quality-keyed dir —
+    # and the dir this job's own source_path pointed into (the
+    # bot's tg-file: entries live under neither URL key). Any
+    # dir an ACTIVE job still references via its source_path is
+    # skipped: one job's cleanup must not pull the source out
+    # from under a queued/running sibling on the same link.
+    keep = _active_preview_dirs()
+    targets = []
     if url:
-        _, pdir = _preview_dir(url)
-        shutil.rmtree(pdir, ignore_errors=True)
+        targets += [pdir for _pid, pdir in _preview_dirs_for(url)]
+    if source_path:
+        parent = Path(source_path).parent
+        if parent.parent == PREVIEWS_DIR:
+            targets.append(parent)
+    for pdir in targets:
+        if str(pdir) not in keep:
+            shutil.rmtree(pdir, ignore_errors=True)
 
 
 def _job_minutes(job):
@@ -1909,9 +1933,72 @@ def _preview_allowed():
     return True
 
 
-def _preview_dir(url):
-    pid = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+def _preview_dir(url, quality=None):
+    """Preview cache identity (build 203, audit V08).
+
+    With a quality, the pid hashes URL + quality, so an hd entry
+    and a 480p entry for the same link are independent cache
+    entries that can never evict or overwrite each other (before,
+    the URL-only key made alternating-quality requests unlink and
+    re-download over one shared file). Without a quality this
+    returns the LEGACY pre-203 pid — kept deliberately as the
+    read path for entries cached before build 203 and as the
+    bot prepare flow's own key (the bot downloads before the
+    customer picks a quality, and _preview_quality() on the
+    entry's source_info.json still gates job reuse). The "\\n"
+    separator cannot appear in a cleaned URL, so a keyed pid can
+    never collide with a legacy one."""
+    if quality:
+        pid = hashlib.sha256(
+            f"{url}\n{quality}".encode("utf-8")).hexdigest()[:12]
+    else:
+        pid = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
     return pid, PREVIEWS_DIR / pid
+
+
+def _preview_dirs_for(url):
+    """Every cache dir a URL may own: the legacy entry plus one
+    keyed entry per quality (deduped, order-stable)."""
+    out, seen = [], set()
+    for q in (None, "hd", "720", "480"):
+        pid, pdir = _preview_dir(url, q)
+        if pid not in seen:
+            seen.add(pid)
+            out.append((pid, pdir))
+    return out
+
+
+# Per-key preview locks (build 203, audit V08): the same
+# lock-dict pattern as pipeline/telegram_send._chat_lock. One
+# lock per preview pid serializes that entry's whole
+# check -> download -> publish sequence, so two concurrent
+# previews of the same URL+quality coalesce onto ONE download
+# instead of both unlinking and streaming into the same file.
+_PREVIEW_LOCKS = {}
+_PREVIEW_LOCKS_G = threading.Lock()
+
+
+def _preview_lock(pid):
+    with _PREVIEW_LOCKS_G:
+        lk = _PREVIEW_LOCKS.get(pid)
+        if lk is None:
+            lk = _PREVIEW_LOCKS[pid] = threading.Lock()
+        return lk
+
+
+def _active_preview_dirs():
+    """Preview dirs an ACTIVE (queued/running) job still depends
+    on via its source_path. Cleanup and the sweeper must never
+    remove these (build 203, audit V08): before, one job's
+    cleanup could rmtree the shared preview dir out from under
+    another job that had not reached phase 1 yet."""
+    out = set()
+    for j in list(JOBS.values()):
+        if j.get("status") in ("queued", "running"):
+            sp = j.get("source_path")
+            if sp:
+                out.add(str(Path(sp).parent))
+    return out
 
 
 def _preview_quality(pdir):
@@ -1954,13 +2041,14 @@ def _preview_download_bounded(url, pdir, quality):
     ("error", exception).
 
     A Python thread cannot be killed, so on timeout the worker
-    may run on in the background; its writes stay inside this
-    preview's own dir, the caller removes the partial files and
-    releases the slot, and the download itself is bounded by the
-    V04 byte cap plus download()'s per-request socket timeouts —
-    a late-finishing worker can only land a complete file for
-    the SAME url, which the _src_valid gate then treats like
-    any cached preview."""
+    may run on in the background; the caller passes a STAGING
+    dir (build 203), so its writes stay inside that staging dir
+    — the caller removes it and releases the slot, and a
+    late-finishing worker can only ever write into the staging
+    dir (at worst recreating it as garbage the startup sweep
+    collects); it can never touch the published cache entry.
+    The download itself is bounded by the V04 byte cap plus
+    download()'s per-request socket timeouts."""
     box = {}
 
     def _go():
@@ -1981,7 +2069,8 @@ def _preview_download_bounded(url, pdir, quality):
 
 @app.post("/api/preview")
 def make_preview():
-    """Download (once, cached by URL) and report size/duration for the editor."""
+    """Download (once, cached by URL+quality) and report
+    size/duration for the editor."""
     data = request.get_json(force=True)
     url = dl_mod.clean_url(data.get("url") or "")
     if not url.startswith(("http://", "https://")):
@@ -1999,59 +2088,90 @@ def make_preview():
     # requested one; the job-side quality check in create_job
     # stays as the guarantee when the two still differ.
     quality = dl_mod.norm_quality(data.get("quality"))
-    pid, pdir = _preview_dir(url)
-    pdir.mkdir(parents=True, exist_ok=True)
-    src = pdir / "source.mp4"
-    try:
-        if not (_src_valid(src)
-                and _preview_quality(pdir) == quality):
-            # Build 202 (audit V05): only a couple of preview
-            # downloads may run at once — the rest of the web
-            # threads stay free for logins and status calls.
-            if not _PREVIEW_SEM.acquire(blocking=False):
-                return jsonify({"error": "Preview အလုပ် များနေပါတယ် — "
-                                         "ခဏ စောင့်ပြီး ပြန် စမ်းပါ"}), 429
-            try:
+    pid, pdir = _preview_dir(url, quality)
+    # Build 203 (audit V08): the whole check -> download ->
+    # publish sequence runs under this entry's own lock, so
+    # parallel previews of the same URL+quality coalesce onto
+    # ONE download (the second caller waits, then hits the
+    # fresh entry); different qualities hold different locks
+    # and different dirs and never disturb each other.
+    with _preview_lock(pid):
+        serve_pid, serve_dir = pid, pdir
+        src = pdir / "source.mp4"
+        try:
+            if not _src_valid(src):
+                # Deliberate legacy read path: an entry cached
+                # before build 203 (or by the bot prepare flow)
+                # under the URL-only key still serves when it
+                # was fetched at THIS quality. Read-only here —
+                # a quality mismatch downloads into the keyed
+                # entry and leaves the legacy entry intact for
+                # its own quality's callers (no more thrash).
+                lpid, ldir = _preview_dir(url)
+                if ldir != pdir \
+                        and _src_valid(ldir / "source.mp4") \
+                        and _preview_quality(ldir) == quality:
+                    serve_pid, serve_dir = lpid, ldir
+                    src = ldir / "source.mp4"
+            if serve_dir == pdir and not _src_valid(src):
+                # Build 202 (audit V05): only a couple of preview
+                # downloads may run at once — the rest of the web
+                # threads stay free for logins and status calls.
+                if not _PREVIEW_SEM.acquire(blocking=False):
+                    return jsonify({"error": "Preview အလုပ် များနေပါတယ် — "
+                                             "ခဏ စောင့်ပြီး ပြန် စမ်းပါ"}), 429
+                # Download into a staging sibling dir; the entry
+                # at the key is replaced only once a complete
+                # download exists (atomic publish below), so a
+                # failed or interrupted download never destroys
+                # a previously valid entry.
+                staging = PREVIEWS_DIR / (
+                    pid + ".tmp-" + uuid.uuid4().hex[:8])
+                staging.mkdir(parents=True, exist_ok=True)
+                try:
+                    state, err = _preview_download_bounded(
+                        url, staging, quality)
+                finally:
+                    _PREVIEW_SEM.release()
+                if state == "timeout":
+                    # The still-running worker writes only into
+                    # the staging dir; drop it and report. The
+                    # slot is already released.
+                    shutil.rmtree(staging, ignore_errors=True)
+                    return jsonify({"error": "Preview ဒေါင်းတာ အချိန် "
+                                             "ကုန်သွားပါတယ် — ခဏနေပြီး "
+                                             "ပြန် စမ်းပါ"}), 504
+                if state == "error":
+                    shutil.rmtree(staging, ignore_errors=True)
+                    raise err
+                shutil.rmtree(pdir, ignore_errors=True)
+                os.rename(staging, pdir)
+                src = pdir / "source.mp4"
+            dur = probe_duration(src)
+            if dur > _PREVIEW_MAX_DURATION_S:
+                # A preview exists to pick a blur spot; an overlong
+                # source is refused (and not kept cached) — the job
+                # itself is unaffected and can be submitted directly.
                 src.unlink(missing_ok=True)
-                state, err = _preview_download_bounded(
-                    url, pdir, quality)
-            finally:
-                _PREVIEW_SEM.release()
-            if state == "timeout":
-                # Drop whatever the still-running worker has
-                # written so far; the slot is already released.
-                src.unlink(missing_ok=True)
-                (pdir / "source.mp4.part").unlink(missing_ok=True)
-                return jsonify({"error": "Preview ဒေါင်းတာ အချိန် "
-                                         "ကုန်သွားပါတယ် — ခဏနေပြီး "
-                                         "ပြန် စမ်းပါ"}), 504
-            if state == "error":
-                raise err
-        dur = probe_duration(src)
-        if dur > _PREVIEW_MAX_DURATION_S:
-            # A preview exists to pick a blur spot; an overlong
-            # source is refused (and not kept cached) — the job
-            # itself is unaffected and can be submitted directly.
-            src.unlink(missing_ok=True)
-            (pdir / "source_info.json").unlink(missing_ok=True)
-            return jsonify({"error": "ဒီ video က အရမ်း ရှည်နေလို့ "
-                                     "preview မရပါ (အများဆုံး "
-                                     "၆၀ မိနစ်) — preview မပါဘဲ job "
-                                     "တိုက်ရိုက် တင်လို့ ရပါတယ်"}), 400
-        w, h = fx_mod.video_size(src)
-    except Exception as e:
-        # Build 166 (fix F1): polite Burmese category to the
-        # customer; the raw error is logged server-side only.
-        print(f"[preview] FAILED {url}: {str(e)[:400]}", flush=True)
-        return jsonify({"error": dl_mod.polite_error(e, url)}), 502
+                (serve_dir / "source_info.json").unlink(missing_ok=True)
+                return jsonify({"error": "ဒီ video က အရမ်း ရှည်နေလို့ "
+                                         "preview မရပါ (အများဆုံး "
+                                         "၆၀ မိနစ်) — preview မပါဘဲ job "
+                                         "တိုက်ရိုက် တင်လို့ ရပါတယ်"}), 400
+            w, h = fx_mod.video_size(src)
+        except Exception as e:
+            # Build 166 (fix F1): polite Burmese category to the
+            # customer; the raw error is logged server-side only.
+            print(f"[preview] FAILED {url}: {str(e)[:400]}", flush=True)
+            return jsonify({"error": dl_mod.polite_error(e, url)}), 502
     title = None
-    info_p = pdir / "source_info.json"
+    info_p = serve_dir / "source_info.json"
     if info_p.exists():
         try:
             title = json.loads(info_p.read_text(encoding="utf-8")).get("title")
         except Exception:
             pass
-    return jsonify({"preview_id": pid, "duration": round(dur, 2),
+    return jsonify({"preview_id": serve_pid, "duration": round(dur, 2),
                     "width": w, "height": h, "title": title,
                     "quality": quality})
 
@@ -3543,9 +3663,13 @@ def create_job():
         # A preview may be reused ONLY for the very link it was taken
         # from (its id is a hash of that link). A stale id left over
         # from a previous video must never substitute the old video
-        # for the new link's job.
-        expected_pid, _ = _preview_dir(job["url"])
-        if str(preview_id) != expected_pid:
+        # for the new link's job. Build 203 (audit V08): the id may
+        # be the URL+quality keyed pid for THIS job's quality, or
+        # the legacy URL-only pid — a legacy entry still has to
+        # pass the _src_valid + _preview_quality gate below.
+        expected_pid, _ = _preview_dir(job["url"], job["quality"])
+        legacy_pid, _ = _preview_dir(job["url"])
+        if str(preview_id) not in (expected_pid, legacy_pid):
             preview_id = None
     if preview_id:
         cand = PREVIEWS_DIR / str(preview_id) / "source.mp4"
@@ -3963,6 +4087,9 @@ def _startup_sweep():
     1-hour sweep broke that promise on every restart). Queued/running
     leftovers are left for the load-time heal in _all_jobs."""
     now = time.time()
+    # Build 203 (audit V08): preview dirs an active job still
+    # references survive the sweep, exactly as in _cleanup_job.
+    keep = _active_preview_dirs()
     for d in list(JOBS_DIR.iterdir()):
         if not d.is_dir():
             continue
@@ -3977,8 +4104,9 @@ def _startup_sweep():
                 shutil.rmtree(d, ignore_errors=True)
                 url = meta.get("url")
                 if url:
-                    _, pdir = _preview_dir(url)
-                    shutil.rmtree(pdir, ignore_errors=True)
+                    for _pid, pdir in _preview_dirs_for(url):
+                        if str(pdir) not in keep:
+                            shutil.rmtree(pdir, ignore_errors=True)
             continue
         if meta:
             continue
@@ -3989,7 +4117,8 @@ def _startup_sweep():
             pass
     for d in list(PREVIEWS_DIR.iterdir()):
         try:
-            if d.is_dir() and now - d.stat().st_mtime > 3600:
+            if d.is_dir() and str(d) not in keep \
+                    and now - d.stat().st_mtime > 3600:
                 shutil.rmtree(d, ignore_errors=True)
         except Exception:
             pass

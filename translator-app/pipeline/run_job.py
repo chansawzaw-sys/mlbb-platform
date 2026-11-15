@@ -75,6 +75,23 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
         # instead of copying a stub into the job.
         src = workdir / "source.mp4"
         shutil.copyfile(source_path, src)
+        # Build 203 (audit V06): carry the caption sidecars too.
+        # download() leaves source.<lang>.vtt next to the preview's
+        # source.mp4, and transcribe() looks for them in the JOB
+        # workdir — copying only the video stranded them in the
+        # preview dir, so every preview-reused job silently fell
+        # back to a full Whisper transcription. Stem-matched to
+        # the reused source, from its own directory only, so a
+        # different video's captions can never leak in. A sidecar
+        # that fails to copy (or parses to nothing) is harmless:
+        # transcribe() still falls back to Whisper as before.
+        _stem = Path(source_path).stem
+        for _vtt in sorted(Path(source_path).parent
+                           .glob(_stem + ".*.vtt")):
+            try:
+                shutil.copyfile(_vtt, workdir / _vtt.name)
+            except Exception:
+                pass
     else:
         src = download.download(url, workdir, quality=quality)
     mark("download", "done")

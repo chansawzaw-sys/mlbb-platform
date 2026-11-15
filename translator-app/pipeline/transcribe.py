@@ -9,6 +9,7 @@ Writes <workdir>/segments_en.json  [{start, end, text}]
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 
 from .common import run, save_segments
@@ -48,16 +49,29 @@ def _parse_vtt(vtt_path: Path):
 
 
 _MODEL_CACHE = {}
+_MODEL_LOCK = threading.Lock()
 
 
 def _get_model(model_ref):
     """Load the whisper model ONCE per process and reuse it across jobs.
 
     Loading took seconds (plus a hub metadata round-trip) on every job;
-    the app is a long-lived process and jobs are serialized by the gate,
-    so a cached model is safe and removes that fixed cost entirely."""
+    the app is a long-lived process, so a cached model removes that
+    fixed cost entirely. Jobs are NOT serialized — up to four worker
+    threads transcribe concurrently (build 180) — so initialization
+    is serialized with double-checked locking (build 203, audit
+    V07): without it, N simultaneous cold calls each constructed
+    their own full ctranslate2 model. Only construction holds the
+    lock; inference stays unlocked. The cache is published ONLY
+    after a successful construction, so a failed load leaves the
+    cache empty and a later call retries."""
     m = _MODEL_CACHE.get(model_ref)
-    if m is None:
+    if m is not None:
+        return m
+    with _MODEL_LOCK:
+        m = _MODEL_CACHE.get(model_ref)
+        if m is not None:
+            return m
         from faster_whisper import WhisperModel
         # Build 186 (speed audit fix #2): num_workers=2 —
         # ctranslate2's inter_threads follows num_workers, and at
@@ -77,7 +91,7 @@ def _get_model(model_ref):
             m = WhisperModel(model_ref, device="cpu", compute_type="int8",
                              num_workers=2)
         _MODEL_CACHE[model_ref] = m
-    return m
+        return m
 
 
 def transcribe(video_path, workdir, use_captions=False):
