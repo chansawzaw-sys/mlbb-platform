@@ -50,7 +50,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 201"
+BUILD_TAG = "build 202"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1933,6 +1933,52 @@ def _preview_quality(pdir):
     return "720"
 
 
+# Build 202 (audit V05): preview work is BOUNDED. A preview used
+# to run a full download synchronously inside the request, outside
+# the job queue — enough slow previews could occupy all 8 Waitress
+# threads and stall logins. Now at most _PREVIEW_MAX_CONCURRENT
+# preview downloads run at once (overflow gets an immediate 429),
+# each download runs under a hard total deadline, and a source
+# longer than _PREVIEW_MAX_DURATION_S is refused as a preview
+# (jobs themselves have no such ceiling — the wizard's skip
+# button still lets the customer submit the job directly). The
+# per-user 30/hour admission cap and the login gate are unchanged.
+_PREVIEW_SEM = threading.Semaphore(2)
+_PREVIEW_DEADLINE_S = 180
+_PREVIEW_MAX_DURATION_S = 3600  # 60 minutes
+
+
+def _preview_download_bounded(url, pdir, quality):
+    """Run one preview download on a worker thread under the
+    total deadline. Returns ("ok", None), ("timeout", None) or
+    ("error", exception).
+
+    A Python thread cannot be killed, so on timeout the worker
+    may run on in the background; its writes stay inside this
+    preview's own dir, the caller removes the partial files and
+    releases the slot, and the download itself is bounded by the
+    V04 byte cap plus download()'s per-request socket timeouts —
+    a late-finishing worker can only land a complete file for
+    the SAME url, which the _src_valid gate then treats like
+    any cached preview."""
+    box = {}
+
+    def _go():
+        try:
+            dl_mod.download(url, pdir, quality=quality)
+        except Exception as e:  # surfaced by the caller
+            box["err"] = e
+
+    t = threading.Thread(target=_go, daemon=True)
+    t.start()
+    t.join(_PREVIEW_DEADLINE_S)
+    if t.is_alive():
+        return "timeout", None
+    if "err" in box:
+        return "error", box["err"]
+    return "ok", None
+
+
 @app.post("/api/preview")
 def make_preview():
     """Download (once, cached by URL) and report size/duration for the editor."""
@@ -1959,9 +2005,39 @@ def make_preview():
     try:
         if not (_src_valid(src)
                 and _preview_quality(pdir) == quality):
-            src.unlink(missing_ok=True)
-            dl_mod.download(url, pdir, quality=quality)
+            # Build 202 (audit V05): only a couple of preview
+            # downloads may run at once — the rest of the web
+            # threads stay free for logins and status calls.
+            if not _PREVIEW_SEM.acquire(blocking=False):
+                return jsonify({"error": "Preview အလုပ် များနေပါတယ် — "
+                                         "ခဏ စောင့်ပြီး ပြန် စမ်းပါ"}), 429
+            try:
+                src.unlink(missing_ok=True)
+                state, err = _preview_download_bounded(
+                    url, pdir, quality)
+            finally:
+                _PREVIEW_SEM.release()
+            if state == "timeout":
+                # Drop whatever the still-running worker has
+                # written so far; the slot is already released.
+                src.unlink(missing_ok=True)
+                (pdir / "source.mp4.part").unlink(missing_ok=True)
+                return jsonify({"error": "Preview ဒေါင်းတာ အချိန် "
+                                         "ကုန်သွားပါတယ် — ခဏနေပြီး "
+                                         "ပြန် စမ်းပါ"}), 504
+            if state == "error":
+                raise err
         dur = probe_duration(src)
+        if dur > _PREVIEW_MAX_DURATION_S:
+            # A preview exists to pick a blur spot; an overlong
+            # source is refused (and not kept cached) — the job
+            # itself is unaffected and can be submitted directly.
+            src.unlink(missing_ok=True)
+            (pdir / "source_info.json").unlink(missing_ok=True)
+            return jsonify({"error": "ဒီ video က အရမ်း ရှည်နေလို့ "
+                                     "preview မရပါ (အများဆုံး "
+                                     "၆၀ မိနစ်) — preview မပါဘဲ job "
+                                     "တိုက်ရိုက် တင်လို့ ရပါတယ်"}), 400
         w, h = fx_mod.video_size(src)
     except Exception as e:
         # Build 166 (fix F1): polite Burmese category to the
@@ -2515,20 +2591,72 @@ def _set_session(resp, token):
 
 
 _REG_ATTEMPTS = {}
+_REG_LOCK = threading.Lock()
+_REG_LIMIT = 10
+_REG_WINDOW_S = 3600
 
 
 def _reg_throttled(ip):
     """At most 10 registrations per hour per source — account
-    farming is the cheapest abuse there is."""
+    farming is the cheapest abuse there is.
+
+    Build 202 (audit V03): this helper existed but was never
+    called; auth_register now checks it FIRST, before any
+    password hashing or account creation. The check-and-append
+    is atomic under _REG_LOCK (Waitress serves from 8 threads,
+    so an unlocked check could be raced past the budget), and
+    every access prunes expired hits and drops keys whose last
+    hit aged out, so the table cannot grow without bound. The
+    state is process-local BY DESIGN: the app runs as a single
+    Waitress process, so an in-memory table is the whole
+    picture — a multi-process deployment would need a shared
+    store instead."""
     now = time.time()
-    hits = [t for t in _REG_ATTEMPTS.get(ip, []) if now - t < 3600]
-    hits.append(now)
-    _REG_ATTEMPTS[ip] = hits
-    return len(hits) > 10
+    with _REG_LOCK:
+        for key in list(_REG_ATTEMPTS):
+            live = [t for t in _REG_ATTEMPTS[key]
+                    if now - t < _REG_WINDOW_S]
+            if live:
+                _REG_ATTEMPTS[key] = live
+            else:
+                del _REG_ATTEMPTS[key]
+        hits = _REG_ATTEMPTS.setdefault(ip, [])
+        hits.append(now)
+        return len(hits) > _REG_LIMIT
+
+
+def _reg_retry_after(ip):
+    """Seconds until the oldest in-window registration hit from
+    this source expires (0 when the source is not throttled) —
+    the advisory wait handed back with the 429."""
+    now = time.time()
+    with _REG_LOCK:
+        hits = [t for t in _REG_ATTEMPTS.get(ip, [])
+                if now - t < _REG_WINDOW_S]
+    if len(hits) <= _REG_LIMIT:
+        return 0
+    return max(1, int(hits[0] + _REG_WINDOW_S - now) + 1)
 
 
 @app.post("/api/auth/register")
 def auth_register():
+    # Build 202 (audit V03): throttle FIRST — before hashing or
+    # account work. Password hashing is deliberately expensive
+    # (scrypt), so an unthrottled register endpoint is a CPU
+    # amplifier as well as a farming hole. Keyed by _client_ip()
+    # — the Caddy-appended last X-Forwarded-For entry, the same
+    # identity the login lockout trusts — so rotating the
+    # client-supplied earlier entries cannot reset the budget.
+    ip = _client_ip()
+    if _reg_throttled(ip):
+        retry = _reg_retry_after(ip)
+        resp = jsonify({
+            "error": "မှတ်ပုံတင် ကြိုးစားမှု များလွန်းနေပါတယ် — "
+                     "ခဏ စောင့်ပြီး ပြန် စမ်းပါ",
+            "retry_after": retry})
+        if retry:
+            resp.headers["Retry-After"] = str(retry)
+        return resp, 429
     data = request.get_json(force=True, silent=True) or {}
     user, err = accounts.create_user(data.get("username"),
                                      data.get("password"))

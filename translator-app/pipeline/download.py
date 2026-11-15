@@ -41,6 +41,133 @@ _FORMAT_SELECTORS = {
 }
 
 
+# ----------------------------------------------------------------
+# Build 202 (audit V04): ONE egress guard for the whole download
+# connection chain. Until now only the ADMISSION url was checked
+# (app._public_url_ok, before a job/preview is accepted); every
+# URL the chain discovered later — resolver renditions, page and
+# embed candidates, redirect targets — was fetched unguarded, so
+# a public page could bounce the server into a private address.
+# egress_url_ok mirrors app._public_url_ok's semantics exactly
+# (http/https only; the host must resolve, and EVERY record must
+# be a public address — one bad record refuses the whole host)
+# and is applied at every fetch point below: immediately before
+# each connection, at every hop of the manually walked redirect
+# chains, and to the final URL of auto-followed fetches.
+# Residual (proof202 NOTES): validation happens immediately
+# before connecting, but the HTTP library then resolves again
+# for the actual connection — a sub-second DNS flip between the
+# two is a TOCTOU window only a validating egress proxy closes.
+# yt-dlp's internal fetches cannot be pinned from Python at all
+# and are a documented residual for the same reason.
+MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB stream ceiling
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+
+def _resolve_ips(host):
+    """Every A/AAAA record for host — the resolver seam (proofs
+    stub this; production uses the system resolver)."""
+    import socket
+    return [info[4][0] for info in
+            socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)]
+
+
+def egress_url_ok(url):
+    """True only for an http(s) URL whose host resolves entirely
+    to public addresses. Fail-closed: any error, empty answer,
+    bad scheme or single bad record refuses the URL."""
+    import ipaddress
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https"):
+            return False
+        host = p.hostname
+        if not host:
+            return False
+        ips = _resolve_ips(host)
+        if not ips:
+            return False
+        for raw in ips:
+            ip = ipaddress.ip_address(raw)
+            if ip.is_private or ip.is_loopback or ip.is_link_local \
+                    or ip.is_reserved or ip.is_multicast \
+                    or ip.is_unspecified:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _require_public(url, what="download URL"):
+    if not egress_url_ok(url):
+        raise RuntimeError(f"refused non-public {what}: {url[:120]}")
+    return url
+
+
+def _fetch_follow(get_once, url, max_hops=6):
+    """GET url following redirects BY HAND, egress-validating the
+    start URL and every hop target immediately before connecting
+    to it. get_once(u) performs ONE GET with redirects disabled
+    and returns the response. Returns (response, final_url) —
+    final_url is the last validated URL actually fetched."""
+    cur = url
+    for _ in range(max_hops + 1):
+        _require_public(cur, "fetch URL")
+        resp = get_once(cur)
+        loc = None
+        if getattr(resp, "status_code", 200) in _REDIRECT_STATUSES:
+            headers = getattr(resp, "headers", None) or {}
+            loc = headers.get("Location") or headers.get("location")
+        if not loc:
+            return resp, cur
+        cur = urljoin(cur, loc)
+    raise RuntimeError("too many redirects")
+
+
+def _stream_url_to_file(url, tmp, headers, timeout=180):
+    """Stream url to the file tmp with the egress guard on the
+    start URL and every redirect hop (redirects followed
+    manually), plus a hard byte ceiling. Returns the byte count.
+    On ANY failure the partial file is removed."""
+    import requests
+    tmp = Path(tmp)
+    cur = url
+    try:
+        for _ in range(7):
+            _require_public(cur, "media URL")
+            with requests.get(cur, headers=headers, timeout=timeout,
+                              stream=True,
+                              allow_redirects=False) as resp:
+                if getattr(resp, "status_code", 200) \
+                        in _REDIRECT_STATUSES:
+                    hdrs = getattr(resp, "headers", None) or {}
+                    loc = hdrs.get("Location") \
+                        or hdrs.get("location")
+                    if not loc:
+                        resp.raise_for_status()
+                        raise RuntimeError(
+                            f"redirect without Location: {cur[:120]}")
+                    cur = urljoin(cur, loc)
+                    continue
+                resp.raise_for_status()
+                total = 0
+                with open(tmp, "wb") as f:
+                    for chunk in resp.iter_content(1 << 20):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > MAX_DOWNLOAD_BYTES:
+                            raise RuntimeError(
+                                "download exceeded the 2 GiB "
+                                "safety cap")
+                        f.write(chunk)
+                return total
+        raise RuntimeError("too many redirects")
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def clean_url(raw: str) -> str:
     """Best URL out of whatever was pasted (build 166). Share
     blurbs carry text around the link; TikTok tracking parameters
@@ -160,17 +287,27 @@ def _resolve_short(url: str) -> str:
     for _round in range(2):
         for kind, creq, imp in _attempts():
             try:
+                # Build 202 (audit V04): redirects are walked by
+                # hand through the egress guard — the final URL
+                # is validated hop by hop before it is adopted,
+                # never after an auto-follow already connected.
                 if kind == "cffi":
-                    r = creq.get(url, impersonate=imp, timeout=10)
+                    def _once(u, _imp=imp):
+                        return creq.get(u, impersonate=_imp,
+                                        timeout=10,
+                                        allow_redirects=False)
                 else:
                     import requests
-                    r = requests.get(
-                        url,
-                        headers={"User-Agent":
-                                 "Mozilla/5.0 (Linux; Android 13) "
-                                 "AppleWebKit/537.36"},
-                        timeout=10, allow_redirects=True)
-                got = _judge_resolution(r.url or "", r.text or "",
+
+                    def _once(u):
+                        return requests.get(
+                            u,
+                            headers={"User-Agent":
+                                     "Mozilla/5.0 (Linux; Android 13) "
+                                     "AppleWebKit/537.36"},
+                            timeout=10, allow_redirects=False)
+                r, final = _fetch_follow(_once, url)
+                got = _judge_resolution(final or "", r.text or "",
                                         url, want_video)
                 if got:
                     return got
@@ -303,6 +440,13 @@ def _tiktok_fallback(url: str, workdir: Path, quality: str = "hd") -> dict:
                              params={"url": url, "hd": 1},
                              headers=headers, timeout=30)
             r.raise_for_status()
+            # Build 202 (audit V04): this fetch auto-follows
+            # redirects — refuse the payload if it landed on a
+            # non-public address.
+            landed = getattr(r, "url", None)
+            if landed and not egress_url_ok(landed):
+                raise RuntimeError(
+                    "tikwm API redirected to a non-public URL")
             payload = r.json()
         except Exception as e:
             last_exc = e
@@ -319,21 +463,13 @@ def _tiktok_fallback(url: str, workdir: Path, quality: str = "hd") -> dict:
             raise last_exc
         raise RuntimeError(f"tikwm resolver returned no video URL: {payload!r:.200}")
     data = payload.get("data") or {}
-    out = workdir / "source.mp4"
-    # Stream to a .part file and rename only when complete: an
-    # interrupted download must never leave a truncated source.mp4
-    # behind for the shared preview cache to reuse forever.
-    tmp = workdir / "source.mp4.part"
-    with requests.get(play, headers=headers, timeout=180, stream=True) as resp:
-        resp.raise_for_status()
-        with open(tmp, "wb") as f:
-            for chunk in resp.iter_content(1 << 20):
-                if chunk:
-                    f.write(chunk)
-    if tmp.stat().st_size < 10_000:
-        tmp.unlink(missing_ok=True)
-        raise RuntimeError("tikwm download came back empty/truncated")
-    tmp.replace(out)
+    # Stream via the guarded streamer (build 202, audit V04): the
+    # resolver-supplied rendition URL is egress-validated before
+    # connecting and at every redirect hop, under the byte cap,
+    # to a .part file renamed only when complete — an interrupted
+    # download must never leave a truncated source.mp4 behind for
+    # the shared preview cache to reuse forever.
+    _stream_to_source(play, workdir, headers)
     author = data.get("author") or {}
     return {
         "title": data.get("title"),
@@ -396,18 +532,14 @@ def _embed_candidates(html):
 def _stream_to_source(play, workdir, headers):
     """Stream a direct file URL to <workdir>/source.mp4 via a
     .part file + rename — the same discipline as the tikwm route,
-    so a truncated file can never pose as a finished download."""
-    import requests
+    so a truncated file can never pose as a finished download.
+    Build 202 (audit V04): the streaming itself is the guarded
+    _stream_url_to_file — the URL is egress-validated before
+    connecting and at every redirect hop, under the byte cap."""
     out = workdir / "source.mp4"
     tmp = workdir / "source.mp4.part"
-    with requests.get(play, headers=headers, timeout=180,
-                      stream=True) as resp:
-        resp.raise_for_status()
-        with open(tmp, "wb") as f:
-            for chunk in resp.iter_content(1 << 20):
-                if chunk:
-                    f.write(chunk)
-    if tmp.stat().st_size < 10_000:
+    size = _stream_url_to_file(play, tmp, headers)
+    if size < 10_000:
         tmp.unlink(missing_ok=True)
         raise RuntimeError("download came back empty/truncated")
     tmp.replace(out)
@@ -542,11 +674,17 @@ def _tiktok_page_fallback(url: str, workdir: Path,
     last_exc = None
     for imp in ("chrome", "safari"):
         try:
-            r = creq.get(url, impersonate=imp, headers=headers,
-                         timeout=20)
+            # Build 202 (audit V04): the page fetch walks its
+            # redirects by hand through the egress guard, so the
+            # landed address is validated hop by hop — and every
+            # candidate extracted below is streamed through the
+            # guarded _stream_to_source.
+            def _once(u, _imp=imp):
+                return creq.get(u, impersonate=_imp, headers=headers,
+                                timeout=20, allow_redirects=False)
+            r, landed = _fetch_follow(_once, url)
             r.raise_for_status()
             html = r.text or ""
-            landed = r.url or None
             break
         except Exception as e:
             last_exc = e
@@ -604,8 +742,16 @@ def _tiktok_embed_fallback(url: str, workdir: Path,
     r = requests.get(f"https://www.tiktok.com/embed/v2/{m.group(1)}",
                      headers=headers, timeout=15)
     r.raise_for_status()
+    # Build 202 (audit V04): this fetch auto-follows redirects —
+    # refuse a landing on a non-public address, and drop every
+    # extracted candidate that is not public BEFORE the
+    # quality selection picks one to stream.
+    landed = getattr(r, "url", None)
+    if landed and not egress_url_ok(landed):
+        raise RuntimeError("embed page redirected to a non-public URL")
     html = r.text or ""
-    cands = _embed_candidates(html)
+    cands = [(u, b) for u, b in _embed_candidates(html)
+             if egress_url_ok(u)]
     if not cands:
         raise RuntimeError("embed page carried no playable video URL")
     if quality == "hd":
@@ -643,6 +789,12 @@ def _xhs_candidates(url: str):
     xsec_token the site now demands for web viewing. Follow hops by
     hand with an impersonated client and collect every item URL,
     rewritten onto the canonical xiaohongshu.com host."""
+    # Build 202 (audit V04): the share URL and EVERY hop's
+    # Location are egress-validated before being followed — a
+    # hop into a private address ends the walk and is never
+    # collected as a candidate.
+    if not egress_url_ok(url):
+        return []
     seen = [url]
     try:
         from curl_cffi import requests as creq
@@ -653,7 +805,10 @@ def _xhs_candidates(url: str):
             loc = r.headers.get("Location") or r.headers.get("location")
             if r.status_code not in (301, 302, 303, 307, 308) or not loc:
                 break
-            cur = urljoin(cur, loc)
+            nxt = urljoin(cur, loc)
+            if not egress_url_ok(nxt):
+                break
+            cur = nxt
             seen.append(cur)
             if "login" in cur:
                 break
@@ -730,9 +885,18 @@ def _xhs_fallback(url: str, workdir: Path, quality: str = "hd") -> dict:
     # page-state parse: the note page embeds the video URL directly
     try:
         from curl_cffi import requests as creq
-        resp = creq.get(cands[0], impersonate="chrome", timeout=30,
-                        headers={"Referer": "https://www.xiaohongshu.com/"})
-        video_urls = _xhs_page_video_urls(resp.text or "")
+
+        # Build 202 (audit V04): the note page is fetched through
+        # the guarded redirect walk, and every regex-harvested
+        # .mp4 candidate must be public before it is streamed.
+        def _once(u):
+            return creq.get(u, impersonate="chrome", timeout=30,
+                            headers={"Referer":
+                                     "https://www.xiaohongshu.com/"},
+                            allow_redirects=False)
+        resp, _landed = _fetch_follow(_once, cands[0])
+        video_urls = [u for u in _xhs_page_video_urls(resp.text or "")
+                      if egress_url_ok(u)]
     except Exception as e:
         video_urls = []
         last_err = e
@@ -740,14 +904,8 @@ def _xhs_fallback(url: str, workdir: Path, quality: str = "hd") -> dict:
     tmp = workdir / "source.mp4.part"
     for vu in video_urls:
         try:
-            with requests.get(vu, headers=headers, timeout=180,
-                              stream=True) as resp:
-                resp.raise_for_status()
-                with open(tmp, "wb") as f:
-                    for chunk in resp.iter_content(1 << 20):
-                        if chunk:
-                            f.write(chunk)
-            if tmp.exists() and tmp.stat().st_size > 100_000:
+            size = _stream_url_to_file(vu, tmp, headers)
+            if size > 100_000:
                 tmp.replace(out)
                 return {"title": None, "duration": None,
                         "webpage_url": cands[0], "uploader": None}
@@ -835,6 +993,13 @@ def download(url: str, workdir: Path, quality: str = "hd") -> Path:
         # sites fingerprint plain datacenter clients and answer with an
         # error page ("Unexpected response from webpage request");
         # impersonating a real browser's TLS/headers usually gets through.
+        # Build 202 (audit V04) residual: yt-dlp performs its own
+        # fetches (page, fragments, the caption fetch below) and
+        # offers no per-connection destination pinning from Python,
+        # so this ladder — reached only after the guarded routes
+        # above — is NOT egress-validated hop by hop. Closing that
+        # needs a validating egress proxy in front of the worker;
+        # recorded as a documented residual in proof202 NOTES.
         for target in (None, "chrome", "safari"):
             attempt_opts = dict(opts)
             if target is not None:
