@@ -49,7 +49,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 196"
+BUILD_TAG = "build 197"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -2625,7 +2625,11 @@ def _run_translate_probe():
                 res["gemini_ok"] = False
         except Exception as e:
             res["gemini_ok"] = False
-            res["gemini_err"] = str(e)[:500]
+            # Build 197: the Gemini walk records a body snippet
+            # per attempt; 500 chars cut off before the later
+            # models, so the cap is raised modestly to keep the
+            # discriminating attempts visible.
+            res["gemini_err"] = str(e)[:1200]
         if not res.get("gemini_ok"):
             # Build 164: when generateContent 404s everywhere, ask
             # the project what it CAN see — the model catalogue is

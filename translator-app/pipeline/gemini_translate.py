@@ -12,7 +12,9 @@ numbers intact and translating idioms by meaning. The response is strictly
 validated (same id set, non-empty strings); ANY failure raises, and the
 caller falls back to the free Google->Bing->source chain.
 
-Model: env GEMINI_MODEL, default "gemini-2.0-flash" (free tier).
+Model order: see _models() — the configured model and the static
+Flash primary first, then preferred names from the key's LIVE
+catalogue, retired names last (build 197).
 
 CLI test (mocked in verification; live needs a real key + network):
   python -m pipeline.gemini_translate   # prints whether a key is configured
@@ -161,18 +163,60 @@ def list_models():
     return [], last
 
 
+# Build 197: the static list alone kept missing the key's real
+# catalogue (the live probe returned a full ListModels while every
+# generateContent 404'd). The walk now merges in the names the key
+# can actually see, in this preference order, after the primaries.
+_CATALOGUE_PREFS = ("gemini-flash-latest", "gemini-2.5-flash",
+                    "gemini-3.5-flash", "gemini-2.5-flash-lite")
+# Retired for new keys (a key created in late 2026 may never have
+# had them — the live probe on 2026-11-09 showed gemini_ok=false
+# with the single-model client); kept only as last resorts.
+_RETIRED_MODELS = ("gemini-2.0-flash", "gemini-1.5-flash")
+# A fully-failing walk tries every model x version x auth shape,
+# so the model count is capped to keep that walk bounded.
+_MAX_MODELS = 6
+_CATALOGUE_TTL = 600.0  # 10 min: jobs don't pay a listing per job
+_catalogue_cache = {"ts": 0.0, "names": None}  # None = never fetched
+
+
+def _catalogue_names():
+    """The key's live model catalogue (generateContent-capable
+    only — list_models already filters), cached briefly at module
+    level. A failed listing caches as empty for the same TTL and
+    the caller falls back to the static order silently."""
+    now = time.time()
+    if _catalogue_cache["names"] is not None and \
+            now - _catalogue_cache["ts"] < _CATALOGUE_TTL:
+        return _catalogue_cache["names"]
+    try:
+        names, err = list_models()
+    except Exception:
+        names, err = [], "raise"
+    if err:
+        names = []
+    _catalogue_cache.update(ts=now, names=list(names))
+    return _catalogue_cache["names"]
+
+
 def _models():
-    """Model fallback order: the configured model first, then the
-    current Flash names. (A key created in late 2026 may not accept
-    gemini-2.0-flash at all — the live probe on 2026-11-09 showed
-    gemini_ok=false with the single-model client.)"""
+    """Model fallback order (build 197): the configured model and
+    the static Flash primary first; then the preferred names the
+    key's LIVE catalogue actually lists; the retired names last,
+    as last resorts. Deduped, capped at _MAX_MODELS."""
     env = (os.environ.get("GEMINI_MODEL") or "").strip()
     out = []
-    for m in [env, "gemini-2.5-flash", "gemini-2.0-flash",
-              "gemini-1.5-flash"]:
+    for m in [env, "gemini-2.5-flash"]:
         if m and m not in out:
             out.append(m)
-    return out
+    catalogue = set(_catalogue_names())
+    for m in _CATALOGUE_PREFS:
+        if m in catalogue and m not in out:
+            out.append(m)
+    for m in _RETIRED_MODELS:
+        if m not in out:
+            out.append(m)
+    return out[:_MAX_MODELS]
 
 
 def _note_error(msg):
@@ -252,12 +296,22 @@ def translate_all(segments, style="subs"):
     }
     result = None
     attempts = []
-    last_body = ""
+
+    def _clean(text):
+        # Diagnostic snippets must never carry the key: an error
+        # body shouldn't contain it, but a network exception for a
+        # query-auth attempt can embed the full ?key= URL.
+        s = str(text or "")
+        if key:
+            s = s.replace(key, "***")
+        return s
+
     for mdl in _models():
         badfmt = False
         for ver in ("v1beta", "v1"):
             url = _API_TMPL.format(ver=ver, model=mdl)
             for use_query in (False, True):
+                auth = "query" if use_query else "header"
                 try:
                     resp = requests.post(
                         url + (f"?key={key}" if use_query else ""),
@@ -268,7 +322,8 @@ def translate_all(segments, style="subs"):
                                      "Content-Type":
                                          "application/json"}))
                 except Exception as e:  # network-level: next shape
-                    attempts.append(f"{mdl}@{ver}=net:{e}"[:60])
+                    attempts.append(
+                        f"{mdl}@{ver}[{auth}]=net: {_clean(e)[:120]}")
                     continue
                 if resp.status_code == 200:
                     # Build 163: validate NOW, inside the walk —
@@ -282,24 +337,30 @@ def translate_all(segments, style="subs"):
                             text_out, segments, "Gemini")
                     except Exception as e:
                         attempts.append(
-                            f"{mdl}@{ver}=badformat:{e}"[:70])
+                            f"{mdl}@{ver}[{auth}]=badformat: "
+                            f"{_clean(e)[:120]}")
                         badfmt = True
                     break
-                # NOTE: body may hold an error message, never the key.
-                attempts.append(f"{mdl}@{ver}={resp.status_code}")
-                last_body = resp.text[:200]
-                if resp.status_code in (400, 404):
-                    break  # model/version problem — move on
-                if resp.status_code in (401, 403) and not use_query:
-                    continue  # try query-param auth once
-                break
+                # Build 197: record EVERY attempt with its own
+                # body snippet — the FIRST attempt's body (e.g.
+                # gemini-2.5-flash@v1beta) is the discriminating
+                # one, and the old code kept only the last. And
+                # NEVER short-circuit the auth loop on an HTTP
+                # error (the old code broke out on 400/404): a
+                # model/version whose header attempt 404s may
+                # still answer to query-param auth, so both
+                # shapes are tried before moving on. (401/403 on
+                # the header shape already fell through to query
+                # auth; that is now simply the general rule.)
+                attempts.append(
+                    f"{mdl}@{ver}[{auth}]={resp.status_code}: "
+                    f"{_clean(resp.text)[:120]}")
             if result is not None or badfmt:
                 break
         if result is not None:
             break
     if result is None:
-        msg = ("Gemini failed: " + "; ".join(attempts)
-               + f" | last: {last_body}")
+        msg = "Gemini failed: " + "; ".join(attempts)
         _note_error(msg)
         raise RuntimeError(msg)
     return result
