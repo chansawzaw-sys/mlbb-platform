@@ -35,6 +35,8 @@ from pipeline import elevenlabs_tts
 from pipeline import envfile
 from pipeline import fx as fx_mod
 from pipeline import recap as recap_mod
+from pipeline import story as story_mod
+from pipeline import story_render
 from pipeline import run_job, tts
 from pipeline.common import (encode_threads, job_context, probe_duration,
                              run as sh, set_active_jobs_provider,
@@ -54,7 +56,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 215"
+BUILD_TAG = "build 216"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -62,6 +64,7 @@ STEP_LABELS = {
     "transcribe": "စကားသံကို စာသားထုတ်",
     "translate": "မြန်မာ ဘာသာပြန်",
     "script": "Recap စာသား ရေးရန်",
+    "render": "Cartoon ဗီဒီယို ဖန်တီး",
     "tts": "မြန်မာ အသံထုတ်",
     "retime": "အချိန်ကိုက် ညှိ (လိုရင် ဖရိမ်ရပ်)",
     "finalize": "စာတန်းထိုး (ရုပ်ရှင်ပုံစံ) + Logo/Blur + ဗီဒီယို ပေါင်းစပ်",
@@ -1885,7 +1888,9 @@ def _job_dispatcher():
                     _TG_PENDING.remove(jid)
                 target = {"rerun": _worker2,
                           "recap1": _recap_worker,
-                          "recap2": _recap_worker2}.get(kind, _worker)
+                          "recap2": _recap_worker2,
+                          "story1": _story_worker,
+                          "story2": _story_worker2}.get(kind, _worker)
                 wt = threading.Thread(target=target, args=(job,),
                                       daemon=True)
                 # Build 204 (audit V09): registered BEFORE start
@@ -4883,7 +4888,7 @@ def _job_view(job):
              "created_at", "updated_at", "finished_at", "cleanup_at",
              # Build 210: studio (Text-to-Voice) jobs share this
              # listing — the UI labels them from these fields.
-             "type", "voice_label", "duration")}
+             "type", "voice_label", "duration", "story_topic")}
     # Build 213: per-stage timings ride the view (owner/admin
     # only ever see them — _owns gates every caller).
     view["timings"] = _timings_of(job)
@@ -5759,6 +5764,319 @@ def render_recap(jid):
     _save(job)
     _enqueue_job(job, kind="recap2")
     return jsonify({"ok": True})
+
+
+
+# ---------- Story Video product (build 216) ----------
+# Topic (or a pasted story) -> an AI Burmese narration script
+# + a shot plan over the renderer's FIXED cartoon asset
+# vocabulary -> the script parks at "waiting_script" for the
+# customer's review/edit (zero charged) -> render: the script
+# is narrated by the chosen voice and pipeline.story_render
+# draws the cartoon (code-drawn flat 2D cast over painted
+# sets, slow zoompan, cinematic subtitles) into a vertical
+# MP4. Two phases mirroring Recap exactly (worker kinds
+# "story1" / "story2"); the record is a normal job (type
+# "story"), so the jobs listing, download/stream routes and
+# the single 24h retention rule serve it unchanged.
+# Charge-on-success only, like every product: the quote is
+# the TARGET length's started minutes x the voice's rate
+# (checked at phase 1 and again before the render), and
+# _finish charges the FINISHED video's started minutes x
+# the rate — _charge_for_job is the single charge point.
+
+STORY_STEPS = ["script", "tts", "render"]
+STORY_TEXT_CAP = 20000       # chars, pasted story / final edit
+STORY_TOPIC_CAP = 300        # chars, for the topic line
+STORY_MINUTES = (1, 2, 3)    # offered target lengths
+_STORY_RENDER_SEM = threading.Semaphore(1)
+
+
+def _story_steps():
+    return [{"key": "script", "label": "Story စာသား ရေးရန်",
+             "state": "pending"},
+            {"key": "tts", "label": STEP_LABELS["tts"],
+             "state": "pending"},
+            {"key": "render", "label": STEP_LABELS["render"],
+             "state": "pending"}]
+
+
+def _story_view(job):
+    view = {k: job.get(k) for k in
+            ("id", "type", "status", "current", "error",
+             "voice", "voice_label", "quote_minutes",
+             "quote_credits", "charged_minutes", "story_edited",
+             "story_topic", "story_minutes", "story_music",
+             "created_at", "finished_at")}
+    view["timings"] = _timings_of(job)  # build 213
+    view["steps"] = job.get("steps") or []
+    if job.get("story_text") is not None:
+        view["story_text"] = job["story_text"]
+    if job.get("status") == "queued":
+        waiting = [q for q, _k in _JOB_QUEUE]
+        if job["id"] in waiting:
+            view["queue_pos"] = waiting.index(job["id"]) + 1
+    return view
+
+
+def _quote_for_story(job):
+    """Admission quote for a story job — _quote_for_job's
+    contract with the TARGET length standing in for the
+    source duration (a story job has no source video): a
+    non-admin account must cover the target's started
+    minutes x the voice's per-minute rate (1 standard; the
+    premium rate for ElevenLabs voices). Nothing is
+    deducted here — credits move only in _finish."""
+    uid = job.get("user_id")
+    if not uid:
+        return
+    user = accounts.get_user(uid)
+    if not user or user["role"] == "admin":
+        return
+    minutes = int(job.get("story_minutes") or 1)
+    job["quote_minutes"] = minutes
+    needed = minutes * _credits_per_min_for(job)
+    job["quote_credits"] = needed
+    _save(job)
+    if (user["credits"] or 0) < needed:
+        raise RuntimeError(
+            f"credit မလောက်ပါ — ဒီ video အတွက် {needed} credits "
+            f"လိုပါတယ်, လက်ကျန် {user['credits']} credits ပဲ "
+            "ရှိပါတယ်")
+
+
+def _story_worker(job):
+    """Phase 1: quote -> script + shot plan -> park at
+    waiting_script; nothing is charged. A pasted story skips
+    script generation (the words are the customer's own) —
+    only its shot plan is AI work, with a built-in fallback
+    plan when every gateway is down."""
+    threading.Thread(target=_heartbeat, args=(job,),
+                     daemon=True).start()
+    with job_context(job["id"]):
+        try:
+            job["status"] = "running"
+            _timing_start(job)  # build 213
+            _save(job)
+            _quote_for_story(job)
+            progress = _progress_fn(job)
+            progress("script", "running")
+            if job.get("story_text"):
+                shots, provider = story_mod.plan_for_text(
+                    job["story_text"])
+            else:
+                target = int(job.get("story_minutes") or 1) \
+                    * story_mod.CHARS_PER_MIN
+                script, shots, provider = \
+                    story_mod.generate_story(
+                        job.get("story_topic") or "", target)
+                job["story_text"] = script
+            job["story_shots"] = shots
+            job["story_provider"] = provider
+            progress("script", "done")
+            job["story_edited"] = False
+            job["status"] = "waiting_script"
+            job["current"] = None
+            # The human review park is not machine time
+            # (build 213, same as recap).
+            _timing_close(job)
+            _save(job)
+            try:
+                from pipeline import api_stats
+                api_stats.record(
+                    [{"text": "story", "provider": provider}])
+            except Exception:
+                pass
+        except JobCancelled:
+            _cancelled(job)
+        except Exception as e:
+            if job.get("cancel_requested"):
+                _cancelled(job)
+            else:
+                _fail(job, e)
+
+
+def _story_worker2(job):
+    """Phase 2: narrate + render the cartoon, then settle
+    the charge on the FINISHED video's started minutes and
+    _finish (the only place a story job is ever charged).
+    The story-render semaphore (1) keeps a render from
+    starving dub/recap jobs of CPU on the shared box."""
+    workdir = JOBS_DIR / job["id"]
+    threading.Thread(target=_heartbeat, args=(job,),
+                     daemon=True).start()
+    with job_context(job["id"]):
+        try:
+            job["status"] = "running"
+            _timing_start(job)  # build 213
+            _save(job)
+            with _STORY_RENDER_SEM:
+                story_render.render_story(
+                    workdir, job, progress=_progress_fn(job))
+            out = workdir / "output.mp4"
+            minutes = max(1, math.ceil(
+                probe_duration(out) / 60.0))
+            job["quote_minutes"] = minutes
+            job["quote_credits"] = minutes \
+                * _credits_per_min_for(job)
+            _finish(job)
+        except JobCancelled:
+            _cancelled(job)
+        except Exception as e:
+            if job.get("cancel_requested"):
+                _cancelled(job)
+            else:
+                _fail(job, e)
+
+
+@app.post("/api/story")
+def create_story():
+    user = _current_user()
+    data = request.get_json(force=True, silent=True) or {}
+    topic = (data.get("topic") or "").strip()
+    text = (data.get("text") or "").strip()
+    if text:
+        if len(text) > STORY_TEXT_CAP:
+            return jsonify({"error":
+                            f"စာသား အရှည်ဆုံး {STORY_TEXT_CAP} "
+                            "လုံး ပဲ ရပါတယ် — လျှော့ပြီး "
+                            "ပြန်စမ်းပါ"}), 400
+        topic = topic[:STORY_TOPIC_CAP]
+    elif topic:
+        if len(topic) > STORY_TOPIC_CAP:
+            return jsonify({"error":
+                            f"ခေါင်းစဉ် အရှည်ဆုံး "
+                            f"{STORY_TOPIC_CAP} လုံး ပဲ ရပါတယ်"}), \
+                400
+    else:
+        return jsonify({"error": "ခေါင်းစဉ် အရင် ထည့်ပါ"}), 400
+    try:
+        minutes = int(data.get("minutes") or 1)
+    except (TypeError, ValueError):
+        minutes = 1
+    if minutes not in STORY_MINUTES:
+        minutes = 1
+    # Voice resolution mirrors create_recap / _new_job exactly
+    # (builds 200 / 205 / 206 / 212): an ElevenLabs pick must
+    # resolve for the caller through _resolve_el_entry —
+    # registry voices gated, the caller's own clone on
+    # ownership; a style key resolves through the shared
+    # table; anything else fails safe to the product default.
+    voice_in = data.get("voice")
+    el_entry = None
+    if voice_in and elevenlabs_tts.is_el_voice(str(voice_in).strip()):
+        el_entry, el_blocked = _resolve_el_entry(
+            user, elevenlabs_tts.voice_id_of(str(voice_in).strip()))
+        if el_entry is None:
+            return jsonify({"error":
+                            "ရွေးထားတဲ့ ElevenLabs အသံ မရှိတော့ပါ — "
+                            "အသံ ပြန်ရွေးပေးပါ"}), 400
+        if el_blocked:
+            return jsonify({"error":
+                            "ဒီ Premium အသံ က အခု စမ်းသပ်ဆဲ "
+                            "ဖြစ်လို့ သတ်မှတ်ထားတဲ့ account တွေ ပဲ "
+                            "သုံးလို့ရပါသေးတယ် — မကြာခင် အားလုံး "
+                            "အတွက် ဖွင့်ပေးပါမယ်"}), 403
+        voice = "el:" + el_entry["id"]
+        voice_style = voice
+        voice_label = el_entry["name"]
+        voice_rate, voice_pitch = 0, 0
+    else:
+        style = tts.resolve_style(voice_in)
+        voice = style["voice"]
+        voice_style = style["key"]
+        voice_label = style["label"]
+        voice_rate, voice_pitch = style["rate"], style["pitch"]
+    now = time.time()
+    job = {"id": uuid.uuid4().hex[:12], "type": "story",
+           "url": "", "mode": "story",
+           "story_topic": topic, "story_minutes": minutes,
+           "story_music": bool(data.get("music")),
+           "story_text": text or None,
+           "voice": voice, "voice_style": voice_style,
+           "voice_label": voice_label,
+           "voice_rate": voice_rate, "voice_pitch": voice_pitch,
+           "font": "noto", "subs": _build_subs(data),
+           "status": "queued", "current": None, "error": None,
+           "created_at": now, "updated_at": now,
+           "finished_at": None,
+           "steps": _story_steps()}
+    if el_entry is not None:
+        job["tts_engine"] = "elevenlabs"
+        job["voice_name"] = el_entry["name"]
+    if user:
+        # Same admission gates as a recap job, in the same
+        # order — both refuse before the job exists.
+        setup_msg = _setup_gate_message(user)
+        if setup_msg:
+            return jsonify({"error": setup_msg}), 400
+        job["user_id"] = user["id"]
+        accounts.mark_has_job(user["id"])
+        limit_msg = _daily_limit_message(user)
+        if limit_msg:
+            return jsonify({"error": limit_msg}), 400
+    JOBS[job["id"]] = job
+    _save(job)
+    _enqueue_job(job, kind="story1")
+    return jsonify(_story_view(job))
+
+
+@app.get("/api/story/<jid>")
+def get_story(jid):
+    job = _load_job(jid)
+    if not job or job.get("type") != "story" \
+            or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    return jsonify(_story_view(job))
+
+
+@app.post("/api/story/<jid>/render")
+def render_story(jid):
+    """Submit the final story text (edited or untouched) and
+    queue the render. Only a job parked at waiting_script can
+    be rendered; the balance is re-checked against the
+    target-length estimate here, and the charge still lands
+    only on a finished video (at its own started minutes)."""
+    job = _load_job(jid)
+    if not job or job.get("type") != "story" \
+            or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    if job["status"] != "waiting_script":
+        return jsonify({"error":
+                        "ဒီ job က စာသား အတည်ပြုရန် အဆင့် "
+                        "မဟုတ်ပါ"}), 409
+    data = request.get_json(force=True, silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "Story စာသား အရင် ထည့်ပါ"}), 400
+    if len(text) > STORY_TEXT_CAP:
+        return jsonify({"error":
+                        f"စာသား အရှည်ဆုံး {STORY_TEXT_CAP} လုံး "
+                        "ပဲ ရပါတယ် — လျှော့ပြီး ပြန်စမ်းပါ"}), 400
+    uid = job.get("user_id")
+    if uid:
+        acct = accounts.get_user(uid)
+        if acct and acct["role"] != "admin":
+            needed = int(job.get("story_minutes") or 1) \
+                * _credits_per_min_for(job)
+            if (acct["credits"] or 0) < needed:
+                return jsonify({"error":
+                                f"credit မလောက်ပါ — ဒီ video "
+                                f"အတွက် {needed} credits လိုပါတယ်, "
+                                f"လက်ကျန် {acct['credits']} credits "
+                                "ပဲ ရှိပါတယ်"}), 400
+    if text != (job.get("story_text") or ""):
+        job["story_edited"] = True
+    job["story_text"] = text
+    old_timer = CLEANUP_TIMERS.pop(jid, None)
+    if old_timer:
+        old_timer.cancel()
+    job.pop("cleanup_at", None)
+    job["status"] = "queued"
+    _save(job)
+    _enqueue_job(job, kind="story2")
+    return jsonify({"ok": True})
+
 
 
 # ---------- text-only export + bulk text input ----------

@@ -331,6 +331,13 @@ for b64 in "$APP_DIR"/static/*.b64; do
   base64 -d "$b64" > "${b64%.b64}"
   echo "Decoded asset: ${b64%.b64}"
 done
+# Build 216: the Story Video cartoon library (backgrounds +
+# characters) travels the same way, one level down.
+for b64 in "$APP_DIR"/assets/story/bg/*.b64 "$APP_DIR"/assets/story/chars/*.b64; do
+  [ -e "$b64" ] || continue
+  base64 -d "$b64" > "${b64%.b64}"
+  echo "Decoded asset: ${b64%.b64}"
+done
 
 # --- 9. ownership ----------------------------------------------------------------------
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
