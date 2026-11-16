@@ -54,7 +54,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 213"
+BUILD_TAG = "build 214"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -2329,20 +2329,48 @@ def _ensure_std_preview(style_key):
     return path if path.exists() else None
 
 
+_EL_PREVIEW_LOCK = threading.Lock()
+
+
+def _ensure_el_preview(voice_id):
+    """Lazily synthesize a REGISTRY voice's preview clip ONCE
+    (build 214) — the bulk import stores entries without
+    generating previews, so the first request for the clip
+    makes it, exactly like the built-in std- clips. Only ids
+    in the registry ever generate (an unknown id is a plain
+    404 and never costs an API call). Returns the path, or
+    None when generation failed (no key / API error) — the
+    caller then serves the same plain 404 as a missing clip,
+    and a later request may retry."""
+    path = elevenlabs_tts.preview_path_el(voice_id)
+    if path.exists():
+        return path
+    if not elevenlabs_tts.find_voice(voice_id):
+        return None
+    with _EL_PREVIEW_LOCK:
+        if path.exists():
+            return path
+        elevenlabs_tts.generate_preview(voice_id)
+    return path if path.exists() else None
+
+
 @app.get("/voice-previews/<name>")
 def voice_preview_file(name):
     """Serve a voice-library preview clip (build 207). Strict
     filename shape — el-<voice id>.mp3 / std-<style key>.mp3 /
     usr-<voice id>.mp3 (build 212 user clones) only, no
     traversal. Built-in clips generate lazily on first
-    request; ElevenLabs clips exist only if one was generated,
-    so a missing file is a plain 404."""
+    request; registry el- clips do too since build 214 (the
+    bulk import never generates); usr- clips exist only if
+    one was generated, so a missing file is a plain 404."""
     if not re.fullmatch(r"(?:el|std|usr)-[A-Za-z0-9_-]{1,64}\.mp3",
                         name or ""):
         return jsonify({"error": "မရှိပါ"}), 404
     path = elevenlabs_tts.PREVIEW_DIR / name
     if not path.exists() and name.startswith("std-"):
         _ensure_std_preview(name[4:-4])
+    elif not path.exists() and name.startswith("el-"):
+        _ensure_el_preview(name[3:-4])
     if not path.exists():
         return jsonify({"error": "မရှိပါ"}), 404
     return send_file(path, mimetype="audio/mpeg")
@@ -3116,30 +3144,48 @@ def elevenlabs_save():
                     "test_users": elevenlabs_tts.get_test_users()})
 
 
-@app.post("/api/settings/elevenlabs-voices")
-def elevenlabs_voice_add():
-    data = request.get_json(force=True) or {}
-    vid = (data.get("id") or "").strip()
-    name = (data.get("name") or "").strip()
-    tag = (data.get("tag") or "").strip()
-    desc = (data.get("desc") or "").strip()
+def _el_validate_entry(data):
+    """Validate one registry entry (build 214: shared by the
+    single-add route and the bulk import so both apply EXACTLY
+    the same rules). Returns (entry, None) or (None, error) —
+    the entry stores tag/desc only when non-empty, so a plain
+    {id, name} keeps the build-205 shape exactly."""
+    if not isinstance(data, dict):
+        return None, "entry ပုံစံ မမှန်ပါ (object ဖြစ်ရပါမယ်)"
+    vid = data.get("id")
+    vid = vid.strip() if isinstance(vid, str) else ""
+    name = data.get("name")
+    name = name.strip() if isinstance(name, str) else ""
+    tag = data.get("tag")
+    tag = tag.strip() if isinstance(tag, str) else ""
+    desc = data.get("desc")
+    desc = desc.strip() if isinstance(desc, str) else ""
     if not vid or len(vid) > 64 \
             or not all(ch.isalnum() or ch in "_-" for ch in vid):
-        return jsonify({"error": "Voice ID မမှန်ပါ"}), 400
+        return None, "Voice ID မမှန်ပါ"
     if not name or len(name) > 60:
-        return jsonify({"error": "အသံ နာမည် ထည့်ပါ (အများဆုံး 60 လုံး)"}), 400
+        return None, "အသံ နာမည် ထည့်ပါ (အများဆုံး 60 လုံး)"
     if len(tag) > 40:
-        return jsonify({"error": "ပုံစံ (tag) ရှည်လွန်းပါတယ် — အများဆုံး 40 လုံး"}), 400
+        return None, "ပုံစံ (tag) ရှည်လွန်းပါတယ် — အများဆုံး 40 လုံး"
     if len(desc) > 160:
-        return jsonify({"error": "ရှင်းလင်းချက် ရှည်လွန်းပါတယ် — အများဆုံး 160 လုံး"}), 400
-    # Build 207: re-adding an id replaces the WHOLE entry (the
-    # edit path) — tag/desc are stored only when non-empty, so a
-    # plain {id, name} save keeps the build-205 shape exactly.
+        return None, "ရှင်းလင်းချက် ရှည်လွန်းပါတယ် — အများဆုံး 160 လုံး"
     entry = {"id": vid, "name": name}
     if tag:
         entry["tag"] = tag
     if desc:
         entry["desc"] = desc
+    return entry, None
+
+
+@app.post("/api/settings/elevenlabs-voices")
+def elevenlabs_voice_add():
+    data = request.get_json(force=True) or {}
+    entry, err = _el_validate_entry(data)
+    if err:
+        return jsonify({"error": err}), 400
+    vid = entry["id"]
+    # Build 207: re-adding an id replaces the WHOLE entry (the
+    # edit path).
     voices = [v for v in elevenlabs_tts.get_voices()
               if v["id"] != vid]
     voices.append(entry)
@@ -3155,6 +3201,56 @@ def elevenlabs_voice_add():
                         "ထုတ်လို့ မရသေးပါ။ API key စစ်ပြီး «preview "
                         "ထုတ်ရန်» ခလုတ်နဲ့ ပြန်စမ်းနိုင်ပါတယ်")
     return jsonify(resp)
+
+
+EL_REGISTRY_CAP = 200
+
+
+@app.post("/api/settings/elevenlabs-voices-bulk")
+def elevenlabs_voices_bulk():
+    """Bulk-import registry voices (build 214): the owner
+    pastes a JSON array of {id, name, tag?, desc?} entries —
+    e.g. a whole sampled voice library — and every valid entry
+    is merged by id (existing id replaced, new id appended).
+    Invalid entries are skipped and reported per index; the
+    registry is capped at EL_REGISTRY_CAP entries. NO preview
+    is generated here: previews for imported voices generate
+    lazily on first request (see the /voice-previews route),
+    so importing 58 voices costs zero ElevenLabs calls. The
+    API key is never part of the request or the response."""
+    data = request.get_json(force=True, silent=True)
+    if isinstance(data, dict) and isinstance(
+            data.get("voices"), list):
+        data = data["voices"]
+    if not isinstance(data, list):
+        return jsonify({"error": "JSON array ဖြစ်ရပါမယ် — "
+                                 "[{\"id\": \"…\", \"name\": \"…\"}, …]"}), 400
+    voices = elevenlabs_tts.get_voices()
+    by_id = {v["id"]: i for i, v in enumerate(voices)}
+    imported = 0
+    skipped = []
+    for i, raw in enumerate(data):
+        entry, err = _el_validate_entry(raw)
+        if err:
+            skipped.append({"index": i, "reason": err})
+            continue
+        vid = entry["id"]
+        if vid in by_id:
+            voices[by_id[vid]] = entry
+        elif len(voices) >= EL_REGISTRY_CAP:
+            skipped.append({"index": i,
+                            "reason": "အသံ စာရင်း ပြည့်နေပါပြီ "
+                                      f"(အများဆုံး {EL_REGISTRY_CAP} ခု)"})
+            continue
+        else:
+            by_id[vid] = len(voices)
+            voices.append(entry)
+        imported += 1
+    if imported:
+        _env_write("ELEVENLABS_VOICES",
+                   json.dumps(voices, ensure_ascii=False))
+    return jsonify({"ok": True, "imported": imported,
+                    "skipped": skipped, "voices": voices})
 
 
 @app.post("/api/settings/elevenlabs-voices/preview")

@@ -461,6 +461,12 @@
       <button class="ghost" id="elVoiceAdd">အသံ ထည့်မယ်</button>
     </div>
     <p class="hint">အသံ ထည့်ရင် preview အသံနမူနာ အလိုအလျောက် ထုတ်ပေးမယ် — မရရင် အသံ စာရင်းထဲက «preview ထုတ်ရန်» နဲ့ ပြန်စမ်းနိုင်တယ်။ အသံ ပြင်ချင်ရင် နာမည်/ID အတူတူနဲ့ ပြန်ထည့်ပါ (အစားထိုး ပြင်ပေးမယ်)။</p>
+    <textarea id="elBulkInput" rows="5" placeholder='အသံ အများကြီး တစ်ခါတည်း ထည့်ရန် — JSON array ကို ဒီမှာ paste လုပ်ပါ: [{"id":"…","name":"…","tag":"…","desc":"…"}, …]' autocomplete="off" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box;margin-top:6px"></textarea>
+    <div class="row">
+      <button class="ghost" id="elBulkImport">📥 အများကြီး ထည့်ရန်</button>
+    </div>
+    <div id="elBulkResult" class="hint"></div>
+    <p class="hint">Bulk နဲ့ ထည့်တဲ့ အသံတွေရဲ့ preview ကို ချက်ချင်း မထုတ်ပါ — customer ပထမဆုံး ဖွင့်တဲ့ အချိန်မှာ အလိုအလျောက် ထုတ်ပေးမယ်။ ID တူတာ ပါလာရင် အဟောင်းကို အစားထိုး ပြင်ပေးမယ်၊ မမှန်တဲ့ entry တွေကို ကျော်ပြီး အကြောင်းရင်း ပြပေးမယ်။</p>
   </div>
 
   <div class="card" id="asCard">
@@ -2401,6 +2407,28 @@ $("elVoiceAdd").onclick = async () => {
   else alert("ထည့်ပြီးပြီ — preview အသံပါ ထုတ်ပြီးပါပြီ");
   loadElState();
 };
+$("elBulkImport").onclick = async () => {
+  const raw = $("elBulkInput").value.trim();
+  if (!raw) { alert("JSON အရင် paste လုပ်ပါ"); return; }
+  let arr;
+  try { arr = JSON.parse(raw); }
+  catch (e) { alert("JSON မမှန်ပါ — array ပုံစံ ဖြစ်ရပါမယ်"); return; }
+  if (!Array.isArray(arr)) { alert("JSON array ဖြစ်ရပါမယ်"); return; }
+  const res = await fetch("/api/settings/elevenlabs-voices-bulk",
+    {method: "POST", headers: {"Content-Type": "application/json"},
+     body: JSON.stringify(arr)});
+  const d = await res.json();
+  if (!res.ok) { alert(d.error || "ထည့်လို့ မရပါ"); return; }
+  let msg = `✅ ${d.imported} ခု ထည့်ပြီးပါပြီ`;
+  if (d.skipped && d.skipped.length) {
+    msg += `<br>⚠️ ${d.skipped.length} ခု ကျော်ခဲ့ပါတယ်:`
+      + d.skipped.map(s =>
+          `<br>• #${s.index + 1}: ${s.reason}`).join("");
+  }
+  $("elBulkResult").innerHTML = msg;
+  $("elBulkInput").value = "";
+  loadElState();
+};
 loadElState();
 
 /* ---------------- Apps Script settings ---------------- */
@@ -3297,6 +3325,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 213</p>
+<p class="hint" id="buildTag" style="text-align:center">build 214</p>
 </body>
 </html>
