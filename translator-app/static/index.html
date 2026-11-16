@@ -74,6 +74,8 @@
   .step.running { color: #7ea6ff; }
   .step.done { color: #7dd87d; }
   .step.error { color: #ff8080; }
+  .timingLine { font-size: 12px; color: #8a8894; padding: 2px 0 6px;
+    line-height: 1.7; word-break: break-word; }
   .err { color: #ff9a9a; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
   a.dl { display: block; text-align: center; margin-top: 12px; padding: 13px; border-radius: 10px;
     background: #2fbf71; color: #fff; font-weight: 700; text-decoration: none; }
@@ -335,6 +337,8 @@
         <button class="ghost" id="apiStatsBtn">🔄 ပြန်စစ်မယ်</button>
         <button class="ghost" id="apiResetBtn">🗑 အရေအတွက် 0 ပြန်စ</button>
       </div>
+      <h4 style="margin:10px 0 4px">⏱ အဆင့်လိုက် ကြာချိန် — ပျမ်းမျှ (နောက်ဆုံး ပြီးဆုံး job 50)</h4>
+      <div id="timingStats"><p class="hint">…</p></div>
     </div>
     <div class="row">
       <button class="ghost" id="setToggle">⚙️ Settings — key · QR · ငွေလက်ခံ</button>
@@ -757,6 +761,7 @@
         <audio id="ttsAudio" controls preload="metadata"></audio>
         <a class="dl" id="ttsDl" download>⬇️ အသံ ဒေါင်းလုပ် (.mp3)</a>
         <p class="hint" id="ttsCharged"></p>
+        <div id="ttsTiming"></div>
       </div>
     </div>
   </div><!-- /view-studio -->
@@ -812,6 +817,7 @@
         <video id="recapVideo" controls preload="metadata" style="width:100%;border-radius:10px"></video>
         <a class="dl" id="recapDl" download>⬇️ ဗီဒီယို ဒေါင်းလုပ် (.mp4)</a>
         <p class="hint" id="recapCharged"></p>
+        <div id="recapTiming"></div>
       </div>
     </div>
   </div><!-- /view-recap -->
@@ -1110,6 +1116,7 @@ window.ttsPlayHist = function (id) {
   $("ttsAudio").src = "/api/jobs/" + id + "/stream";
   $("ttsDl").href = "/api/jobs/" + id + "/download";
   $("ttsCharged").textContent = "";
+  $("ttsTiming").innerHTML = "";
   $("ttsAudio").play().catch(() => {});
 };
 $("ttsGo").onclick = async () => {
@@ -1131,6 +1138,7 @@ $("ttsGo").onclick = async () => {
       + " · " + mmss(d.duration || 0)
       + (d.charged ? " · " + d.charged + " credits ဖြတ်ပြီး"
                     : " · credit မဖြတ်ပါ");
+    $("ttsTiming").innerHTML = timingLineHtml(d);
     if ($("ttsHist").style.display !== "none") loadTtsHistory();
     loadMe();   // refresh the balance everywhere
   } catch (e) { $("ttsErr").textContent = e.message; }
@@ -1267,7 +1275,7 @@ $("recapVoiceChip").onclick = () => {
 function recapStepsHtml(job) {
   return (job.steps || []).map(s =>
     `<div class="step ${s.state}">${ICON[s.state] || "⏳"} ${s.label}</div>`
-  ).join("");
+  ).join("") + timingLineHtml(job);
 }
 function stopRecapPoll() {
   if (recapTimer) { clearInterval(recapTimer); recapTimer = null; }
@@ -1302,6 +1310,7 @@ async function pollRecap() {
       + (job.charged_minutes
           ? " · " + job.charged_minutes + " credits ဖြတ်ပြီး"
           : " · credit မဖြတ်ပါ");
+    $("recapTiming").innerHTML = timingLineHtml(job);
     $("recapResult").style.display = "";
     $("recapGo").disabled = false;
     loadMe(); loadJobs();
@@ -1883,6 +1892,30 @@ $("bulkGo").onclick = async () => {
 
 function mbOf(n) { return n ? (n / 1e6).toFixed(1) + " MB" : ""; }
 
+/* Build 213: per-stage timing line — the job record's timings
+   dict rendered compactly (finished stages only), so the
+   owner can see WHICH stage ate the time before deciding on
+   hardware. Long stages read as m:ss, short ones as seconds. */
+const TIMING_LABELS = [["download", "ဒေါင်းလုပ်"],
+  ["transcribe", "စာသားထုတ်"], ["translate", "ဘာသာပြန်"],
+  ["script", "Recap စာသား"], ["tts", "အသံထုတ်"],
+  ["render", "ဗီဒီယိုထုတ်"]];
+function fmtStageS(s) {
+  s = Number(s) || 0;
+  return s >= 60 ? mmss(s) : (Math.round(s * 10) / 10) + "s";
+}
+function timingLineHtml(job) {
+  const t = (job && job.timings) || {};
+  const parts = [];
+  for (const [k, label] of TIMING_LABELS)
+    if (t[k] != null) parts.push(label + " " + fmtStageS(t[k]));
+  if (!parts.length) return "";
+  let tail = "";
+  if (t.queue_s) tail += " · တန်းစီ " + fmtStageS(t.queue_s);
+  if (t.total_s != null) tail += " · စုစုပေါင်း " + fmtStageS(t.total_s);
+  return `<div class="timingLine">⏱ ${parts.join(" · ")}${tail}</div>`;
+}
+
 // Build 198: the compact copy is generated lazily on the first
 // download tap, so there is nothing to poll for after done —
 // doneKey only keeps the preview load + scroll one-shot.
@@ -1909,7 +1942,7 @@ async function poll(id) {
       job.status === "done" ? "done" : job.status === "error" ? "error" : "running"}">${
       job.status === "done" ? "✅ အသံ ရပြီ"
         : job.status === "error" ? "❌ အသံ ထုတ်တာ မရပါ"
-        : "🔄 အသံ ထုတ်နေဆဲ…"}</div>`;
+        : "🔄 အသံ ထုတ်နေဆဲ…"}</div>` + timingLineHtml(job);
     if (job.status === "done") {
       clearInterval(timer);
       $("go").disabled = false;
@@ -1938,7 +1971,8 @@ async function poll(id) {
         ` — အရင် job တွေ ပြီးတာနဲ့ အလိုအလျောက် စ လုပ်ပါမယ်၊ ဒီ page ကို ဖွင့်ထားရုံပါပဲ</div>`
       : "") +
     job.steps.map(s =>
-      `<div class="step ${s.state}">${ICON[s.state] || "⏳"} ${s.label}</div>`).join("");
+      `<div class="step ${s.state}">${ICON[s.state] || "⏳"} ${s.label}</div>`).join("")
+    + timingLineHtml(job);
   if (job.status === "waiting_review" && reviewShownFor !== id) loadReview(id);
   if (job.status === "done") {
     // Build 198: no post-done polling — the compact copy is made
@@ -2799,6 +2833,33 @@ async function loadApiStats() {
       "<p class='hint'>build 162 မှာ အရေအတွက် အကုန် 0 က ပြန်စထားပါတယ် — နောက် job တွေက ဒီမှာ ပြန် တက်လာပါမယ်</p>";
   } catch (e) {}
 }
+/* Per-stage timing averages (build 213): which stage eats
+   the time, averaged over the last 50 finished jobs — the
+   owner's hardware-decision board. Rendered from the
+   admin-only /api/admin/timing-stats. */
+async function loadTimingStats() {
+  try {
+    const d = await (await fetch("/api/admin/timing-stats")).json();
+    const avg = d.avg || {}, counts = d.counts || {};
+    if (!d.jobs) {
+      $("timingStats").innerHTML =
+        "<p class='hint'>ပြီးဆုံး job မရှိသေးပါ</p>";
+      return;
+    }
+    const row = (label, k, cls) => avg[k] != null
+      ? "<div class='step " + (cls || "done")
+        + "' style='justify-content:space-between'><span>" + label
+        + "</span><span>" + fmtStageS(avg[k]) + " <small>("
+        + (counts[k] || 0) + " job)</small></span></div>" : "";
+    $("timingStats").innerHTML =
+      TIMING_LABELS.map(([k, label]) => row(label, k)).join("")
+      + row("တန်းစီ စောင့်", "queue_s")
+      + row("စုစုပေါင်း (စက် အလုပ် လုပ်ချိန်)", "total_s", "running")
+      + "<p class='hint'>ပြီးဆုံး job " + d.jobs
+      + " ခု ရဲ့ ပျမ်းမျှ — အဆင့် တစ်ခုချင်းကို အဲဒီ အဆင့် ပါတဲ့ job"
+      + " တွေပေါ်ပဲ ပျမ်းမျှထားပါတယ်</p>";
+  } catch (e) {}
+}
 $("apiStatsBtn").onclick = loadApiStats;
 $("apiResetBtn").onclick = async () => {
   if (!confirm("ထုတ်ပြီး အရေအတွက် မှတ်တမ်း အကုန်လုံး 0 ပြန်စမလား?")) return;
@@ -2852,7 +2913,7 @@ $("apiToggle").onclick = () => {
   const p = $("apiPanel");
   const open = p.style.display === "none";
   p.style.display = open ? "" : "none";
-  if (open) { loadApiStats(); refreshEngineStats(); }
+  if (open) { loadApiStats(); loadTimingStats(); refreshEngineStats(); }
 };
 $("setToggle").onclick = () => {
   const p = $("settingsPanel");
@@ -3236,6 +3297,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 212</p>
+<p class="hint" id="buildTag" style="text-align:center">build 213</p>
 </body>
 </html>

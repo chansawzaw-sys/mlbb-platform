@@ -54,7 +54,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 212"
+BUILD_TAG = "build 213"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -138,7 +138,97 @@ class JobCancelled(Exception):
     """Raised inside a worker when the user asked to stop the job."""
 
 
+# ---------- per-stage job timings (build 213) ----------
+# The owner wants to SEE which pipeline stage eats the time
+# before deciding on any hardware purchase. Raw marks have
+# lived in job["phase_s"] since build 171 (run_job measures
+# download / transcribe / translate / tts / retime / finalize
+# and the dispatcher stamps the queue wait); build 213 folds
+# them into one canonical job["timings"] dict — per-stage
+# seconds, queue_s, and an accumulated active-processing
+# total_s — shown on the job's own progress/done views and
+# averaged for the owner in the Admin panel. Presentation
+# only: nothing here feeds a charge, a gate or a decision
+# inside a worker.
+
+_TIMING_STAGES = ("download", "transcribe", "translate",
+                  "script", "tts", "render")
+
+
+def _fold_timing(job, key, secs):
+    """Fold one raw phase mark into job["timings"]. retime +
+    finalize are ONE presentation stage ("render": retime,
+    fx/blur, subtitle burn and the encode are a single
+    customer-visible step), recomputed from both phase_s
+    parts so a mid-render fold never drops the retime half;
+    the dispatcher's queue wait becomes queue_s."""
+    try:
+        secs = round(float(secs), 1)
+    except (TypeError, ValueError):
+        return
+    t = job.setdefault("timings", {})
+    if key in _TIMING_STAGES:
+        t[key] = secs
+    elif key in ("retime", "finalize"):
+        ph = job.get("phase_s") or {}
+        t["render"] = round(sum(
+            float(ph[k]) for k in ("retime", "finalize")
+            if isinstance(ph.get(k), (int, float))), 1)
+    elif key == "queue_wait":
+        t["queue_s"] = secs
+
+
+def _timings_of(job):
+    """The job's timings for display/aggregation: the
+    canonical dict when the job has one, else derived
+    read-only from a pre-213 job's phase_s marks (stage keys
+    + queue only — a legacy total is never fabricated)."""
+    t = job.get("timings")
+    if t:
+        return t
+    ph = job.get("phase_s") or {}
+    if not ph:
+        return {}
+    out = {}
+    for k in _TIMING_STAGES:
+        if isinstance(ph.get(k), (int, float)):
+            out[k] = ph[k]
+    parts = [ph[k] for k in ("retime", "finalize")
+             if isinstance(ph.get(k), (int, float))]
+    if parts:
+        out["render"] = round(sum(parts), 1)
+    if isinstance(ph.get("queue_wait"), (int, float)):
+        out["queue_s"] = ph["queue_wait"]
+    elif isinstance(job.get("queue_wait_s"), (int, float)):
+        out["queue_s"] = job["queue_wait_s"]
+    return out
+
+
+def _timing_start(job):
+    """Stamp the start of a worker's active-processing span
+    (monotonic — immune to wall-clock jumps)."""
+    job["_run_t0"] = time.monotonic()
+
+
+def _timing_close(job):
+    """Close the active span into timings["total_s"],
+    ACCUMULATED across a job's workers: a recap job's human
+    review park between phase 1 and the render is not machine
+    time and must not inflate the hardware-decision number."""
+    t0 = job.pop("_run_t0", None)
+    if t0 is None:
+        return
+    try:
+        secs = round(time.monotonic() - float(t0), 1)
+    except (TypeError, ValueError):
+        return
+    t = job.setdefault("timings", {})
+    t["total_s"] = round(float(t.get("total_s") or 0) + secs, 1)
+
+
 def _progress_fn(job):
+    starts = {}
+
     def progress(step, state, note="", phase_s=None):
         if job.get("cancel_requested"):
             raise JobCancelled()
@@ -150,11 +240,29 @@ def _progress_fn(job):
                     s["note"] = note
         job["current"] = step
         if phase_s:
-            # Build 171: per-phase wall-clock seconds measured
-            # in run_job — kept on the job (and in job.json) so
-            # a slow job can be diagnosed phase by phase.
+            # Build 171: per-phase seconds measured in run_job
+            # — kept on the job (and in job.json) so a slow job
+            # can be diagnosed phase by phase. Build 213: the
+            # same marks fold into the canonical timings dict
+            # the UI + Admin averages read.
             try:
                 job.setdefault("phase_s", {}).update(phase_s)
+                for k, v in phase_s.items():
+                    _fold_timing(job, k, v)
+            except Exception:
+                pass
+            starts.pop(step, None)
+        elif state == "running":
+            # Build 213: a step announced directly through
+            # progress() — the recap "script" step, which has
+            # no run_job marks — is timed here, from its own
+            # running/done pair.
+            starts[step] = time.monotonic()
+        elif state == "done" and step in starts:
+            secs = round(time.monotonic() - starts.pop(step), 1)
+            try:
+                job.setdefault("phase_s", {})[step] = secs
+                _fold_timing(job, step, secs)
             except Exception:
                 pass
         _save(job)
@@ -1760,6 +1868,9 @@ def _job_dispatcher():
                                             or time.time()), 1)
                     job["queue_wait_s"] = waited
                     job.setdefault("phase_s", {})["queue_wait"] = waited
+                    # Build 213: the same wait in the canonical
+                    # timings dict (queue_s).
+                    job.setdefault("timings", {})["queue_s"] = waited
                 except Exception:
                     pass
                 if jid in _TG_PENDING:
@@ -1926,6 +2037,7 @@ def _refund_charge(job):
 
 
 def _fail(job, e):
+    _timing_close(job)  # build 213: settle the timing span first
     _refund_charge(job)
     job["status"] = "error"
     if job.get("current") == "download":
@@ -1988,6 +2100,7 @@ def _enforce_done_cap(job):
 
 
 def _finish(job):
+    _timing_close(job)  # build 213: settle the timing span first
     # Build 204 (audit V09): a cancel that landed after the last
     # progress boundary (i.e. during the final phase, with no
     # further progress call to raise JobCancelled) must not flip
@@ -2029,6 +2142,7 @@ def _finish(job):
 
 
 def _cancelled(job):
+    _timing_close(job)  # build 213: settle the timing span first
     _refund_charge(job)
     job["status"] = "cancelled"
     job["error"] = "ရပ်လိုက်ပြီ — ဖျက်ရန် တောင်းဆိုထားသည်"
@@ -2054,6 +2168,7 @@ def _worker(job):
     with job_context(job["id"]):
         try:
             job["status"] = "running"
+            _timing_start(job)  # build 213
             _save(job)
             run_job.run_phase1(workdir, job["url"], source_path=job.get("source_path"),
                                progress=_progress_fn(job),
@@ -2080,6 +2195,7 @@ def _worker2(job):
     with job_context(job["id"]):
         try:
             job["status"] = "running"
+            _timing_start(job)  # build 213
             _save(job)
             _run_phase2(job)
             _finish(job)
@@ -3900,6 +4016,38 @@ def admin_api_stats_reset():
     return jsonify(api_stats.reset())
 
 
+@app.get("/api/admin/timing-stats")
+def admin_timing_stats():
+    """Per-stage average seconds over the last 50 finished
+    jobs (build 213) — the owner's hardware-decision board:
+    which stage eats the time, on real production jobs.
+    Admin-only, like the usage board above. Each stage is
+    averaged over the jobs that HAVE that stage (a subs job
+    has no tts; a studio job has only tts), and counts ride
+    along so a thin average is visible as thin."""
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    keys = ("download", "transcribe", "translate", "script",
+            "tts", "render", "queue_s", "total_s")
+    fin = [j for j in _all_jobs()
+           if j.get("status") in ("done", "error")
+           and j.get("finished_at")]
+    fin.sort(key=lambda j: j.get("finished_at") or 0,
+             reverse=True)
+    fin = fin[:50]
+    sums, counts = {}, {}
+    for j in fin:
+        t = _timings_of(j)
+        for k in keys:
+            v = t.get(k)
+            if isinstance(v, (int, float)):
+                sums[k] = sums.get(k, 0.0) + float(v)
+                counts[k] = counts.get(k, 0) + 1
+    avg = {k: round(sums[k] / counts[k], 1) for k in counts}
+    return jsonify({"jobs": len(fin), "avg": avg,
+                    "counts": counts})
+
+
 @app.post("/api/topup")
 def topup_create():
     """Customer submits a credit top-up from the WEB app (build 156):
@@ -4512,6 +4660,9 @@ def _job_view(job):
              # Build 210: studio (Text-to-Voice) jobs share this
              # listing — the UI labels them from these fields.
              "type", "voice_label", "duration")}
+    # Build 213: per-stage timings ride the view (owner/admin
+    # only ever see them — _owns gates every caller).
+    view["timings"] = _timings_of(job)
     if job.get("status") == "queued":
         # 1-based place among waiting jobs, so the UI/bot can SAY
         # "you are in the queue" instead of looking stuck (build 180).
@@ -4911,6 +5062,7 @@ def _tts_view(job):
             "charged": job.get("charged_minutes"),
             "created_at": job.get("created_at"),
             "finished_at": job.get("finished_at"),
+            "timings": _timings_of(job),  # build 213
             "download": f"/api/jobs/{job['id']}/download",
             "stream": f"/api/jobs/{job['id']}/stream"}
 
@@ -4920,6 +5072,7 @@ def _run_tts_job(job, text, speed):
     any failure (the caller records the error; nothing has been
     charged at that point)."""
     from pipeline.common import load_segments, save_segments
+    _timing_start(job)  # build 213: the studio run is one span
     workdir = JOBS_DIR / job["id"]
     workdir.mkdir(parents=True, exist_ok=True)
     segs, t = [], 0.0
@@ -4932,6 +5085,7 @@ def _run_tts_job(job, text, speed):
                      "end": round(t + dur, 3), "text_my": chunk})
         t += dur
     save_segments(segs, workdir / "segments_my.json")
+    _tts_t0 = time.monotonic()  # build 213: synthesis stage
     if job.get("tts_engine") == "elevenlabs":
         elevenlabs_tts.synthesize(
             workdir, elevenlabs_tts.voice_id_of(job["voice"]),
@@ -4944,6 +5098,8 @@ def _run_tts_job(job, text, speed):
         rate_pct = style["rate"] + int(round((speed - 1.0) * 100))
         tts.synthesize(workdir, voice=style["voice"],
                        rate=rate_pct, pitch=style["pitch"])
+    job.setdefault("timings", {})["tts"] = round(
+        time.monotonic() - _tts_t0, 1)
     segs = load_segments(workdir / "segments_my.json")
     files = [s["tts_file"] for s in segs if s.get("tts_file")]
     if not files:
@@ -4971,6 +5127,7 @@ def _run_tts_job(job, text, speed):
     job["quote_minutes"] = minutes
     job["quote_credits"] = minutes * rate
     _tts_charge(job, minutes * rate)
+    _timing_close(job)  # build 213
     job["status"] = "done"
     job["finished_at"] = time.time()
     _save(job)
@@ -5047,7 +5204,9 @@ def create_tts():
            "text": text, "chars": len(text), "speed": speed,
            "user_id": uid, "status": "running", "current": "tts",
            "error": None, "created_at": now, "updated_at": now,
-           "finished_at": None, "steps": []}
+           "finished_at": None, "steps": [],
+           # Build 213: studio jobs never queue — the wait is 0.
+           "timings": {"queue_s": 0.0}}
     if el_entry is not None:
         job["tts_engine"] = "elevenlabs"
         job["voice_name"] = el_entry["name"]
@@ -5056,6 +5215,7 @@ def create_tts():
     try:
         _run_tts_job(job, text, speed)
     except Exception as e:
+        _timing_close(job)  # build 213: keep the partial span
         job["status"] = "error"
         job["error"] = str(e)[-1500:]
         job["finished_at"] = time.time()
@@ -5111,6 +5271,7 @@ def _recap_view(job):
              "voice", "voice_label", "quote_minutes",
              "quote_credits", "charged_minutes", "recap_edited",
              "created_at", "finished_at")}
+    view["timings"] = _timings_of(job)  # build 213
     view["steps"] = job.get("steps") or []
     if job.get("recap_text") is not None:
         view["recap_text"] = job["recap_text"]
@@ -5130,6 +5291,7 @@ def _recap_worker(job):
     with job_context(job["id"]):
         try:
             job["status"] = "running"
+            _timing_start(job)  # build 213
             _save(job)
             run_job.run_recap_phase1(
                 workdir, job["url"], progress=_progress_fn(job),
@@ -5146,6 +5308,10 @@ def _recap_worker(job):
             job["recap_edited"] = False
             job["status"] = "waiting_script"
             job["current"] = None
+            # Build 213: phase 1's machine time ends at the
+            # park — the human review wait that follows is not
+            # processing time (see _timing_close).
+            _timing_close(job)
             _save(job)
             # Admin usage board: count this video under the
             # gateway that wrote its script (best-effort, like
@@ -5175,6 +5341,7 @@ def _recap_worker2(job):
     with job_context(job["id"]):
         try:
             job["status"] = "running"
+            _timing_start(job)  # build 213
             _save(job)
             from pipeline.common import save_segments
             total = probe_duration(workdir / "source.mp4")
