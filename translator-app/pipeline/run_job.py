@@ -149,7 +149,7 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
 
 def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
                fx=None, font=burn.DEFAULT_FONT, voice_rate=0, voice_pitch=0,
-               subs=None, max_speed=None, quality="hd"):
+               subs=None, max_speed=None, quality="hd", voice_name=None):
     """Phase 2: from the FINAL (possibly user-edited) segments_my.json —
     TTS -> retime -> logo/blur -> subtitle burn -> output.mp4.
     `subs` is the subtitle-layout dict (size_pct/width_pct/bottom_pct/align);
@@ -179,7 +179,8 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
         # fails the job loudly — a premium pick is NEVER silently
         # re-voiced with a free voice.
         elevenlabs_tts.synthesize(
-            workdir, elevenlabs_tts.voice_id_of(voice))
+            workdir, elevenlabs_tts.voice_id_of(voice),
+            voice_name=voice_name)
     else:
         tts.synthesize(workdir, voice, rate=voice_rate, pitch=voice_pitch)
     mark("tts", "done")

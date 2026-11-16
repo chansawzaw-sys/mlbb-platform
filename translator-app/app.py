@@ -54,7 +54,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 211"
+BUILD_TAG = "build 212"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1309,6 +1309,16 @@ def _tg_voice_step(chat_id, flow):
             label += " · " + e["tag"]
         rows.append([(label + f" ({e['rate']} credits/မိနစ်)",
                       "e:" + elevenlabs_tts.voice_id_of(e["id"]))])
+    # Build 212: the chat's OWN clones join the step too (the
+    # linked account's rows from the clone store — ownership is
+    # the permission, so they show even in test mode; the
+    # callback is the same "e:<voice_id>" as a registry pick).
+    acct = accounts.user_for_tg(chat_id)
+    if acct and elevenlabs_tts.key_configured():
+        rate = elevenlabs_tts.credits_per_min()
+        for c in accounts.clones_for(acct["id"]):
+            rows.append([(f"🎙 {c['name']} ({rate} credits/မိနစ်)",
+                          "e:" + c["voice_id"])])
     tg.send_message(chat_id, "အသံ ရွေးပေးပါ", buttons=rows)
 
 
@@ -1368,16 +1378,25 @@ def _tg_start_flow_job(chat_id, flow):
     from pipeline import telegram_send as tg
     ratio = flow.get("ratio") or "orig"
     acct = accounts.user_for_tg(chat_id)
-    if elevenlabs_tts.is_el_voice(flow.get("voice_style")) \
-            and not elevenlabs_tts.elevenlabs_allowed(
-                _tg_el_subject(chat_id)):
-        # Build 206: the credit pre-check below must agree with
-        # the gate — a premium pick this chat may not use (mode
-        # flipped mid-flow, crafted callback) is refused HERE,
-        # before any quote math, and no job is created.
-        _TG_FLOW.pop(chat_id, None)
-        tg.send_message(chat_id, _EL_GATE_MSG)
-        return
+    if elevenlabs_tts.is_el_voice(flow.get("voice_style")):
+        # Build 212: the account's OWN clone is exempt from the
+        # gate (ownership is the permission, as on the web
+        # surfaces); every other premium pick keeps the rule.
+        _vid = elevenlabs_tts.voice_id_of(flow["voice_style"])
+        _clone = accounts.clone_by_voice(_vid) if acct else None
+        _own_clone = bool(_clone and acct
+                          and _clone["user_id"] == acct["id"])
+        if not _own_clone \
+                and not elevenlabs_tts.elevenlabs_allowed(
+                    _tg_el_subject(chat_id)):
+            # Build 206: the credit pre-check below must agree
+            # with the gate — a premium pick this chat may not
+            # use (mode flipped mid-flow, crafted callback) is
+            # refused HERE, before any quote math, and no job
+            # is created.
+            _TG_FLOW.pop(chat_id, None)
+            tg.send_message(chat_id, _EL_GATE_MSG)
+            return
     if not tg.is_admin(chat_id):
         if not acct:
             _TG_FLOW.pop(chat_id, None)
@@ -1653,6 +1672,16 @@ def _on_tg_callback(cq):
         # ignored, never substituted with a free voice.
         entry = elevenlabs_tts.find_voice(data[2:])
         if not entry:
+            # Build 212: not a registry voice — it may be the
+            # chat's OWN clone (same ownership rule as the web
+            # surfaces). Someone else's clone is a stale tap:
+            # ignored, exactly like a removed registry voice.
+            acct = accounts.user_for_tg(chat_id)
+            clone = accounts.clone_by_voice(data[2:]) if acct else None
+            if not clone or clone["user_id"] != acct["id"]:
+                return
+            flow["voice_style"] = "el:" + clone["voice_id"]
+            _tg_speed_step(chat_id, flow)
             return
         # Build 206: the access gate judges the tap too — the
         # buttons may predate a mode flip, or the callback may
@@ -1928,7 +1957,8 @@ def _run_phase2(job):
                        voice_pitch=job.get("voice_pitch", 0),
                        subs=job.get("subs"),
                        max_speed=job.get("speed_cap") or 1.3,
-                       quality=job.get("quality") or "hd")
+                       quality=job.get("quality") or "hd",
+                       voice_name=job.get("voice_name"))
 
 
 _KEEP_DONE_PER_USER = 2
@@ -2093,6 +2123,27 @@ def api_version():
     return resp
 
 
+def _mine_entries(user):
+    """The CALLER's own clones in picker shape (build 212) —
+    the "mine" array of /api/voices. Empty for logged-out
+    callers, and empty while no ElevenLabs key is configured
+    (a clone cannot speak without the key, exactly like the
+    registry group above). Rows come from the accounts clone
+    store; ownership was recorded at creation, so this is a
+    pure read of the caller's own rows."""
+    if not user or not user.get("id"):
+        return []
+    if not elevenlabs_tts.key_configured():
+        return []
+    rate = elevenlabs_tts.credits_per_min()
+    return [{"id": "el:" + c["voice_id"], "label": c["name"],
+             "name": c["name"], "tag": "Clone",
+             "desc": "ကိုယ်ပိုင် clone အသံ",
+             "preview": elevenlabs_tts.preview_url_usr(c["voice_id"]),
+             "premium": True, "rate": rate}
+            for c in accounts.clones_for(user["id"])]
+
+
 @app.get("/api/voices")
 def voices():
     # Build 200: the picker offers voice STYLES from the one
@@ -2121,12 +2172,12 @@ def voices():
     # Build 208: the payload is an object. "voices" is the
     # catalogue above (built-ins + gate-filtered registry
     # voices — the picker's Ready-made tab). "mine" is the
-    # CALLER's own cloned voices, read from the per-account
-    # clone store; that store (self-serve Voice Clone) lands
-    # in a later build, so mine is [] for everyone until
-    # then, logged-out callers included — the picker's
-    # My-voices tab renders its empty note from it.
-    return jsonify({"voices": out, "mine": []})
+    # CALLER's own cloned voices. Build 212: the self-serve
+    # Voice Clone store is live, so "mine" now reads the
+    # caller's real clone rows (still [] for logged-out
+    # callers and while ElevenLabs is unconfigured).
+    return jsonify({"voices": out,
+                    "mine": _mine_entries(_current_user())})
 
 
 _STD_PREVIEW_LOCK = threading.Lock()
@@ -2165,11 +2216,12 @@ def _ensure_std_preview(style_key):
 @app.get("/voice-previews/<name>")
 def voice_preview_file(name):
     """Serve a voice-library preview clip (build 207). Strict
-    filename shape — el-<voice id>.mp3 / std-<style key>.mp3
-    only, no traversal. Built-in clips generate lazily on first
-    request; ElevenLabs clips exist only if the admin generated
-    one, so a missing file is a plain 404."""
-    if not re.fullmatch(r"(?:el|std)-[A-Za-z0-9_-]{1,64}\.mp3",
+    filename shape — el-<voice id>.mp3 / std-<style key>.mp3 /
+    usr-<voice id>.mp3 (build 212 user clones) only, no
+    traversal. Built-in clips generate lazily on first
+    request; ElevenLabs clips exist only if one was generated,
+    so a missing file is a plain 404."""
+    if not re.fullmatch(r"(?:el|std|usr)-[A-Za-z0-9_-]{1,64}\.mp3",
                         name or ""):
         return jsonify({"error": "မရှိပါ"}), 404
     path = elevenlabs_tts.PREVIEW_DIR / name
@@ -2178,6 +2230,180 @@ def voice_preview_file(name):
     if not path.exists():
         return jsonify({"error": "မရှိပါ"}), 404
     return send_file(path, mimetype="audio/mpeg")
+
+
+# ---------- Voice Clone, self-serve (build 212) ----------
+# ကိုယ်ပိုင် အသံ = the voice an ACCOUNT HOLDER records
+# themselves (owner's definition, 2026-11-16). A logged-in
+# user uploads ONE sample of their own voice; the server
+# creates an ElevenLabs IVC clone under the OWNER's key and
+# records ownership in the accounts clone store. The sample
+# itself is validated, sent to ElevenLabs, and DELETED — it
+# is never stored, never served, and its temp dir sits outside
+# every public route. While no key is configured the whole
+# feature is an honest locked state (the Clone view shows a
+# lock card, the API refuses politely) and it activates with
+# the key alone — no deploy.
+
+MAX_USER_CLONES = 3
+CLONE_SAMPLE_MAX_BYTES = 25 * 1024 * 1024
+CLONE_MIN_SECONDS = 10.0
+CLONE_MAX_SECONDS = 180.0
+CLONE_TMP_DIR = ROOT / "clone_tmp"
+CLONE_TMP_DIR.mkdir(exist_ok=True)
+_CLONE_EXTS = (".mp3", ".m4a", ".wav", ".ogg", ".oga", ".webm",
+               ".mp4", ".aac", ".flac", ".opus")
+
+
+def _clone_view(c):
+    return {"voice_id": c["voice_id"], "name": c["name"],
+            "preview": elevenlabs_tts.preview_url_usr(c["voice_id"]),
+            "created_at": c["created_at"]}
+
+
+def _clone_sample_error(path):
+    """Validate an uploaded clone sample -> a Burmese error
+    string, or None when the sample is usable: it must decode
+    as audio, run 10 s – 3 min, and carry measurable speech
+    energy (a silent or near-silent file would clone into a
+    voice that says nothing)."""
+    from pipeline.common import probe_streams
+    try:
+        streams = probe_streams(path)
+        dur = probe_duration(path)
+    except Exception:
+        return "အသံဖိုင် မဟုတ်ပါ — အသံဖိုင် အစစ် တင်ပေးပါ"
+    if not any(s.get("codec_type") == "audio" for s in streams):
+        return "အသံဖိုင် မဟုတ်ပါ — အသံဖိုင် အစစ် တင်ပေးပါ"
+    if dur < CLONE_MIN_SECONDS:
+        return ("နမူနာ အသံ တိုလွန်းပါတယ် — အနည်းဆုံး "
+                "၁၀ စက္ကန့် ပြောထားတဲ့ အသံ တင်ပေးပါ")
+    if dur > CLONE_MAX_SECONDS:
+        return ("နမူနာ အသံ ရှည်လွန်းပါတယ် — အများဆုံး "
+                "၃ မိနစ် အတွင်း ဖြတ်ပြီး တင်ပေးပါ")
+    try:
+        done = sh(["ffmpeg", "-v", "info", "-i", str(path),
+                   "-af", "volumedetect", "-f", "null", "-"])
+        text = (done.stderr or "") + (done.stdout or "")
+        m_mean = re.search(r"mean_volume:\s*(-?[\d.]+|-inf) dB", text)
+        m_max = re.search(r"max_volume:\s*(-?[\d.]+|-inf) dB", text)
+        mean = float(m_mean.group(1)) if m_mean else float("-inf")
+        peak = float(m_max.group(1)) if m_max else float("-inf")
+    except Exception:
+        return "အသံကို စစ်လို့ မရပါ — တခြား အသံဖိုင် စမ်းကြည့်ပါ"
+    if mean <= -55.0 or peak <= -40.0:
+        return ("အသံ မကြားရပါ — တိတ်ဆိတ်နေတဲ့ ဖိုင် ဖြစ်နေပါတယ်။ "
+                "ပုံမှန် အသံနဲ့ ပြောထားတဲ့ နမူနာ ပြန်တင်ပေးပါ")
+    return None
+
+
+@app.get("/api/clones")
+def clones_list():
+    user = _current_user()
+    clones = [_clone_view(c) for c in accounts.clones_for(user["id"])] \
+        if user and user.get("id") else []
+    return jsonify({"configured": elevenlabs_tts.key_configured(),
+                    "cap": MAX_USER_CLONES, "clones": clones})
+
+
+@app.post("/api/clones")
+def clones_create():
+    user = _current_user()
+    if not user or not user.get("id"):
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    if not elevenlabs_tts.key_configured():
+        return jsonify({"error":
+                        "ElevenLabs မချိတ်ရသေးပါ — admin က key "
+                        "ထည့်ပြီးမှ clone လုပ်လို့ရပါမယ်"}), 400
+    name = (request.form.get("name") or "").strip()
+    if not name or len(name) > 60 or "\n" in name \
+            or any(ch in name for ch in '<>&"'):
+        return jsonify({"error": "အသံ နာမည် ထည့်ပေးပါ "
+                                 "(အက္ခရာ ၆၀ အတွင်း)"}), 400
+    if (request.form.get("consent") or "") not in \
+            ("1", "true", "on", "yes"):
+        return jsonify({"error":
+                        "«ဒါ ကျွန်တော့်/ကျွန်မ ကိုယ်ပိုင်အသံပါ» ကို "
+                        "အတည်ပြုပေးပါ"}), 400
+    if accounts.clone_count(user["id"]) >= MAX_USER_CLONES:
+        return jsonify({"error":
+                        f"Clone အသံ {MAX_USER_CLONES} ခု ပြည့်နေပါပြီ — "
+                        "အရင် တစ်ခု ဖျက်ပြီးမှ အသစ် ထည့်လို့ရပါမယ်"}), 400
+    f = request.files.get("sample")
+    if f is None or not f.filename:
+        return jsonify({"error": "နမူနာ အသံဖိုင် ရွေးပေးပါ"}), 400
+    ext = Path(f.filename).suffix.lower()
+    if ext not in _CLONE_EXTS:
+        ext = ".audio"
+    tmp = CLONE_TMP_DIR / (uuid.uuid4().hex + ext)
+    try:
+        size = 0
+        with open(tmp, "wb") as out:
+            while True:
+                chunk = f.stream.read(1 << 20)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > CLONE_SAMPLE_MAX_BYTES:
+                    return jsonify({"error":
+                                    "ဖိုင် ကြီးလွန်းပါတယ် — "
+                                    "အများဆုံး 25 MB ပဲ ရပါတယ်"}), 400
+                out.write(chunk)
+        err = _clone_sample_error(tmp)
+        if err:
+            return jsonify({"error": err}), 400
+        try:
+            voice_id = elevenlabs_tts.add_voice(name, tmp)
+        except RuntimeError as e:
+            return jsonify({"error": str(e)}), 400
+        try:
+            row = accounts.add_clone(user["id"], voice_id, name)
+        except Exception:
+            # The ElevenLabs voice exists but the ownership row
+            # did not land — remove the orphan so it never leaks
+            # a slot in the owner's account.
+            try:
+                elevenlabs_tts.delete_voice(voice_id)
+            except Exception:
+                pass
+            return jsonify({"error":
+                            "Clone သိမ်းတာ မရပါ — ခဏနေမှ "
+                            "ပြန်စမ်းပါ"}), 400
+        elevenlabs_tts.generate_preview_usr(voice_id)
+        return jsonify({"clone": _clone_view(row),
+                        "clones": [_clone_view(c) for c in
+                                   accounts.clones_for(user["id"])]}), 201
+    finally:
+        # The sample is the user's private recording: whatever
+        # happened above, it does not stay on this server.
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+@app.delete("/api/clones/<voice_id>")
+def clones_delete(voice_id):
+    user = _current_user()
+    if not user or not user.get("id"):
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    row = accounts.clone_by_voice(voice_id)
+    if row is None or row["user_id"] != user["id"]:
+        return jsonify({"error": "မရှိပါ"}), 404
+    try:
+        elevenlabs_tts.delete_voice(voice_id)
+    except RuntimeError as e:
+        # ElevenLabs still holds the voice — keep the row so
+        # the slot is accounted for and the user can retry.
+        return jsonify({"error": str(e)}), 400
+    accounts.delete_clone(user["id"], voice_id)
+    try:
+        elevenlabs_tts.preview_path_usr(voice_id).unlink(
+            missing_ok=True)
+    except Exception:
+        pass
+    return jsonify({"clones": [_clone_view(c) for c in
+                               accounts.clones_for(user["id"])]})
 
 
 def _public_url_ok(url):
@@ -4048,6 +4274,36 @@ def _build_subs(data):
     }
 
 
+def _resolve_el_entry(user, voice_id):
+    """Resolve an ElevenLabs "el:" pick for THIS caller ->
+    (entry, gate_blocked). The ONE resolution every job surface
+    (dub / studio / recap / bot) shares, so the rules can never
+    drift between them:
+
+    - A REGISTRY voice resolves for everyone, but the build-206
+      gate may still block the caller (gate_blocked=True) —
+      exactly the pre-212 rule.
+    - A voice that is the CALLER'S OWN clone (build 212)
+      resolves with gate_blocked=False: ownership is the
+      permission, the test-mode gate is about the catalogue.
+    - Anything else — a removed registry voice, or a clone
+      belonging to someone else — resolves to (None, False);
+      callers answer with the removed-voice message, so a
+      stranger's clone is indistinguishable from a voice that
+      does not exist."""
+    entry = elevenlabs_tts.find_voice(voice_id)
+    if entry is not None:
+        blocked = user is not None \
+            and not elevenlabs_tts.elevenlabs_allowed(user)
+        return entry, blocked
+    if user is not None and user.get("id"):
+        clone = accounts.clone_by_voice(voice_id)
+        if clone and clone["user_id"] == user["id"]:
+            return {"id": str(voice_id), "name": clone["name"],
+                    "clone": True}, False
+    return None, False
+
+
 def _new_job(data, user=None):
     """Build a job record from request-style data, or (None, error).
     Shared by the web form and the Telegram bot, so a job is a job
@@ -4088,18 +4344,19 @@ def _new_job(data, user=None):
     el_entry = None
     if style_in and elevenlabs_tts.is_el_voice(str(style_in).strip()):
         # Build 205: an ElevenLabs premium pick ("el:<voice_id>").
-        # It must still be in the owner's registry — a removed
+        # It must still resolve for this caller — a removed
         # voice refuses the job HERE with a clear message instead
         # of failing mid-render, and it NEVER falls back to an
         # edge-tts style: the customer picked (and pays a premium
-        # for) THIS voice.
-        el_entry = elevenlabs_tts.find_voice(
-            elevenlabs_tts.voice_id_of(str(style_in).strip()))
+        # for) THIS voice. Build 212: resolution goes through
+        # _resolve_el_entry — registry voices keep the build-206
+        # gate; the caller's OWN clone resolves on ownership.
+        el_entry, el_blocked = _resolve_el_entry(
+            user, elevenlabs_tts.voice_id_of(str(style_in).strip()))
         if el_entry is None:
             return None, ("ရွေးထားတဲ့ ElevenLabs အသံ မရှိတော့ပါ — "
                           "အသံ ပြန်ရွေးပေးပါ")
-        if user is not None \
-                and not elevenlabs_tts.elevenlabs_allowed(user):
+        if el_blocked:
             # Build 206: THE enforcement — hiding the picker
             # group is not enough; a premium pick from an
             # account outside the gate (test mode: not an
@@ -4677,7 +4934,8 @@ def _run_tts_job(job, text, speed):
     save_segments(segs, workdir / "segments_my.json")
     if job.get("tts_engine") == "elevenlabs":
         elevenlabs_tts.synthesize(
-            workdir, elevenlabs_tts.voice_id_of(job["voice"]))
+            workdir, elevenlabs_tts.voice_id_of(job["voice"]),
+            voice_name=job.get("voice_name"))
     else:
         style = tts.resolve_style(job["voice_style"])
         # The studio speed rides the existing tuning machinery:
@@ -4737,21 +4995,21 @@ def create_tts():
     if speed not in TTS_SPEEDS:
         speed = 1.0
     # Voice resolution mirrors _new_job exactly (builds 200 /
-    # 205 / 206): an ElevenLabs pick must still be registered
-    # and the caller must pass the access gate; a style key
-    # resolves through the shared table; anything else fails
-    # safe to the product default style.
+    # 205 / 206 / 212): an ElevenLabs pick must resolve for the
+    # caller through _resolve_el_entry — registry voices gated,
+    # the caller's own clone on ownership; a style key resolves
+    # through the shared table; anything else fails safe to the
+    # product default style.
     voice_in = data.get("voice")
     el_entry = None
     if voice_in and elevenlabs_tts.is_el_voice(str(voice_in).strip()):
-        el_entry = elevenlabs_tts.find_voice(
-            elevenlabs_tts.voice_id_of(str(voice_in).strip()))
+        el_entry, el_blocked = _resolve_el_entry(
+            user, elevenlabs_tts.voice_id_of(str(voice_in).strip()))
         if el_entry is None:
             return jsonify({"error":
                             "ရွေးထားတဲ့ ElevenLabs အသံ မရှိတော့ပါ — "
                             "အသံ ပြန်ရွေးပေးပါ"}), 400
-        if user is not None \
-                and not elevenlabs_tts.elevenlabs_allowed(user):
+        if el_blocked:
             return jsonify({"error":
                             "ဒီ Premium အသံ က အခု စမ်းသပ်ဆဲ "
                             "ဖြစ်လို့ သတ်မှတ်ထားတဲ့ account တွေ ပဲ "
@@ -4935,7 +5193,8 @@ def _recap_worker2(job):
                 voice_pitch=job.get("voice_pitch", 0),
                 subs=job.get("subs"),
                 max_speed=job.get("speed_cap") or 1.3,
-                quality=job.get("quality") or "hd")
+                quality=job.get("quality") or "hd",
+                voice_name=job.get("voice_name"))
             _finish(job)
         except JobCancelled:
             _cancelled(job)
@@ -4956,21 +5215,22 @@ def create_recap():
     if not _public_url_ok(url):
         return jsonify({"error": "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"}), 400
     # Voice resolution mirrors the studio / _new_job exactly
-    # (builds 200 / 205 / 206): an ElevenLabs pick must still
-    # be registered and the caller must pass the access gate;
-    # a style key resolves through the shared table; anything
-    # else fails safe to the product default style.
+    # (builds 200 / 205 / 206 / 212): an ElevenLabs pick must
+    # resolve for the caller through _resolve_el_entry —
+    # registry voices gated, the caller's own clone on
+    # ownership; a style key resolves through the shared
+    # table; anything else fails safe to the product default
+    # style.
     voice_in = data.get("voice")
     el_entry = None
     if voice_in and elevenlabs_tts.is_el_voice(str(voice_in).strip()):
-        el_entry = elevenlabs_tts.find_voice(
-            elevenlabs_tts.voice_id_of(str(voice_in).strip()))
+        el_entry, el_blocked = _resolve_el_entry(
+            user, elevenlabs_tts.voice_id_of(str(voice_in).strip()))
         if el_entry is None:
             return jsonify({"error":
                             "ရွေးထားတဲ့ ElevenLabs အသံ မရှိတော့ပါ — "
                             "အသံ ပြန်ရွေးပေးပါ"}), 400
-        if user is not None \
-                and not elevenlabs_tts.elevenlabs_allowed(user):
+        if el_blocked:
             return jsonify({"error":
                             "ဒီ Premium အသံ က အခု စမ်းသပ်ဆဲ "
                             "ဖြစ်လို့ သတ်မှတ်ထားတဲ့ account တွေ ပဲ "

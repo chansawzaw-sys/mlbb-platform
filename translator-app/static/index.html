@@ -175,6 +175,10 @@
   .vlib-play { width: auto; margin: 0; padding: 8px 13px; border-radius: 999px;
     flex: 0 0 auto; background: #2c2c31; color: #eee;
     border: 1px solid #3a3a41; font-size: 14px; }
+  /* ---------- Voice Clone (build 212) ---------- */
+  .clone-del { width: auto; margin: 0; padding: 8px 11px; border-radius: 999px;
+    flex: 0 0 auto; background: transparent; color: #ff9a9a;
+    border: 1px solid #4a3436; font-size: 14px; }
   /* ---------- app shell (build 210): top bar + sidebar + views ---------- */
   #topbar { position: sticky; top: 0; z-index: 40; background: #101013;
     display: flex; align-items: center; gap: 10px; padding: 8px 0 10px;
@@ -237,7 +241,7 @@
 <div id="sbScrim"></div>
 <nav id="sidebar">
   <div class="sb-head">🎬 ဗီဒီယို မြန်မာဘာသာပြန်</div>
-  <button class="sb-item" data-view="clone">🎙 အသံ Clone <span class="badge">မကြာမီ</span></button>
+  <button class="sb-item" data-view="clone">🎙 အသံ Clone</button>
   <button class="sb-item" data-view="studio">✍️ စာသားမှ အသံ</button>
   <div class="sb-sec">အကြောင်းအရာ</div>
   <button class="sb-item" data-view="recap">📝 Recap</button>
@@ -758,10 +762,26 @@
   </div><!-- /view-studio -->
 
   <div class="view" id="view-clone" style="display:none">
-    <div class="card show">
-      <h3 style="margin-top:0">🎙 အသံ Clone <span class="badge">မကြာမီ</span></h3>
-      <p class="hint">ကိုယ့် အသံကို နမူနာ အသံဖိုင် သွင်းထားရုံနဲ့ ကိုယ်ပိုင် clone အသံ တစ်ခု ဖန်တီးပေးမယ့် အပိုင်းပါ — ဖန်တီးပြီးသား clone တွေက အသံ ရွေးတဲ့နေရာက «ကိုယ်ပိုင် အသံများ» tab ထဲမှာ ပေါ်လာပြီး၊ အသံထပ် နဲ့ စာသားမှ အသံ နှစ်ခုလုံးမှာ သုံးနိုင်ပါမယ်။</p>
-      <p class="hint">ပြင်ဆင်နေဆဲ ဖြစ်လို့ မကြာခင် ဖွင့်ပေးပါမယ်။ အခုအတွက် အသင့်သုံး အသံတွေနဲ့ 🌟 Premium အသံတွေကို သုံးနိုင်ပါတယ်။</p>
+    <div class="card show" id="cloneLocked" style="display:none">
+      <h3 style="margin-top:0">🎙 အသံ Clone</h3>
+      <p class="hint">🔒 ElevenLabs မချိတ်ရသေးပါ — admin က ElevenLabs key ထည့်ပြီးမှ ကိုယ်ပိုင် အသံ clone လုပ်လို့ရပါမယ်။ ချိတ်ပြီးတာနဲ့ ဒီနေရာမှာပဲ ကိုယ့်အသံ နမူနာ တင်ပြီး clone ဖန်တီးနိုင်ပါမယ်။</p>
+    </div>
+    <div class="card show" id="cloneMain" style="display:none">
+      <h3 style="margin-top:0">🎙 အသံ Clone</h3>
+      <p class="hint">ကိုယ့် အသံကို နမူနာ အသံဖိုင် တင်လိုက်ရုံနဲ့ ကိုယ်ပိုင် clone အသံ ဖန်တီးပေးပါတယ် — ဖန်တီးပြီးသား clone တွေက အသံ ရွေးတဲ့နေရာက «ကိုယ်ပိုင် အသံများ» tab ထဲမှာ ပေါ်လာပြီး အသံထပ် / စာသားမှ အသံ / Recap အားလုံးမှာ သုံးနိုင်ပါတယ်။</p>
+      <div id="cloneList"></div>
+      <p class="hint" id="cloneCap"></p>
+      <label>အသံ နာမည်
+        <input id="cloneName" type="text" maxlength="60" placeholder="ဥပမာ — ကျွန်တော့် အသံ" style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+      </label>
+      <label>နမူနာ အသံဖိုင် (၁၀ စက္ကန့် – ၃ မိနစ်, အများဆုံး 25 MB)
+        <input id="cloneFile" type="file" accept="audio/*,.m4a,.mp3,.wav,.ogg,.webm,.mp4">
+      </label>
+      <p class="hint">အသံ ရှင်းရှင်းလင်းလင်း ကြားရတဲ့ နေရာမှာ ပုံမှန် လေသံနဲ့ ၁–၂ မိနစ် စာလောက် ပြောထားရင် clone အရည်အသွေး ပိုကောင်းပါတယ်။ နမူနာ မူရင်းဖိုင်ကို ကိုယ့်ဖုန်းမှာပဲ သိမ်းထားပါ — ဒီ server ပေါ်မှာ သိမ်းမထားပါ။</p>
+      <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="cloneConsent" style="width:auto"> ဒါ ကျွန်တော့်/ကျွန်မ ကိုယ်ပိုင်အသံပါ</label>
+      <p class="err" id="cloneErr"></p>
+      <button id="cloneGo">🎙 Clone ဖန်တီးမယ်</button>
+      <p class="hint" id="cloneStatus"></p>
     </div>
   </div><!-- /view-clone -->
 
@@ -972,6 +992,7 @@ function showView(name) {
   window.scrollTo(0, 0);
   if (name === "studio") { renderTtsVoiceChip(); ttsEstimate(); }
   if (name === "recap") renderRecapVoiceChip();
+  if (name === "clone") loadClones();
 }
 $("menuBtn").onclick = () => {
   $("sidebar").classList.add("open");
@@ -1116,6 +1137,106 @@ $("ttsGo").onclick = async () => {
   ttsBusy = false;
   $("ttsGo").textContent = "🔊 အသံ ထုတ်မယ်";
   ttsEstimate();
+};
+
+/* ---------------- Voice Clone (build 212) ----------------
+   ကိုယ်ပိုင် အသံ = the account holder's OWN recorded voice.
+   The view reads GET /api/clones: while ElevenLabs is not
+   configured it shows the honest locked card (no form); once
+   a key exists, the create form + the caller's clone list
+   (preview play + delete). After any change the shared
+   /api/voices payload is refetched so the picker's
+   «ကိုယ်ပိုင် အသံများ» tab follows immediately. */
+let cloneBusy = false;
+function refreshVoices() {
+  fetch("/api/voices").then(r => r.json()).then(d => {
+    myVoiceList = (d && d.mine) || [];
+    voiceChips((d && d.voices) || d || VOICE_STYLES_FALLBACK);
+    renderTtsVoiceChip();
+  }).catch(() => {});
+}
+function cloneRow(c) {
+  const safe = escAttr(c.name || "?");
+  const ava = (c.name || "?").trim().charAt(0).toUpperCase();
+  return `<div class="vlib-row">`
+    + `<div class="vlib-ava">${ava}</div>`
+    + `<div class="vlib-main"><div class="vlib-name">${safe} · Clone</div>`
+    + `<div class="vlib-desc">ကိုယ်ပိုင် clone အသံ</div></div>`
+    + (c.preview ? `<button class="vlib-play" data-clone-play="${c.voice_id}">▶</button>` : "")
+    + `<button class="clone-del" data-clone-del="${c.voice_id}">🗑</button>`
+    + `</div>`;
+}
+async function loadClones() {
+  let d = null;
+  try {
+    const r = await fetch("/api/clones");
+    d = await r.json();
+  } catch (e) { /* leave both cards hidden on a network blip */ }
+  if (!d) return;
+  $("cloneLocked").style.display = d.configured ? "none" : "";
+  $("cloneMain").style.display = d.configured ? "" : "none";
+  if (!d.configured) return;
+  const list = d.clones || [];
+  $("cloneList").innerHTML = list.length
+    ? list.map(cloneRow).join("")
+    : `<p class="hint">Clone အသံ မရှိသေးပါ — အောက်မှာ နမူနာ တင်ပြီး ပထမဆုံး clone ဖန်တီးနိုင်ပါတယ်။</p>`;
+  $("cloneCap").textContent = "Clone " + list.length + " / " + (d.cap || 3)
+    + " ခု — ပြည့်ရင် အရင် တစ်ခု ဖျက်ပြီးမှ အသစ် ထည့်လို့ရပါမယ်။";
+  $("cloneList").querySelectorAll("[data-clone-play]").forEach(b =>
+    b.onclick = () => {
+      const c = list.find(x => x.voice_id === b.dataset.clonePlay);
+      if (c && c.preview)
+        togglePreview({id: "el:" + c.voice_id, preview: c.preview}, b);
+    });
+  $("cloneList").querySelectorAll("[data-clone-del]").forEach(b =>
+    b.onclick = () => deleteClone(b.dataset.cloneDel));
+}
+async function deleteClone(voiceId) {
+  if (cloneBusy) return;
+  if (!confirm("ဒီ clone အသံကို ဖျက်မှာ သေချာပါသလား?")) return;
+  cloneBusy = true;
+  $("cloneErr").textContent = "";
+  try {
+    const r = await fetch("/api/clones/" + encodeURIComponent(voiceId),
+                          {method: "DELETE"});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "ဖျက်လို့ မရပါ");
+    refreshVoices();
+    await loadClones();
+  } catch (e) { $("cloneErr").textContent = e.message; }
+  cloneBusy = false;
+}
+$("cloneGo").onclick = async () => {
+  if (cloneBusy) return;
+  $("cloneErr").textContent = "";
+  const name = $("cloneName").value.trim();
+  const file = $("cloneFile").files[0];
+  if (!name) { $("cloneErr").textContent = "အသံ နာမည် ထည့်ပေးပါ"; return; }
+  if (!file) { $("cloneErr").textContent = "နမူနာ အသံဖိုင် ရွေးပေးပါ"; return; }
+  if (!$("cloneConsent").checked) {
+    $("cloneErr").textContent = "«ဒါ ကျွန်တော့်/ကျွန်မ ကိုယ်ပိုင်အသံပါ» ကို အတည်ပြုပေးပါ";
+    return;
+  }
+  cloneBusy = true;
+  $("cloneGo").textContent = "⏳ Clone ဖန်တီးနေပါတယ်…";
+  $("cloneStatus").textContent = "";
+  try {
+    const fd = new FormData();
+    fd.append("name", name);
+    fd.append("consent", "1");
+    fd.append("sample", file);
+    const r = await fetch("/api/clones", {method: "POST", body: fd});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "Clone ဖန်တီးလို့ မရပါ");
+    $("cloneName").value = "";
+    $("cloneFile").value = "";
+    $("cloneConsent").checked = false;
+    $("cloneStatus").textContent = "✅ Clone ရပါပြီ — အသံ ရွေးတဲ့နေရာက «ကိုယ်ပိုင် အသံများ» tab မှာ တွေ့ရပါမယ်။";
+    refreshVoices();
+    await loadClones();
+  } catch (e) { $("cloneErr").textContent = e.message; }
+  cloneBusy = false;
+  $("cloneGo").textContent = "🎙 Clone ဖန်တီးမယ်";
 };
 
 /* ---------------- Recap (build 211) ----------------
@@ -3115,6 +3236,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 211</p>
+<p class="hint" id="buildTag" style="text-align:center">build 212</p>
 </body>
 </html>

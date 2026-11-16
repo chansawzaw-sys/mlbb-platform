@@ -71,6 +71,13 @@ CREATE TABLE IF NOT EXISTS deleted_users (
   deleted_at REAL,
   why TEXT
 );
+CREATE TABLE IF NOT EXISTS clones (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  voice_id TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  created_at REAL NOT NULL
+);
 """
 
 
@@ -664,3 +671,61 @@ def decide_topup(topup_id, ok):
                      f"topup:{topup_id}")
     return {"user_id": row["user_id"], "credits": row["credits"],
             "tg_chat_id": row["tg_chat_id"]}
+
+
+# ---------------- voice clones (build 212) ----------------
+# Self-serve Voice Clone: an account holder clones their OWN
+# voice at ElevenLabs (IVC, under the owner's API key); the row
+# here is the ONLY record of who owns which voice_id. A clone
+# belongs to exactly one account: /api/voices' "mine" reads
+# these rows, and job creation resolves an "el:<voice_id>" pick
+# against them — a clone is usable by its owner alone, whatever
+# the registry gate says about catalogue voices.
+
+def add_clone(user_id, voice_id, name):
+    """Record a freshly created clone. Returns the row dict.
+    voice_id is UNIQUE — a duplicate raises IntegrityError and
+    the caller cleans up the orphan ElevenLabs voice."""
+    with _LOCK, _db() as conn:
+        cur = conn.execute(
+            "INSERT INTO clones (user_id, voice_id, name, "
+            "created_at) VALUES (?, ?, ?, ?)",
+            (int(user_id), str(voice_id), str(name), time.time()))
+        row = conn.execute("SELECT * FROM clones WHERE id = ?",
+                           (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def clones_for(user_id):
+    """The account's clones, in creation order."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM clones WHERE user_id = ? ORDER BY id",
+            (int(user_id),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def clone_by_voice(voice_id):
+    """The clone row for a voice_id, whoever owns it — callers
+    MUST compare user_id themselves before granting anything."""
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM clones WHERE voice_id = ?",
+                           (str(voice_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def clone_count(user_id):
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM clones WHERE user_id = ?",
+            (int(user_id),)).fetchone()
+    return int(row["n"])
+
+
+def delete_clone(user_id, voice_id):
+    """Delete ONLY the caller's own row. True when one went."""
+    with _LOCK, _db() as conn:
+        cur = conn.execute(
+            "DELETE FROM clones WHERE user_id = ? AND voice_id = ?",
+            (int(user_id), str(voice_id)))
+    return cur.rowcount == 1

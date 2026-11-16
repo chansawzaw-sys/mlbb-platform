@@ -55,6 +55,15 @@ nothing extra in .env. Preview generation is best-effort and
 NEVER raises: a missing key or API error leaves the voice
 saved without a clip. (The job path is the one that must fail
 loud; a preview is decoration.)
+
+Build 212 — self-serve Voice Clone: customers clone their OWN
+voice via IVC (add_voice / delete_voice below) under the
+owner's key. Ownership rows live in pipeline.accounts (the
+clones table); a clone's preview follows the same convention
+with the usr- prefix (usr-<voice_id>.mp3). A clone is usable
+by its owner alone — app.py's job creation resolves ownership
+before a job exists, and synthesize() accepts the resolved
+display name for a non-registry voice.
 """
 import json
 import os
@@ -310,28 +319,131 @@ def preview_url_el(voice_id):
     return None
 
 
-def generate_preview(voice_id):
-    """Best-effort preview synthesis -> PREVIEW_DIR/el-<id>.mp3.
-    Returns True when the clip exists afterwards. NEVER raises:
-    no key / API error just leaves the voice without a preview
-    (unlike a job, which must fail loud)."""
+def _generate_preview_to(voice_id, path):
+    """The shared best-effort core: synthesize SAMPLE_TEXT into
+    `path` (via a temp sibling + atomic replace). Returns True
+    when the clip exists afterwards. NEVER raises."""
     try:
         if not key_configured():
             return False
         PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = PREVIEW_DIR / (preview_filename_el(voice_id) + ".tmp")
+        tmp = path.with_name(path.name + ".tmp")
         try:
             _synth_one(get_api_key(), get_model(), voice_id,
                        SAMPLE_TEXT, tmp)
-            tmp.replace(preview_path_el(voice_id))
+            tmp.replace(path)
         finally:
             try:
                 tmp.unlink(missing_ok=True)
             except Exception:
                 pass
-        return preview_path_el(voice_id).exists()
+        return path.exists()
     except Exception:
         return False
+
+
+def generate_preview(voice_id):
+    """Best-effort preview synthesis -> PREVIEW_DIR/el-<id>.mp3.
+    Returns True when the clip exists afterwards. NEVER raises:
+    no key / API error just leaves the voice without a preview
+    (unlike a job, which must fail loud)."""
+    return _generate_preview_to(voice_id, preview_path_el(voice_id))
+
+
+# ---------- User clones (build 212) ----------
+# Self-serve Voice Clone: a customer's clone lives in the
+# OWNER's ElevenLabs account (created with the owner's key via
+# Instant Voice Cloning) but belongs to that customer — the
+# ownership row lives in pipeline.accounts (clones table), and
+# the preview clip follows the same filename-convention
+# pattern with the usr- prefix so it can never collide with a
+# registry voice's el- clip.
+
+def preview_filename_usr(voice_id):
+    return f"usr-{voice_id}.mp3"
+
+
+def preview_path_usr(voice_id):
+    return PREVIEW_DIR / preview_filename_usr(voice_id)
+
+
+def preview_url_usr(voice_id):
+    if preview_path_usr(voice_id).exists():
+        return f"/voice-previews/{preview_filename_usr(voice_id)}"
+    return None
+
+
+def generate_preview_usr(voice_id):
+    """Best-effort preview for a user clone -> usr-<id>.mp3.
+    NEVER raises (same rule as registry previews)."""
+    return _generate_preview_to(voice_id, preview_path_usr(voice_id))
+
+
+def add_voice(name, sample_path):
+    """Create an Instant Voice Clone from ONE sample file ->
+    the new voice_id. Raises RuntimeError (polite Burmese) on
+    any failure — the caller stores NOTHING in that case, so a
+    failed clone attempt never leaves a row pointing at a
+    voice that does not exist."""
+    key = get_api_key()
+    if not key:
+        raise RuntimeError(
+            "ElevenLabs key မထည့်ရသေးပါ — admin က key ထည့်ပြီးမှ "
+            "clone လုပ်လို့ရပါမယ်")
+    url = f"{API_BASE}/v1/voices/add"
+    last = None
+    for attempt in range(2):
+        try:
+            with open(sample_path, "rb") as fh:
+                r = requests.post(
+                    url, headers={"xi-api-key": key},
+                    data={"name": name},
+                    files={"files": (Path(sample_path).name, fh)},
+                    timeout=120)
+            if r.status_code == 200:
+                vid = (r.json() or {}).get("voice_id")
+                if vid:
+                    return str(vid)
+                last = "no voice_id in response"
+            else:
+                last = f"HTTP {r.status_code}"
+                if r.status_code in (401, 403):
+                    break
+        except Exception as e:  # network blip — one retry
+            last = str(e)[:120]
+        if attempt + 1 < 2:
+            time.sleep(2)
+    raise RuntimeError(
+        "Clone ဖန်တီးတာ မရပါ — ElevenLabs service ခဏ "
+        "အလုပ်မလုပ်ပါ။ ခဏနေမှ ပြန်စမ်းပါ"
+        + (f" [{last}]" if last else ""))
+
+
+def delete_voice(voice_id):
+    """Delete a voice from the owner's ElevenLabs account.
+    A 404 counts as success (already gone — the local row may
+    still be cleaned up). Any other failure raises RuntimeError
+    and the caller KEEPS the local row, so the voice never
+    silently leaks a slot in the owner's account while looking
+    deleted here."""
+    key = get_api_key()
+    if not key:
+        raise RuntimeError(
+            "ElevenLabs key မရှိတော့ပါ — admin က key ပြန်ထည့်ပြီးမှ "
+            "ဖျက်လို့ရပါမယ်")
+    url = f"{API_BASE}/v1/voices/{voice_id}"
+    try:
+        r = requests.delete(url, headers={"xi-api-key": key},
+                            timeout=_REQUEST_TIMEOUT)
+    except Exception as e:
+        raise RuntimeError(
+            "Clone ဖျက်တာ မရပါ — ElevenLabs service ခဏ "
+            f"အလုပ်မလုပ်ပါ။ ခဏနေမှ ပြန်စမ်းပါ [{str(e)[:120]}]")
+    if r.status_code in (200, 204, 404):
+        return
+    raise RuntimeError(
+        "Clone ဖျက်တာ မရပါ — ElevenLabs service ခဏ "
+        f"အလုပ်မလုပ်ပါ။ ခဏနေမှ ပြန်စမ်းပါ [HTTP {r.status_code}]")
 
 
 def _synth_one(key, model, voice_id, text, out_path):
@@ -365,19 +477,28 @@ def _synth_one(key, model, voice_id, text, out_path):
     raise RuntimeError(FAIL_MSG + (f" [{last}]" if last else ""))
 
 
-def synthesize(workdir, voice_id):
+def synthesize(workdir, voice_id, voice_name=None):
     """Per-segment ElevenLabs synthesis with the SAME output
     contract as pipeline.tts.synthesize: writes tts/seg_XXX.mp3
     and sets tts_file / tts_duration / tts_provider on every
     segment of segments_my.json — plus tts_engine / tts_voice /
     tts_voice_name, so the job record shows what actually spoke.
-    The retime step consumes the files unchanged."""
+    The retime step consumes the files unchanged.
+
+    Build 212: `voice_name` is the display name the CALLER
+    already resolved for a voice that is NOT in the registry —
+    a customer's own clone (job creation verified ownership
+    before the job existed). A registry voice always wins over
+    the passed name; an unknown id with no name keeps the
+    removed-voice failure below."""
     key = get_api_key()
     if not key:
         raise RuntimeError(
             "ElevenLabs key မထည့်ရသေးပါ — admin က key ထည့်ပြီးမှ "
             "ဒီ အသံ သုံးလို့ရပါမယ် (credit လုံးဝ မဖြတ်ပါ)")
     entry = find_voice(voice_id)
+    if entry is None and voice_name:
+        entry = {"id": str(voice_id), "name": str(voice_name)}
     if entry is None:
         raise RuntimeError(
             "ရွေးထားတဲ့ ElevenLabs အသံ မရှိတော့ပါ — အသံ ပြန်ရွေးပေးပါ "
