@@ -34,6 +34,7 @@ from pipeline import download as dl_mod
 from pipeline import elevenlabs_tts
 from pipeline import envfile
 from pipeline import fx as fx_mod
+from pipeline import commentary as commentary_mod
 from pipeline import recap as recap_mod
 from pipeline import story as story_mod
 from pipeline import story_render
@@ -56,7 +57,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 216"
+BUILD_TAG = "build 217"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -978,6 +979,21 @@ def _daily_job_limit():
         return 0
 
 
+def _commentary_credits_per_min():
+    """Admin setting COMMENTARY_CREDITS_PER_MIN: the standard
+    per-started-minute rate for Commentary jobs (build 217),
+    default 2 (= 300 kyat/min at the 150-kyat credit — inside
+    the owner's 300-400 kyat/min target band, against Burma
+    Voice's ~1,800). Read live like DAILY_JOB_LIMIT. Premium
+    ElevenLabs voices on a commentary job bill the premium
+    rate + 1 (see _credits_per_min_for)."""
+    try:
+        return max(1, min(100, int(
+            _env_value("COMMENTARY_CREDITS_PER_MIN") or 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
 def _account_daily_count(user_id):
     """Videos this account STARTED today (Asia/Yangon), web and
     Telegram combined — both channels stamp the same user_id on
@@ -1890,7 +1906,10 @@ def _job_dispatcher():
                           "recap1": _recap_worker,
                           "recap2": _recap_worker2,
                           "story1": _story_worker,
-                          "story2": _story_worker2}.get(kind, _worker)
+                          "story2": _story_worker2,
+                          "commentary1": _commentary_worker,
+                          "commentary2": _commentary_worker2}.get(
+                              kind, _worker)
                 wt = threading.Thread(target=target, args=(job,),
                                       daemon=True)
                 # Build 204 (audit V09): registered BEFORE start
@@ -1974,6 +1993,14 @@ def _credits_per_min_for(job):
     ELEVENLABS_CREDITS_PER_MIN (default 2); every other voice —
     and subtitles-only jobs, whose voice is never premium — is
     the standard 1 credit per started minute."""
+    if job.get("type") == "commentary":
+        # Build 217: Commentary bills its own per-minute rate
+        # — the COMMENTARY_CREDITS_PER_MIN setting (default 2)
+        # for standard voices, the premium rate + 1 for
+        # ElevenLabs voices.
+        if elevenlabs_tts.is_el_voice(job.get("voice")):
+            return elevenlabs_tts.credits_per_min() + 1
+        return _commentary_credits_per_min()
     if elevenlabs_tts.is_el_voice(job.get("voice")):
         return elevenlabs_tts.credits_per_min()
     return 1
@@ -3073,6 +3100,7 @@ def elevenlabs_status():
         "credits_per_min": elevenlabs_tts.credits_per_min(),
         "access": elevenlabs_tts.get_access_mode(),
         "test_users": elevenlabs_tts.get_test_users(),
+        "commentary_credits_per_min": _commentary_credits_per_min(),
         "voices": _el_status_voices()})
 
 
@@ -3118,6 +3146,16 @@ def elevenlabs_save():
         if data["access"] not in elevenlabs_tts.ACCESS_MODES:
             return jsonify({"error": "သုံးခွင့် ပုံစံ မမှန်ပါ"}), 400
         writes["ELEVENLABS_ACCESS"] = data["access"]
+    if "commentary_credits_per_min" in data:
+        try:
+            crate = int(data["commentary_credits_per_min"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "credit နှုန်း မမှန်ပါ"}), 400
+        if not 1 <= crate <= 100:
+            return jsonify({"error":
+                            "credit နှုန်း 1–100 အတွင်း "
+                            "ဖြစ်ရပါမယ်"}), 400
+        writes["COMMENTARY_CREDITS_PER_MIN"] = str(crate)
     if "test_users" in data:
         users, uerr = elevenlabs_tts.parse_test_users(
             data["test_users"])
@@ -3133,7 +3171,9 @@ def elevenlabs_save():
                     "credits_per_min":
                         elevenlabs_tts.credits_per_min(),
                     "access": elevenlabs_tts.get_access_mode(),
-                    "test_users": elevenlabs_tts.get_test_users()})
+                    "test_users": elevenlabs_tts.get_test_users(),
+                    "commentary_credits_per_min":
+                        _commentary_credits_per_min()})
 
 
 def _el_validate_entry(data):
@@ -6077,6 +6117,330 @@ def render_story(jid):
     _enqueue_job(job, kind="story2")
     return jsonify({"ok": True})
 
+
+
+
+# ---------- Commentary product (build 217) ----------
+# The customer gives a video (link or uploaded file); its
+# own speech is transcribed and pipeline.commentary writes
+# an energetic Burmese sports/commentary-style script from
+# the transcript (play-by-play, present tense) through the
+# same free-first LLM chain as Recap/Story. Two phases
+# mirroring Recap exactly (worker kinds "commentary1" /
+# "commentary2"): phase 1 downloads + transcribes through
+# the shared guarded chain, refuses honestly when the
+# transcript has fewer than 3 usable segments (v1 invents
+# nothing), admission-quotes the job (started SOURCE
+# minutes x the commentary rate — COMMENTARY_CREDITS_PER_MIN
+# for standard voices, the premium rate + 1 for ElevenLabs
+# voices, via _credits_per_min_for), writes the script and
+# parks at "waiting_script", zero charged.
+# POST /api/commentary/<id>/render stores the final
+# (possibly edited) text and queues phase 2: recap's
+# proportional segments -> the UNCHANGED dub phase 2 in
+# mode "both" (TTS narration, shared retime, cinematic
+# subtitle burn of the commentary text) — then, when the
+# customer chose the DUCKED original-audio mode (the
+# default), pipeline.commentary.mix_bed lays the original
+# audio under the narration at ~13% volume, re-timed chunk
+# by chunk so it stays in sync with the picture; OFF keeps
+# the narration-only track. The record is a normal job
+# (type "commentary"), so retention (the single 24h rule),
+# the jobs listing and the download/stream routes serve
+# it. Charge-on-success only: _finish is the single charge
+# point; any failure or cancel charges exactly zero.
+
+COMMENTARY_STEPS = ["download", "transcribe", "script",
+                    "tts", "retime", "finalize"]
+COMMENTARY_TEXT_CAP = 20000  # chars, for the render-time edit
+COMMENTARY_AUDIO_MODES = ("ducked", "off")
+
+
+def _commentary_steps():
+    return [{"key": "download", "label": STEP_LABELS["download"],
+             "state": "pending"},
+            {"key": "transcribe",
+             "label": STEP_LABELS["transcribe"],
+             "state": "pending"},
+            {"key": "script", "label": "Commentary စာသား ရေးရန်",
+             "state": "pending"},
+            {"key": "tts", "label": STEP_LABELS["tts"],
+             "state": "pending"},
+            {"key": "retime", "label": STEP_LABELS["retime"],
+             "state": "pending"},
+            {"key": "finalize", "label": STEP_LABELS["finalize"],
+             "state": "pending"}]
+
+
+def _commentary_view(job):
+    view = {k: job.get(k) for k in
+            ("id", "type", "url", "status", "current", "error",
+             "voice", "voice_label", "quote_minutes",
+             "quote_credits", "charged_minutes",
+             "commentary_edited", "commentary_audio",
+             "created_at", "finished_at")}
+    view["timings"] = _timings_of(job)  # build 213
+    view["upload"] = bool(job.get("upload"))  # build 215
+    view["steps"] = job.get("steps") or []
+    if job.get("commentary_text") is not None:
+        view["commentary_text"] = job["commentary_text"]
+    if job.get("status") == "queued":
+        waiting = [q for q, _k in _JOB_QUEUE]
+        if job["id"] in waiting:
+            view["queue_pos"] = waiting.index(job["id"]) + 1
+    return view
+
+
+def _commentary_worker(job):
+    """Phase 1: download -> transcribe -> segment check ->
+    quote -> commentary script. Parks the job at
+    waiting_script; nothing is charged."""
+    workdir = JOBS_DIR / job["id"]
+    threading.Thread(target=_heartbeat, args=(job,),
+                     daemon=True).start()
+    with job_context(job["id"]):
+        try:
+            job["status"] = "running"
+            _timing_start(job)  # build 213
+            _save(job)
+            run_job.run_recap_phase1(
+                workdir, job["url"], progress=_progress_fn(job),
+                quality=job.get("quality") or "hd",
+                source_path=job.get("source_path"))
+            if job.get("upload"):
+                job.setdefault("timings", {})["download"] = 0
+            # Edge rule: a video with (almost) no speech has
+            # nothing to commentate on — fail loudly here,
+            # before any quote or script work, zero charged.
+            if commentary_mod.usable_segment_count(workdir) \
+                    < commentary_mod.MIN_SEGMENTS:
+                raise RuntimeError(commentary_mod.SPARSE_MSG)
+            _quote_for_job(job)
+            progress = _progress_fn(job)
+            progress("script", "running")
+            target = recap_mod.target_chars_for(workdir)
+            script, provider = commentary_mod.generate_script(
+                workdir, target)
+            progress("script", "done")
+            job["commentary_text"] = script
+            job["commentary_provider"] = provider
+            job["commentary_edited"] = False
+            job["status"] = "waiting_script"
+            job["current"] = None
+            # The human review park is not machine time
+            # (build 213, same as recap).
+            _timing_close(job)
+            _save(job)
+            try:
+                from pipeline import api_stats
+                api_stats.record(
+                    [{"text": "commentary",
+                      "provider": provider}])
+            except Exception:
+                pass
+        except JobCancelled:
+            _cancelled(job)
+        except Exception as e:
+            if job.get("cancel_requested"):
+                _cancelled(job)
+            else:
+                _fail(job, e)
+
+
+def _commentary_worker2(job):
+    """Phase 2: the final script -> proportional timed
+    segments -> the dub phase 2 in mode "both" -> the
+    ducked original-audio bed when chosen -> _finish (the
+    only place a commentary job is ever charged)."""
+    workdir = JOBS_DIR / job["id"]
+    threading.Thread(target=_heartbeat, args=(job,),
+                     daemon=True).start()
+    with job_context(job["id"]):
+        try:
+            job["status"] = "running"
+            _timing_start(job)  # build 213
+            _save(job)
+            from pipeline.common import save_segments
+            total = probe_duration(workdir / "source.mp4")
+            segs = recap_mod.script_segments(
+                job.get("commentary_text") or "", total)
+            if not segs:
+                raise RuntimeError(
+                    "Commentary စာသား မရှိပါ — စာသား "
+                    "ပြန်ထည့်ပြီး ပြန်စမ်းပါ "
+                    "(credit လုံးဝ မဖြတ်ပါ)")
+            save_segments(segs, workdir / "segments_my.json")
+            run_job.run_phase2(
+                workdir, mode="both", voice=job["voice"],
+                progress=_progress_fn(job), fx=None,
+                font=job.get("font") or "noto",
+                voice_rate=job.get("voice_rate", 0),
+                voice_pitch=job.get("voice_pitch", 0),
+                subs=job.get("subs"),
+                max_speed=job.get("speed_cap") or 1.3,
+                quality=job.get("quality") or "hd",
+                voice_name=job.get("voice_name"))
+            if job.get("commentary_audio") != "off":
+                # Ducked bed (the default): the original
+                # audio under the narration at ~13%. The bed
+                # is garnish — a mix failure leaves the
+                # narration-only output standing and the job
+                # still succeeds (Story's music-bed rule).
+                progress = _progress_fn(job)
+                progress("finalize", "running")
+                try:
+                    job["commentary_bed"] = bool(
+                        commentary_mod.mix_bed(workdir))
+                except Exception as bed_err:
+                    print(f"[job {job['id']}] commentary bed "
+                          f"skipped: {bed_err}", flush=True)
+                    job["commentary_bed"] = False
+                progress("finalize", "done")
+            _finish(job)
+        except JobCancelled:
+            _cancelled(job)
+        except Exception as e:
+            if job.get("cancel_requested"):
+                _cancelled(job)
+            else:
+                _fail(job, e)
+
+
+@app.post("/api/commentary")
+def create_commentary():
+    user = _current_user()
+    # Multipart = uploaded file source, the same
+    # _accept_upload gate as the dub wizard / Recap
+    # (build 215).
+    data, upload_file = _request_upload()
+    url = (data.get("url") or "").strip()
+    if upload_file is not None:
+        url = ""
+    elif not url.startswith(("http://", "https://")):
+        return jsonify({"error": "လင့်ခ် မမှန်ပါ"}), 400
+    elif not _public_url_ok(url):
+        return jsonify({"error": "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"}), 400
+    # Voice resolution mirrors create_recap exactly (builds
+    # 200 / 205 / 206 / 212): an ElevenLabs pick must resolve
+    # for the caller through _resolve_el_entry — registry
+    # voices gated, the caller's own clone on ownership; a
+    # style key resolves through the shared table; anything
+    # else fails safe to the product default style.
+    voice_in = data.get("voice")
+    el_entry = None
+    if voice_in and elevenlabs_tts.is_el_voice(str(voice_in).strip()):
+        el_entry, el_blocked = _resolve_el_entry(
+            user, elevenlabs_tts.voice_id_of(str(voice_in).strip()))
+        if el_entry is None:
+            return jsonify({"error":
+                            "ရွေးထားတဲ့ ElevenLabs အသံ မရှိတော့ပါ — "
+                            "အသံ ပြန်ရွေးပေးပါ"}), 400
+        if el_blocked:
+            return jsonify({"error":
+                            "ဒီ Premium အသံ က အခု စမ်းသပ်ဆဲ "
+                            "ဖြစ်လို့ သတ်မှတ်ထားတဲ့ account တွေ ပဲ "
+                            "သုံးလို့ရပါသေးတယ် — မကြာခင် အားလုံး "
+                            "အတွက် ဖွင့်ပေးပါမယ်"}), 403
+        voice = "el:" + el_entry["id"]
+        voice_style = voice
+        voice_label = el_entry["name"]
+        voice_rate, voice_pitch = 0, 0
+    else:
+        style = tts.resolve_style(voice_in)
+        voice = style["voice"]
+        voice_style = style["key"]
+        voice_label = style["label"]
+        voice_rate, voice_pitch = style["rate"], style["pitch"]
+    quality = data.get("quality") if data.get("quality") in \
+        ("hd", "720", "480") else "hd"
+    try:
+        speed_cap = max(1.0, min(4.0,
+                                 float(data.get("speed_cap") or 1.3)))
+    except (TypeError, ValueError):
+        speed_cap = 1.3
+    audio_mode = data.get("audio_mode") \
+        if data.get("audio_mode") in COMMENTARY_AUDIO_MODES \
+        else "ducked"
+    now = time.time()
+    job = {"id": uuid.uuid4().hex[:12], "type": "commentary",
+           "url": url, "mode": "commentary",
+           "commentary_audio": audio_mode,
+           "voice": voice, "voice_style": voice_style,
+           "voice_label": voice_label,
+           "voice_rate": voice_rate, "voice_pitch": voice_pitch,
+           "speed_cap": speed_cap, "quality": quality,
+           "font": "noto", "subs": _build_subs(data), "fx": None,
+           "source_path": None,
+           "status": "queued", "current": None, "error": None,
+           "created_at": now, "updated_at": now,
+           "finished_at": None,
+           "steps": _commentary_steps()}
+    if el_entry is not None:
+        job["tts_engine"] = "elevenlabs"
+        job["voice_name"] = el_entry["name"]
+    if user:
+        # Same admission gates as a recap job, in the same
+        # order — both refuse before the job exists.
+        setup_msg = _setup_gate_message(user)
+        if setup_msg:
+            return jsonify({"error": setup_msg}), 400
+        job["user_id"] = user["id"]
+        accounts.mark_has_job(user["id"])
+        limit_msg = _daily_limit_message(user)
+        if limit_msg:
+            return jsonify({"error": limit_msg}), 400
+    if upload_file is not None:
+        uerr = _accept_upload(job, upload_file, user)
+        if uerr:
+            return jsonify({"error": uerr}), 400
+    JOBS[job["id"]] = job
+    _save(job)
+    _enqueue_job(job, kind="commentary1")
+    return jsonify(_commentary_view(job))
+
+
+@app.get("/api/commentary/<jid>")
+def get_commentary(jid):
+    job = _load_job(jid)
+    if not job or job.get("type") != "commentary" \
+            or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    return jsonify(_commentary_view(job))
+
+
+@app.post("/api/commentary/<jid>/render")
+def render_commentary(jid):
+    """Submit the final commentary text (edited or untouched)
+    and queue the render. Only a job parked at waiting_script
+    can be rendered — the quote from phase 1 stands, and the
+    charge still lands only on a finished video."""
+    job = _load_job(jid)
+    if not job or job.get("type") != "commentary" \
+            or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    if job["status"] != "waiting_script":
+        return jsonify({"error":
+                        "ဒီ job က စာသား အတည်ပြုရန် အဆင့် "
+                        "မဟုတ်ပါ"}), 409
+    data = request.get_json(force=True, silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "Commentary စာသား အရင် ထည့်ပါ"}), 400
+    if len(text) > COMMENTARY_TEXT_CAP:
+        return jsonify({"error":
+                        f"စာသား အရှည်ဆုံး {COMMENTARY_TEXT_CAP} လုံး "
+                        "ပဲ ရပါတယ် — လျှော့ပြီး ပြန်စမ်းပါ"}), 400
+    if text != (job.get("commentary_text") or ""):
+        job["commentary_edited"] = True
+    job["commentary_text"] = text
+    old_timer = CLEANUP_TIMERS.pop(jid, None)
+    if old_timer:
+        old_timer.cancel()
+    job.pop("cleanup_at", None)
+    job["status"] = "queued"
+    _save(job)
+    _enqueue_job(job, kind="commentary2")
+    return jsonify({"ok": True})
 
 
 # ---------- text-only export + bulk text input ----------
