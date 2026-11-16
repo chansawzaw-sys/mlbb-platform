@@ -202,6 +202,51 @@ def translate_all(segments, style="subs"):
     raise RuntimeError(msg)
 
 
+def generate_text(prompt):
+    """Free-form text generation (build 211, for the Recap
+    script): ONE chat request with the caller's prompt over the
+    SAME model walk as translate_all. Returns the model's raw
+    text (prose — no JSON validation). Raises on ANY problem
+    so the caller can fall back."""
+    import requests
+
+    key = get_api_key()
+    if not key:
+        raise RuntimeError("no XKIRO_API_KEY configured")
+    body = {"messages": [{"role": "user", "content": prompt}]}
+    attempts = []
+    last_body = ""
+    for mdl in _models():
+        try:
+            resp = requests.post(
+                _API_URL, json={**body, "model": mdl}, timeout=60,
+                headers={"Authorization": f"Bearer {key}",
+                         "Content-Type": "application/json"})
+        except Exception as e:  # network-level: next model shape
+            attempts.append(f"{mdl}=net:{e}"[:60])
+            continue
+        if resp.status_code == 200:
+            try:
+                text_out = resp.json()["choices"][0][
+                    "message"]["content"]
+                if not (text_out or "").strip():
+                    raise ValueError("empty generation")
+            except Exception as e:
+                attempts.append(f"{mdl}=badformat:{e}"[:70])
+                continue
+            _note_model(mdl)
+            globals()["LAST_MODEL"] = mdl
+            return text_out
+        attempts.append(f"{mdl}={resp.status_code}")
+        last_body = resp.text[:200]
+        if resp.status_code == 401:
+            break  # bad key — no model will help
+    msg = ("xKiro generation failed: " + "; ".join(attempts)
+           + f" | last: {last_body}")
+    _note_error(msg)
+    raise RuntimeError(msg)
+
+
 if __name__ == "__main__":
     print("xkiro key configured:", key_configured(),
           "| models:", _models())

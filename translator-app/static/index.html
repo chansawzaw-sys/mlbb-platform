@@ -240,7 +240,7 @@
   <button class="sb-item" data-view="clone">🎙 အသံ Clone <span class="badge">မကြာမီ</span></button>
   <button class="sb-item" data-view="studio">✍️ စာသားမှ အသံ</button>
   <div class="sb-sec">အကြောင်းအရာ</div>
-  <button class="sb-item" data-view="recap">📝 Recap <span class="badge">မကြာမီ</span></button>
+  <button class="sb-item" data-view="recap">📝 Recap</button>
   <button class="sb-item on" data-view="dub">🎬 အသံထပ်</button>
   <button class="sb-item" data-view="account">👤 အကောင့်</button>
   <div class="sb-foot">
@@ -767,9 +767,32 @@
 
   <div class="view" id="view-recap" style="display:none">
     <div class="card show">
-      <h3 style="margin-top:0">📝 Recap <span class="badge">မကြာမီ</span></h3>
-      <p class="hint">ဗီဒီယိုလင့်ခ် ထည့်လိုက်ရုံနဲ့ ဇာတ်လမ်းကို အစအဆုံး ပြန်ပြောပြတဲ့ recap ဗီဒီယို — မြန်မာ အသံထွက် + စာတန်း အပါ — အလိုအလျောက် ထုတ်ပေးမယ့် အပိုင်းပါ။</p>
-      <p class="hint">ပြင်ဆင်နေဆဲ ဖြစ်လို့ မကြာခင် ဖွင့်ပေးပါမယ်။ အခုအတွက် လင့်ခ်ကနေ စာတန်းထိုး / အသံထွက် လုပ်တဲ့ «အသံထပ်» အပိုင်းကို သုံးနိုင်ပါတယ်။</p>
+      <h3 style="margin-top:0">📝 Recap</h3>
+      <p class="hint">ဗီဒီယိုလင့်ခ် ထည့်လိုက်ရုံနဲ့ ဇာတ်လမ်းကို အစအဆုံး ပြန်ပြောပြတဲ့ recap ဗီဒီယို — မြန်မာ အသံထွက် + စာတန်း အပါ — ထုတ်ပေးပါတယ်။ အရင် recap စာသား ထုတ်ပေးမှာမို့ စစ်ပြီး ပြင်ချင်ရင် ပြင်နိုင်ပါတယ် — အတည်ပြုမှ အသံထပ် စပြီး credit ဖြတ်ပါမယ်။</p>
+      <input id="recapUrl" type="url" placeholder="https://www.youtube.com/watch?v=..." style="width:100%;padding:10px;border-radius:8px;box-sizing:border-box">
+      <p class="hint">YouTube / TikTok / Facebook / RedNote လင့်ခ် ထည့်ပါ</p>
+      <div class="tts-voicerow">
+        <button id="recapVoiceChip">
+          <span class="vlib-ava" id="recapVoiceAva">T</span>
+          <span id="recapVoiceName">Thiha · ပုံမှန်</span>
+          <span>▾</span>
+        </button>
+      </div>
+      <p class="hint" id="recapRate">နှုန်း: ဗီဒီယို ၁ မိနစ် = 1 credit</p>
+      <p class="err" id="recapErr"></p>
+      <button id="recapGo">📝 Recap စာသား ထုတ်မယ်</button>
+      <div id="recapProg" style="display:none"></div>
+      <div id="recapScriptBox" style="display:none">
+        <p class="hint" id="recapQuote"></p>
+        <textarea id="recapText" rows="10" style="width:100%;box-sizing:border-box"></textarea>
+        <p class="hint">စာသားကို စစ်ပါ — ပြင်ချင်ရင် ဒီမှာပဲ ပြင်နိုင်ပါတယ်။</p>
+        <button id="recapRender">✅ ဒီစာသားနဲ့ အသံထပ်မယ်</button>
+      </div>
+      <div id="recapResult" style="display:none">
+        <video id="recapVideo" controls preload="metadata" style="width:100%;border-radius:10px"></video>
+        <a class="dl" id="recapDl" download>⬇️ ဗီဒီယို ဒေါင်းလုပ် (.mp4)</a>
+        <p class="hint" id="recapCharged"></p>
+      </div>
     </div>
   </div><!-- /view-recap -->
 
@@ -948,6 +971,7 @@ function showView(name) {
   closeSidebar();
   window.scrollTo(0, 0);
   if (name === "studio") { renderTtsVoiceChip(); ttsEstimate(); }
+  if (name === "recap") renderRecapVoiceChip();
 }
 $("menuBtn").onclick = () => {
   $("sidebar").classList.add("open");
@@ -1092,6 +1116,137 @@ $("ttsGo").onclick = async () => {
   ttsBusy = false;
   $("ttsGo").textContent = "🔊 အသံ ထုတ်မယ်";
   ttsEstimate();
+};
+
+/* ---------------- Recap (build 211) ----------------
+   Paste a link -> phase 1 (download + transcribe + AI recap
+   script) -> the script parks for review/edit -> render.
+   The voice chip opens the SAME library sheet as the studio
+   (shared W.voice selection). Polling reads /api/recap/<id>;
+   the finished video plays/downloads through the normal job
+   routes. */
+let recapJobId = null, recapTimer = null;
+function renderRecapVoiceChip() {
+  const v = curVoiceEntry();
+  if (!v) return;
+  $("recapVoiceAva").textContent =
+    (v.name || v.label || "?").trim().charAt(0).toUpperCase();
+  $("recapVoiceName").textContent = (v.name || v.label || "")
+    + (v.tag ? " · " + v.tag : "") + (v.premium ? " 🌟" : "");
+  const rate = v.premium ? (v.rate || 2) : 1;
+  $("recapRate").textContent = "နှုန်း: ဗီဒီယို ၁ မိနစ် = " + rate
+    + " credit" + (v.premium ? " (🌟 Premium အသံ)" : "");
+}
+$("recapVoiceChip").onclick = () => {
+  sheetHost = $("ttsSheetBody");
+  sheetOnPick = () => { closeTtsSheet(); renderRecapVoiceChip(); };
+  $("ttsSheetWrap").style.display = "";
+  voiceChips(voiceList);
+};
+function recapStepsHtml(job) {
+  return (job.steps || []).map(s =>
+    `<div class="step ${s.state}">${ICON[s.state] || "⏳"} ${s.label}</div>`
+  ).join("");
+}
+function stopRecapPoll() {
+  if (recapTimer) { clearInterval(recapTimer); recapTimer = null; }
+}
+async function pollRecap() {
+  if (!recapJobId) return;
+  let job;
+  try {
+    const res = await fetch("/api/recap/" + recapJobId);
+    job = await res.json();
+    if (!res.ok) throw new Error(job.error || "job မတွေ့ပါ");
+  } catch (e) { stopRecapPoll(); return; }
+  if (job.status === "waiting_script") {
+    stopRecapPoll();
+    $("recapProg").style.display = "none";
+    $("recapQuote").textContent = "ဗီဒီယို " + (job.quote_minutes || "?")
+      + " မိနစ် · ကုန်ကျ " + (job.quote_credits || "?")
+      + " credits (အောင်မြင်မှ ဖြတ်ပါမယ်)";
+    if (document.activeElement !== $("recapText"))
+      $("recapText").value = job.recap_text || "";
+    $("recapScriptBox").style.display = "";
+    $("recapGo").disabled = false;
+    return;
+  }
+  if (job.status === "done") {
+    stopRecapPoll();
+    $("recapProg").style.display = "none";
+    $("recapScriptBox").style.display = "none";
+    $("recapVideo").src = "/api/jobs/" + job.id + "/stream";
+    $("recapDl").href = "/api/jobs/" + job.id + "/download";
+    $("recapCharged").textContent = "✅ ရပြီ"
+      + (job.charged_minutes
+          ? " · " + job.charged_minutes + " credits ဖြတ်ပြီး"
+          : " · credit မဖြတ်ပါ");
+    $("recapResult").style.display = "";
+    $("recapGo").disabled = false;
+    loadMe(); loadJobs();
+    return;
+  }
+  if (job.status === "error" || job.status === "cancelled") {
+    stopRecapPoll();
+    $("recapProg").style.display = "none";
+    $("recapErr").textContent = job.error || "မရပါ";
+    $("recapGo").disabled = false;
+    return;
+  }
+  $("recapProg").style.display = "";
+  $("recapProg").innerHTML =
+    (job.status === "queued"
+      ? `<div class="step running">⏳ တန်းစီ စောင့်နေပါတယ်`
+        + (job.queue_pos ? " (အဆင့် " + job.queue_pos + ")" : "")
+        + `</div>` : "")
+    + recapStepsHtml(job);
+}
+$("recapGo").onclick = async () => {
+  const url = $("recapUrl").value.trim();
+  if (!url) { $("recapErr").textContent = "လင့်ခ် အရင် ထည့်ပါ"; return; }
+  $("recapErr").textContent = "";
+  $("recapScriptBox").style.display = "none";
+  $("recapResult").style.display = "none";
+  $("recapGo").disabled = true;
+  try {
+    const res = await fetch("/api/recap", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({url, voice: W.voice})});
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error || "Recap စလို့ မရပါ");
+    recapJobId = d.id;
+    $("recapProg").style.display = "";
+    $("recapProg").innerHTML =
+      `<div class="step running">🔄 စာသား ထုတ်နေပြီ… ခဏစောင့်ပါ</div>`;
+    stopRecapPoll();
+    recapTimer = setInterval(pollRecap, 2500);
+    pollRecap();
+  } catch (e) {
+    $("recapErr").textContent = e.message;
+    $("recapGo").disabled = false;
+  }
+};
+$("recapRender").onclick = async () => {
+  if (!recapJobId) return;
+  const text = $("recapText").value.trim();
+  if (!text) { $("recapErr").textContent = "Recap စာသား အရင် ထည့်ပါ"; return; }
+  $("recapErr").textContent = "";
+  $("recapRender").disabled = true;
+  try {
+    const res = await fetch("/api/recap/" + recapJobId + "/render",
+      {method: "POST", headers: {"Content-Type": "application/json"},
+       body: JSON.stringify({text})});
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error || "အသံထပ် စလို့ မရပါ");
+    $("recapScriptBox").style.display = "none";
+    $("recapProg").style.display = "";
+    $("recapProg").innerHTML =
+      `<div class="step running">🔄 အသံထပ်နေပြီ… ခဏစောင့်ပါ</div>`;
+    stopRecapPoll();
+    recapTimer = setInterval(pollRecap, 2500);
+    pollRecap();
+  } catch (e) { $("recapErr").textContent = e.message; }
+  $("recapRender").disabled = false;
 };
 
 /* ---------------- preview ---------------- */
@@ -1722,6 +1877,7 @@ async function poll(id) {
 /* ---------------- jobs list / restore / notify ---------------- */
 const ACTIVE_ST = ["queued", "running", "waiting_review"];
 const ST_ICON = {queued: "⏳", running: "🔄", waiting_review: "✏️",
+                 waiting_script: "📝",
                  done: "✅", error: "❌", cancelled: "⏹"};
 let lastStatus = {};
 function escHtml(s) {
@@ -1769,7 +1925,9 @@ async function loadJobs() {
       const title = j.type === "tts"
         ? "🎙 " + escHtml(j.voice_label || "စာသားမှ အသံ")
           + (j.duration ? " · " + mmss(j.duration) : "")
-        : shortUrl(j.url);
+        : j.type === "recap"
+          ? "📝 Recap · " + shortUrl(j.url)
+          : shortUrl(j.url);
       return `<div class="jobrow jobitem">` +
         `<div class="jhead">${ST_ICON[j.status] || "•"} <span class="jurl">${title}</span></div>` +
         (parts.length ? `<div class="jmeta">${parts.join(" · ")}</div>` : "") +
@@ -2957,6 +3115,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 210</p>
+<p class="hint" id="buildTag" style="text-align:center">build 211</p>
 </body>
 </html>

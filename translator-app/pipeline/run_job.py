@@ -256,3 +256,28 @@ def run_job(workdir, url, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
     return run_phase2(workdir, mode=mode, voice=voice, progress=progress,
                       fx=fx, font=font, voice_rate=voice_rate,
                       voice_pitch=voice_pitch, subs=subs, quality=quality)
+
+
+def run_recap_phase1(workdir, url, progress=None, quality="hd"):
+    """Recap phase 1 (build 211): download -> transcribe. NO
+    translation — the recap script is generated from the source
+    transcript by pipeline.recap.generate_script (the app's
+    recap worker calls it as the job's "script" step), then the
+    job parks for the user's review/edit before the render.
+    A recap job never reuses a preview download (the Recap view
+    has no preview step), so this always fetches fresh through
+    the same guarded download chain as a dub job."""
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    mark = _marks(progress)
+
+    mark("download", "running")
+    src = download.download(url, workdir, quality=quality)
+    mark("download", "done")
+
+    mark("transcribe", "running")
+    # Captions first when download.py fetched them, Whisper
+    # otherwise — the same rule as run_phase1.
+    transcribe.transcribe(src, workdir, use_captions=True)
+    mark("transcribe", "done")
+    return src

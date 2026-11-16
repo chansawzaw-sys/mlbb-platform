@@ -34,6 +34,7 @@ from pipeline import download as dl_mod
 from pipeline import elevenlabs_tts
 from pipeline import envfile
 from pipeline import fx as fx_mod
+from pipeline import recap as recap_mod
 from pipeline import run_job, tts
 from pipeline.common import (encode_threads, job_context, probe_duration,
                              run as sh, set_active_jobs_provider,
@@ -53,13 +54,14 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 210"
+BUILD_TAG = "build 211"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
     "download": "ဗီဒီယို ဒေါင်းလုပ်",
     "transcribe": "စကားသံကို စာသားထုတ်",
     "translate": "မြန်မာ ဘာသာပြန်",
+    "script": "Recap စာသား ရေးရန်",
     "tts": "မြန်မာ အသံထုတ်",
     "retime": "အချိန်ကိုက် ညှိ (လိုရင် ဖရိမ်ရပ်)",
     "finalize": "စာတန်းထိုး (ရုပ်ရှင်ပုံစံ) + Logo/Blur + ဗီဒီယို ပေါင်းစပ်",
@@ -1733,7 +1735,9 @@ def _job_dispatcher():
                     pass
                 if jid in _TG_PENDING:
                     _TG_PENDING.remove(jid)
-                target = _worker2 if kind == "rerun" else _worker
+                target = {"rerun": _worker2,
+                          "recap1": _recap_worker,
+                          "recap2": _recap_worker2}.get(kind, _worker)
                 wt = threading.Thread(target=target, args=(job,),
                                       daemon=True)
                 # Build 204 (audit V09): registered BEFORE start
@@ -4812,6 +4816,262 @@ def tts_history():
     mine = [j for j in _all_jobs()
             if j.get("type") == "tts" and _owns(user, j)]
     return jsonify({"items": [_tts_view(j) for j in mine[:20]]})
+
+
+# ---------- Recap product (build 211) ----------
+# Burma-Voice-style Recap: paste a link -> a ready Burmese recap
+# video of the WHOLE video (အစအဆုံး), narrated in a chosen
+# voice. Two phases, mirroring the dub pipeline's split:
+# phase 1 (worker kind "recap1") downloads + transcribes
+# through the same guarded chain as a dub job, admission-quotes
+# the job (started SOURCE minutes x the voice's per-minute
+# rate, _quote_for_job), then pipeline.recap writes the
+# narration script from the transcript through the translator's
+# own LLM gateway chain. The job parks at status
+# "waiting_script" — the translator's review philosophy: the
+# script is the one thing worth reading before credits move.
+# POST /api/recap/<id>/render stores the final (possibly
+# edited) text and queues phase 2 (kind "recap2"): the script
+# is chunked into proportional timed segments and rendered by
+# the UNCHANGED dub phase 2 in mode "both" — TTS narration,
+# retime fits it to the video (same speed caps as dub), recap
+# lines burned as cinematic subtitles, original audio off.
+# The record is a normal job (type "recap"), so retention, the
+# jobs listing and the download/stream routes serve it.
+# Charge-on-success only: _finish is the single charge point;
+# a phase-1 failure, a script failure, an insufficient balance
+# at quote time or a render failure charges exactly zero.
+
+RECAP_STEPS = ["download", "transcribe", "script",
+               "tts", "retime", "finalize"]
+RECAP_TEXT_CAP = 20000       # chars, for the render-time edit
+
+
+def _recap_view(job):
+    view = {k: job.get(k) for k in
+            ("id", "type", "url", "status", "current", "error",
+             "voice", "voice_label", "quote_minutes",
+             "quote_credits", "charged_minutes", "recap_edited",
+             "created_at", "finished_at")}
+    view["steps"] = job.get("steps") or []
+    if job.get("recap_text") is not None:
+        view["recap_text"] = job["recap_text"]
+    if job.get("status") == "queued":
+        waiting = [q for q, _k in _JOB_QUEUE]
+        if job["id"] in waiting:
+            view["queue_pos"] = waiting.index(job["id"]) + 1
+    return view
+
+
+def _recap_worker(job):
+    """Phase 1: download -> transcribe -> quote -> script.
+    Parks the job at waiting_script; nothing is charged."""
+    workdir = JOBS_DIR / job["id"]
+    threading.Thread(target=_heartbeat, args=(job,),
+                     daemon=True).start()
+    with job_context(job["id"]):
+        try:
+            job["status"] = "running"
+            _save(job)
+            run_job.run_recap_phase1(
+                workdir, job["url"], progress=_progress_fn(job),
+                quality=job.get("quality") or "hd")
+            _quote_for_job(job)
+            progress = _progress_fn(job)
+            progress("script", "running")
+            target = recap_mod.target_chars_for(workdir)
+            script, provider = recap_mod.generate_script(
+                workdir, target)
+            progress("script", "done")
+            job["recap_text"] = script
+            job["recap_provider"] = provider
+            job["recap_edited"] = False
+            job["status"] = "waiting_script"
+            job["current"] = None
+            _save(job)
+            # Admin usage board: count this video under the
+            # gateway that wrote its script (best-effort, like
+            # the translation count in run_phase1).
+            try:
+                from pipeline import api_stats
+                api_stats.record(
+                    [{"text": "recap", "provider": provider}])
+            except Exception:
+                pass
+        except JobCancelled:
+            _cancelled(job)
+        except Exception as e:
+            if job.get("cancel_requested"):
+                _cancelled(job)
+            else:
+                _fail(job, e)
+
+
+def _recap_worker2(job):
+    """Phase 2: the final script -> proportional timed segments
+    -> the dub phase 2 in mode "both" -> _finish (the only
+    place a recap job is ever charged)."""
+    workdir = JOBS_DIR / job["id"]
+    threading.Thread(target=_heartbeat, args=(job,),
+                     daemon=True).start()
+    with job_context(job["id"]):
+        try:
+            job["status"] = "running"
+            _save(job)
+            from pipeline.common import save_segments
+            total = probe_duration(workdir / "source.mp4")
+            segs = recap_mod.script_segments(
+                job.get("recap_text") or "", total)
+            if not segs:
+                raise RuntimeError(
+                    "Recap စာသား မရှိပါ — စာသား ပြန်ထည့်ပြီး "
+                    "ပြန်စမ်းပါ (credit လုံးဝ မဖြတ်ပါ)")
+            save_segments(segs, workdir / "segments_my.json")
+            run_job.run_phase2(
+                workdir, mode="both", voice=job["voice"],
+                progress=_progress_fn(job), fx=None,
+                font=job.get("font") or "noto",
+                voice_rate=job.get("voice_rate", 0),
+                voice_pitch=job.get("voice_pitch", 0),
+                subs=job.get("subs"),
+                max_speed=job.get("speed_cap") or 1.3,
+                quality=job.get("quality") or "hd")
+            _finish(job)
+        except JobCancelled:
+            _cancelled(job)
+        except Exception as e:
+            if job.get("cancel_requested"):
+                _cancelled(job)
+            else:
+                _fail(job, e)
+
+
+@app.post("/api/recap")
+def create_recap():
+    user = _current_user()
+    data = request.get_json(force=True, silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"error": "လင့်ခ် မမှန်ပါ"}), 400
+    if not _public_url_ok(url):
+        return jsonify({"error": "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"}), 400
+    # Voice resolution mirrors the studio / _new_job exactly
+    # (builds 200 / 205 / 206): an ElevenLabs pick must still
+    # be registered and the caller must pass the access gate;
+    # a style key resolves through the shared table; anything
+    # else fails safe to the product default style.
+    voice_in = data.get("voice")
+    el_entry = None
+    if voice_in and elevenlabs_tts.is_el_voice(str(voice_in).strip()):
+        el_entry = elevenlabs_tts.find_voice(
+            elevenlabs_tts.voice_id_of(str(voice_in).strip()))
+        if el_entry is None:
+            return jsonify({"error":
+                            "ရွေးထားတဲ့ ElevenLabs အသံ မရှိတော့ပါ — "
+                            "အသံ ပြန်ရွေးပေးပါ"}), 400
+        if user is not None \
+                and not elevenlabs_tts.elevenlabs_allowed(user):
+            return jsonify({"error":
+                            "ဒီ Premium အသံ က အခု စမ်းသပ်ဆဲ "
+                            "ဖြစ်လို့ သတ်မှတ်ထားတဲ့ account တွေ ပဲ "
+                            "သုံးလို့ရပါသေးတယ် — မကြာခင် အားလုံး "
+                            "အတွက် ဖွင့်ပေးပါမယ်"}), 403
+        voice = "el:" + el_entry["id"]
+        voice_style = voice
+        voice_label = el_entry["name"]
+        voice_rate, voice_pitch = 0, 0
+    else:
+        style = tts.resolve_style(voice_in)
+        voice = style["voice"]
+        voice_style = style["key"]
+        voice_label = style["label"]
+        voice_rate, voice_pitch = style["rate"], style["pitch"]
+    quality = data.get("quality") if data.get("quality") in \
+        ("hd", "720", "480") else "hd"
+    try:
+        speed_cap = max(1.0, min(4.0,
+                                 float(data.get("speed_cap") or 1.3)))
+    except (TypeError, ValueError):
+        speed_cap = 1.3
+    now = time.time()
+    job = {"id": uuid.uuid4().hex[:12], "type": "recap",
+           "url": url, "mode": "recap",
+           "voice": voice, "voice_style": voice_style,
+           "voice_label": voice_label,
+           "voice_rate": voice_rate, "voice_pitch": voice_pitch,
+           "speed_cap": speed_cap, "quality": quality,
+           "font": "noto", "subs": _build_subs(data), "fx": None,
+           "source_path": None,
+           "status": "queued", "current": None, "error": None,
+           "created_at": now, "updated_at": now,
+           "finished_at": None,
+           "steps": [{"key": k, "label": STEP_LABELS[k],
+                      "state": "pending"} for k in RECAP_STEPS]}
+    if el_entry is not None:
+        job["tts_engine"] = "elevenlabs"
+        job["voice_name"] = el_entry["name"]
+    if user:
+        # Same admission gates as a dub job, in the same order:
+        # one-time setup, then the daily limit — both refuse
+        # before the job exists (and before any charge).
+        setup_msg = _setup_gate_message(user)
+        if setup_msg:
+            return jsonify({"error": setup_msg}), 400
+        job["user_id"] = user["id"]
+        accounts.mark_has_job(user["id"])
+        limit_msg = _daily_limit_message(user)
+        if limit_msg:
+            return jsonify({"error": limit_msg}), 400
+    JOBS[job["id"]] = job
+    _save(job)
+    _enqueue_job(job, kind="recap1")
+    return jsonify(_recap_view(job))
+
+
+@app.get("/api/recap/<jid>")
+def get_recap(jid):
+    job = _load_job(jid)
+    if not job or job.get("type") != "recap" \
+            or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    return jsonify(_recap_view(job))
+
+
+@app.post("/api/recap/<jid>/render")
+def render_recap(jid):
+    """Submit the final recap text (edited or untouched) and
+    queue the render. Only a job parked at waiting_script can
+    be rendered — the quote from phase 1 stands, and the charge
+    still lands only on a finished video."""
+    job = _load_job(jid)
+    if not job or job.get("type") != "recap" \
+            or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    if job["status"] != "waiting_script":
+        return jsonify({"error":
+                        "ဒီ job က စာသား အတည်ပြုရန် အဆင့် "
+                        "မဟုတ်ပါ"}), 409
+    data = request.get_json(force=True, silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "Recap စာသား အရင် ထည့်ပါ"}), 400
+    if len(text) > RECAP_TEXT_CAP:
+        return jsonify({"error":
+                        f"စာသား အရှည်ဆုံး {RECAP_TEXT_CAP} လုံး "
+                        "ပဲ ရပါတယ် — လျှော့ပြီး ပြန်စမ်းပါ"}), 400
+    if text != (job.get("recap_text") or ""):
+        job["recap_edited"] = True
+    job["recap_text"] = text
+    # A render supersedes any pending auto-cleanup (a parked
+    # job has none today; the mirror of job_review stays exact).
+    old_timer = CLEANUP_TIMERS.pop(jid, None)
+    if old_timer:
+        old_timer.cancel()
+    job.pop("cleanup_at", None)
+    job["status"] = "queued"
+    _save(job)
+    _enqueue_job(job, kind="recap2")
+    return jsonify({"ok": True})
 
 
 # ---------- text-only export + bulk text input ----------

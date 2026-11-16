@@ -367,6 +367,78 @@ def translate_all(segments, style="subs"):
     return result
 
 
+def generate_text(prompt):
+    """Free-form text generation (build 211, for the Recap
+    script): ONE generateContent call with the caller's prompt
+    over the SAME model/version/auth-shape walk as
+    translate_all (tunnel kwargs included), but plain prose
+    out — no JSON mime type, no array validation. Returns the
+    model's raw text. Raises on ANY problem so the caller can
+    fall back."""
+    import requests
+
+    key = get_api_key()
+    if not key:
+        raise RuntimeError("no GEMINI_API_KEY configured")
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.7},
+    }
+    result = None
+    attempts = []
+
+    def _clean(text):
+        s = str(text or "")
+        if key:
+            s = s.replace(key, "***")
+        return s
+
+    for mdl in _models():
+        badfmt = False
+        for ver in ("v1beta", "v1"):
+            url = _API_TMPL.format(ver=ver, model=mdl)
+            for use_query in (False, True):
+                auth = "query" if use_query else "header"
+                try:
+                    resp = requests.post(
+                        url + (f"?key={key}" if use_query else ""),
+                        **tunnel.request_kwargs(
+                            json=body, timeout=120,
+                            headers={**({} if use_query else
+                                        {"x-goog-api-key": key}),
+                                     "Content-Type":
+                                         "application/json"}))
+                except Exception as e:  # network-level: next shape
+                    attempts.append(
+                        f"{mdl}@{ver}[{auth}]=net: {_clean(e)[:120]}")
+                    continue
+                if resp.status_code == 200:
+                    try:
+                        text_out = resp.json()["candidates"][0][
+                            "content"]["parts"][0]["text"]
+                        if not (text_out or "").strip():
+                            raise ValueError("empty generation")
+                        result = text_out
+                    except Exception as e:
+                        attempts.append(
+                            f"{mdl}@{ver}[{auth}]=badformat: "
+                            f"{_clean(e)[:120]}")
+                        badfmt = True
+                    break
+                attempts.append(
+                    f"{mdl}@{ver}[{auth}]={resp.status_code}: "
+                    f"{_clean(resp.text)[:120]}")
+            if result is not None or badfmt:
+                break
+        if result is not None:
+            break
+    if result is None:
+        msg = "Gemini generation failed: " + "; ".join(attempts)
+        _note_error(msg)
+        raise RuntimeError(msg)
+    return result
+
+
 if __name__ == "__main__":
     print("gemini key configured:", key_configured(),
           "| model:", os.environ.get("GEMINI_MODEL", DEFAULT_MODEL))
