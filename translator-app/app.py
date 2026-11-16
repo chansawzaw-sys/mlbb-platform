@@ -54,7 +54,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 214"
+BUILD_TAG = "build 215"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -284,18 +284,26 @@ def _heartbeat(job):
 
 
 # ---------- auto-cleanup: no job data stays on the server ----------
-# 24 hours after a job finishes (done or error), its whole folder —
-# source, intermediates and output — plus the cached preview copy of
-# the same URL is deleted, so nothing accumulates on the disk.
+# Build 215 (owner order 2026-11-16): ONE retention rule for every
+# job — 24 hours after a job reaches a FINISHED state (done, error
+# or cancelled) its whole folder is deleted: source (downloaded or
+# uploaded), intermediates, output video/audio AND the text records
+# (job.json with its script / segments / translations). Nothing
+# job-related remains. Accounts, the credits ledger, top-ups and
+# settings are not job data and are never touched here. Queued /
+# running jobs and parked review states (waiting_review /
+# waiting_script) are not finished states and are never reaped.
 CLEANUP_DELAY = 24 * 3600
 CLEANUP_TIMERS = {}
 
 
 def _job_retention(job):
-    """Every finished job stays 24h — customers come back for their
-    video (owner order 2026-11-14, build 180: web jobs raised from
-    12h to match the bot jobs' long-standing 24h)."""
-    return 24 * 3600 if job.get("tg_chat_id") else CLEANUP_DELAY
+    """Build 215: the single 24h rule — every finished job, web or
+    bot, done, error or cancelled, is kept exactly CLEANUP_DELAY
+    after it finished, then deleted in full (files + records).
+    (Supersedes the build-180 web/bot split and the build-94
+    newest-2-per-account cap, both removed in this build.)"""
+    return CLEANUP_DELAY
 
 
 def _schedule_cleanup(job):
@@ -504,8 +512,8 @@ def _ensure_small_copy(job):
     budgeted for download speed instead of the bot's 50 MB cap.
     The done-state's main download button serves this copy; the
     full master stays one tap away (?v=full). Lives in the job
-    dir, so the 24h retention and the newest-2-per-account cap
-    (both whole-dir deletes) cover it — no orphans.
+    dir, so the single 24h retention rule (a whole-dir delete)
+    covers it — no orphans.
 
     Build 198: LAZY — nothing calls this at finish time any more
     (build 186 already had it off the _finish path, in a
@@ -597,8 +605,8 @@ def _small_on_demand(jid):
         except Exception:
             pass
         # Guarded save, as the old background thread did: the job
-        # dir may have been reaped meanwhile (retention /
-        # newest-2 cap) — never resurrect a deleted job.
+        # dir may have been reaped meanwhile (24h retention) —
+        # never resurrect a deleted job.
         try:
             if (JOBS_DIR / jid).exists() and JOBS.get(jid) is job:
                 _save(job)
@@ -2073,32 +2081,6 @@ def _run_phase2(job):
                        voice_name=job.get("voice_name"))
 
 
-_KEEP_DONE_PER_USER = 2
-
-
-def _enforce_done_cap(job):
-    """Owner rule (2026-11-09): per account, keep only the newest 2
-    finished videos — when a 3rd is produced, the oldest is deleted
-    (files included), whatever its time-retention window says. Bot
-    jobs without an account group under their Telegram chat."""
-    uid = job.get("user_id")
-    tg = job.get("tg_chat_id")
-    if uid:
-        mine = [j for j in _all_jobs() if j.get("user_id") == uid]
-    elif tg:
-        mine = [j for j in _all_jobs()
-                if j.get("tg_chat_id") == tg and not j.get("user_id")]
-    else:
-        return
-    done = sorted(
-        (j for j in mine if j.get("status") == "done"),
-        key=lambda j: j.get("finished_at") or j.get("created_at") or 0,
-        reverse=True)
-    for old in done[_KEEP_DONE_PER_USER:]:
-        if old["id"] != job["id"]:
-            _cleanup_job(old["id"])
-
-
 def _finish(job):
     _timing_close(job)  # build 213: settle the timing span first
     # Build 204 (audit V09): a cancel that landed after the last
@@ -2136,7 +2118,6 @@ def _finish(job):
     job["finished_at"] = time.time()
     _schedule_cleanup(job)
     _save(job)
-    _enforce_done_cap(job)
     _tg_deliver_async(job)
     _web_tg_autosend(job)
 
@@ -2147,10 +2128,11 @@ def _cancelled(job):
     job["status"] = "cancelled"
     job["error"] = "ရပ်လိုက်ပြီ — ဖျက်ရန် တောင်းဆိုထားသည်"
     job["finished_at"] = time.time()
+    # Build 215: cancelled is a finished state like any other —
+    # the same single 24h rule applies (the pre-215 code deleted
+    # cancelled jobs after only 20 seconds).
+    _schedule_cleanup(job)
     _save(job)
-    t = threading.Timer(20, _cleanup_job, args=(job["id"],))
-    t.daemon = True
-    t.start()
 
 
 def _worker(job):
@@ -2173,7 +2155,12 @@ def _worker(job):
             run_job.run_phase1(workdir, job["url"], source_path=job.get("source_path"),
                                progress=_progress_fn(job),
                                style="subs" if job["mode"] == "subs" else "dub",
-                               quality=job.get("quality") or "hd")
+                               quality=job.get("quality") or "hd",
+                               force_source=bool(job.get("upload")))
+            if job.get("upload"):
+                # Build 215: an uploaded source has no download
+                # stage at all — the timing says so exactly.
+                job.setdefault("timings", {})["download"] = 0
             _quote_for_job(job)
             _run_phase2(job)
             _finish(job)
@@ -4548,6 +4535,131 @@ def _resolve_el_entry(user, voice_id):
     return None, False
 
 
+# ---------- web video-file upload (build 215, item 7) ----------
+# Both web video flows (the dub wizard and Recap) accept a video
+# FILE as the source, not only a link — the Telegram bot has
+# accepted files all along; the web was link-only until now. The
+# route saves the upload into the job's own directory under a
+# FIXED safe name (never the client filename; extension
+# whitelist), probes it, and only then registers the job with
+# source_path pointing at the saved file, so phase 1 copies it
+# and the download stage is skipped entirely (timings.download
+# is stamped 0). Admission mirrors a link job exactly: login via
+# the normal guard, the quote/balance check happens BEFORE any
+# processing (duration from ffprobe on the saved file), and any
+# refusal deletes the uploaded file. The 2 GiB ceiling is the
+# download chain's own MAX_DOWNLOAD_BYTES. Because the file
+# lives in the job dir, the single 24h retention rule (item 3)
+# deletes it with everything else.
+UPLOAD_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v")
+
+
+def _form_data():
+    """Parse a multipart form into the request-style dict the
+    JSON routes eat: fx/subs arrive as JSON strings, the numeric
+    knobs as plain strings."""
+    data = {}
+    for k in request.form:
+        v = request.form.get(k)
+        if k in ("fx", "subs"):
+            try:
+                data[k] = json.loads(v)
+            except Exception:
+                data[k] = {}
+        elif k in ("voice_rate", "voice_pitch"):
+            try:
+                data[k] = int(v)
+            except (TypeError, ValueError):
+                data[k] = 0
+        elif k == "speed_cap":
+            try:
+                data[k] = float(v)
+            except (TypeError, ValueError):
+                data[k] = 1.3
+        else:
+            data[k] = v
+    return data
+
+
+def _request_upload():
+    """(data, file_storage|None): multipart requests carry the
+    job fields as form fields plus the video in the "file" part;
+    anything else keeps the historical JSON body."""
+    if request.files:
+        f = request.files.get("file")
+        if f is not None and (f.filename or "").strip():
+            data = _form_data()
+            data["upload"] = True
+            return data, f
+    return (request.get_json(force=True, silent=True) or {}), None
+
+
+def _accept_upload(job, file_storage, user):
+    """Save + validate + quote-check one uploaded video for a
+    not-yet-registered job. Returns None on success (the job's
+    source_path / upload fields are set) or a polite Burmese
+    error string; on ANY refusal the job dir — file included —
+    is deleted and nothing is charged or registered."""
+    from pipeline.common import probe_streams
+    name = (file_storage.filename or "").strip()
+    ext = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext not in UPLOAD_EXTS:
+        return ("ဒီ ဖိုင် အမျိုးအစား မရပါ — mp4, mkv, mov, avi, "
+                "webm ဖိုင် ပဲ တင်လို့ရပါတယ်")
+    workdir = JOBS_DIR / job["id"]
+    workdir.mkdir(parents=True, exist_ok=True)
+    dest = workdir / ("upload" + ext)
+    cap = dl_mod.MAX_DOWNLOAD_BYTES
+    total = 0
+    too_big = False
+    try:
+        with open(dest, "wb") as out:
+            stream = file_storage.stream
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > cap:
+                    too_big = True
+                    break
+                out.write(chunk)
+    except Exception:
+        shutil.rmtree(workdir, ignore_errors=True)
+        return "ဖိုင် တင်တာ မအောင်မြင်ပါ — ပြန်စမ်းပါ"
+    if too_big:
+        shutil.rmtree(workdir, ignore_errors=True)
+        return ("ဖိုင် အရွယ် ကြီးလွန်းပါတယ် — အများဆုံး 2 GB "
+                "ပဲ တင်လို့ရပါတယ်")
+    try:
+        dur = probe_duration(dest)
+        streams = probe_streams(dest)
+        has_video = any(st.get("codec_type") == "video"
+                        for st in streams)
+    except Exception:
+        dur, has_video = 0, False
+    if not dur or dur <= 0 or not has_video:
+        shutil.rmtree(workdir, ignore_errors=True)
+        return ("ဖိုင် ကို ဗီဒီယို အဖြစ် ဖတ်လို့ မရပါ — "
+                "ဗီဒီယို ဖိုင် အမှန် ပြန်တင်ပါ")
+    job["source_path"] = str(dest)
+    job["upload"] = True
+    job["upload_name"] = name[:120]
+    # Balance pre-check BEFORE processing, exactly like the
+    # preview-reuse pre-check for link jobs (audit B5): the
+    # duration is known from the probe, so refuse up front
+    # instead of burning server work the quote would reject.
+    if ACCOUNTS_ENFORCED and user and user["role"] != "admin":
+        mins = max(1, math.ceil(dur / 60.0))
+        need = mins * _credits_per_min_for(job)
+        if (user["credits"] or 0) < need:
+            shutil.rmtree(workdir, ignore_errors=True)
+            return (f"credit မလောက်ပါ — ဒီ video အတွက် {need} "
+                    f"credits လိုပါတယ်, လက်ကျန် {user['credits']} "
+                    "credits ပဲ ရှိပါတယ်")
+    return None
+
+
 def _new_job(data, user=None):
     """Build a job record from request-style data, or (None, error).
     Shared by the web form and the Telegram bot, so a job is a job
@@ -4639,9 +4751,14 @@ def _new_job(data, user=None):
         ("hd", "720", "480") else "hd"
     if font not in FONT_LABELS:
         return None, "font မမှန်ပါ"
-    if not url.startswith(("http://", "https://")):
+    if data.get("upload"):
+        # Build 215 (item 7): upload-sourced — there is no link
+        # to validate; the route validates the FILE itself
+        # (extension, size, ffprobe, balance) in _accept_upload.
+        url = ""
+    elif not url.startswith(("http://", "https://")):
         return None, "လင့်ခ် မမှန်ပါ"
-    if not _public_url_ok(url):
+    elif not _public_url_ok(url):
         return None, "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"
     if mode not in ("subs", "dub", "both"):
         return None, "mode မမှန်ပါ"
@@ -4666,6 +4783,8 @@ def _new_job(data, user=None):
         "steps": [{"key": k, "label": STEP_LABELS[k], "state": "pending"}
                   for k in run_job.steps_for_mode(mode)],
     }
+    if data.get("upload"):
+        job["upload"] = True
     if el_entry is not None:
         # Build 205: record the premium engine + the display name
         # on the job itself (the segments record the same facts
@@ -4677,7 +4796,9 @@ def _new_job(data, user=None):
 
 @app.post("/api/jobs")
 def create_job():
-    data = request.get_json(force=True)
+    # Build 215 (item 7): a multipart body means the source is an
+    # uploaded file; JSON keeps the historical link behaviour.
+    data, upload_file = _request_upload()
     # Build 206: the session user is resolved BEFORE _new_job so
     # the ElevenLabs access gate can judge a premium pick (the
     # setup/daily gates below reuse the same `me`).
@@ -4741,6 +4862,13 @@ def create_job():
                 "error": f"credit မလောက်ပါ — ဒီ video အတွက် {_need} "
                          f"credits လိုပါတယ်, လက်ကျန် {me['credits']} "
                          "credits ပဲ ရှိပါတယ်"}), 400
+    if upload_file is not None:
+        # Save + probe + balance-check the file BEFORE the job is
+        # registered or queued; a refusal deletes the file and no
+        # job ever exists (charge-on-success is untouched).
+        uerr = _accept_upload(job, upload_file, me)
+        if uerr:
+            return jsonify({"error": uerr}), 400
     JOBS[job["id"]] = job
     _save(job)
     # Build 180: queue for a worker slot instead of starting inline —
@@ -4759,6 +4887,7 @@ def _job_view(job):
     # Build 213: per-stage timings ride the view (owner/admin
     # only ever see them — _owns gates every caller).
     view["timings"] = _timings_of(job)
+    view["upload"] = bool(job.get("upload"))  # build 215
     if job.get("status") == "queued":
         # 1-based place among waiting jobs, so the UI/bot can SAY
         # "you are in the queue" instead of looking stuck (build 180).
@@ -4821,7 +4950,7 @@ def _scan_disk_jobs():
                 # A queued bot job died with the restart — the
                 # customer must be TOLD, not left waiting forever.
                 _tg_error_async(j)
-        elif j.get("status") in ("done", "error"):
+        elif j.get("status") in ("done", "error", "cancelled"):
             JOBS[jid] = j
             if jid not in CLEANUP_TIMERS:
                 fin = j.get("finished_at") or j.get("created_at") or time.time()
@@ -4835,8 +4964,10 @@ def _scan_disk_jobs():
                 CLEANUP_TIMERS[jid] = t
                 j["cleanup_at"] = time.time() + remain
         else:
-            # cancelled / waiting_review / anything else: load
-            # as-is so listings match the pre-204 read exactly.
+            # waiting_review / waiting_script / anything else:
+            # parked, not finished — load as-is, no timer (the
+            # pre-204 read did the same). Build 215: cancelled
+            # moved into the finished branch above.
             JOBS[jid] = j
 
 
@@ -5076,7 +5207,7 @@ def delete_job(jid):
 # synthesize it exactly like a dub (same contracts, same loud
 # failure doctrine: an ElevenLabs failure is NEVER silently
 # re-voiced with edge-tts). The record is a job (type "tts"),
-# so the per-account 24h retention (_schedule_cleanup), the
+# so the single 24h retention rule (_schedule_cleanup), the
 # jobs listing and the download/stream routes serve it like
 # any other job. Charge-on-success only, mirroring
 # _charge_for_job: the quoted estimate is checked up front
@@ -5087,7 +5218,22 @@ def delete_job(jid):
 TTS_TEXT_CAP = 5000          # characters, per studio request
 TTS_CHARS_PER_MIN = 700      # estimate basis (matches the UI)
 TTS_CHUNK_CHARS = 450        # per-engine-call chunk ceiling
-TTS_SPEEDS = (0.8, 1.0, 1.2, 1.5)
+TTS_SPEEDS = (0.8, 1.0, 1.2, 1.5, 2.0, 3.0, 4.0)
+
+
+def _atempo_chain(speed):
+    """ffmpeg atempo filter chain for a playback speed. A single
+    atempo instance only accepts 0.5..2.0, so speeds above 2.0
+    chain instances (build 215: studio speeds now reach 4.0x —
+    4.0 -> "atempo=2.0,atempo=2.0", 3.0 -> "atempo=2.0,atempo=1.5").
+    Speeds at or below 2.0 keep the historical single filter."""
+    parts = []
+    s = float(speed)
+    while s > 2.0:
+        parts.append(2.0)
+        s /= 2.0
+    parts.append(round(s, 4))
+    return ",".join(f"atempo={p:g}" for p in parts)
 
 
 def _tts_chunks(text, limit=TTS_CHUNK_CHARS):
@@ -5188,12 +5334,15 @@ def _run_tts_job(job, text, speed):
             voice_name=job.get("voice_name"))
     else:
         style = tts.resolve_style(job["voice_style"])
-        # The studio speed rides the existing tuning machinery:
-        # edge-tts rate percent (0.8x -> -20%, 1.5x -> +50%),
-        # added to the style's own preset rate (0 today).
-        rate_pct = style["rate"] + int(round((speed - 1.0) * 100))
+        # Build 215: the studio speed is applied ONCE, on the
+        # assembled audio below (chained atempo), for BOTH
+        # engines — the pre-215 standard path baked it into the
+        # edge-tts rate percent (+300% at 4.0x, which edge-tts
+        # cannot honour reliably), and the ElevenLabs path used
+        # a single atempo that tops out at 2.0. Synthesis now
+        # always runs at the style's own preset rate/pitch.
         tts.synthesize(workdir, voice=style["voice"],
-                       rate=rate_pct, pitch=style["pitch"])
+                       rate=style["rate"], pitch=style["pitch"])
     job.setdefault("timings", {})["tts"] = round(
         time.monotonic() - _tts_t0, 1)
     segs = load_segments(workdir / "segments_my.json")
@@ -5208,10 +5357,13 @@ def _run_tts_job(job, text, speed):
     out = workdir / "output.mp3"
     cmd = ["ffmpeg", "-y", "-v", "error", "-f", "concat",
            "-safe", "0", "-i", str(listfile)]
-    if job.get("tts_engine") == "elevenlabs" and speed != 1.0:
-        # ElevenLabs has no rate knob; the retime machinery's
-        # atempo does the same job on the assembled audio.
-        cmd += ["-filter:a", f"atempo={speed}"]
+    if speed != 1.0:
+        # Build 215: one speed application for both engines, on
+        # the assembled audio — chained atempo, so 3.0x and 4.0x
+        # are real (a single atempo caps at 2.0). The measured
+        # duration below (and therefore the charge) follows the
+        # sped-up file automatically.
+        cmd += ["-filter:a", _atempo_chain(speed)]
     cmd += ["-c:a", "libmp3lame", "-q:a", "3", str(out)]
     sh(cmd)
     dur = probe_duration(out)
@@ -5368,6 +5520,7 @@ def _recap_view(job):
              "quote_credits", "charged_minutes", "recap_edited",
              "created_at", "finished_at")}
     view["timings"] = _timings_of(job)  # build 213
+    view["upload"] = bool(job.get("upload"))  # build 215
     view["steps"] = job.get("steps") or []
     if job.get("recap_text") is not None:
         view["recap_text"] = job["recap_text"]
@@ -5391,7 +5544,10 @@ def _recap_worker(job):
             _save(job)
             run_job.run_recap_phase1(
                 workdir, job["url"], progress=_progress_fn(job),
-                quality=job.get("quality") or "hd")
+                quality=job.get("quality") or "hd",
+                source_path=job.get("source_path"))
+            if job.get("upload"):
+                job.setdefault("timings", {})["download"] = 0
             _quote_for_job(job)
             progress = _progress_fn(job)
             progress("script", "running")
@@ -5471,11 +5627,15 @@ def _recap_worker2(job):
 @app.post("/api/recap")
 def create_recap():
     user = _current_user()
-    data = request.get_json(force=True, silent=True) or {}
+    # Build 215 (item 7): multipart = uploaded file source, the
+    # same _accept_upload gate as the dub wizard.
+    data, upload_file = _request_upload()
     url = (data.get("url") or "").strip()
-    if not url.startswith(("http://", "https://")):
+    if upload_file is not None:
+        url = ""
+    elif not url.startswith(("http://", "https://")):
         return jsonify({"error": "လင့်ခ် မမှန်ပါ"}), 400
-    if not _public_url_ok(url):
+    elif not _public_url_ok(url):
         return jsonify({"error": "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"}), 400
     # Voice resolution mirrors the studio / _new_job exactly
     # (builds 200 / 205 / 206 / 212): an ElevenLabs pick must
@@ -5545,6 +5705,10 @@ def create_recap():
         limit_msg = _daily_limit_message(user)
         if limit_msg:
             return jsonify({"error": limit_msg}), 400
+    if upload_file is not None:
+        uerr = _accept_upload(job, upload_file, user)
+        if uerr:
+            return jsonify({"error": uerr}), 400
     JOBS[job["id"]] = job
     _save(job)
     _enqueue_job(job, kind="recap1")
@@ -5731,9 +5895,9 @@ def job_review_bulk(jid):
 
 
 def _startup_sweep():
-    """Remove leftovers from before a restart — honouring each job's
-    own retention window (bot jobs are promised 24h; the old flat
-    1-hour sweep broke that promise on every restart). Queued/running
+    """Remove leftovers from before a restart — honouring the
+    single 24h retention window (build 215; the old flat 1-hour
+    sweep broke the 24h promise on every restart). Queued/running
     leftovers are left for the heal in _scan_disk_jobs (build 204)."""
     now = time.time()
     # Build 203 (audit V08): preview dirs an active job still
@@ -5747,7 +5911,8 @@ def _startup_sweep():
             meta = json.loads((d / "job.json").read_text(encoding="utf-8"))
         except Exception:
             meta = None
-        if meta and meta.get("status") in ("done", "error"):
+        if meta and meta.get("status") in ("done", "error",
+                                           "cancelled"):
             ref = meta.get("finished_at") or meta.get("created_at") or 0
             if now - float(ref) > _job_retention(meta):
                 shutil.rmtree(d, ignore_errors=True)

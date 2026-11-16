@@ -55,20 +55,23 @@ def _marks(progress):
 
 
 def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
-               quality="hd"):
+               quality="hd", force_source=False):
     """Phase 1: download -> transcribe -> translate. Then the job waits for
     human review/edit of the Myanmar segments before phase 2.
     `quality` (build 167) is the download rendition choice; the
     caller passes source_path only when the cached preview was
     fetched at this same quality, so a fresh download here honours
-    the choice."""
+    the choice. `force_source` (build 215) marks a user-UPLOADED
+    file: it was already ffprobe-validated at admission, so the
+    50 KB preview-integrity floor below does not apply to it."""
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     mark = _marks(progress)
 
     mark("download", "running")
     if source_path and Path(source_path).exists() \
-            and Path(source_path).stat().st_size > 50_000:
+            and (force_source
+                 or Path(source_path).stat().st_size > 50_000):
         # preview was already downloaded by /api/preview — reuse that file.
         # The size gate (build 183) mirrors app.py's _src_valid floor:
         # if the cached preview vanished or was truncated after the
@@ -261,21 +264,29 @@ def run_job(workdir, url, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
                       voice_pitch=voice_pitch, subs=subs, quality=quality)
 
 
-def run_recap_phase1(workdir, url, progress=None, quality="hd"):
+def run_recap_phase1(workdir, url, progress=None, quality="hd",
+                     source_path=None):
     """Recap phase 1 (build 211): download -> transcribe. NO
     translation — the recap script is generated from the source
     transcript by pipeline.recap.generate_script (the app's
     recap worker calls it as the job's "script" step), then the
     job parks for the user's review/edit before the render.
-    A recap job never reuses a preview download (the Recap view
-    has no preview step), so this always fetches fresh through
-    the same guarded download chain as a dub job."""
+    A link recap job never reuses a preview download (the Recap
+    view has no preview step), so it fetches fresh through the
+    same guarded download chain as a dub job. Build 215: an
+    UPLOADED source (source_path, already ffprobe-validated at
+    admission) is copied in instead and the download is skipped,
+    exactly like run_phase1's upload path."""
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     mark = _marks(progress)
 
     mark("download", "running")
-    src = download.download(url, workdir, quality=quality)
+    if source_path and Path(source_path).exists():
+        src = workdir / "source.mp4"
+        shutil.copyfile(source_path, src)
+    else:
+        src = download.download(url, workdir, quality=quality)
     mark("download", "done")
 
     mark("transcribe", "running")
