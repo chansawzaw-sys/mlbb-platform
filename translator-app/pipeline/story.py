@@ -1,7 +1,18 @@
 """Story Video generation (build 216; shot density +
-expression pack build 218) — the Story product's brain: a
-topic in, a Burmese narration script + a shot plan out; or
-the customer's own story text in, a shot plan out.
+expression pack build 218; animated shots build 225) — the
+Story product's brain: a topic in, a Burmese narration
+script + a shot plan out; or the customer's own story text
+in, a shot plan out.
+
+Build 225 (ANIMATED-STORY-SCOPE.md): the shot plan grows an
+OPTIONAL movement vocabulary — per-character entries
+{char, expr, pos, action} (idle / slide_in / walk / fade_in),
+a per-shot camera (zoom / pan) and transition (cut / fade),
+plus three new assets (the translucent "shadow" character,
+the "path" and "interior" sets). sanitize_shots() validates
+the new fields with the same strictness as the old ones;
+a plan using NONE of them keeps the exact build-218 shape
+and renders exactly as build 218 did.
 
 The script is written by the SAME LLM gateways the translator
 and Recap use, walked in the SAME order as recap.generate_
@@ -35,12 +46,44 @@ from . import (gemini_translate, openai_translate,
 CHARS_PER_MIN = recap.CHARS_PER_MIN
 
 BACKGROUNDS = ("village", "town", "forest", "river", "field",
-               "market", "house", "night", "school", "bridge")
+               "market", "house", "night", "school", "bridge",
+               "path", "interior")
 CHARACTERS = ("boy", "girl", "man", "woman", "elder-man",
-              "elder-woman", "dog", "cat", "bird", "buffalo")
+              "elder-woman", "dog", "cat", "bird", "buffalo",
+              "shadow")
 MOODS = ("day", "sunset", "night")
 EXPRESSIONS = ("neutral", "happy", "sad", "surprised", "angry")
 MAX_CHARS_PER_SHOT = 3
+# Build 225 movement vocabulary (ANIMATED-STORY-SCOPE.md).
+ACTIONS = ("idle", "slide_in", "walk", "fade_in")
+CAMERAS = ("none", "zoom_in", "zoom_out", "pan_left",
+           "pan_right")
+TRANSITIONS = ("cut", "fade")
+POS_FRACTIONS = {"left": 0.22, "center": 0.50, "right": 0.78}
+# Default stage positions by cast size (mirrors the
+# renderer's SLOTS — story.py cannot import story_render).
+DEFAULT_POS = {1: (0.50,), 2: (0.30, 0.70),
+               3: (0.20, 0.50, 0.80)}
+
+
+def pos_fraction(pos, idx=0, count=1):
+    """Normalize a v2 `pos` to an x fraction of the frame:
+    left / center / right words, a number (or numeric
+    string) clamped inside the frame, or — for anything
+    unusable — the default slot for this cast position.
+    Never raises."""
+    if isinstance(pos, str):
+        if pos in POS_FRACTIONS:
+            return POS_FRACTIONS[pos]
+        try:
+            pos = float(pos)
+        except ValueError:
+            pos = None
+    if isinstance(pos, (int, float)) \
+            and not isinstance(pos, bool):
+        return min(0.92, max(0.08, float(pos)))
+    slots = DEFAULT_POS.get(min(max(count, 1), 3), (0.50,))
+    return slots[idx] if idx < len(slots) else 0.50
 # Build 218: the owner counted only ~5 scenes in a 1-minute
 # build-216 video. The planner now targets ~12 shots per
 # minute (a fresh picture every ~5 s) and the sanitizer cap
@@ -85,16 +128,22 @@ Length: the finished video is about __MINUTES__ minutes long. The script must be
 
 Shot plan rules:
 - "shots" is a list of scenes in story order — one shot per story beat. The finished video is about __MINUTES__ minutes long, so give about __SHOTS__ shots (a new scene every 4-6 seconds) so the picture keeps changing.
-- Each shot is {"bg": ..., "chars": [...], "mood": ..., "expr": ...}.
-- "bg" MUST be exactly one of: village, town, forest, river, field, market, house, night, school, bridge
-- "chars" is a list of 0 to 3 entries, each exactly one of: boy, girl, man, woman, elder-man, elder-woman, dog, cat, bird, buffalo
+- Each shot is {"bg": ..., "chars": [...], "mood": ..., "expr": ...} plus the OPTIONAL movement fields below.
+- "bg" MUST be exactly one of: village, town, forest, river, field, market, house, night, school, bridge, path, interior
+- "chars" is a list of 0 to 3 entries, each exactly one of: boy, girl, man, woman, elder-man, elder-woman, dog, cat, bird, buffalo, shadow
 - "mood" is exactly one of: day, sunset, night
 - "expr" is exactly one of: neutral, happy, sad, surprised, angry — the main character's feeling during that scene; choose it from what happens in that part of the story.
 - Consecutive shots must not repeat the same bg with the same chars — keep changing the scene.
 - Use ONLY those words for bg / chars / mood / expr — never invent new ones.
 
+Movement (OPTIONAL — use it on some shots so the cartoon feels alive):
+- A "chars" entry may be an object {"char": "boy", "expr": "happy", "pos": "left", "action": "walk"}: "pos" is left / center / right (where the character stands), "action" is one of idle / slide_in / walk / fade_in, and its "expr" may differ per character. Use "walk" when a character enters the scene, "fade_in" when someone or something appears suddenly — above all with "shadow" (a dark ghost figure) appearing behind someone.
+- A shot may add "camera": one of zoom_in / zoom_out / pan_left / pan_right for a slow camera move — use it on a few shots only, never on every shot.
+- A shot may add "transition": "fade" for a soft change into a very different scene (for example into a night or frightening scene); otherwise leave it out.
+- Plain string entries in "chars" are still fine for simple shots.
+
 Answer with ONLY a JSON object, no other text:
-{"script": "<the Burmese narration script>", "shots": [{"bg": "village", "chars": ["boy"], "mood": "day", "expr": "happy"}]}
+{"script": "<the Burmese narration script>", "shots": [{"bg": "village", "chars": ["boy"], "mood": "day", "expr": "happy"}, {"bg": "interior", "chars": [{"char": "girl", "expr": "surprised", "pos": "center", "action": "idle"}, {"char": "shadow", "pos": "right", "action": "fade_in"}], "mood": "night", "expr": "surprised", "camera": "zoom_in", "transition": "fade"}]}
 
 Topic:
 __TOPIC__
@@ -102,16 +151,22 @@ __TOPIC__
 
 PROMPT_PLAN = """You are planning cartoon scenes for a Burmese story video. The narration script is below. Make a shot plan: a list of scenes in story order, one shot per story beat — about __SHOTS__ shots (a new scene every 4-6 seconds) so the picture keeps changing.
 
-Each shot is {"bg": ..., "chars": [...], "mood": ..., "expr": ...}.
-- "bg" MUST be exactly one of: village, town, forest, river, field, market, house, night, school, bridge
-- "chars" is a list of 0 to 3 entries, each exactly one of: boy, girl, man, woman, elder-man, elder-woman, dog, cat, bird, buffalo
+Each shot is {"bg": ..., "chars": [...], "mood": ..., "expr": ...} plus the OPTIONAL movement fields below.
+- "bg" MUST be exactly one of: village, town, forest, river, field, market, house, night, school, bridge, path, interior
+- "chars" is a list of 0 to 3 entries, each exactly one of: boy, girl, man, woman, elder-man, elder-woman, dog, cat, bird, buffalo, shadow
 - "mood" is exactly one of: day, sunset, night
 - "expr" is exactly one of: neutral, happy, sad, surprised, angry — the main character's feeling during that scene; choose it from what happens in that part of the story.
 - Consecutive shots must not repeat the same bg with the same chars — keep changing the scene.
 - Use ONLY those words — never invent new ones.
 
+Movement (OPTIONAL — use it on some shots so the cartoon feels alive):
+- A "chars" entry may be an object {"char": "boy", "expr": "happy", "pos": "left", "action": "walk"}: "pos" is left / center / right (where the character stands), "action" is one of idle / slide_in / walk / fade_in, and its "expr" may differ per character. Use "walk" when a character enters the scene, "fade_in" when someone or something appears suddenly — above all with "shadow" (a dark ghost figure) appearing behind someone.
+- A shot may add "camera": one of zoom_in / zoom_out / pan_left / pan_right for a slow camera move — use it on a few shots only, never on every shot.
+- A shot may add "transition": "fade" for a soft change into a very different scene (for example into a night or frightening scene); otherwise leave it out.
+- Plain string entries in "chars" are still fine for simple shots.
+
 Answer with ONLY a JSON object, no other text:
-{"shots": [{"bg": "village", "chars": ["boy"], "mood": "day", "expr": "happy"}]}
+{"shots": [{"bg": "village", "chars": ["boy"], "mood": "day", "expr": "happy"}, {"bg": "interior", "chars": [{"char": "girl", "expr": "surprised", "pos": "center", "action": "idle"}, {"char": "shadow", "pos": "right", "action": "fade_in"}], "mood": "night", "expr": "surprised", "camera": "zoom_in", "transition": "fade"}]}
 
 Script:
 __SCRIPT__
@@ -274,15 +329,81 @@ def dedupe_shots(shots):
     return out
 
 
+def _sanitize_chars(item, shot_expr):
+    """(chars, extra) for one raw shot (build 225). A shot
+    using NO v2 feature returns the build-218 shape — chars
+    as a list of names, extra None. A shot using ANY v2
+    feature (a dict char entry, a real camera move, a fade
+    transition) returns entry dicts {char, expr, pos,
+    action} plus {"camera", "transition"}: unknown
+    characters are dropped, unknown expr/action/camera/
+    transition values fall back to safe defaults, a bad pos
+    becomes the default slot, the cast caps at 3. Never
+    raises."""
+    raw_chars = item.get("characters", item.get("chars"))
+    entries = raw_chars if isinstance(raw_chars, list) else []
+    camera = item.get("camera")
+    transition = item.get("transition")
+    is_v2 = any(isinstance(c, dict) for c in entries) \
+        or (camera in CAMERAS and camera != "none") \
+        or transition == "fade"
+    if not is_v2:
+        chars = []
+        for c in entries:
+            if c in CHARACTERS and c not in chars:
+                chars.append(c)
+            if len(chars) >= MAX_CHARS_PER_SHOT:
+                break
+        return chars, None
+    picked = []
+    for c in entries:
+        if isinstance(c, dict):
+            name, raw_e = c.get("char", c.get("name")), c
+        elif isinstance(c, str):
+            name, raw_e = c, None
+        else:
+            continue
+        if name not in CHARACTERS:
+            continue
+        if any(n == name for n, _r in picked):
+            continue
+        picked.append((name, raw_e))
+        if len(picked) >= MAX_CHARS_PER_SHOT:
+            break
+    chars = []
+    for idx, (name, raw_e) in enumerate(picked):
+        e = {"char": name, "expr": shot_expr,
+             "pos": pos_fraction(None, idx, len(picked)),
+             "action": "idle"}
+        if raw_e:
+            ex = raw_e.get("expr", raw_e.get("expression"))
+            if ex in EXPRESSIONS:
+                e["expr"] = ex
+            pos = raw_e.get("pos", raw_e.get("position"))
+            if pos is not None:
+                e["pos"] = pos_fraction(pos, idx, len(picked))
+            if raw_e.get("action") in ACTIONS:
+                e["action"] = raw_e["action"]
+        chars.append(e)
+    extra = {"camera": camera if camera in CAMERAS else "none",
+             "transition": transition
+             if transition in TRANSITIONS else "cut"}
+    return chars, extra
+
+
 def sanitize_shots(raw, max_shots=None):
     """Enforce the fixed asset vocabulary on a raw plan.
     Unknown backgrounds fall back to "village", unknown
     characters are dropped, unknown moods become "day",
     unknown/missing expressions become "neutral" (build
-    218); non-dict entries are dropped. The result is
-    deduped (no two consecutive identical pictures). An
-    empty result becomes the default plan — this function
-    NEVER raises and NEVER returns an empty list."""
+    218); non-dict entries are dropped. Build 225: the
+    optional movement fields are validated by
+    _sanitize_chars with the same strictness, and shots
+    that use none of them keep the exact build-218 shape.
+    The result is deduped (no two consecutive identical
+    pictures). An empty result becomes the default plan —
+    this function NEVER raises and NEVER returns an
+    empty list."""
     cap = max_shots or ABSOLUTE_MAX_SHOTS
     out = []
     if isinstance(raw, list):
@@ -296,23 +417,18 @@ def sanitize_shots(raw, max_shots=None):
             bg = item.get("background", item.get("bg"))
             if bg not in BACKGROUNDS:
                 bg = "village"
-            chars = []
-            raw_chars = item.get("characters",
-                                 item.get("chars"))
-            if isinstance(raw_chars, list):
-                for c in raw_chars:
-                    if c in CHARACTERS and c not in chars:
-                        chars.append(c)
-                    if len(chars) >= MAX_CHARS_PER_SHOT:
-                        break
             mood = item.get("mood")
             if mood not in MOODS:
                 mood = "day"
             expr = item.get("expr", item.get("expression"))
             if expr not in EXPRESSIONS:
                 expr = "neutral"
-            out.append({"bg": bg, "chars": chars, "mood": mood,
-                        "expr": expr})
+            chars, extra = _sanitize_chars(item, expr)
+            shot = {"bg": bg, "chars": chars, "mood": mood,
+                    "expr": expr}
+            if extra:
+                shot.update(extra)
+            out.append(shot)
             if len(out) >= cap:
                 break
     return dedupe_shots(out) or default_shots()

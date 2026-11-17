@@ -1,9 +1,12 @@
 """Story Video asset factory (build 216; expression pack
 build 218) — draws the whole cartoon asset library in code
-with PIL: 10 backgrounds (720x1280) and 10 characters
+with PIL: 12 backgrounds (720x1280) and 11 characters
 (transparent PNGs), each character also in 5 expression
 variants (neutral / happy / sad / surprised / angry — face
-variants on the same body, same flat ink style).
+variants on the same body, same flat ink style). Build 225
+added the village-path + house-interior sets and the
+translucent "shadow" character (its variants are identical
+— a shadow has no face).
 
 The art is ORIGINAL flat-style work drawn for this product
 (simple shapes, one ink outline colour, one warm palette) —
@@ -403,6 +406,119 @@ def bg_bridge():
     return finish(img, BW, BH)
 
 
+def bg_path():
+    """Build 225: a village path — a winding dirt track
+    between huts and palms, a pagoda on the horizon hill.
+    The reference genre's establishing shot."""
+    img, p = bg_base((135, 206, 250, 255), (214, 240, 253, 255),
+                     (124, 179, 96, 255))
+    sun(p, 96, 118)
+    cloud(p, 480, 140), cloud(p, 220, 226, 0.8)
+    hills(p, 800, (96, 165, 90, 255))
+    # Pagoda on the horizon hill (tiered roofs + spire).
+    px, py = 560, 742
+    p.ell([px - 120, py - 26, px + 120, py + 30],
+          fill=(88, 150, 84, 255))
+    for i, wdt in enumerate((64, 50, 38, 27)):
+        y = py - 24 - i * 21
+        p.poly([(px - wdt, y), (px + wdt, y),
+                (px + wdt - 10, y - 15), (px - wdt + 10, y - 15)],
+               fill=(238, 232, 218, 255), outline=INK, width=2)
+    p.line([(px, py - 116), (px, py - 138)], fill=(250, 176, 32, 255),
+           width=4)
+    p.ell([px - 5, py - 146, px + 5, py - 136],
+          fill=(250, 176, 32, 255))
+    p.rect([0, 830, BW, BH], fill=(124, 179, 96, 255))
+    # The winding dirt path: wide at the viewer's feet,
+    # narrowing to the horizon gap between the hills.
+    p.poly([(196, BH), (330, 848), (404, 848), (560, BH)],
+           fill=(199, 168, 118, 255))
+    p.poly([(196, BH), (330, 848), (352, 848), (268, BH)],
+           fill=(178, 146, 100, 255))
+    for y, wdt in ((920, 9), (1020, 14), (1140, 20)):
+        p.line([(360 - wdt * 3, y), (360 + wdt * 3, y)],
+               fill=(178, 146, 100, 255), width=4)
+    hut(p, 112, 884, 0.9)
+    hut(p, 636, 908, 0.75, wall=(232, 198, 152, 255))
+    palm(p, 216, 918, 0.95)
+    palm(p, 540, 946, 0.8)
+    tree(p, 688, 990, 0.85)
+    # Fence posts along the path.
+    for x, y, s in ((238, 962, 0.8), (486, 962, 0.8),
+                    (272, 1064, 1.0), (462, 1064, 1.0)):
+        p.rect([x - 5 * s, y - 44 * s, x + 5 * s, y],
+               fill=(121, 85, 52, 255), outline=INK, width=2)
+        p.line([(x - 26 * s, y - 34 * s), (x + 26 * s, y - 34 * s)],
+               fill=(121, 85, 52, 255), width=max(2, int(5 * s)))
+    return finish(img, BW, BH)
+
+
+def bg_interior():
+    """Build 225: inside a wooden house — plank walls, an
+    open doorway, floor mats, a hanging lamp. The reference
+    genre's indoor scenes (bg_house is the bright daytime
+    room; this is the warm evening interior)."""
+    img = canvas(BW, BH, (214, 164, 116, 255))
+    p = Pen(img)
+    # Plank walls with seams + a woven band.
+    p.rect([0, 0, BW, 900], fill=(203, 152, 102, 255))
+    for x in range(0, BW + 60, 60):
+        p.line([(x, 0), (x, 900)], fill=(170, 122, 74, 255), width=3)
+    p.rect([0, 560, BW, 640], fill=(160, 110, 66, 255))
+    for x in range(0, BW, 40):
+        p.line([(x, 566), (x + 20, 634)], fill=(140, 92, 52, 255),
+               width=3)
+        p.line([(x + 20, 566), (x, 634)], fill=(186, 138, 88, 255),
+               width=3)
+    # Open doorway, left of centre: lamplight beyond.
+    p.rect([70, 180, 300, 900], fill=(84, 56, 36, 255), outline=INK,
+           width=5)
+    p.rect([88, 198, 282, 900], fill=(250, 196, 110, 255))
+    p.poly([(88, 900), (282, 760), (282, 900)], fill=(238, 172, 88, 255))
+    p.rect([262, 180, 300, 900], fill=(141, 90, 50, 255), outline=INK,
+           width=4)
+    # Window right: deep blue evening outside, warm frame.
+    p.rect([430, 170, 660, 480], fill=(38, 55, 110, 255),
+           outline=(141, 90, 50, 255), width=10)
+    p.line([(545, 170), (545, 480)], fill=(141, 90, 50, 255), width=7)
+    p.line([(430, 325), (660, 325)], fill=(141, 90, 50, 255), width=7)
+    p.ell([586, 208, 636, 258], fill=(255, 241, 180, 255))
+    # Hanging lamp with a warm glow.
+    p.line([(360, 0), (360, 120)], fill=INK, width=5)
+    p.poly([(318, 176), (402, 176), (378, 122), (342, 122)],
+           fill=(183, 58, 44, 255), outline=INK, width=3)
+    p.ell([338, 168, 382, 204], fill=(255, 196, 64, 255))
+    glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse([230 * SS, 60 * SS, 490 * SS, 320 * SS],
+               fill=(255, 190, 80, 46))
+    img.alpha_composite(glow)
+    # Shelf with pots, right wall.
+    p.rect([452, 700, 668, 724], fill=(121, 85, 52, 255), outline=INK,
+           width=3)
+    for cx, r in ((492, 30), (560, 24), (622, 28)):
+        p.ell([cx - r, 700 - r * 1.5, cx + r, 700], fill=(93, 64, 55, 255),
+              outline=INK, width=3)
+    # Floor: boards running away, then woven mats.
+    p.rect([0, 900, BW, BH], fill=(168, 118, 70, 255))
+    for i, y in enumerate((972, 1058, 1156)):
+        p.line([(0, y), (BW, y + 10)], fill=(141, 92, 52, 255),
+               width=4)
+    for x in range(60, BW, 170):
+        p.line([(x, 906), (x - 26, BH)], fill=(141, 92, 52, 255),
+               width=3)
+    p.rect([70, 1000, 330, 1130], fill=(196, 60, 50, 255),
+           outline=(141, 42, 32, 255), width=3)
+    p.rect([390, 1030, 650, 1160], fill=(66, 130, 160, 255),
+           outline=(40, 90, 120, 255), width=3)
+    for mx, mw, col in ((70, 260, (216, 96, 80, 255)),
+                        (390, 260, (96, 160, 190, 255))):
+        for gx in range(mx + 14, mx + mw - 10, 30):
+            p.line([(gx, 1006 if mx == 70 else 1036),
+                    (gx, 1124 if mx == 70 else 1154)], fill=col, width=3)
+    return finish(img, BW, BH)
+
+
 # ---------------- characters ----------------
 
 def face(p, cx, cy, r, hair_top=True, gray=False, expr="neutral"):
@@ -670,11 +786,39 @@ def ch_buffalo(expr="neutral"):
     return finish(img, CW, CH)
 
 
+def ch_shadow(expr="neutral"):
+    """Build 225: the shadow — a dark translucent silhouette
+    figure for ghost reveals (used with the fade_in action).
+    No face, no ink outline; the soft edge and the see-through
+    fill are the scare. `expr` is accepted (the expression
+    pack loop calls every painter with one) and ignored: a
+    shadow has no expressions."""
+    from PIL import ImageFilter
+    img = canvas(CW, CH)
+    p = Pen(img)
+    cx = CW // 2
+    body = (14, 14, 22, 196)
+    # Long robe body, widening to the ground, arms merged.
+    p.poly([(cx - 44, 150), (cx + 44, 150), (cx + 86, 520),
+            (cx - 86, 520)], fill=body)
+    p.rect([cx - 62, 190, cx - 40, 470], fill=body)
+    p.rect([cx + 40, 190, cx + 62, 470], fill=body)
+    # Head + a hint of shoulders.
+    p.ell([cx - 46, 40, cx + 46, 140], fill=body)
+    p.ell([cx - 58, 128, cx + 58, 178], fill=body)
+    # Two faint eyes — barely there.
+    for ex in (-0.36, 0.36):
+        exx = cx + ex * 62
+        p.ell([exx - 5, 92, exx + 5, 102], fill=(210, 210, 225, 80))
+    out = finish(img, CW, CH)
+    return out.filter(ImageFilter.GaussianBlur(3))
+
+
 BACKGROUNDS = {
     "village": bg_village, "town": bg_town, "forest": bg_forest,
     "river": bg_river, "field": bg_field, "market": bg_market,
     "house": bg_house, "night": bg_night, "school": bg_school,
-    "bridge": bg_bridge,
+    "bridge": bg_bridge, "path": bg_path, "interior": bg_interior,
 }
 EXPRESSIONS = ("neutral", "happy", "sad", "surprised", "angry")
 
@@ -695,7 +839,7 @@ CHARACTERS = {
         (0, 137, 123), (94, 53, 177), girl=True, elder=True,
         bun=True, shawl=(0, 105, 95), expr=expr),
     "dog": ch_dog, "cat": ch_cat, "bird": ch_bird,
-    "buffalo": ch_buffalo,
+    "buffalo": ch_buffalo, "shadow": ch_shadow,
 }
 
 

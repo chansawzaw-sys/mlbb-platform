@@ -37,7 +37,19 @@ it from there.
 Build 220: when the customer ticked the Karaoke option, the
 burn runs with style="karaoke" (per-word highlight) — a free
 style option; the cue layer, pricing and flow are unchanged.
+
+Build 225 (ANIMATED-STORY-SCOPE.md): shots carrying the
+schema-v2 movement vocabulary (per-character entries with
+pos/action, a camera move, a fade transition) render
+through an animated path — PIL frame compositing at
+ANIM_FPS: every character is its own sprite, placed,
+faded and walked per frame over a camera-cropped oversized
+set, piped into one x264 encode at the house spec. Shots
+with NO v2 fields keep the build-218 layered path below,
+unchanged; an animated-path failure falls back to it, so
+motion never breaks a render.
 """
+import math
 import re
 from pathlib import Path
 
@@ -53,8 +65,11 @@ GROUND_MARGIN = 56           # px below the characters' feet
 CHAR_HEIGHTS = {"boy": 500, "girl": 500, "man": 520,
                 "woman": 500, "elder-man": 500,
                 "elder-woman": 500, "buffalo": 350, "dog": 210,
-                "cat": 230, "bird": 170}
+                "cat": 230, "bird": 170, "shadow": 520}
 SLOTS = {0: [], 1: [0.5], 2: [0.30, 0.70], 3: [0.20, 0.50, 0.80]}
+ANIM_FPS = 12        # build 225: limited-animation frame rate
+CAM_SCALE = 1.3      # build 225: the animated set is oversized
+                     # by this factor so camera crops have room
 
 _assets_ready = False
 
@@ -222,28 +237,86 @@ def synthesize_narration(workdir, job):
     return spoken
 
 
+def _norm_one(s):
+    """Normalize ONE stored shot for the renderer (build
+    225): valid bg / mood / expr, the cast as entry dicts
+    {char, expr, pos, action}, camera + transition, and the
+    "animated" flag — True when the STORED shot uses any
+    schema-v2 feature (a dict char entry, a camera move, a
+    fade transition), which routes it to the animated
+    compositing path. A build-216/218 shot (name entries, no
+    v2 keys) normalizes with animated=False and keeps the
+    legacy render path exactly; its entries inherit the
+    shot's expression and stage slots, like build 218.
+    Never raises."""
+    bg = s.get("bg") if s.get("bg") \
+        in story_mod.BACKGROUNDS else "village"
+    mood = s.get("mood") if s.get("mood") \
+        in story_mod.MOODS else "day"
+    expr = s.get("expr") if s.get("expr") \
+        in story_mod.EXPRESSIONS else "neutral"
+    raw_chars = s.get("chars")
+    if not isinstance(raw_chars, list):
+        raw_chars = []
+    animated = any(isinstance(c, dict) for c in raw_chars) \
+        or s.get("camera") not in (None, "none") \
+        or s.get("transition") == "fade"
+    entries, seen = [], set()
+    for c in raw_chars:
+        entry = None
+        if isinstance(c, dict):
+            name = c.get("char", c.get("name"))
+            if name in story_mod.CHARACTERS \
+                    and name not in seen:
+                e_expr = c.get("expr") if c.get("expr") \
+                    in story_mod.EXPRESSIONS else expr
+                pos = c.get("pos")
+                entry = {
+                    "char": name, "expr": e_expr,
+                    "pos": story_mod.pos_fraction(
+                        pos, len(entries), 3)
+                    if pos is not None else None,
+                    "action": c.get("action") if
+                    c.get("action") in story_mod.ACTIONS
+                    else "idle"}
+        elif isinstance(c, str):
+            if c in story_mod.CHARACTERS and c not in seen:
+                entry = {"char": c, "expr": expr, "pos": None,
+                         "action": "idle" if animated
+                         else "slide_in"}
+        if entry is None:
+            continue
+        entries.append(entry)
+        seen.add(entry["char"])
+        if len(entries) >= story_mod.MAX_CHARS_PER_SHOT:
+            break
+    n = len(entries)
+    for i, e in enumerate(entries):
+        if e["pos"] is None:
+            slots = SLOTS.get(n) or [0.5]
+            e["pos"] = slots[i] if i < len(slots) else 0.5
+    return {"bg": bg, "chars": entries, "mood": mood,
+            "expr": expr,
+            "camera": s.get("camera") if s.get("camera")
+            in story_mod.CAMERAS else "none",
+            "transition": s.get("transition")
+            if s.get("transition") in story_mod.TRANSITIONS
+            else "cut",
+            "animated": bool(animated)}
+
+
 def _norm_shots(shots):
     """Normalize a stored plan for the renderer: every shot
-    gains valid bg / chars / mood / expr (legacy build-216
-    plans have no expr — they get "neutral"), unknown values
-    fall back safely, and consecutive identical pictures are
-    deduped. Never raises, never returns an empty list."""
-    out = []
-    for s in shots or []:
-        if not isinstance(s, dict):
-            continue
-        out.append({
-            "bg": s.get("bg") if s.get("bg")
-            in story_mod.BACKGROUNDS else "village",
-            "chars": [c for c in (s.get("chars") or [])
-                      if c in story_mod.CHARACTERS]
-            [:story_mod.MAX_CHARS_PER_SHOT],
-            "mood": s.get("mood") if s.get("mood")
-            in story_mod.MOODS else "day",
-            "expr": s.get("expr") if s.get("expr")
-            in story_mod.EXPRESSIONS else "neutral"})
-    return story_mod.dedupe_shots(out) \
-        or story_mod.default_shots()
+    is normalized by _norm_one (legacy build-216 plans have
+    no expr — they get "neutral"), and consecutive
+    identical pictures are deduped. Never raises, never
+    returns an empty list."""
+    out = [_norm_one(s) for s in shots or []
+           if isinstance(s, dict)]
+    out = story_mod.dedupe_shots(out)
+    if not out:
+        out = [_norm_one(s) for s in story_mod.default_shots()]
+    return out
 
 
 def shot_spans(spoken, shots):
@@ -290,48 +363,236 @@ def _char_sprite(name, expr):
     return ASSETS_DIR / "chars" / f"{name}.png"
 
 
+def _wash_for(shot):
+    """The shot's mood grade (build 218 values): a
+    translucent night or sunset wash colour, or None."""
+    mood = shot.get("mood")
+    if mood == "night" and shot.get("bg") != "night":
+        return (10, 16, 48, 110)
+    if mood == "sunset":
+        return (255, 120, 40, 44)
+    return None
+
+
+def _tint(img, wash):
+    """Grade an RGBA image with a mood wash through its own
+    alpha (the build-218 technique: opaque areas take the
+    full wash, transparent ones none). Mutates and returns
+    the image."""
+    from PIL import Image
+    alpha = img.split()[3]
+    tint = Image.new("RGBA", img.size, wash)
+    tint.putalpha(alpha.point(lambda v: v * wash[3] // 255))
+    img.alpha_composite(tint)
+    return img
+
+
+def _graded_bg(shot):
+    """The painted set with the mood wash baked in."""
+    from PIL import Image
+    ensure_assets()
+    bg = Image.open(ASSETS_DIR / "bg" / f"{shot['bg']}.png") \
+        .convert("RGBA")
+    wash = _wash_for(shot)
+    if wash:
+        bg.alpha_composite(Image.new("RGBA", bg.size, wash))
+    return bg
+
+
+def _sprite_img(name, expr):
+    """A character's expression sprite at its stage height
+    (build 218's _char_sprite picks the file)."""
+    from PIL import Image
+    ch = Image.open(_char_sprite(name, expr))
+    h = CHAR_HEIGHTS.get(name, 500)
+    w = int(ch.width * h / ch.height)
+    return ch.resize((w, h), Image.LANCZOS)
+
+
+def _char_top(name, height):
+    """A sprite's top y on stage: the bird flies; everyone
+    else stands on the ground line."""
+    if name == "bird":
+        return 300
+    return OUT_H - GROUND_MARGIN - height
+
+
 def _shot_layers(shot):
     """Build one shot in two layers: (background, characters).
 
     The background carries the painted set; the character
     layer is a transparent full-frame canvas with the shot's
-    cast at their ground slots (the bird flies), drawn from
-    each character's EXPRESSION variant for this shot. The
-    mood grade (a translucent night or sunset wash) tints
-    the set directly and the characters through their own
-    alpha, so both layers grade together."""
+    cast at their stage positions (the bird flies), drawn
+    from each character's EXPRESSION variant. The mood grade
+    (a translucent night or sunset wash) tints the set
+    directly and the characters through their own alpha, so
+    both layers grade together. Accepts a raw stored shot
+    or a normalized one (build 225 entries carry their own
+    expr/pos; legacy entries reproduce the build-218 slots
+    and shot-level expression exactly)."""
     from PIL import Image
-    ensure_assets()
-    bg = Image.open(ASSETS_DIR / "bg" / f"{shot['bg']}.png") \
-        .convert("RGBA")
+    if "animated" not in shot:
+        shot = _norm_one(shot)
+    bg = _graded_bg(shot)
     layer = Image.new("RGBA", (OUT_W, OUT_H), (0, 0, 0, 0))
-    chars = (shot.get("chars") or [])[:3]
-    expr = shot.get("expr") or "neutral"
-    for name, fx in zip(chars, SLOTS[len(chars)]):
-        ch = Image.open(_char_sprite(name, expr))
-        h = CHAR_HEIGHTS.get(name, 500)
-        w = int(ch.width * h / ch.height)
-        ch = ch.resize((w, h), Image.LANCZOS)
-        x = int(fx * OUT_W - w / 2)
-        if name == "bird":
-            y = 300
-        else:
-            y = OUT_H - GROUND_MARGIN - h
-        layer.alpha_composite(ch, (x, y))
-    mood = shot.get("mood")
-    wash = None
-    if mood == "night" and shot["bg"] != "night":
-        wash = (10, 16, 48, 110)
-    elif mood == "sunset":
-        wash = (255, 120, 40, 44)
+    for e in shot["chars"]:
+        spr = _sprite_img(e["char"], e["expr"])
+        x = int(e["pos"] * OUT_W - spr.width / 2)
+        layer.alpha_composite(
+            spr, (x, _char_top(e["char"], spr.height)))
+    wash = _wash_for(shot)
     if wash:
-        bg.alpha_composite(Image.new("RGBA", bg.size, wash))
-        alpha = layer.split()[3]
-        tint = Image.new("RGBA", layer.size, wash)
-        tint.putalpha(alpha.point(
-            lambda v: v * wash[3] // 255))
-        layer.alpha_composite(tint)
+        _tint(layer, wash)
     return bg, layer
+
+
+# ---------------- animated path (build 225) ----------------
+
+def _camera_window(frac, camera, big_w, big_h):
+    """The crop window (x, y, w, h) into the oversized set
+    at timeline fraction `frac` (0..1) for a camera move.
+    The window keeps the set's aspect; zooming shrinks it,
+    panning slides its centre. Pure — the proofs measure
+    the moves through this AND through rendered frames."""
+    if camera == "zoom_in":
+        s = 1.0 - 0.22 * frac
+    elif camera == "zoom_out":
+        s = 0.78 + 0.22 * frac
+    else:
+        s = 0.86
+    cx = 0.50
+    if camera == "pan_left":
+        cx = 0.60 - 0.20 * frac
+    elif camera == "pan_right":
+        cx = 0.40 + 0.20 * frac
+    w, h = big_w * s, big_h * s
+    x = min(max(cx * big_w - w / 2, 0.0), big_w - w)
+    y = min(max(0.5 * big_h - h / 2, 0.0), big_h - h)
+    return int(x), int(y), int(w), int(h)
+
+
+def _char_motion(e, spr_w, t, dur):
+    """One character's animated state at time t: (centre x,
+    alpha 0..1, vertical bob offset in px). idle keeps the
+    build-218 gentle bob; slide_in adds the 0.6 s side
+    slide; walk enters from the nearest screen edge over
+    the first ~60% of the shot with a step bounce, then
+    idles; fade_in ramps alpha 0 -> full over the first
+    ~40% of the shot (the ghost-reveal move)."""
+    pos_x = e["pos"] * OUT_W
+    bob = 6 * math.sin(2 * math.pi * t / 2.3)
+    action = e.get("action")
+    if action == "walk":
+        walk_dur = max(0.3, dur * 0.6)
+        p = min(t / walk_dur, 1.0) if walk_dur > 0 else 1.0
+        pe = 1.0 - (1.0 - p) ** 2
+        if pos_x <= OUT_W / 2:
+            start_x = -spr_w / 2 - 12
+        else:
+            start_x = OUT_W + spr_w / 2 + 12
+        x = start_x + (pos_x - start_x) * pe
+        if p < 1.0:
+            bob = -abs(math.sin(2 * math.pi * t / 0.45)) * 8
+        return x, 1.0, bob
+    if action == "fade_in":
+        ramp = max(0.4 * dur, 0.05)
+        return pos_x, min(t / ramp, 1.0), bob
+    if action == "slide_in":
+        p = min(t / 0.6, 1.0)
+        d = -34 if pos_x <= OUT_W / 2 else 34
+        return pos_x + d * (1.0 - p), 1.0, bob
+    return pos_x, 1.0, bob
+
+
+def _with_alpha(img, factor):
+    """A copy of an RGBA sprite with its alpha scaled."""
+    a = img.split()[3].point(lambda v: int(v * factor))
+    out = img.copy()
+    out.putalpha(a)
+    return out
+
+
+def _anim_frame(big, sprites, shot, t, dur):
+    """Composite one animated frame: the camera-cropped set
+    plus each character at its animated position / alpha.
+    `sprites` = [(entry, sprite)] pre-loaded and pre-tinted.
+    A "fade" transition fades from/to black at the ends,
+    like the legacy clips."""
+    from PIL import Image
+    frac = min(t / dur, 1.0) if dur > 0 else 0.0
+    x, y, w, h = _camera_window(frac, shot.get("camera"),
+                                big.width, big.height)
+    frame = big.crop((x, y, x + w, y + h)).resize(
+        (OUT_W, OUT_H), Image.BILINEAR)
+    for e, spr in sprites:
+        cx, alpha, bob = _char_motion(e, spr.width, t, dur)
+        if alpha <= 0.0:
+            continue
+        img = spr if alpha >= 0.999 else _with_alpha(spr, alpha)
+        top = _char_top(e["char"], spr.height) + int(round(bob))
+        frame.alpha_composite(
+            img, (int(round(cx - spr.width / 2)), top))
+    if shot.get("transition") == "fade" and dur >= 1.0:
+        fd = min(0.35, dur / 3.0)
+        f = 1.0
+        if t < fd:
+            f = t / fd
+        elif t > dur - fd:
+            f = max(0.0, (dur - t) / fd)
+        if f < 1.0:
+            black = Image.new("RGBA", (OUT_W, OUT_H),
+                               (0, 0, 0, 255))
+            frame = Image.blend(black, frame, f)
+    return frame.convert("RGB")
+
+
+def _shot_clip_anim(shot, dur, out_path):
+    """Animate one schema-v2 shot (build 225): PIL frame
+    compositing at ANIM_FPS — multi-character scenes,
+    per-character alpha ramps and camera moves combined in
+    one shot — piped as raw frames into one x264 encode at
+    the house output spec. Raises on any failure; the
+    caller falls back to the build-218 layered clip, so
+    motion never breaks a render."""
+    import subprocess
+    from PIL import Image
+    bg = _graded_bg(shot)
+    big = bg.resize((int(OUT_W * CAM_SCALE),
+                     int(OUT_H * CAM_SCALE)), Image.BILINEAR)
+    wash = _wash_for(shot)
+    sprites = []
+    for e in shot["chars"]:
+        spr = _sprite_img(e["char"], e["expr"])
+        if wash:
+            spr = _tint(spr, wash)
+        sprites.append((e, spr))
+    frames = max(2, int(round(dur * ANIM_FPS)))
+    cmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo",
+           "-pix_fmt", "rgb24", "-s", f"{OUT_W}x{OUT_H}",
+           "-r", str(ANIM_FPS), "-i", "-",
+           "-vf", f"fps={FPS},format=yuv420p",
+           "-t", f"{dur:.3f}", "-an",
+           "-c:v", "libx264", "-preset", "ultrafast",
+           "-crf", "24", "-threads", str(encode_threads()),
+           str(out_path)]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    try:
+        for i in range(frames):
+            frame = _anim_frame(big, sprites, shot,
+                                i / ANIM_FPS, dur)
+            proc.stdin.write(frame.tobytes())
+        proc.stdin.close()
+        if proc.wait(timeout=1200) != 0:
+            raise RuntimeError("animated encode failed")
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise
+    return out_path
 
 
 def _shot_still(shot, out_path):
@@ -516,6 +777,17 @@ def render_story(workdir, job, progress=None):
     shots_dir.mkdir(exist_ok=True)
     clips = []
     for i, (shot, a, b) in enumerate(spans):
+        clip_path = shots_dir / f"clip_{i:03d}.mp4"
+        if shot.get("animated"):
+            # Build 225: the movement path. Any failure
+            # falls through to the build-218 layered clip
+            # below — motion never breaks a render.
+            try:
+                clips.append(_shot_clip_anim(shot, b - a,
+                                             clip_path))
+                continue
+            except Exception:
+                pass
         bg_img, layer_img = _shot_layers(shot)
         bg_still = shots_dir / f"shot_{i:03d}_bg.png"
         bg_img.convert("RGB").save(bg_still)
@@ -523,8 +795,7 @@ def render_story(workdir, job, progress=None):
         layer_img.save(layer_png)
         still = _shot_still(shot, shots_dir / f"shot_{i:03d}.png")
         clips.append(_shot_clip(bg_still, layer_png, b - a, i,
-                                shots_dir / f"clip_{i:03d}.mp4",
-                                still=still))
+                                clip_path, still=still))
     video = _concat(clips, workdir / "story_video.mp4", workdir)
     narration = _concat([f for _t, _d, f in spoken],
                           workdir / "narration.m4a", workdir,
