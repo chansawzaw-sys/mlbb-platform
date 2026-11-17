@@ -33,6 +33,10 @@ bottom band and the characters visible above it).
 Output: 720x1280 (9:16) H.264 + AAC, output.mp4 in the job
 dir — the standard finish/download/retention machinery takes
 it from there.
+
+Build 220: when the customer ticked the Karaoke option, the
+burn runs with style="karaoke" (per-word highlight) — a free
+style option; the cue layer, pricing and flow are unchanged.
 """
 import re
 from pathlib import Path
@@ -550,6 +554,7 @@ def render_story(workdir, job, progress=None):
     srt = _write_srt(spoken, workdir / "story_subs.srt", subs)
     final = workdir / "output.mp4"
     burn.burn(av, srt, final, font=job.get("font") or "noto",
-              subs=subs, cap_k=maxrate_cap_k("hd"))
+              subs=subs, cap_k=maxrate_cap_k("hd"),
+              style="karaoke" if job.get("story_karaoke") else None)
     mark("render", "done")
     return final

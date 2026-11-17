@@ -154,14 +154,18 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
 
 def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
                fx=None, font=burn.DEFAULT_FONT, voice_rate=0, voice_pitch=0,
-               subs=None, max_speed=None, quality="hd", voice_name=None):
+               subs=None, max_speed=None, quality="hd", voice_name=None,
+               karaoke=False):
     """Phase 2: from the FINAL (possibly user-edited) segments_my.json —
     TTS -> retime -> logo/blur -> subtitle burn -> output.mp4.
     `subs` is the subtitle-layout dict (size_pct/width_pct/bottom_pct/align);
     None = burn.py defaults (the previous cinematic look).
     `quality` (build 167) only sets the encode maxrate ceiling via
     maxrate_cap_k — an "hd" job's original rendition is not
-    strangled back down by the build-102 cap."""
+    strangled back down by the build-102 cap.
+    `karaoke` (build 220) applies only to mode "subs" (the
+    Captions-only product): the burn uses the karaoke subtitle
+    style — a free style option, same price."""
     workdir = Path(workdir)
     mark = _marks(progress)
     cap_k = maxrate_cap_k(quality)
@@ -172,7 +176,8 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
         # fx (if any) rides INSIDE the burn encode — no separate fx pass.
         burn.burn(src, workdir / "subs_my.srt", final, font=font, subs=subs,
                   blur_box=(fx or {}).get("blur"),
-                  fx=fx if fx_mod.has_fx(fx) else None, cap_k=cap_k)
+                  fx=fx if fx_mod.has_fx(fx) else None, cap_k=cap_k,
+                  style="karaoke" if karaoke else None)
         mark("finalize", "done")
         return final
 

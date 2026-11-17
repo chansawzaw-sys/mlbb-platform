@@ -88,6 +88,109 @@ def _ass_time(ts):
     return f"{total_cs // 360000}:{(total_cs // 6000) % 60:02d}:{(total_cs // 100) % 60:02d}.{total_cs % 100:02d}"
 
 
+# --- Karaoke subtitles (build 220) --------------------------------
+# A subtitle STYLE for the burn (style="karaoke"): while a cue is
+# on screen, the word being spoken fills with the highlight
+# colour, advancing word by word — ASS \kf tags: libass draws
+# each word in the style's SecondaryColour until its slot, then
+# sweeps it to the PrimaryColour. So a karaoke style's Primary
+# is the highlight (bright yellow) and its Secondary is the
+# cue's normal colour. Word timings inside a cue are
+# proportional to word length (character share) across the
+# cue's window — the approximation build 218 used for story
+# cues. Burmese text often has no spaces between words, so a
+# space-less run longer than _KARAOKE_UNIT_MAX chars is cut
+# into <= that many chars per highlight unit (never right
+# before a combining mark, which would break the shaping).
+KARAOKE_HIGHLIGHT = "&H0000FFFF"   # bright yellow, ASS &HAABBGGRR
+_KARAOKE_UNIT_MAX = 8              # chars per highlight unit
+
+
+def _ass_cs(t):
+    """An ASS timestamp ("H:MM:SS.cc") as centiseconds."""
+    try:
+        h, rest = t.split(":", 1)
+        m, rest = rest.split(":", 1)
+        s, cs = rest.split(".", 1)
+        return ((int(h) * 60 + int(m)) * 60 + int(s)) * 100 \
+            + int((cs + "00")[:2])
+    except Exception:
+        return 0
+
+
+def _split_run(word):
+    """Cut one space-less word into highlight units of at most
+    _KARAOKE_UNIT_MAX chars; a cut never lands right before a
+    combining mark (Unicode category M*)."""
+    if len(word) <= _KARAOKE_UNIT_MAX:
+        return [word]
+    import unicodedata
+    units, cur = [], ""
+    for i, ch in enumerate(word):
+        cur += ch
+        nxt = word[i + 1] if i + 1 < len(word) else ""
+        if len(cur) >= _KARAOKE_UNIT_MAX and not (
+                nxt and unicodedata.category(nxt).startswith("M")):
+            units.append(cur)
+            cur = ""
+    if cur:
+        units.append(cur)
+    return units
+
+
+def _karaoke_units(body):
+    """Highlight units of one cue body: a list of lines (the
+    body's explicit \\N breaks), each a list of unit strings —
+    words split on spaces, long space-less runs cut by
+    _split_run."""
+    lines = []
+    for hard in body.split("\\N"):
+        units = []
+        for w in hard.split():
+            units.extend(_split_run(w))
+        if units:
+            lines.append(units)
+    return lines
+
+
+def _karaoke_body(body, dur_cs):
+    """The cue body with a {\\kf<cs>} tag before every unit:
+    each unit's slot is its character share of the cue window
+    (the last unit absorbs the rounding, so the tags cover
+    the window exactly and monotonically). A leading override
+    block (the \\fs / \\pos prefixes srt_to_ass adds) is kept
+    in front, untagged."""
+    prefix = ""
+    while body.startswith("{"):
+        end = body.find("}")
+        if end < 0:
+            break
+        prefix += body[:end + 1]
+        body = body[end + 1:]
+    lines = _karaoke_units(body)
+    flat = [u for ln in lines for u in ln]
+    if not flat:
+        return prefix + body
+    total = sum(len(u) for u in flat) or 1
+    dur_cs = max(int(dur_cs), 1)
+    spans, used = [], 0
+    for i, u in enumerate(flat):
+        if i == len(flat) - 1:
+            cs = max(1, dur_cs - used)
+        else:
+            cs = max(1, int(round(dur_cs * len(u) / total)))
+            used += cs
+        spans.append(cs)
+    out, k = [], 0
+    for ln in lines:
+        parts = []
+        for u in ln:
+            parts.append("{\\kf%d}%s" % (spans[k], u))
+            k += 1
+        out.append(" ".join(parts))
+    return prefix + "\\N".join(out)
+
+
 def _parse_srt(srt_path):
     text = Path(srt_path).read_text(encoding="utf-8-sig")
     cues = []
@@ -236,8 +339,11 @@ def _fit_box(text, family, base_fs, rect_w, rect_h,
     return best if best is not None else min_fs
 
 
-def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None):
-    """Write an ASS script with PlayRes = the real video resolution."""
+def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None,
+               style=None):
+    """Write an ASS script with PlayRes = the real video resolution.
+    style="karaoke" (build 220) emits per-word \\kf timing with
+    the highlight colour as Primary — see the karaoke block."""
     cfg = normalize_subs(subs)
     font_size = _BASE_FS_FRAC * height * cfg["size_pct"] / 100.0
     outline = max(1, round(_BASE_OUTLINE * height))
@@ -245,6 +351,13 @@ def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None):
     margin_lr = round((100.0 - cfg["width_pct"]) / 200.0 * width)
     margin_v = round(cfg["bottom_pct"] / 100.0 * height)
     alignment = 8 if cfg["align"] == "top" else 2
+    # Karaoke (build 220): \kf sweeps each word from the
+    # Secondary colour to the Primary, so Primary becomes the
+    # highlight and Secondary keeps the cue's chosen colour.
+    primary = SUB_COLORS[cfg["color"]]
+    secondary = "&H000000FF"
+    if style == "karaoke":
+        primary, secondary = KARAOKE_HIGHLIGHT, primary
     lines = [
         "[Script Info]",
         "Title: Myanmar subtitles (layout)",
@@ -264,7 +377,7 @@ def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None):
         # reads on bright/dark. Black text gets a WHITE outline so it
         # stays readable.
         (f"Style: Default,{family},{font_size:.1f},"
-         f"{SUB_COLORS[cfg['color']]},&H000000FF,"
+         f"{primary},{secondary},"
          f"{'&H00FFFFFF' if cfg['color'] == 'black' else '&H00000000'},"
          f"&H60000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},"
          f"{alignment},{margin_lr},{margin_lr},{margin_v},1"),
@@ -321,6 +434,9 @@ def srt_to_ass(srt_path, ass_path, width, height, family, subs, blur_box=None):
             fs = _fit_font_size(body, family, font_size, avail_w)
             if fs < font_size - 0.6:
                 body = f"{{\\fs{fs:.0f}}}" + body
+        if style == "karaoke":
+            body = _karaoke_body(body,
+                                 _ass_cs(end) - _ass_cs(start))
         lines.append(f"Dialogue: 0,{start},{end},Default,,{ev_ml},{ev_mr},0,,{body}")
     Path(ass_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return ass_path
@@ -415,7 +531,7 @@ def _fonts_dir():
 
 
 def _prepare_ass(input_mp4, srt_path, font=DEFAULT_FONT, subs=None,
-                 blur_box=None, fx=None):
+                 blur_box=None, fx=None, style=None):
     """Font check + layout dims + the ASS script for a burn.
 
     Returns (ass_path, fonts_dir, width, height) where width/height
@@ -447,7 +563,7 @@ def _prepare_ass(input_mp4, srt_path, font=DEFAULT_FONT, subs=None,
                     fx["aspect"].get("style") or "blur")
     ass_path = Path(srt_path).with_name(Path(srt_path).stem + ".layout.ass")
     srt_to_ass(srt_path, ass_path, width, height, family, subs,
-               blur_box=blur_box)
+               blur_box=blur_box, style=style)
     return ass_path, fonts_dir, width, height
 
 
@@ -458,7 +574,8 @@ def _ass_filter(ass_path, fonts_dir):
 
 
 def finalize_filters(input_mp4, srt_path, font=DEFAULT_FONT, subs=None,
-                     blur_box=None, fx=None, start="[0:v]", logo="[1:v]"):
+                     blur_box=None, fx=None, start="[0:v]", logo="[1:v]",
+                     style=None):
     """Filter-complex segments turning the video stream at label
     `start` into the finished picture: the fx chain (blur/logo/
     aspect) with the subtitle burn appended — the same graph burn()
@@ -469,7 +586,7 @@ def finalize_filters(input_mp4, srt_path, font=DEFAULT_FONT, subs=None,
     two; `logo` names the input slot the logo image will occupy in
     that larger command."""
     ass_path, fonts_dir, width, height = _prepare_ass(
-        input_mp4, srt_path, font, subs, blur_box, fx)
+        input_mp4, srt_path, font, subs, blur_box, fx, style=style)
     if fx:
         from . import fx as fx_mod
         if fx_mod.has_fx(fx):
@@ -481,7 +598,7 @@ def finalize_filters(input_mp4, srt_path, font=DEFAULT_FONT, subs=None,
 
 
 def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
-         blur_box=None, fx=None, cap_k=2500):
+         blur_box=None, fx=None, cap_k=2500, style=None):
     if fx:
         from . import fx as fx_mod
         if fx_mod.has_fx(fx):
@@ -489,7 +606,8 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
             # runs first, the ass filter is appended to its output.
             # (Was: a full fx encode followed by a full burn encode.)
             filters, _out, logo_path = finalize_filters(
-                input_mp4, srt_path, font, subs, blur_box, fx)
+                input_mp4, srt_path, font, subs, blur_box, fx,
+                style=style)
             cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4)]
             if logo_path:
                 cmd += ["-i", str(logo_path)]
@@ -508,7 +626,7 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
             run(cmd)
             return output_mp4
     ass_path, fonts_dir, _w, _h = _prepare_ass(
-        input_mp4, srt_path, font, subs, blur_box, fx)
+        input_mp4, srt_path, font, subs, blur_box, fx, style=style)
     vf = _ass_filter(ass_path, fonts_dir)
     if _fps_cap(input_mp4):
         vf += "," + _FPS_CAP

@@ -57,7 +57,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 219"
+BUILD_TAG = "build 220"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -5892,6 +5892,7 @@ def _story_view(job):
              "voice", "voice_label", "quote_minutes",
              "quote_credits", "charged_minutes", "story_edited",
              "story_topic", "story_minutes", "story_music",
+             "story_karaoke",
              "created_at", "finished_at")}
     view["timings"] = _timings_of(job)  # build 213
     view["steps"] = job.get("steps") or []
@@ -6078,6 +6079,7 @@ def create_story():
            "url": "", "mode": "story",
            "story_topic": topic, "story_minutes": minutes,
            "story_music": bool(data.get("music")),
+           "story_karaoke": bool(data.get("karaoke")),
            "story_text": text or None,
            "voice": voice, "voice_style": voice_style,
            "voice_label": voice_label,
@@ -6514,6 +6516,9 @@ def render_commentary(jid):
 # ceil(started SOURCE minutes x rate), minimum 1 credit.
 # Charge-on-success only: _finish is the single charge
 # point; any failure or cancel charges exactly zero.
+# Build 220: the view's Karaoke tick (job["karaoke"]) makes
+# phase 2 burn with the karaoke subtitle style (per-word
+# highlight) — a free style option, same price either way.
 
 CAPTIONS_STEPS = ["download", "transcribe", "translate",
                   "finalize"]
@@ -6523,7 +6528,7 @@ def _captions_view(job):
     view = {k: job.get(k) for k in
             ("id", "type", "url", "status", "current", "error",
              "quote_minutes", "quote_credits", "charged_minutes",
-             "edited_count", "created_at", "finished_at")}
+             "edited_count", "karaoke", "created_at", "finished_at")}
     view["timings"] = _timings_of(job)  # build 213
     view["upload"] = bool(job.get("upload"))  # build 215
     view["steps"] = job.get("steps") or []
@@ -6596,7 +6601,8 @@ def _captions_worker2(job):
             run_job.run_phase2(
                 workdir, mode="subs", progress=_progress_fn(job),
                 font=job.get("font") or "noto", subs=None,
-                quality=job.get("quality") or "hd")
+                quality=job.get("quality") or "hd",
+                karaoke=bool(job.get("karaoke")))
             _finish(job)
         except JobCancelled:
             _cancelled(job)
@@ -6623,10 +6629,18 @@ def create_captions():
         return jsonify({"error": "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"}), 400
     quality = data.get("quality") if data.get("quality") in \
         ("hd", "720", "480") else "hd"
+    # Karaoke subtitle style (build 220): a free style option,
+    # ticked in the Captions view; JSON carries a bool, the
+    # multipart form a string.
+    _kar = data.get("karaoke")
+    karaoke = _kar is True or (isinstance(_kar, str)
+                               and _kar.strip().lower()
+                               in ("1", "true", "on", "yes"))
     now = time.time()
     job = {"id": uuid.uuid4().hex[:12], "type": "captions",
            "url": url, "mode": "captions",
            "quality": quality, "font": "noto", "fx": None,
+           "karaoke": karaoke,
            "source_path": None,
            "status": "queued", "current": None, "error": None,
            "created_at": now, "updated_at": now,
