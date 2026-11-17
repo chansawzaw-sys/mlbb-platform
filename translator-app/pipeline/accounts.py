@@ -108,7 +108,61 @@ def _db():
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub "
         "ON users(google_sub) WHERE google_sub IS NOT NULL")
+    # Build 221: referral system. Every account owns a unique,
+    # stable referral_code; referred_by points at the inviter's
+    # user id; referral_rewarded is the exactly-once flag the
+    # inviter's reward flips (see pay_referral_reward). Existing
+    # accounts are backfilled here — the UPDATE guards on the
+    # row still being codeless and a code collision just retries
+    # with a fresh code, so concurrent first touches are safe.
+    if "referral_code" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN referral_code "
+                     "TEXT")
+    if "referred_by" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN referred_by "
+                     "INTEGER")
+    if "referral_rewarded" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN "
+                     "referral_rewarded INTEGER DEFAULT 0")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code "
+        "ON users(referral_code) WHERE referral_code IS NOT NULL")
+    missing = conn.execute(
+        "SELECT id FROM users WHERE referral_code IS NULL").fetchall()
+    for r in missing:
+        for _try in range(10):
+            try:
+                conn.execute(
+                    "UPDATE users SET referral_code = ? "
+                    "WHERE id = ? AND referral_code IS NULL",
+                    (_gen_referral_code(), r["id"]))
+            except sqlite3.IntegrityError:
+                continue  # code taken by a racing insert; retry
+            break  # filled — or a racing fill got there first
+    if missing:
+        conn.commit()
     return conn
+
+
+# Referral codes (build 221): 8 chars from an alphabet with no
+# look-alikes (no 0/O, 1/I/L) so a code survives being read off
+# a screen and typed by hand.
+_REF_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+
+def _gen_referral_code():
+    return "".join(secrets.choice(_REF_ALPHABET) for _ in range(8))
+
+
+def _fresh_referral_code(conn):
+    """A code no account owns yet (caller holds _LOCK)."""
+    for _try in range(20):
+        code = _gen_referral_code()
+        if not conn.execute(
+                "SELECT 1 FROM users WHERE referral_code = ?",
+                (code,)).fetchone():
+            return code
+    raise RuntimeError("referral code generation failed")
 
 
 def _public(row):
@@ -124,11 +178,18 @@ def _public(row):
                                   and row["google_sub"]),
             "needs_setup": bool("needs_setup" in keys
                                 and row["needs_setup"]),
+            "referral_code": row["referral_code"]
+            if "referral_code" in keys else None,
+            "referred_by": row["referred_by"]
+            if "referred_by" in keys else None,
             "created_at": row["created_at"]}
 
 
-def create_user(username, password):
-    """(user, error) — usernames unique case-insensitively."""
+def create_user(username, password, referred_by=None):
+    """(user, error) — usernames unique case-insensitively.
+    Build 221: every new account is born with its own referral
+    code; `referred_by` (the inviter's user id, already resolved
+    from a code by the caller) is stamped in the same insert."""
     username = (username or "").strip()
     if not _USERNAME_RE.match(username):
         return None, "username ၃–၂၄ လုံး, အင်္ဂလိပ်/ဂဏန်း/./_ ပဲ ရပါတယ်"
@@ -139,9 +200,11 @@ def create_user(username, password):
                         (username,)).fetchone():
             return None, "ဒီ username ယူပြီးသား ဖြစ်နေပါတယ်"
         cur = conn.execute(
-            "INSERT INTO users (username, pass_hash, created_at) "
-            "VALUES (?, ?, ?)",
-            (username, generate_password_hash(password), time.time()))
+            "INSERT INTO users (username, pass_hash, created_at, "
+            "referral_code, referred_by) VALUES (?, ?, ?, ?, ?)",
+            (username, generate_password_hash(password), time.time(),
+             _fresh_referral_code(conn),
+             int(referred_by) if referred_by else None))
         row = conn.execute("SELECT * FROM users WHERE id = ?",
                            (cur.lastrowid,)).fetchone()
     return _public(row), None
@@ -416,10 +479,12 @@ def create_google_user(sub, email):
     with _LOCK, _db() as conn:
         cur = conn.execute(
             "INSERT INTO users (username, pass_hash, created_at, "
-            "google_sub, email, last_login, needs_setup) "
-            "VALUES (?, ?, ?, ?, ?, ?, 1)",
+            "google_sub, email, last_login, needs_setup, "
+            "referral_code) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
             (username, generate_password_hash(secrets.token_urlsafe(48)),
-             time.time(), str(sub), email, time.time()))
+             time.time(), str(sub), email, time.time(),
+             _fresh_referral_code(conn)))
         row = conn.execute("SELECT * FROM users WHERE id = ?",
                            (cur.lastrowid,)).fetchone()
     return _public(row)
@@ -671,6 +736,99 @@ def decide_topup(topup_id, ok):
                      f"topup:{topup_id}")
     return {"user_id": row["user_id"], "credits": row["credits"],
             "tg_chat_id": row["tg_chat_id"]}
+
+
+# ---------------- referrals (build 221) ----------------
+
+def user_for_referral_code(code):
+    """Resolve a referral code to its owner (public dict) —
+    case-insensitive, surrounding space ignored. None when the
+    code is empty or unknown."""
+    code = (code or "").strip().upper()
+    if not code:
+        return None
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE referral_code = ? "
+            "COLLATE NOCASE", (code,)).fetchone()
+    return _public(row)
+
+
+def set_referred_by(user_id, inviter_id):
+    """Set-once: stamp the inviter on an account that has none
+    yet (the profile path — Google-born accounts arrive without
+    one). The WHERE guard makes a second set, or a race, a clean
+    False; an account can never refer itself."""
+    if int(user_id) == int(inviter_id):
+        return False
+    with _LOCK, _db() as conn:
+        cur = conn.execute(
+            "UPDATE users SET referred_by = ? WHERE id = ? "
+            "AND referred_by IS NULL",
+            (int(inviter_id), int(user_id)))
+    return cur.rowcount == 1
+
+
+def referral_stats(user_id):
+    """The profile referral block: own code, who invited this
+    account (if anyone), how many accounts it has referred, and
+    total credits earned from referral rewards (the ledger is
+    the source of truth, so the figure can never drift from the
+    balance history)."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT referral_code, referred_by FROM users "
+            "WHERE id = ?", (int(user_id),)).fetchone()
+        if row is None:
+            return None
+        inviter_name = None
+        if row["referred_by"]:
+            irow = conn.execute(
+                "SELECT username FROM users WHERE id = ?",
+                (row["referred_by"],)).fetchone()
+            inviter_name = irow["username"] if irow else None
+        count = conn.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE referred_by = ?",
+            (int(user_id),)).fetchone()["n"]
+        earned = conn.execute(
+            "SELECT COALESCE(SUM(delta), 0) AS s FROM ledger "
+            "WHERE user_id = ? AND reason = 'referral'",
+            (int(user_id),)).fetchone()["s"]
+    return {"code": row["referral_code"],
+            "referred_by": row["referred_by"],
+            "referred_by_name": inviter_name,
+            "count": int(count), "earned": int(earned)}
+
+
+def pay_referral_reward(referred_user_id, amount):
+    """The inviter's one-time reward for a referred account's
+    first charged job — EXACTLY ONCE per referred account: the
+    referral_rewarded flag flips inside the same locked
+    transaction that reads referred_by, so a retry, a re-render
+    or a restart can never pay twice. The credit itself goes
+    through apply_credit like every other money move (ledger
+    reason 'referral', ref 'referral:<referred user id>').
+    Returns the amount paid (0 when nothing was due)."""
+    amount = int(amount or 0)
+    if amount <= 0:
+        return 0
+    with _LOCK, _db() as conn:
+        row = conn.execute(
+            "SELECT referred_by, referral_rewarded FROM users "
+            "WHERE id = ?", (int(referred_user_id),)).fetchone()
+        if row is None or not row["referred_by"] \
+                or row["referral_rewarded"]:
+            return 0
+        cur = conn.execute(
+            "UPDATE users SET referral_rewarded = 1 WHERE id = ? "
+            "AND COALESCE(referral_rewarded, 0) = 0",
+            (int(referred_user_id),))
+        if cur.rowcount != 1:
+            return 0
+        inviter = row["referred_by"]
+    apply_credit(inviter, amount, "referral",
+                 f"referral:{int(referred_user_id)}")
+    return amount
 
 
 # ---------------- voice clones (build 212) ----------------

@@ -57,7 +57,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 220"
+BUILD_TAG = "build 221"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1010,6 +1010,42 @@ def _captions_credits_per_min():
         return 0.5
 
 
+def _referral_reward_credits():
+    """Admin setting REFERRAL_REWARD_CREDITS: the one-time
+    credit reward an inviter earns when a referred account
+    completes its first charged job (build 221), default 2.
+    Read live like CAPTIONS_CREDITS_PER_MIN. 0 switches the
+    payout off (referral links still record who invited whom;
+    the one-time flag is only consumed by an actual payout)."""
+    try:
+        return max(0, min(1000, int(
+            _env_value("REFERRAL_REWARD_CREDITS") or 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _maybe_referral_reward(job):
+    """Build 221: after a job's success charge actually took
+    credits (charged_minutes > 0), a referred account's FIRST
+    such job pays its inviter the referral reward — exactly
+    once (accounts.pay_referral_reward flips a persisted flag
+    atomically, so re-renders/restarts can't double-pay).
+    Called from both charge points (_charge_for_job for every
+    video product, _tts_charge for the studio). Failed and
+    cancelled jobs never reach a charge; admin/anonymous jobs
+    charge 0 — neither triggers anything. Best-effort: a
+    referral hiccup must never break a finished job."""
+    try:
+        uid = job.get("user_id")
+        if not uid or not (job.get("charged_minutes") or 0):
+            return
+        amount = _referral_reward_credits()
+        if amount > 0:
+            accounts.pay_referral_reward(uid, amount)
+    except Exception:
+        pass
+
+
 def _account_daily_count(user_id):
     """Videos this account STARTED today (Asia/Yangon), web and
     Telegram combined — both channels stamp the same user_id on
@@ -1263,8 +1299,17 @@ def _tg_menu_step(msg, chat_id, text):
         return True
     if text == "💳 လက်ကျန်":
         if acct:
-            tg.send_message(chat_id, f"💳 👤 {acct['username']} — "
-                                     f"လက်ကျန် {acct['credits']} credits ရှိပါတယ်")
+            msg = (f"💳 👤 {acct['username']} — "
+                   f"လက်ကျန် {acct['credits']} credits ရှိပါတယ်")
+            if acct.get("referral_code"):
+                # Build 221: the bot balance view also carries
+                # the account's own referral code (read-only).
+                msg += (f"\n🎁 သင့် referral code: "
+                        f"{acct['referral_code']}\n"
+                        "သူငယ်ချင်းတွေ ဒီ code နဲ့ account "
+                        "ဖွင့်ပြီး ပထမဆုံး အလုပ် ပြီးတာနဲ့ "
+                        "သင် credit ဆု ရပါမယ်")
+            tg.send_message(chat_id, msg)
         else:
             tg.send_message(chat_id, "🙏 အရင် 👤 Username ချိတ်ပေးပါ — web "
                                      "app ရဲ့ account card မှာ code ထုတ်ပြီး ဒီမှာ ပို့ရပါမယ်" + _LINK_HINT)
@@ -2093,6 +2138,7 @@ def _charge_for_job(job):
             job["charge_shortfall"] = minutes - paid
     job["charged_minutes"] = paid
     _save(job)
+    _maybe_referral_reward(job)  # build 221
 
 
 def _refund_charge(job):
@@ -3134,6 +3180,7 @@ def elevenlabs_status():
         "test_users": elevenlabs_tts.get_test_users(),
         "commentary_credits_per_min": _commentary_credits_per_min(),
         "captions_credits_per_min": _captions_credits_per_min(),
+        "referral_reward_credits": _referral_reward_credits(),
         "voices": _el_status_voices()})
 
 
@@ -3199,6 +3246,16 @@ def elevenlabs_save():
                             "credit နှုန်း 0.05–10 အတွင်း "
                             "ဖြစ်ရပါမယ်"}), 400
         writes["CAPTIONS_CREDITS_PER_MIN"] = str(caprate)
+    if "referral_reward_credits" in data:
+        try:
+            refamt = int(data["referral_reward_credits"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "credit ဆု မမှန်ပါ"}), 400
+        if not 0 <= refamt <= 1000:
+            return jsonify({"error":
+                            "credit ဆု 0–1000 အတွင်း "
+                            "ဖြစ်ရပါမယ်"}), 400
+        writes["REFERRAL_REWARD_CREDITS"] = str(refamt)
     if "test_users" in data:
         users, uerr = elevenlabs_tts.parse_test_users(
             data["test_users"])
@@ -3218,7 +3275,9 @@ def elevenlabs_save():
                     "commentary_credits_per_min":
                         _commentary_credits_per_min(),
                     "captions_credits_per_min":
-                        _captions_credits_per_min()})
+                        _captions_credits_per_min(),
+                    "referral_reward_credits":
+                        _referral_reward_credits()})
 
 
 def _el_validate_entry(data):
@@ -3783,8 +3842,24 @@ def auth_register():
             resp.headers["Retry-After"] = str(retry)
         return resp, 429
     data = request.get_json(force=True, silent=True) or {}
+    # Build 221: optional referral code — validated BEFORE the
+    # account exists: an unknown code refuses the signup with a
+    # clear message (fix it or clear the field and retry); a
+    # known code stamps referred_by on the new account in the
+    # same insert. An empty field is a plain signup, unchanged.
+    referred_by = None
+    ref_code = (data.get("referral_code") or "").strip()
+    if ref_code:
+        inviter = accounts.user_for_referral_code(ref_code)
+        if not inviter:
+            return jsonify({"error":
+                            "referral code မတွေ့ပါ — ပြန်စစ် "
+                            "ထည့်ပါ၊ မရှိရင် ဖြုတ်ပြီး "
+                            "ဆက်လုပ်ပါ"}), 400
+        referred_by = inviter["id"]
     user, err = accounts.create_user(data.get("username"),
-                                     data.get("password"))
+                                     data.get("password"),
+                                     referred_by=referred_by)
     if err:
         return jsonify({"error": err}), 400
     return _set_session(jsonify({"user": user}),
@@ -4109,6 +4184,52 @@ def auth_change_password():
     # mint a fresh one so THIS device stays signed in.
     resp = jsonify({"ok": True})
     return _set_session(resp, accounts.new_session(user["id"]))
+
+
+@app.get("/api/referral")
+def referral_info():
+    """Build 221: the signed-in account's referral block — own
+    code, inviter (if any), referral count, credits earned, and
+    the current reward size so the profile can say exactly what
+    an invite pays."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    stats = accounts.referral_stats(user["id"])
+    if stats is None:
+        return jsonify({"error": "account မတွေ့ပါ"}), 404
+    stats["reward"] = _referral_reward_credits()
+    return jsonify(stats)
+
+
+@app.post("/api/referral/apply")
+def referral_apply():
+    """Build 221: set-once inviter entry from the profile (the
+    path Google-born accounts use — they never saw the register
+    form). Own code refused; unknown code refused; once set it
+    can never be changed."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    code = (data.get("code") or "").strip()
+    if not code:
+        return jsonify({"error": "code အရင် ထည့်ပါ"}), 400
+    inviter = accounts.user_for_referral_code(code)
+    if not inviter:
+        return jsonify({"error": "referral code မတွေ့ပါ"}), 400
+    if inviter["id"] == user["id"]:
+        return jsonify({"error":
+                        "ကိုယ့် code ကိုယ် ပြန် ထည့်လို့ "
+                        "မရပါ"}), 400
+    if not accounts.set_referred_by(user["id"], inviter["id"]):
+        return jsonify({"error":
+                        "referral code သတ်မှတ်ပြီးသား "
+                        "ဖြစ်နေပါတယ် — ပြန် ပြောင်းလို့ "
+                        "မရပါ"}), 400
+    stats = accounts.referral_stats(user["id"])
+    stats["reward"] = _referral_reward_credits()
+    return jsonify({"ok": True, **stats})
 
 
 @app.post("/api/auth/setup")
@@ -5382,6 +5503,7 @@ def _tts_charge(job, due):
         if paid < due:
             job["charge_shortfall"] = due - paid
     job["charged_minutes"] = paid
+    _maybe_referral_reward(job)  # build 221
 
 
 def _tts_view(job):
