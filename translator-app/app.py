@@ -57,7 +57,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 223"
+BUILD_TAG = "build 224"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1971,7 +1971,8 @@ def _job_dispatcher():
                           "commentary1": _commentary_worker,
                           "commentary2": _commentary_worker2,
                           "captions1": _captions_worker,
-                          "captions2": _captions_worker2}.get(
+                          "captions2": _captions_worker2,
+                          "captions_api": _api_captions_worker}.get(
                               kind, _worker)
                 wt = threading.Thread(target=target, args=(job,),
                                       daemon=True)
@@ -3744,6 +3745,12 @@ def _accounts_guard():
         return None
     path = request.path
     if not path.startswith("/api/") or path.startswith("/api/auth/"):
+        return None
+    if path.startswith("/api/v1/"):
+        # Build 224: the reseller API authenticates with its
+        # own Bearer token inside the routes (_api_user) — the
+        # web session guard must neither substitute for it nor
+        # block it. The two auth paths never mix.
         return None
     user = _current_user()
     if path.startswith("/api/settings/") or path.startswith("/api/admin/"):
@@ -7270,6 +7277,298 @@ def job_cover_file(jid, name):
     if not p.exists():
         return jsonify({"error": "ဖိုင် မတွေ့ပါ"}), 404
     return send_file(p, mimetype="image/jpeg")
+
+
+# ---------- Reseller API (build 224, roadmap 8) ----------
+# A token-keyed API so shops can build on this engine (Burma
+# Voice has no API at all). Auth is a per-account Bearer token
+# (accounts.set_api_token — only its SHA-256 hash is stored,
+# the plaintext is shown exactly once in the profile) and it
+# is FULLY separate from web sessions: _api_user() reads the
+# Authorization header and nothing else, web routes read the
+# session cookie and nothing else, and _accounts_guard exempts
+# /api/v1/ so neither path can substitute for the other.
+#
+# v1 surface: balance, job submit (dub + captions, URL only —
+# no uploads, and no Recap/Story/Commentary: those need the
+# interactive script park), job status/list, and downloads via
+# DEDICATED token-authenticated routes (the session-gated web
+# file routes stay session-only). API jobs are ordinary jobs:
+# the same queue, the same admission gates (setup, daily cap),
+# the same ElevenLabs test-gate (through _new_job), the same
+# quote-after-phase-1 and the same charge-on-success — an API
+# dub runs the shared _worker; an API captions job runs
+# _api_captions_worker, the uninterrupted form of the web
+# captions pair (no review park: phase 1 -> quote -> burn).
+
+
+def _api_user():
+    """The account behind the request's Bearer token, or None.
+    THE auth check for every /api/v1 route — a session cookie
+    is never even looked at here."""
+    auth = request.headers.get("Authorization") or ""
+    if not auth.startswith("Bearer "):
+        return None
+    return accounts.user_for_api_token(auth[len("Bearer "):])
+
+
+def _api_auth_error():
+    return jsonify({"error": "invalid or missing API token"}), 401
+
+
+def _api_job_view(job):
+    """The API shape of a job: product mode in API terms
+    ("dub" | "captions"), lifecycle status, current stage,
+    the success charge, and — once done — the token download
+    URLs (paths; clients resolve them against the host)."""
+    jid = job["id"]
+    view = {"id": jid,
+            "mode": job.get("api_mode")
+            or ("captions" if job.get("type") == "captions"
+                else "dub"),
+            "status": job.get("status"),
+            "stage": job.get("current"),
+            "error": job.get("error"),
+            "charged": job.get("charged_minutes") or 0,
+            "created_at": job.get("created_at"),
+            "finished_at": job.get("finished_at")}
+    if job.get("status") == "queued":
+        waiting = [q for q, _k in _JOB_QUEUE]
+        if jid in waiting:
+            view["queue_pos"] = waiting.index(jid) + 1
+    if job.get("status") == "done":
+        view["download_url"] = f"/api/v1/jobs/{jid}/download"
+        if job.get("type") == "captions":
+            view["srt_url"] = f"/api/v1/jobs/{jid}/srt"
+    return view
+
+
+def _api_captions_worker(job):
+    """Uninterrupted captions run for the API: phase 1 (the
+    shared guarded subs chain) -> quote -> regenerate
+    subs_my.srt from the final segments -> burn into the
+    original video -> _finish (the only charge point). The
+    web pair (_captions_worker + _captions_worker2) parks at
+    waiting_review between the same two halves for the human
+    edit; an API client has no review step, so the halves run
+    back to back here with identical pieces."""
+    workdir = JOBS_DIR / job["id"]
+    threading.Thread(target=_heartbeat, args=(job,),
+                     daemon=True).start()
+    with job_context(job["id"]):
+        try:
+            job["status"] = "running"
+            _timing_start(job)  # build 213
+            _save(job)
+            run_job.run_phase1(
+                workdir, job["url"],
+                source_path=job.get("source_path"),
+                progress=_progress_fn(job), style="subs",
+                quality=job.get("quality") or "hd")
+            _quote_for_job(job)
+            from pipeline.common import load_segments, write_srt
+            segs = load_segments(workdir / "segments_my.json")
+            if not segs:
+                raise RuntimeError(
+                    "စာတန်း မရှိပါ — ပြန်စမ်းပါ "
+                    "(credit လုံးဝ မဖြတ်ပါ)")
+            write_srt(segs, workdir / "subs_my.srt")
+            run_job.run_phase2(
+                workdir, mode="subs", progress=_progress_fn(job),
+                font=job.get("font") or "noto", subs=None,
+                quality=job.get("quality") or "hd",
+                karaoke=bool(job.get("karaoke")))
+            _finish(job)
+        except JobCancelled:
+            _cancelled(job)
+        except Exception as e:
+            if job.get("cancel_requested"):
+                _cancelled(job)
+            else:
+                _fail(job, e)
+
+
+# ----- token management (web session routes) -----
+
+@app.get("/api/api-token")
+def api_token_status():
+    """Profile API block: whether a token exists. The token
+    itself is NEVER returned — not here, not anywhere."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    return jsonify({"has_token":
+                    accounts.has_api_token(user["id"])})
+
+
+@app.post("/api/api-token")
+def api_token_generate():
+    """Generate (or regenerate) the account's API token. The
+    plaintext rides THIS response only — the one time it is
+    ever shown; regenerating kills the previous token in the
+    same write."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    return jsonify({"token": accounts.set_api_token(user["id"])})
+
+
+@app.delete("/api/api-token")
+def api_token_revoke():
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    accounts.revoke_api_token(user["id"])
+    return jsonify({"ok": True, "has_token": False})
+
+
+# ----- v1 routes (Bearer token auth only) -----
+
+@app.get("/api/v1/balance")
+def api_v1_balance():
+    user = _api_user()
+    if not user:
+        return _api_auth_error()
+    return jsonify({"username": user["username"],
+                    "credits": user["credits"] or 0})
+
+
+@app.post("/api/v1/jobs")
+def api_v1_create_job():
+    user = _api_user()
+    if not user:
+        return _api_auth_error()
+    data = request.get_json(force=True, silent=True) or {}
+    mode = str(data.get("mode") or "").strip().lower()
+    if mode not in ("dub", "captions"):
+        return jsonify({"error":
+                        "mode must be 'dub' or 'captions'"}), 400
+    url = (data.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"error": "လင့်ခ် မမှန်ပါ"}), 400
+    if not _public_url_ok(url):
+        return jsonify({"error": "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"}), 400
+    if mode == "dub":
+        voice = data.get("voice")
+        if voice is not None:
+            voice = str(voice).strip()
+            # A voice the API does not know is a 400, never a
+            # silent fallback: the reseller must learn their
+            # request was wrong. Style keys and "el:<id>" picks
+            # are the vocabulary; _new_job then applies the
+            # build-206 gate to a premium pick exactly as web.
+            if voice and not elevenlabs_tts.is_el_voice(voice) \
+                    and voice not in tts.STYLE_BY_KEY:
+                return jsonify({"error": "voice မမှန်ပါ"}), 400
+        job, err = _new_job({"url": url, "mode": "both",
+                             "voice": voice or None}, user=user)
+        if err:
+            return jsonify({"error": err}), 400
+        job["api_mode"] = "dub"
+        kind = "main"
+    else:
+        _kar = data.get("karaoke")
+        karaoke = _kar is True or (isinstance(_kar, str)
+                                   and _kar.strip().lower()
+                                   in ("1", "true", "on", "yes"))
+        now = time.time()
+        job = {"id": uuid.uuid4().hex[:12], "type": "captions",
+               "url": url, "mode": "captions",
+               "quality": "hd", "font": "noto", "fx": None,
+               "karaoke": karaoke, "api_mode": "captions",
+               "source_path": None,
+               "status": "queued", "current": None, "error": None,
+               "created_at": now, "updated_at": now,
+               "finished_at": None,
+               "steps": [{"key": k, "label": STEP_LABELS[k],
+                          "state": "pending"}
+                         for k in CAPTIONS_STEPS]}
+        kind = "captions_api"
+    # The admission gates every web submission passes, in the
+    # same spirit: setup first, then the daily cap, then the
+    # balance. Every refusal lands BEFORE the job exists.
+    setup_msg = _setup_gate_message(user)
+    if setup_msg:
+        return jsonify({"error": setup_msg}), 400
+    limit_msg = _daily_limit_message(user)
+    if limit_msg:
+        return jsonify({"error": limit_msg}), 429
+    if user["role"] != "admin" and (user["credits"] or 0) < 1:
+        # The cheapest any successful job can be is 1 credit
+        # (the captions minimum) — below that, no product can
+        # ever be afforded, so refuse up front like the web
+        # pre-check. Fuller quotes still happen after phase 1
+        # (_quote_for_job), exactly as web, once the duration
+        # is known.
+        return jsonify({"error": "credit မလောက်ပါ",
+                        "balance": user["credits"] or 0,
+                        "needed": 1}), 402
+    job["user_id"] = user["id"]
+    job["via"] = "api"
+    accounts.mark_has_job(user["id"])
+    JOBS[job["id"]] = job
+    _save(job)
+    _enqueue_job(job, kind=kind)
+    return jsonify({"job_id": job["id"], "status": job["status"]}), 201
+
+
+@app.get("/api/v1/jobs")
+def api_v1_list_jobs():
+    user = _api_user()
+    if not user:
+        return _api_auth_error()
+    mine = [j for j in _all_jobs()
+            if j.get("user_id") == user["id"]]
+    return jsonify({"jobs": [_api_job_view(j) for j in mine[:20]]})
+
+
+@app.get("/api/v1/jobs/<jid>")
+def api_v1_get_job(jid):
+    user = _api_user()
+    if not user:
+        return _api_auth_error()
+    job = _load_job(jid)
+    if not job or job.get("user_id") != user["id"]:
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    return jsonify(_api_job_view(job))
+
+
+@app.get("/api/v1/jobs/<jid>/download")
+def api_v1_download(jid):
+    """The finished video, token-authenticated (the web
+    download route stays session-only). Owner-only, done-only;
+    conditional responses keep Range/resume working."""
+    user = _api_user()
+    if not user:
+        return _api_auth_error()
+    job = _load_job(jid)
+    if not job or job.get("user_id") != user["id"]:
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    out = JOBS_DIR / jid / "output.mp4"
+    if job.get("status") != "done" or not out.exists():
+        return jsonify({"error": "မပြီးသေးပါ"}), 404
+    return send_file(out, as_attachment=True,
+                     download_name=f"myanmar-{jid}.mp4",
+                     conditional=True)
+
+
+@app.get("/api/v1/jobs/<jid>/srt")
+def api_v1_srt(jid):
+    """The Burmese .srt of a captions job (subs_my.srt — the
+    same file the web download serves)."""
+    user = _api_user()
+    if not user:
+        return _api_auth_error()
+    job = _load_job(jid)
+    if not job or job.get("user_id") != user["id"] \
+            or job.get("type") != "captions":
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    srt = JOBS_DIR / jid / "subs_my.srt"
+    if job.get("status") != "done" or not srt.exists():
+        return jsonify({"error": "စာတန်း ဖိုင် မရှိသေးပါ"}), 404
+    return send_file(srt, as_attachment=True,
+                     download_name=f"myanmar-{jid}.srt",
+                     conditional=True)
 
 
 # ---------- text-only export + bulk text input ----------

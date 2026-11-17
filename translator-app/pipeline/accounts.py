@@ -11,6 +11,7 @@ everything. There is exactly one bootstrap path for the first admin:
 claim_admin() works only while NO admin exists (the app still sits
 behind the owner's login wall at that point) and never again after.
 """
+import hashlib
 import re
 import secrets
 import sqlite3
@@ -135,6 +136,18 @@ def _db():
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code "
         "ON users(referral_code) WHERE referral_code IS NOT NULL")
+    # Build 224: reseller API token. api_token_hash holds ONLY
+    # the SHA-256 of the account's one API token — the plaintext
+    # is shown to the owner exactly once at generation and never
+    # stored, so a database read can never leak a usable token.
+    # The partial unique index keeps one token per account and
+    # token -> account resolution unambiguous.
+    if "api_token_hash" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN "
+                     "api_token_hash TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_token "
+        "ON users(api_token_hash) WHERE api_token_hash IS NOT NULL")
     missing = conn.execute(
         "SELECT id FROM users WHERE referral_code IS NULL").fetchall()
     for r in missing:
@@ -950,3 +963,72 @@ def cover_series_upsert(user_id, name, part=None):
             (int(user_id), _series_key(name))).fetchone()
     return {"name": row["name"],
             "last_part": int(row["last_part"])}
+
+
+# ---------------- API tokens (build 224) ----------------
+# The reseller API authenticates with a per-account Bearer
+# token, fully separate from web sessions: a token is NOT a
+# session (it never touches the sessions table) and a session
+# cookie never authenticates an API call. Each account has at
+# most ONE live token; generating a new one replaces the old
+# (the old token dies in the same UPDATE), revoking clears it.
+# Only the SHA-256 hash is stored — the plaintext is returned
+# to the caller exactly once, at generation, and the profile
+# can afterwards only report THAT a token exists.
+
+_API_TOKEN_PREFIX = "vt_"
+
+
+def _api_token_hash(token):
+    return hashlib.sha256(
+        (token or "").encode("utf-8")).hexdigest()
+
+
+def set_api_token(user_id):
+    """Generate (or regenerate) the account's API token and
+    return the PLAINTEXT — the one and only time it exists
+    outside the owner's hands. Regeneration invalidates the
+    previous token immediately (same row, new hash)."""
+    token = _API_TOKEN_PREFIX + secrets.token_hex(20)
+    with _LOCK, _db() as conn:
+        conn.execute(
+            "UPDATE users SET api_token_hash = ? WHERE id = ?",
+            (_api_token_hash(token), int(user_id)))
+    return token
+
+
+def revoke_api_token(user_id):
+    """Clear the account's API token (True when one existed)."""
+    with _LOCK, _db() as conn:
+        cur = conn.execute(
+            "UPDATE users SET api_token_hash = NULL "
+            "WHERE id = ? AND api_token_hash IS NOT NULL",
+            (int(user_id),))
+    return cur.rowcount == 1
+
+
+def has_api_token(user_id):
+    """Whether the account currently has a live API token —
+    all the profile is ever allowed to know after generation."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT api_token_hash FROM users WHERE id = ?",
+            (int(user_id),)).fetchone()
+    return bool(row and row["api_token_hash"])
+
+
+def user_for_api_token(token):
+    """Resolve a presented Bearer token to its account (public
+    dict) — the API's ONLY auth path. The presented value is
+    hashed and matched against stored hashes; a disabled
+    account's token is refused, exactly like its sessions."""
+    token = (token or "").strip()
+    if not token:
+        return None
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE api_token_hash = ?",
+            (_api_token_hash(token),)).fetchone()
+    if row is None or row["disabled"]:
+        return None
+    return _public(row)
