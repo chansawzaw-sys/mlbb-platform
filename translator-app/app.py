@@ -57,7 +57,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 222"
+BUILD_TAG = "build 223"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -6998,6 +6998,278 @@ def job_title_tags(jid):
     return jsonify({"title": payload["title"],
                     "hashtags": payload["hashtags"],
                     "cached": False})
+
+
+# ---------- Cover maker (build 223, roadmap 7) ----------------
+# On the DONE screen of a finished video job, one tap makes a
+# clean TikTok cover: a sharp REAL frame from the customer's
+# own finished video (the actual characters — never AI-faked
+# imagery) plus a template overlay. The step ASKS the creator
+# for the title text and the part number (owner's design,
+# 2026-11-17); the series name is remembered per account
+# (accounts.cover_series) so the next part of a series only
+# needs the number bumped. FREE — no credit moves anywhere in
+# this flow, and the job's own files are never touched: frames
+# and the finished cover live in the job's cover/ subdir and
+# are swept away with the job by the 24 h cleanup.
+
+COVER_FRAME_FRACS = (0.08, 0.28, 0.48, 0.68, 0.88)
+_COVER_NAME_RE = re.compile(
+    r"^(frame|thumb)_\d+\.jpg$|^cover\.jpg$")
+
+
+def _cover_dir(job):
+    return JOBS_DIR / job["id"] / "cover"
+
+
+def _cover_frames(job):
+    """Extract ~5 candidate frames from the job's output.mp4 at
+    spread timestamps (re-extraction replaces the old set).
+    Returns [{"i", "t", "thumb", "frame"}] or None when the job
+    has no readable output video."""
+    out = JOBS_DIR / job["id"] / "output.mp4"
+    if not out.exists():
+        return None
+    dur = probe_duration(out)
+    if not dur or dur <= 0:
+        return None
+    cdir = _cover_dir(job)
+    cdir.mkdir(parents=True, exist_ok=True)
+    frames = []
+    for i, frac in enumerate(COVER_FRAME_FRACS):
+        t = min(max(dur * frac, 0.0), max(dur - 0.15, 0.0))
+        frame = cdir / f"frame_{i}.jpg"
+        thumb = cdir / f"thumb_{i}.jpg"
+        try:
+            sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}",
+                "-i", str(out), "-frames:v", "1", "-q:v", "2",
+                str(frame)])
+            sh(["ffmpeg", "-y", "-v", "error", "-i", str(frame),
+                "-vf", "scale=270:-2", "-q:v", "4", str(thumb)])
+        except Exception:
+            continue
+        if frame.exists() and thumb.exists():
+            frames.append({
+                "i": i, "t": round(t, 1),
+                "thumb": f"/api/jobs/{job['id']}/cover/"
+                         f"thumb_{i}.jpg",
+                "frame": f"/api/jobs/{job['id']}/cover/"
+                         f"frame_{i}.jpg"})
+    return frames or None
+
+
+def _cover_font(size, bold=True):
+    from PIL import ImageFont
+    from pipeline.common import FONTS_DIR, ensure_fonts
+    ensure_fonts()
+    name = ("NotoSansMyanmar-Bold.ttf" if bold
+            else "NotoSansMyanmar-Regular.ttf")
+    return ImageFont.truetype(str(FONTS_DIR / name),
+                              max(10, int(size)))
+
+
+def _cover_wrap(draw, text, font, max_w):
+    """Word-wrap `text` into lines of at most max_w px, measured
+    with the real font; a single word wider than the line is
+    split by characters so nothing ever spills off the cover."""
+    def fits(s):
+        return draw.textlength(s, font=font) <= max_w
+    lines, cur = [], ""
+    for word in (text or "").split():
+        trial = (cur + " " + word).strip()
+        if fits(trial):
+            cur = trial
+            continue
+        if cur:
+            lines.append(cur)
+            cur = ""
+        while not fits(word) and len(word) > 1:
+            cut = len(word)
+            while cut > 1 and not fits(word[:cut]):
+                cut -= 1
+            lines.append(word[:cut])
+            word = word[cut:]
+        cur = word
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _compose_cover(frame_path, title, series, part, out_path):
+    """The template over the REAL frame (PIL, bundled Myanmar
+    fonts): native aspect (width capped at 1080), a dark
+    gradient band across the bottom third carrying the title
+    (largest size that fits ≤3 lines), a red "PART <n>" badge
+    at the top-right when a part is given, and the series name
+    small at the top-left when given."""
+    from PIL import Image, ImageDraw
+    img = Image.open(frame_path).convert("RGB")
+    if img.width > 1080:
+        img = img.resize(
+            (1080, round(img.height * 1080 / img.width)),
+            Image.LANCZOS)
+    w, h = img.size
+    margin = max(14, round(w * 0.05))
+    # Dark gradient band across the bottom ~38%: transparent at
+    # its top edge, near-opaque black at the bottom.
+    band_h = round(h * 0.38)
+    band_top = h - band_h
+    grad = Image.new("L", (1, band_h))
+    for yy in range(band_h):
+        grad.putpixel((0, yy),
+                      int(228 * (yy / max(band_h - 1, 1)) ** 1.3))
+    img.paste(Image.new("RGB", (w, band_h), (0, 0, 0)),
+              (0, band_top), grad.resize((w, band_h)))
+    draw = ImageDraw.Draw(img, "RGBA")
+    # Title — shrink from ~8% of the width until the wrap fits
+    # ≤3 lines inside the band.
+    avail_w = w - 2 * margin
+    size = max(16, round(w * 0.082))
+    lines, font = [], _cover_font(size)
+    while True:
+        font = _cover_font(size)
+        lines = _cover_wrap(draw, title, font, avail_w)
+        if len(lines) <= 3 \
+                and len(lines) * size * 1.45 <= band_h - margin:
+            break
+        if size <= 12:
+            lines = lines[:3]
+            break
+        size = max(12, round(size * 0.88))
+    line_h = size * 1.45
+    y = band_top + (band_h - len(lines) * line_h) / 2
+    for ln in lines:
+        x = (w - draw.textlength(ln, font=font)) / 2
+        draw.text((x + 2, y + 2), ln, font=font,
+                  fill=(0, 0, 0, 210))
+        draw.text((x, y), ln, font=font,
+                  fill=(255, 255, 255, 255))
+        y += line_h
+    # Series name — small chip at the top-left.
+    if series:
+        sfont = _cover_font(max(13, round(w * 0.034)))
+        sw = draw.textlength(series, font=sfont)
+        pad = round(w * 0.018) + 4
+        draw.rounded_rectangle(
+            [margin, margin, margin + sw + 2 * pad,
+             margin + sfont.size * 1.9],
+            radius=8, fill=(0, 0, 0, 150))
+        draw.text((margin + pad, margin + sfont.size * 0.32),
+                  series, font=sfont, fill=(255, 255, 255, 255))
+    # Part badge — red rounded chip at the top-right.
+    if part:
+        label = f"PART {part}"
+        bfont = _cover_font(max(14, round(w * 0.042)))
+        bw = draw.textlength(label, font=bfont)
+        pad = round(w * 0.022) + 4
+        x1 = w - margin
+        draw.rounded_rectangle(
+            [x1 - bw - 2 * pad, margin, x1,
+             margin + bfont.size * 1.9],
+            radius=9, fill=(228, 18, 38, 255))
+        draw.text((x1 - pad - bw, margin + bfont.size * 0.32),
+                  label, font=bfont, fill=(255, 255, 255, 255))
+    img.save(out_path, "JPEG", quality=88)
+    return out_path
+
+
+@app.post("/api/jobs/<jid>/cover/frames")
+def job_cover_frames(jid):
+    """Extract the candidate cover frames for a DONE job
+    (owner only, same 404 shape as every other job route)."""
+    job = _load_job(jid)
+    if not job or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    if job.get("status") != "done":
+        return jsonify({"error": "ဗီဒီယို မပြီးသေးပါ — "
+                        "ပြီးမှ Cover လုပ်နိုင်ပါမယ်"}), 409
+    frames = _cover_frames(job)
+    if not frames:
+        return jsonify({"error": "ဒီ ဗီဒီယိုကနေ ပုံ ထုတ်လို့ "
+                        "မရပါ"}), 400
+    return jsonify({"frames": frames})
+
+
+@app.get("/api/cover/series")
+def cover_series():
+    """The signed-in account's remembered cover series (name +
+    highest part made), most recent first — the cover form
+    offers them as chips and suggests last part + 1."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    return jsonify(
+        {"series": accounts.cover_series_list(user["id"])})
+
+
+@app.post("/api/jobs/<jid>/cover")
+def job_cover_make(jid):
+    """Compose the cover for a DONE job from a chosen extracted
+    frame + the creator's title / series / part. FREE. When a
+    series is named, the account's series record is upserted
+    with this part (last part only ever moves up)."""
+    job = _load_job(jid)
+    user = _current_user()
+    if not job or not _owns(user, job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    if job.get("status") != "done":
+        return jsonify({"error": "ဗီဒီယို မပြီးသေးပါ — "
+                        "ပြီးမှ Cover လုပ်နိုင်ပါမယ်"}), 409
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "").strip()
+    if not title:
+        return jsonify({"error": "Cover အတွက် ခေါင်းစဉ် စာသား "
+                        "အရင် ထည့်ပါ"}), 400
+    try:
+        idx = int(data.get("frame"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "ပုံ အရင် ရွေးပါ"}), 400
+    cdir = _cover_dir(job)
+    frame = cdir / f"frame_{idx}.jpg"
+    if not frame.exists():
+        _cover_frames(job)  # not extracted yet — do it now
+    if not frame.exists():
+        return jsonify({"error": "ရွေးထားတဲ့ ပုံ မတွေ့ပါ — "
+                        "ပုံ ပြန်ရွေးပါ"}), 400
+    series = (data.get("series") or "").strip()
+    part = data.get("part")
+    try:
+        part = int(part) if part not in (None, "") else None
+    except (TypeError, ValueError):
+        part = None
+    if part is not None and part <= 0:
+        part = None
+    try:
+        _compose_cover(frame, title, series, part,
+                       cdir / "cover.jpg")
+    except Exception:
+        return jsonify({"error": "Cover ထုတ်တာ မရပါ — "
+                        "ခဏနေမှ ပြန်စမ်းပါ"}), 502
+    saved = None
+    if series and user:
+        saved = accounts.cover_series_upsert(
+            user["id"], series, part)
+    job["cover"] = {"title": title, "series": series or None,
+                    "part": part, "frame": idx}
+    _save(job)
+    return jsonify({"url": f"/api/jobs/{jid}/cover/cover.jpg",
+                    "series": saved})
+
+
+@app.get("/api/jobs/<jid>/cover/<name>")
+def job_cover_file(jid, name):
+    """Serve one file from the job's cover/ dir (candidate
+    frames, thumbnails, the finished cover) — owner only, and
+    the name is whitelisted so nothing else can be reached."""
+    job = _load_job(jid)
+    if not job or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    if not _COVER_NAME_RE.match(name or ""):
+        return jsonify({"error": "ဖိုင် မတွေ့ပါ"}), 404
+    p = _cover_dir(job) / name
+    if not p.exists():
+        return jsonify({"error": "ဖိုင် မတွေ့ပါ"}), 404
+    return send_file(p, mimetype="image/jpeg")
 
 
 # ---------- text-only export + bulk text input ----------

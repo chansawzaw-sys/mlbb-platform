@@ -78,6 +78,14 @@ CREATE TABLE IF NOT EXISTS clones (
   name TEXT NOT NULL,
   created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS cover_series (
+  user_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  name_key TEXT NOT NULL,
+  last_part INTEGER NOT NULL DEFAULT 0,
+  updated_at REAL NOT NULL,
+  PRIMARY KEY (user_id, name_key)
+);
 """
 
 
@@ -887,3 +895,58 @@ def delete_clone(user_id, voice_id):
             "DELETE FROM clones WHERE user_id = ? AND voice_id = ?",
             (int(user_id), str(voice_id)))
     return cur.rowcount == 1
+
+
+# ---------------- cover series (build 223) ----------------
+# The cover maker remembers, per account, the series names the
+# creator has made covers for and the highest part number used,
+# so the next part of a series only needs the number bumped.
+# Rows are keyed by the case-insensitive name (name_key); the
+# display name keeps the casing first typed.
+
+def _series_key(name):
+    return (name or "").strip().lower()
+
+
+def cover_series_list(user_id):
+    """The account's cover series, most recently used first:
+    [{"name": display name, "last_part": highest part made}]."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT name, last_part FROM cover_series "
+            "WHERE user_id = ? ORDER BY updated_at DESC",
+            (int(user_id),)).fetchall()
+    return [{"name": r["name"], "last_part": int(r["last_part"])}
+            for r in rows]
+
+
+def cover_series_upsert(user_id, name, part=None):
+    """Record a cover made for `name`. last_part only ever
+    moves UP (MAX), so re-making an earlier part by mistake
+    never lowers the remembered number; `part=None` (or 0)
+    just registers/touches the series. Returns the stored row
+    {"name", "last_part"} — or None for an empty name."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    try:
+        part = int(part or 0)
+    except (TypeError, ValueError):
+        part = 0
+    if part < 0:
+        part = 0
+    with _LOCK, _db() as conn:
+        conn.execute(
+            "INSERT INTO cover_series (user_id, name, name_key, "
+            "last_part, updated_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id, name_key) DO UPDATE SET "
+            "last_part = MAX(last_part, excluded.last_part), "
+            "updated_at = excluded.updated_at",
+            (int(user_id), name, _series_key(name), part,
+             time.time()))
+        row = conn.execute(
+            "SELECT name, last_part FROM cover_series "
+            "WHERE user_id = ? AND name_key = ?",
+            (int(user_id), _series_key(name))).fetchone()
+    return {"name": row["name"],
+            "last_part": int(row["last_part"])}
