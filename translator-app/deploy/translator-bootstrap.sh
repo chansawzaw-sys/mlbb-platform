@@ -333,6 +333,10 @@ for b64 in "$APP_DIR"/static/*.b64; do
 done
 # Build 216: the Story Video cartoon library (backgrounds +
 # characters) travels the same way, one level down.
+# Build 218: the characters' expression variants
+# (chars/<name>-<expr>.png.b64) ride the SAME glob — no new
+# loop needed; the runtime ensure_assets() rglob covers
+# them too.
 for b64 in "$APP_DIR"/assets/story/bg/*.b64 "$APP_DIR"/assets/story/chars/*.b64; do
   [ -e "$b64" ] || continue
   base64 -d "$b64" > "${b64%.b64}"

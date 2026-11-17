@@ -1,6 +1,9 @@
-"""Story Video asset factory (build 216) — draws the whole
-v1 cartoon asset library in code with PIL: 10 backgrounds
-(720x1280) and 10 characters (transparent PNGs).
+"""Story Video asset factory (build 216; expression pack
+build 218) — draws the whole cartoon asset library in code
+with PIL: 10 backgrounds (720x1280) and 10 characters
+(transparent PNGs), each character also in 5 expression
+variants (neutral / happy / sad / surprised / angry — face
+variants on the same body, same flat ink style).
 
 The art is ORIGINAL flat-style work drawn for this product
 (simple shapes, one ink outline colour, one warm palette) —
@@ -402,21 +405,60 @@ def bg_bridge():
 
 # ---------------- characters ----------------
 
-def face(p, cx, cy, r, hair_top=True, gray=False):
+def face(p, cx, cy, r, hair_top=True, gray=False, expr="neutral"):
     p.ell([cx - r, cy - r, cx + r, cy + r], fill=SKIN, outline=INK,
           width=4)
     if hair_top:
         p.pieslice([cx - r, cy - r, cx + r, cy + r * 0.72], 180, 360,
                    fill=GRAY if gray else HAIR)
+    # Brows carry the feeling for sad / angry / surprised;
+    # the neutral face (the build-216 original) has none.
+    if expr == "sad":
+        p.line([(cx - 0.52 * r, cy - 0.30 * r),
+                (cx - 0.16 * r, cy - 0.44 * r)], fill=INK, width=4)
+        p.line([(cx + 0.52 * r, cy - 0.30 * r),
+                (cx + 0.16 * r, cy - 0.44 * r)], fill=INK, width=4)
+    elif expr == "angry":
+        p.line([(cx - 0.52 * r, cy - 0.44 * r),
+                (cx - 0.16 * r, cy - 0.28 * r)], fill=INK, width=5)
+        p.line([(cx + 0.52 * r, cy - 0.44 * r),
+                (cx + 0.16 * r, cy - 0.28 * r)], fill=INK, width=5)
+    elif expr == "surprised":
+        p.arc([cx - 0.54 * r, cy - 0.52 * r, cx - 0.14 * r,
+               cy - 0.30 * r], 180, 360, fill=INK, width=4)
+        p.arc([cx + 0.14 * r, cy - 0.52 * r, cx + 0.54 * r,
+               cy - 0.30 * r], 180, 360, fill=INK, width=4)
     for ex in (-0.36, 0.36):
-        p.ell([cx + ex * r - 5, cy + 2, cx + ex * r + 5, cy + 14],
-              fill=INK)
-    p.arc([cx - r * 0.34, cy + r * 0.18, cx + r * 0.34,
-           cy + r * 0.62], 20, 160, fill=INK, width=4)
+        exx = cx + ex * r
+        if expr == "happy":
+            # closed happy eyes (upward arcs)
+            p.arc([exx - 10, cy - 2, exx + 10, cy + 16], 180, 360,
+                  fill=INK, width=4)
+        elif expr == "surprised":
+            p.ell([exx - 8, cy - 4, exx + 8, cy + 16], fill=INK)
+        else:
+            p.ell([exx - 5, cy + 2, exx + 5, cy + 14],
+                  fill=INK)
+    if expr == "happy":
+        p.arc([cx - r * 0.40, cy + r * 0.10, cx + r * 0.40,
+               cy + r * 0.72], 10, 170, fill=INK, width=5)
+    elif expr == "sad":
+        p.arc([cx - r * 0.32, cy + r * 0.40, cx + r * 0.32,
+               cy + r * 0.78], 200, 340, fill=INK, width=4)
+    elif expr == "surprised":
+        p.ell([cx - 10, cy + r * 0.30, cx + 10, cy + r * 0.30 + 26],
+              fill=(120, 60, 40, 255), outline=INK, width=3)
+    elif expr == "angry":
+        p.line([(cx - r * 0.28, cy + r * 0.44),
+                (cx + r * 0.28, cy + r * 0.44)], fill=INK, width=4)
+    else:
+        p.arc([cx - r * 0.34, cy + r * 0.18, cx + r * 0.34,
+               cy + r * 0.62], 20, 160, fill=INK, width=4)
 
 
 def human(shirt, bottom, long_bottom=True, girl=False, elder=False,
-          bun=False, beard=False, stick=False, shawl=None):
+          bun=False, beard=False, stick=False, shawl=None,
+          expr="neutral"):
     img = canvas(CW, CH)
     p = Pen(img)
     cx = CW // 2
@@ -454,7 +496,7 @@ def human(shirt, bottom, long_bottom=True, girl=False, elder=False,
     if bun:
         p.ell([cx - 22, 6, cx + 22, 48], fill=GRAY if gray else HAIR,
               outline=INK, width=3)
-    face(p, cx, 108, 62, gray=gray)
+    face(p, cx, 108, 62, gray=gray, expr=expr)
     if beard:
         p.pieslice([cx - 46, 108, cx + 46, 196], 0, 180, fill=GRAY)
         face_eyes = None
@@ -466,7 +508,7 @@ def human(shirt, bottom, long_bottom=True, girl=False, elder=False,
     return finish(img, CW, CH)
 
 
-def ch_dog():
+def ch_dog(expr="neutral"):
     img = canvas(CW, CH)
     p = Pen(img)
     body = (176, 124, 74, 255)
@@ -477,17 +519,32 @@ def ch_dog():
               width=3)
     p.arc([238, 168, 330, 300], 300, 80, fill=body, width=16)
     p.ell([232, 196, 336, 300], fill=body, outline=INK, width=4)
-    p.poly([(252, 210), (292, 204), (268, 268)], fill=(140, 96, 52, 255),
-           outline=INK)
+    if expr == "sad":
+        # ear droops down/forward
+        p.poly([(250, 218), (290, 214), (264, 274)],
+               fill=(140, 96, 52, 255), outline=INK)
+    else:
+        p.poly([(252, 210), (292, 204), (268, 268)],
+               fill=(140, 96, 52, 255), outline=INK)
     p.ell([292, 246, 344, 282], fill=(196, 150, 100, 255), outline=INK,
           width=3)
     p.ell([330, 252, 346, 268], fill=INK)
-    p.ell([268, 224, 282, 238], fill=INK)
-    p.ell([262, 220, 270, 228], fill=(255, 255, 255, 255))
+    if expr == "happy":
+        p.arc([264, 220, 286, 240], 180, 360, fill=INK, width=4)
+        # tongue out under the snout
+        p.ell([306, 270, 332, 302], fill=(255, 150, 170, 255),
+              outline=INK, width=3)
+    elif expr == "surprised":
+        p.ell([264, 220, 286, 242], fill=INK)
+    else:
+        p.ell([268, 224, 282, 238], fill=INK)
+        p.ell([262, 220, 270, 228], fill=(255, 255, 255, 255))
+    if expr == "angry":
+        p.line([(258, 216), (288, 224)], fill=INK, width=4)
     return finish(img, CW, CH)
 
 
-def ch_cat():
+def ch_cat(expr="neutral"):
     img = canvas(CW, CH)
     p = Pen(img)
     body = (245, 152, 52, 255)
@@ -499,9 +556,28 @@ def ch_cat():
     p.poly([(118, 156), (126, 116), (152, 144)], fill=(255, 183, 197, 255))
     p.poly([(242, 156), (234, 116), (208, 144)], fill=(255, 183, 197, 255))
     for ex in (140, 206):
-        p.ell([ex, 224, ex + 14, 240], fill=INK)
+        if expr == "happy":
+            p.arc([ex - 1, 218, ex + 15, 238], 180, 360, fill=INK,
+                  width=3)
+        elif expr == "surprised":
+            p.ell([ex - 3, 220, ex + 17, 244], fill=INK)
+        else:
+            p.ell([ex, 224, ex + 14, 240], fill=INK)
+    if expr == "angry":
+        p.line([(130, 202), (162, 214)], fill=INK, width=3)
+        p.line([(230, 202), (198, 214)], fill=INK, width=3)
     p.poly([(172, 252), (188, 252), (180, 264)], fill=(233, 30, 99, 255))
-    p.arc([156, 252, 204, 284], 20, 160, fill=INK, width=3)
+    if expr == "happy":
+        p.arc([150, 246, 210, 290], 10, 170, fill=INK, width=4)
+    elif expr == "sad":
+        p.arc([162, 266, 198, 292], 200, 340, fill=INK, width=3)
+    elif expr == "surprised":
+        p.ell([172, 266, 188, 284], fill=(150, 70, 60, 255),
+              outline=INK, width=2)
+    elif expr == "angry":
+        p.line([(164, 270), (196, 270)], fill=INK, width=3)
+    else:
+        p.arc([156, 252, 204, 284], 20, 160, fill=INK, width=3)
     for wy in (238, 256):
         p.line([(104, wy), (148, wy + 4)], fill=INK, width=3)
         p.line([(256, wy), (212, wy + 4)], fill=INK, width=3)
@@ -510,16 +586,38 @@ def ch_cat():
     return finish(img, CW, CH)
 
 
-def ch_bird():
+def ch_bird(expr="neutral"):
     img = canvas(CW, CH)
     p = Pen(img)
     body = (66, 165, 245, 255)
     p.ell([96, 190, 280, 320], fill=body, outline=INK, width=4)
     p.ell([228, 128, 322, 222], fill=body, outline=INK, width=4)
-    p.poly([(314, 158), (356, 176), (312, 188)], fill=(255, 167, 38, 255),
-           outline=INK)
-    p.ell([272, 152, 288, 168], fill=INK)
-    p.ell([276, 155, 282, 161], fill=(255, 255, 255, 255))
+    if expr == "happy":
+        # beak open, singing
+        p.poly([(314, 156), (358, 168), (312, 180)], fill=(255, 167, 38, 255),
+               outline=INK)
+        p.poly([(312, 182), (352, 190), (310, 194)],
+               fill=(255, 167, 38, 255), outline=INK)
+    elif expr == "surprised":
+        p.poly([(314, 152), (360, 164), (312, 178)],
+               fill=(255, 167, 38, 255), outline=INK)
+        p.poly([(312, 184), (356, 198), (310, 196)],
+               fill=(255, 167, 38, 255), outline=INK)
+    elif expr == "sad":
+        p.poly([(314, 166), (350, 182), (312, 192)],
+               fill=(255, 167, 38, 255), outline=INK)
+    else:
+        p.poly([(314, 158), (356, 176), (312, 188)], fill=(255, 167, 38, 255),
+               outline=INK)
+    if expr == "happy":
+        p.arc([268, 148, 292, 168], 180, 360, fill=INK, width=4)
+    elif expr == "surprised":
+        p.ell([268, 148, 292, 172], fill=INK)
+    else:
+        p.ell([272, 152, 288, 168], fill=INK)
+        p.ell([276, 155, 282, 161], fill=(255, 255, 255, 255))
+    if expr == "angry":
+        p.line([(264, 146), (292, 152)], fill=INK, width=4)
     p.ell([130, 208, 226, 282], fill=(129, 212, 250, 255), outline=INK,
           width=3)
     p.poly([(104, 240), (44, 208), (58, 268), (40, 300), (110, 282)],
@@ -533,7 +631,7 @@ def ch_bird():
     return finish(img, CW, CH)
 
 
-def ch_buffalo():
+def ch_buffalo(expr="neutral"):
     img = canvas(CW, CH)
     p = Pen(img)
     body = (128, 139, 148, 255)
@@ -554,9 +652,21 @@ def ch_buffalo():
           width=13)
     p.arc([286, 128, 370, 216], 210, 340, fill=(236, 230, 220, 255),
           width=13)
-    p.ell([252, 226, 268, 244], fill=INK)
-    p.ell([256, 229, 263, 236], fill=(255, 255, 255, 255))
+    if expr == "happy":
+        p.arc([248, 222, 272, 244], 180, 360, fill=INK, width=4)
+    elif expr == "surprised":
+        p.ell([248, 222, 272, 248], fill=INK)
+    else:
+        p.ell([252, 226, 268, 244], fill=INK)
+        p.ell([256, 229, 263, 236], fill=(255, 255, 255, 255))
     p.poly([(240, 240), (216, 226), (232, 262)], fill=dark, outline=INK)
+    if expr == "happy":
+        p.arc([294, 312, 338, 334], 20, 160, fill=INK, width=3)
+    elif expr == "sad":
+        p.arc([294, 320, 338, 340], 200, 340, fill=INK, width=3)
+    elif expr == "angry":
+        p.arc([246, 212, 274, 238], 180, 360, fill=INK, width=5)
+        p.line([(300, 332), (332, 332)], fill=INK, width=3)
     return finish(img, CW, CH)
 
 
@@ -566,18 +676,24 @@ BACKGROUNDS = {
     "house": bg_house, "night": bg_night, "school": bg_school,
     "bridge": bg_bridge,
 }
+EXPRESSIONS = ("neutral", "happy", "sad", "surprised", "angry")
+
 CHARACTERS = {
-    "boy": lambda: human((66, 165, 245), (255, 112, 67),
-                         long_bottom=False),
-    "girl": lambda: human((233, 30, 99), (171, 71, 188), girl=True),
-    "man": lambda: human((245, 245, 245), (30, 136, 229)),
-    "woman": lambda: human((255, 167, 38), (142, 36, 170), girl=True,
-                           bun=True),
-    "elder-man": lambda: human((141, 110, 99), (93, 64, 55),
-                               elder=True, beard=True, stick=True),
-    "elder-woman": lambda: human((0, 137, 123), (94, 53, 177),
-                                 girl=True, elder=True, bun=True,
-                                 shawl=(0, 105, 95)),
+    "boy": lambda expr="neutral": human(
+        (66, 165, 245), (255, 112, 67), long_bottom=False, expr=expr),
+    "girl": lambda expr="neutral": human(
+        (233, 30, 99), (171, 71, 188), girl=True, expr=expr),
+    "man": lambda expr="neutral": human(
+        (245, 245, 245), (30, 136, 229), expr=expr),
+    "woman": lambda expr="neutral": human(
+        (255, 167, 38), (142, 36, 170), girl=True, bun=True,
+        expr=expr),
+    "elder-man": lambda expr="neutral": human(
+        (141, 110, 99), (93, 64, 55), elder=True, beard=True,
+        stick=True, expr=expr),
+    "elder-woman": lambda expr="neutral": human(
+        (0, 137, 123), (94, 53, 177), girl=True, elder=True,
+        bun=True, shawl=(0, 105, 95), expr=expr),
     "dog": ch_dog, "cat": ch_cat, "bird": ch_bird,
     "buffalo": ch_buffalo,
 }
@@ -594,6 +710,13 @@ def main():
         out = HERE / "chars" / f"{name}.png"
         fn().save(out)
         print("char", name, out.stat().st_size)
+        # Build 218: the expression pack — five face variants
+        # per character next to the base sprite (the base IS
+        # the neutral variant; boy-neutral.png == boy.png).
+        for expr in EXPRESSIONS:
+            vout = HERE / "chars" / f"{name}-{expr}.png"
+            fn(expr).save(vout)
+            print("char-expr", name, expr, vout.stat().st_size)
 
 
 if __name__ == "__main__":

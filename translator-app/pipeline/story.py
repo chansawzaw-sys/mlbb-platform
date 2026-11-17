@@ -1,6 +1,7 @@
-"""Story Video generation (build 216) — the Story product's
-brain: a topic in, a Burmese narration script + a shot plan
-out; or the customer's own story text in, a shot plan out.
+"""Story Video generation (build 216; shot density +
+expression pack build 218) — the Story product's brain: a
+topic in, a Burmese narration script + a shot plan out; or
+the customer's own story text in, a shot plan out.
 
 The script is written by the SAME LLM gateways the translator
 and Recap use, walked in the SAME order as recap.generate_
@@ -38,8 +39,37 @@ BACKGROUNDS = ("village", "town", "forest", "river", "field",
 CHARACTERS = ("boy", "girl", "man", "woman", "elder-man",
               "elder-woman", "dog", "cat", "bird", "buffalo")
 MOODS = ("day", "sunset", "night")
-MAX_SHOTS = 24
+EXPRESSIONS = ("neutral", "happy", "sad", "surprised", "angry")
 MAX_CHARS_PER_SHOT = 3
+# Build 218: the owner counted only ~5 scenes in a 1-minute
+# build-216 video. The planner now targets ~12 shots per
+# minute (a fresh picture every ~5 s) and the sanitizer cap
+# scales with the target length instead of one flat cap.
+_SHOT_CAPS = {1: 16, 2: 28, 3: 44}
+ABSOLUTE_MAX_SHOTS = 48
+
+
+def max_shots_for_minutes(minutes):
+    """Sanitizer cap for a target length: 16 / 28 / 44 shots
+    for 1 / 2 / 3 minutes (the planner asks for ~12 per
+    minute; the cap leaves headroom, never crashes)."""
+    try:
+        m = int(round(float(minutes)))
+    except (TypeError, ValueError):
+        m = 1
+    if m in _SHOT_CAPS:
+        return _SHOT_CAPS[m]
+    return min(ABSOLUTE_MAX_SHOTS, 16 * max(1, m))
+
+
+def shots_target_for_minutes(minutes):
+    """The shot count the planner prompt asks for: ~12 per
+    minute of finished video (one scene every ~5 seconds)."""
+    try:
+        m = float(minutes)
+    except (TypeError, ValueError):
+        m = 1.0
+    return max(10, min(40, int(round(m * 12))))
 
 PROMPT_STORY = """You are a Burmese cartoon-story writer. The topic is below. Write a complete short Burmese story narration script for a vertical cartoon video, AND a shot plan for the cartoon scenes.
 
@@ -54,30 +84,34 @@ Rules for the script:
 Length: the finished video is about __MINUTES__ minutes long. The script must be about __TARGET__ Burmese characters (between __LOW__ and __HIGH__) so the narration fills the video at a natural pace.
 
 Shot plan rules:
-- "shots" is a list of scenes in story order — one shot per story beat (roughly one shot per 2-4 sentences).
-- Each shot is {"bg": ..., "chars": [...], "mood": ...}.
+- "shots" is a list of scenes in story order — one shot per story beat. The finished video is about __MINUTES__ minutes long, so give about __SHOTS__ shots (a new scene every 4-6 seconds) so the picture keeps changing.
+- Each shot is {"bg": ..., "chars": [...], "mood": ..., "expr": ...}.
 - "bg" MUST be exactly one of: village, town, forest, river, field, market, house, night, school, bridge
 - "chars" is a list of 0 to 3 entries, each exactly one of: boy, girl, man, woman, elder-man, elder-woman, dog, cat, bird, buffalo
 - "mood" is exactly one of: day, sunset, night
-- Use ONLY those words for bg / chars / mood — never invent new ones.
+- "expr" is exactly one of: neutral, happy, sad, surprised, angry — the main character's feeling during that scene; choose it from what happens in that part of the story.
+- Consecutive shots must not repeat the same bg with the same chars — keep changing the scene.
+- Use ONLY those words for bg / chars / mood / expr — never invent new ones.
 
 Answer with ONLY a JSON object, no other text:
-{"script": "<the Burmese narration script>", "shots": [{"bg": "village", "chars": ["boy"], "mood": "day"}]}
+{"script": "<the Burmese narration script>", "shots": [{"bg": "village", "chars": ["boy"], "mood": "day", "expr": "happy"}]}
 
 Topic:
 __TOPIC__
 """
 
-PROMPT_PLAN = """You are planning cartoon scenes for a Burmese story video. The narration script is below. Make a shot plan: a list of scenes in story order, one shot per story beat (roughly one shot per 2-4 sentences).
+PROMPT_PLAN = """You are planning cartoon scenes for a Burmese story video. The narration script is below. Make a shot plan: a list of scenes in story order, one shot per story beat — about __SHOTS__ shots (a new scene every 4-6 seconds) so the picture keeps changing.
 
-Each shot is {"bg": ..., "chars": [...], "mood": ...}.
+Each shot is {"bg": ..., "chars": [...], "mood": ..., "expr": ...}.
 - "bg" MUST be exactly one of: village, town, forest, river, field, market, house, night, school, bridge
 - "chars" is a list of 0 to 3 entries, each exactly one of: boy, girl, man, woman, elder-man, elder-woman, dog, cat, bird, buffalo
 - "mood" is exactly one of: day, sunset, night
+- "expr" is exactly one of: neutral, happy, sad, surprised, angry — the main character's feeling during that scene; choose it from what happens in that part of the story.
+- Consecutive shots must not repeat the same bg with the same chars — keep changing the scene.
 - Use ONLY those words — never invent new ones.
 
 Answer with ONLY a JSON object, no other text:
-{"shots": [{"bg": "village", "chars": ["boy"], "mood": "day"}]}
+{"shots": [{"bg": "village", "chars": ["boy"], "mood": "day", "expr": "happy"}]}
 
 Script:
 __SCRIPT__
@@ -184,23 +218,72 @@ def default_shots():
     """The safe built-in plan: a gentle day journey through
     the sets with the core cast. Used when a reply carries no
     usable plan, and for a pasted story whose plan generation
-    failed on every gateway."""
+    failed on every gateway. Build 218: twelve shots (the
+    ~12/min density target) with expressions, no two
+    consecutive shots alike."""
     return [
         {"bg": "village", "chars": ["boy", "girl"],
-         "mood": "day"},
-        {"bg": "field", "chars": ["boy"], "mood": "day"},
-        {"bg": "river", "chars": ["girl", "dog"], "mood": "day"},
-        {"bg": "house", "chars": ["woman"], "mood": "day"},
+         "mood": "day", "expr": "happy"},
+        {"bg": "field", "chars": ["boy"], "mood": "day",
+         "expr": "neutral"},
+        {"bg": "river", "chars": ["girl", "dog"], "mood": "day",
+         "expr": "happy"},
+        {"bg": "forest", "chars": ["boy", "girl"],
+         "mood": "day", "expr": "surprised"},
+        {"bg": "bridge", "chars": ["boy"], "mood": "day",
+         "expr": "neutral"},
+        {"bg": "market", "chars": ["woman", "boy"],
+         "mood": "day", "expr": "happy"},
+        {"bg": "school", "chars": ["girl"], "mood": "day",
+         "expr": "neutral"},
+        {"bg": "town", "chars": ["man", "dog"], "mood": "day",
+         "expr": "neutral"},
+        {"bg": "field", "chars": ["buffalo", "boy"],
+         "mood": "sunset", "expr": "happy"},
+        {"bg": "house", "chars": ["woman", "girl"],
+         "mood": "sunset", "expr": "neutral"},
+        {"bg": "village", "chars": ["boy", "cat"],
+         "mood": "sunset", "expr": "happy"},
+        {"bg": "night", "chars": ["boy"], "mood": "night",
+         "expr": "neutral"},
     ]
 
 
-def sanitize_shots(raw):
+def dedupe_shots(shots):
+    """No two CONSECUTIVE shots may show the same picture
+    (same bg AND same character set): a repeat gets its
+    background rotated to the next set in the vocabulary.
+    Pure and idempotent — the sanitizer applies it to every
+    fresh plan and the renderer re-applies it to stored
+    plans, so a scene visibly changes every few seconds."""
+    out = []
+    for s in shots or []:
+        s = dict(s)
+        if out and s.get("bg") == out[-1].get("bg") \
+                and s.get("chars") == out[-1].get("chars"):
+            try:
+                i = BACKGROUNDS.index(s.get("bg"))
+            except ValueError:
+                i = -1
+            for step in range(1, len(BACKGROUNDS)):
+                cand = BACKGROUNDS[(i + step) % len(BACKGROUNDS)]
+                if cand != out[-1].get("bg"):
+                    s["bg"] = cand
+                    break
+        out.append(s)
+    return out
+
+
+def sanitize_shots(raw, max_shots=None):
     """Enforce the fixed asset vocabulary on a raw plan.
     Unknown backgrounds fall back to "village", unknown
-    characters are dropped, unknown moods become "day";
-    non-dict entries are dropped. An empty result becomes
-    the default plan — this function NEVER raises and NEVER
-    returns an empty list."""
+    characters are dropped, unknown moods become "day",
+    unknown/missing expressions become "neutral" (build
+    218); non-dict entries are dropped. The result is
+    deduped (no two consecutive identical pictures). An
+    empty result becomes the default plan — this function
+    NEVER raises and NEVER returns an empty list."""
+    cap = max_shots or ABSOLUTE_MAX_SHOTS
     out = []
     if isinstance(raw, list):
         for item in raw:
@@ -225,10 +308,14 @@ def sanitize_shots(raw):
             mood = item.get("mood")
             if mood not in MOODS:
                 mood = "day"
-            out.append({"bg": bg, "chars": chars, "mood": mood})
-            if len(out) >= MAX_SHOTS:
+            expr = item.get("expr", item.get("expression"))
+            if expr not in EXPRESSIONS:
+                expr = "neutral"
+            out.append({"bg": bg, "chars": chars, "mood": mood,
+                        "expr": expr})
+            if len(out) >= cap:
                 break
-    return out or default_shots()
+    return dedupe_shots(out) or default_shots()
 
 
 def generate_story(topic, target_chars):
@@ -239,6 +326,8 @@ def generate_story(topic, target_chars):
     minutes = target_chars / CHARS_PER_MIN
     prompt = (PROMPT_STORY
               .replace("__MINUTES__", f"{minutes:.1f}")
+              .replace("__SHOTS__",
+                       str(shots_target_for_minutes(minutes)))
               .replace("__TARGET__", str(int(target_chars)))
               .replace("__LOW__", str(int(target_chars * 0.8)))
               .replace("__HIGH__", str(int(target_chars * 1.2)))
@@ -249,7 +338,8 @@ def generate_story(topic, target_chars):
         script = (script or "").strip()
         if not _usable_script(script, target_chars):
             return None
-        return script, sanitize_shots(shots_raw)
+        return script, sanitize_shots(
+            shots_raw, max_shots_for_minutes(minutes))
 
     try:
         (script, shots), provider = _chain_generate(prompt, extract)
@@ -258,18 +348,27 @@ def generate_story(topic, target_chars):
     return script, shots, provider
 
 
-def plan_for_text(text):
+def plan_for_text(text, minutes=None):
     """Shot plan for a customer-pasted story: (shots,
     provider_label). The script is the customer's own, so a
     total gateway failure falls back to the default plan
-    instead of failing their text."""
-    prompt = PROMPT_PLAN.replace("__SCRIPT__", text[:8000])
+    instead of failing their text. `minutes` is the job's
+    target length (the shot-density cap follows it); when
+    omitted it is estimated from the text length."""
+    if not minutes:
+        minutes = max(1, int(round(len(text or "")
+                                   / CHARS_PER_MIN)))
+    prompt = (PROMPT_PLAN
+              .replace("__SHOTS__",
+                       str(shots_target_for_minutes(minutes)))
+              .replace("__SCRIPT__", text[:8000]))
 
     def extract(raw):
         _script, shots_raw = _parse_reply(raw)
         if not shots_raw:
             return None
-        return sanitize_shots(shots_raw)
+        return sanitize_shots(
+            shots_raw, max_shots_for_minutes(minutes))
 
     try:
         shots, provider = _chain_generate(prompt, extract)

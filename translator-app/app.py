@@ -57,7 +57,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 217"
+BUILD_TAG = "build 218"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -5903,7 +5903,8 @@ def _story_worker(job):
             progress("script", "running")
             if job.get("story_text"):
                 shots, provider = story_mod.plan_for_text(
-                    job["story_text"])
+                    job["story_text"],
+                    minutes=int(job.get("story_minutes") or 1))
             else:
                 target = int(job.get("story_minutes") or 1) \
                     * story_mod.CHARS_PER_MIN
