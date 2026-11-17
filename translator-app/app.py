@@ -57,7 +57,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 218"
+BUILD_TAG = "build 219"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -994,6 +994,22 @@ def _commentary_credits_per_min():
         return 2
 
 
+def _captions_credits_per_min():
+    """Admin setting CAPTIONS_CREDITS_PER_MIN: the per-started-
+    minute rate for Captions-only jobs (build 219) — a FRACTION,
+    default 0.5, because the product's price is half the dub
+    rate: credits = ceil(started minutes x this rate), minimum
+    1 (1-2 min = 1 credit, 3-4 min = 2). Read live like
+    COMMENTARY_CREDITS_PER_MIN. The quote, the upload balance
+    pre-check and the final charge all go through
+    _credits_for_minutes, so the three always agree exactly."""
+    try:
+        return max(0.05, min(10.0, float(
+            _env_value("CAPTIONS_CREDITS_PER_MIN") or 0.5)))
+    except (TypeError, ValueError):
+        return 0.5
+
+
 def _account_daily_count(user_id):
     """Videos this account STARTED today (Asia/Yangon), web and
     Telegram combined — both channels stamp the same user_id on
@@ -1908,7 +1924,9 @@ def _job_dispatcher():
                           "story1": _story_worker,
                           "story2": _story_worker2,
                           "commentary1": _commentary_worker,
-                          "commentary2": _commentary_worker2}.get(
+                          "commentary2": _commentary_worker2,
+                          "captions1": _captions_worker,
+                          "captions2": _captions_worker2}.get(
                               kind, _worker)
                 wt = threading.Thread(target=target, args=(job,),
                                       daemon=True)
@@ -2006,6 +2024,20 @@ def _credits_per_min_for(job):
     return 1
 
 
+def _credits_for_minutes(job, minutes):
+    """Total credits for a job of `minutes` started minutes —
+    THE figure the admission quote, the upload balance
+    pre-check and the success charge all use, so they can
+    never disagree. Every product bills minutes x its
+    per-minute rate except Captions-only (build 219), whose
+    rate is fractional (half the dub rate by default):
+    ceil(minutes x rate), minimum 1 credit."""
+    if job.get("type") == "captions":
+        return max(1, math.ceil(
+            minutes * _captions_credits_per_min()))
+    return minutes * _credits_per_min_for(job)
+
+
 def _quote_for_job(job):
     """Admission check after phase 1 (the duration is known): a
     non-admin account must COVER the job's credits — started
@@ -2026,7 +2058,7 @@ def _quote_for_job(job):
     # per-minute rate (premium ElevenLabs voices cost more than
     # the standard 1/minute). quote_minutes stays on the record
     # as the duration figure; quote_credits is what moves.
-    needed = minutes * _credits_per_min_for(job)
+    needed = _credits_for_minutes(job, minutes)
     job["quote_credits"] = needed
     _save(job)
     if (user["credits"] or 0) < needed:
@@ -2051,7 +2083,7 @@ def _charge_for_job(job):
     # quote_credits is set by _quote_for_job on every fresh run;
     # the fallbacks keep pre-205 records (minutes only) exact.
     minutes = job.get("quote_credits") or job.get("quote_minutes") \
-        or _job_minutes(job) * _credits_per_min_for(job)
+        or _credits_for_minutes(job, _job_minutes(job))
     paid = minutes
     if not accounts.charge(uid, minutes, job["id"]):
         paid = max(0, min(user["credits"] or 0, minutes))
@@ -3101,6 +3133,7 @@ def elevenlabs_status():
         "access": elevenlabs_tts.get_access_mode(),
         "test_users": elevenlabs_tts.get_test_users(),
         "commentary_credits_per_min": _commentary_credits_per_min(),
+        "captions_credits_per_min": _captions_credits_per_min(),
         "voices": _el_status_voices()})
 
 
@@ -3156,6 +3189,16 @@ def elevenlabs_save():
                             "credit နှုန်း 1–100 အတွင်း "
                             "ဖြစ်ရပါမယ်"}), 400
         writes["COMMENTARY_CREDITS_PER_MIN"] = str(crate)
+    if "captions_credits_per_min" in data:
+        try:
+            caprate = float(data["captions_credits_per_min"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "credit နှုန်း မမှန်ပါ"}), 400
+        if not 0.05 <= caprate <= 10:
+            return jsonify({"error":
+                            "credit နှုန်း 0.05–10 အတွင်း "
+                            "ဖြစ်ရပါမယ်"}), 400
+        writes["CAPTIONS_CREDITS_PER_MIN"] = str(caprate)
     if "test_users" in data:
         users, uerr = elevenlabs_tts.parse_test_users(
             data["test_users"])
@@ -3173,7 +3216,9 @@ def elevenlabs_save():
                     "access": elevenlabs_tts.get_access_mode(),
                     "test_users": elevenlabs_tts.get_test_users(),
                     "commentary_credits_per_min":
-                        _commentary_credits_per_min()})
+                        _commentary_credits_per_min(),
+                    "captions_credits_per_min":
+                        _captions_credits_per_min()})
 
 
 def _el_validate_entry(data):
@@ -4696,7 +4741,7 @@ def _accept_upload(job, file_storage, user):
     # instead of burning server work the quote would reject.
     if ACCOUNTS_ENFORCED and user and user["role"] != "admin":
         mins = max(1, math.ceil(dur / 60.0))
-        need = mins * _credits_per_min_for(job)
+        need = _credits_for_minutes(job, mins)
         if (user["credits"] or 0) < need:
             shutil.rmtree(workdir, ignore_errors=True)
             return (f"credit မလောက်ပါ — ဒီ video အတွက် {need} "
@@ -6442,6 +6487,257 @@ def render_commentary(jid):
     _save(job)
     _enqueue_job(job, kind="commentary2")
     return jsonify({"ok": True})
+
+
+# ---------- Captions-only product (build 219) ----------
+# The cheap tier (roadmap item 3): video in -> download ->
+# transcribe -> translate to Burmese through the SAME chain
+# as the dub flow (run_phase1 style "subs": same prompts,
+# same majority-untranslated guard — a guard failure is the
+# loud Burmese error, zero charged) -> the job parks at
+# "waiting_review" with the Burmese segments editable, zero
+# charged -> confirm (POST /api/captions/<id>/render applies
+# the edits exactly like the main flow's job_review) ->
+# phase 2 burns the final segments into the ORIGINAL video
+# through the shared cinematic burn (run_phase2 mode "subs":
+# original audio untouched, NO TTS, no blur boxes) -> the
+# done screen offers BOTH downloads: the subtitled MP4 (the
+# normal job route) and the Burmese .srt (subs_my.srt,
+# regenerated from the final edited segments at render time
+# so the file and the burn are the same text). The record is
+# a normal job (type "captions"), so retention (the single
+# 24h rule), the jobs listing and the download/stream routes
+# serve it. NO voice picker, NO ElevenLabs anywhere.
+# Pricing: half the dub rate — CAPTIONS_CREDITS_PER_MIN
+# (default 0.5) through _credits_for_minutes, so the quote,
+# the upload pre-check and the charge agree exactly:
+# ceil(started SOURCE minutes x rate), minimum 1 credit.
+# Charge-on-success only: _finish is the single charge
+# point; any failure or cancel charges exactly zero.
+
+CAPTIONS_STEPS = ["download", "transcribe", "translate",
+                  "finalize"]
+
+
+def _captions_view(job):
+    view = {k: job.get(k) for k in
+            ("id", "type", "url", "status", "current", "error",
+             "quote_minutes", "quote_credits", "charged_minutes",
+             "edited_count", "created_at", "finished_at")}
+    view["timings"] = _timings_of(job)  # build 213
+    view["upload"] = bool(job.get("upload"))  # build 215
+    view["steps"] = job.get("steps") or []
+    if job.get("status") == "queued":
+        waiting = [q for q, _k in _JOB_QUEUE]
+        if job["id"] in waiting:
+            view["queue_pos"] = waiting.index(job["id"]) + 1
+    return view
+
+
+def _captions_worker(job):
+    """Phase 1: download -> transcribe -> translate (the
+    shared guarded chain) -> quote -> park at
+    waiting_review; nothing is charged."""
+    workdir = JOBS_DIR / job["id"]
+    threading.Thread(target=_heartbeat, args=(job,),
+                     daemon=True).start()
+    with job_context(job["id"]):
+        try:
+            job["status"] = "running"
+            _timing_start(job)  # build 213
+            _save(job)
+            run_job.run_phase1(
+                workdir, job["url"],
+                source_path=job.get("source_path"),
+                progress=_progress_fn(job), style="subs",
+                quality=job.get("quality") or "hd",
+                force_source=bool(job.get("upload")))
+            if job.get("upload"):
+                # An uploaded source has no download stage
+                # (build 215, same as the dub worker).
+                job.setdefault("timings", {})["download"] = 0
+            _quote_for_job(job)
+            job["status"] = "waiting_review"
+            job["current"] = None
+            # The human review park is not machine time
+            # (build 213, same as recap).
+            _timing_close(job)
+            _save(job)
+        except JobCancelled:
+            _cancelled(job)
+        except Exception as e:
+            if job.get("cancel_requested"):
+                _cancelled(job)
+            else:
+                _fail(job, e)
+
+
+def _captions_worker2(job):
+    """Phase 2: regenerate subs_my.srt from the FINAL edited
+    segments (so the .srt download and the burn carry the
+    same text), burn them into the original video with its
+    audio untouched, then _finish (the only place a captions
+    job is ever charged)."""
+    workdir = JOBS_DIR / job["id"]
+    threading.Thread(target=_heartbeat, args=(job,),
+                     daemon=True).start()
+    with job_context(job["id"]):
+        try:
+            job["status"] = "running"
+            _timing_start(job)  # build 213
+            _save(job)
+            from pipeline.common import load_segments, write_srt
+            segs = load_segments(workdir / "segments_my.json")
+            if not segs:
+                raise RuntimeError(
+                    "စာတန်း မရှိပါ — ပြန်စမ်းပါ "
+                    "(credit လုံးဝ မဖြတ်ပါ)")
+            write_srt(segs, workdir / "subs_my.srt")
+            run_job.run_phase2(
+                workdir, mode="subs", progress=_progress_fn(job),
+                font=job.get("font") or "noto", subs=None,
+                quality=job.get("quality") or "hd")
+            _finish(job)
+        except JobCancelled:
+            _cancelled(job)
+        except Exception as e:
+            if job.get("cancel_requested"):
+                _cancelled(job)
+            else:
+                _fail(job, e)
+
+
+@app.post("/api/captions")
+def create_captions():
+    user = _current_user()
+    # Multipart = uploaded file source, the same
+    # _accept_upload gate as the dub wizard / Recap /
+    # Commentary (build 215).
+    data, upload_file = _request_upload()
+    url = (data.get("url") or "").strip()
+    if upload_file is not None:
+        url = ""
+    elif not url.startswith(("http://", "https://")):
+        return jsonify({"error": "လင့်ခ် မမှန်ပါ"}), 400
+    elif not _public_url_ok(url):
+        return jsonify({"error": "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"}), 400
+    quality = data.get("quality") if data.get("quality") in \
+        ("hd", "720", "480") else "hd"
+    now = time.time()
+    job = {"id": uuid.uuid4().hex[:12], "type": "captions",
+           "url": url, "mode": "captions",
+           "quality": quality, "font": "noto", "fx": None,
+           "source_path": None,
+           "status": "queued", "current": None, "error": None,
+           "created_at": now, "updated_at": now,
+           "finished_at": None,
+           "steps": [{"key": k, "label": STEP_LABELS[k],
+                      "state": "pending"} for k in CAPTIONS_STEPS]}
+    if user:
+        # Same admission gates as a recap/commentary job, in
+        # the same order — both refuse before the job exists.
+        setup_msg = _setup_gate_message(user)
+        if setup_msg:
+            return jsonify({"error": setup_msg}), 400
+        job["user_id"] = user["id"]
+        accounts.mark_has_job(user["id"])
+        limit_msg = _daily_limit_message(user)
+        if limit_msg:
+            return jsonify({"error": limit_msg}), 400
+    if upload_file is not None:
+        uerr = _accept_upload(job, upload_file, user)
+        if uerr:
+            return jsonify({"error": uerr}), 400
+    JOBS[job["id"]] = job
+    _save(job)
+    _enqueue_job(job, kind="captions1")
+    return jsonify(_captions_view(job))
+
+
+@app.get("/api/captions/<jid>")
+def get_captions(jid):
+    job = _load_job(jid)
+    if not job or job.get("type") != "captions" \
+            or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    return jsonify(_captions_view(job))
+
+
+@app.post("/api/captions/<jid>/render")
+def render_captions(jid):
+    """Confirm the reviewed subtitles and queue the burn.
+
+    Body: {"edits": [{"idx": 0, "text_my": "..."}, ...]} —
+    applied to segments_my.json exactly like the main flow's
+    job_review (unlisted segments keep their translated
+    text; an edit that empties a line is ignored). Only a
+    job parked at waiting_review can be confirmed — the
+    quote from phase 1 stands, and the charge still lands
+    only on a finished video."""
+    job = _load_job(jid)
+    if not job or job.get("type") != "captions" \
+            or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    if job["status"] != "waiting_review":
+        return jsonify({"error":
+                        "ဒီ job က စာတန်း အတည်ပြုရန် အဆင့် "
+                        "မဟုတ်ပါ"}), 409
+    data = request.get_json(force=True, silent=True) or {}
+    edits = {}
+    for e in data.get("edits") or []:
+        if not isinstance(e, dict):
+            continue
+        try:
+            if "idx" in e and "text_my" in e:
+                edits[int(e["idx"])] = str(e["text_my"])
+        except (TypeError, ValueError):
+            continue
+    from pipeline.common import load_segments, save_segments
+    from pipeline.common import write_srt
+    seg_path = JOBS_DIR / jid / "segments_my.json"
+    segs = load_segments(seg_path)
+    if not segs:
+        return jsonify({"error": "စာတန်း မရှိသေးပါ"}), 409
+    changed = 0
+    for idx, new_text in edits.items():
+        if 0 <= idx < len(segs) and new_text.strip() \
+                and new_text.strip() != \
+                (segs[idx].get("text_my") or "").strip():
+            segs[idx]["text_my"] = new_text.strip()
+            segs[idx]["edited"] = True
+            changed += 1
+    save_segments(segs, seg_path)
+    write_srt(segs, JOBS_DIR / jid / "subs_my.srt")
+    job["edited_count"] = changed
+    # A render supersedes any pending auto-cleanup (a parked
+    # job has none today; the mirror of job_review stays
+    # exact).
+    old_timer = CLEANUP_TIMERS.pop(jid, None)
+    if old_timer:
+        old_timer.cancel()
+    job.pop("cleanup_at", None)
+    job["status"] = "queued"
+    _save(job)
+    _enqueue_job(job, kind="captions2")
+    return jsonify({"ok": True, "edited_count": changed})
+
+
+@app.get("/api/captions/<jid>/srt")
+def download_captions_srt(jid):
+    """The Burmese .srt download: subs_my.srt — regenerated
+    from the final edited segments when the render started,
+    so it carries exactly the text that was burned, with the
+    segments' original timings."""
+    job = _load_job(jid)
+    if not job or job.get("type") != "captions" \
+            or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    srt = JOBS_DIR / jid / "subs_my.srt"
+    if not srt.exists():
+        return jsonify({"error": "စာတန်း ဖိုင် မရှိသေးပါ"}), 404
+    return send_file(srt, as_attachment=True,
+                     download_name=f"myanmar-{jid}.srt",
+                     conditional=True)
 
 
 # ---------- text-only export + bulk text input ----------
