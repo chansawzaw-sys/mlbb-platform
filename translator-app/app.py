@@ -57,7 +57,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 221"
+BUILD_TAG = "build 222"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -5094,7 +5094,8 @@ def _job_view(job):
              "created_at", "updated_at", "finished_at", "cleanup_at",
              # Build 210: studio (Text-to-Voice) jobs share this
              # listing — the UI labels them from these fields.
-             "type", "voice_label", "duration", "story_topic")}
+             "type", "voice_label", "duration", "story_topic",
+             "title_tags")}
     # Build 213: per-stage timings ride the view (owner/admin
     # only ever see them — _owns gates every caller).
     view["timings"] = _timings_of(job)
@@ -5730,6 +5731,7 @@ def _recap_view(job):
             ("id", "type", "url", "status", "current", "error",
              "voice", "voice_label", "quote_minutes",
              "quote_credits", "charged_minutes", "recap_edited",
+             "title_tags",
              "created_at", "finished_at")}
     view["timings"] = _timings_of(job)  # build 213
     view["upload"] = bool(job.get("upload"))  # build 215
@@ -6014,7 +6016,7 @@ def _story_view(job):
              "voice", "voice_label", "quote_minutes",
              "quote_credits", "charged_minutes", "story_edited",
              "story_topic", "story_minutes", "story_music",
-             "story_karaoke",
+             "story_karaoke", "title_tags",
              "created_at", "finished_at")}
     view["timings"] = _timings_of(job)  # build 213
     view["steps"] = job.get("steps") or []
@@ -6347,7 +6349,7 @@ def _commentary_view(job):
             ("id", "type", "url", "status", "current", "error",
              "voice", "voice_label", "quote_minutes",
              "quote_credits", "charged_minutes",
-             "commentary_edited", "commentary_audio",
+             "commentary_edited", "commentary_audio", "title_tags",
              "created_at", "finished_at")}
     view["timings"] = _timings_of(job)  # build 213
     view["upload"] = bool(job.get("upload"))  # build 215
@@ -6650,7 +6652,8 @@ def _captions_view(job):
     view = {k: job.get(k) for k in
             ("id", "type", "url", "status", "current", "error",
              "quote_minutes", "quote_credits", "charged_minutes",
-             "edited_count", "karaoke", "created_at", "finished_at")}
+             "edited_count", "karaoke", "title_tags",
+             "created_at", "finished_at")}
     view["timings"] = _timings_of(job)  # build 213
     view["upload"] = bool(job.get("upload"))  # build 215
     view["steps"] = job.get("steps") or []
@@ -6874,6 +6877,127 @@ def download_captions_srt(jid):
     return send_file(srt, as_attachment=True,
                      download_name=f"myanmar-{jid}.srt",
                      conditional=True)
+
+
+# ---------- Title + hashtag helper (build 222, roadmap 6) -----
+# On the DONE screen of a finished video job, one tap asks the
+# SAME free-first engine chain that writes the Recap/Story/
+# Commentary scripts (story._chain_generate — no new provider)
+# for a ready-to-post TikTok/YouTube title + hashtags, written
+# from the job's OWN text (its Burmese segments / script, plus
+# the topic for a Story job). The result is cached on the job
+# record (job["title_tags"]), so re-opening the done screen or
+# re-tapping NEVER calls an engine again; only the explicit
+# regenerate ({"force": true}) re-calls. FREE — no credit is
+# charged, ever; a total engine failure is a polite Burmese
+# error in the panel and the job itself is never touched.
+
+TITLE_TAGS_PROMPT = """You write the posting text for a finished Burmese video. From the video text below, write:
+
+1. ONE catchy title in Burmese for TikTok / YouTube — short, emotional, makes people want to tap. Personal, place and brand names stay in English letters (never Burmese script). One or two emoji are OK.
+2. Then 6 to 8 hashtags on their own line — each starts with #, no spaces inside a hashtag, a sensible mix of Burmese and English (for example #Myanmar #မြန်မာ).
+
+Answer with ONLY the title on the first line and the hashtags on the second line — no labels, no explanation, nothing else.
+
+Video text:
+__TEXT__
+"""
+
+TITLE_TAGS_FAIL = ("Title ထုတ်တာ မရပါ — AI service တွေ ခဏ "
+                   "အလုပ်မလုပ်ပါ။ ခဏနေမှ ပြန်စမ်းပါ "
+                   "(credit လုံးဝ မဖြတ်ပါ)")
+
+
+def _title_tags_source(job):
+    """The job's own words, excerpted (~1,600 chars): the
+    Story topic first for a story job, then the script text
+    (story / recap / commentary), then the Burmese segments
+    every video product leaves in segments_my.json."""
+    parts = []
+    if job.get("story_topic"):
+        parts.append(str(job["story_topic"]))
+    for key in ("story_text", "recap_text", "commentary_text"):
+        if job.get(key):
+            parts.append(str(job[key]))
+            break
+    seg_path = JOBS_DIR / job["id"] / "segments_my.json"
+    if seg_path.exists():
+        try:
+            from pipeline.common import load_segments
+            segs = load_segments(seg_path)
+            txt = " ".join((s.get("text_my") or s.get("text")
+                            or "") for s in segs).strip()
+            if txt:
+                parts.append(txt)
+        except Exception:
+            pass
+    return "\n".join(p for p in parts if p)[:1600]
+
+
+def _parse_title_tags(text):
+    """(extract for story._chain_generate) — defensively pull
+    {"title", "hashtags"} out of a gateway reply: the title is
+    the first non-empty line (a leading Title:/ခေါင်းစဉ် label,
+    markdown bold and surrounding quotes stripped); hashtags
+    are every #token anywhere in the reply, de-duplicated in
+    order. Usable = a title plus at least 3 hashtags; anything
+    less returns None so the chain fails over to the next
+    gateway, exactly like the script writers' usability gate."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    tags = []
+    for tok in re.findall(r"#(\S+)", t):
+        tok = tok.strip(".,!?'\"#)…")
+        if tok and ("#" + tok) not in tags:
+            tags.append("#" + tok)
+    title = ""
+    for line in t.splitlines():
+        line = line.strip().strip("*").strip()
+        line = re.sub(r"^(title|ခေါင်းစဉ်)\s*[:：]\s*", "",
+                      line, flags=re.I).strip().strip('"').strip()
+        if line and not line.startswith("#"):
+            title = line
+            break
+    if not title or len(tags) < 3:
+        return None
+    return {"title": title[:200], "hashtags": tags[:10]}
+
+
+@app.post("/api/jobs/<jid>/title-tags")
+def job_title_tags(jid):
+    """Free AI title + hashtags for a DONE job (owner only,
+    same 404 shape as every other job route). Cached on the
+    job record; {"force": true} regenerates explicitly."""
+    job = _load_job(jid)
+    if not job or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    if job.get("status") != "done":
+        return jsonify({"error": "ဗီဒီယို မပြီးသေးပါ — "
+                        "ပြီးမှ Title ထုတ်နိုင်ပါမယ်"}), 409
+    data = request.get_json(silent=True) or {}
+    cached = job.get("title_tags")
+    if cached and not data.get("force"):
+        return jsonify({"title": cached.get("title") or "",
+                        "hashtags": cached.get("hashtags") or [],
+                        "cached": True})
+    src = _title_tags_source(job)
+    if not src:
+        return jsonify({"error": "ဒီ job အတွက် စာသား မရှိလို့ "
+                        "Title ထုတ်လို့ မရပါ"}), 409
+    prompt = TITLE_TAGS_PROMPT.replace("__TEXT__", src)
+    try:
+        payload, provider = story_mod._chain_generate(
+            prompt, _parse_title_tags)
+    except Exception:
+        return jsonify({"error": TITLE_TAGS_FAIL}), 502
+    job["title_tags"] = {"title": payload["title"],
+                         "hashtags": payload["hashtags"],
+                         "provider": provider}
+    _save(job)
+    return jsonify({"title": payload["title"],
+                    "hashtags": payload["hashtags"],
+                    "cached": False})
 
 
 # ---------- text-only export + bulk text input ----------
