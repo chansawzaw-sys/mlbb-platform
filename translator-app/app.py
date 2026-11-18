@@ -57,7 +57,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 226"
+BUILD_TAG = "build 227"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -6121,7 +6121,7 @@ def _story_view(job):
              "voice", "voice_label", "quote_minutes",
              "quote_credits", "charged_minutes", "story_edited",
              "story_topic", "story_minutes", "story_music",
-             "story_karaoke", "title_tags",
+             "story_karaoke", "story_style", "title_tags",
              "created_at", "finished_at")}
     view["timings"] = _timings_of(job)  # build 213
     view["steps"] = job.get("steps") or []
@@ -6283,6 +6283,14 @@ def create_story():
     except (TypeError, ValueError):
         story_rate = 0
     story_rate = max(-50, min(100, story_rate))
+    # Build 227: the Story style pack — the form's style
+    # chips send one of the renderer's named grades
+    # (normal / whiteboard / newsreel / anime / pixel);
+    # absent or unknown keeps the normal look. Stored on
+    # the job; the renderer grades the composited scene
+    # frames with it and the subtitle burn is untouched.
+    story_style = story_render.normalize_style(
+        data.get("style"))
     # Voice resolution mirrors create_recap / _new_job exactly
     # (builds 200 / 205 / 206 / 212): an ElevenLabs pick must
     # resolve for the caller through _resolve_el_entry —
@@ -6324,6 +6332,7 @@ def create_story():
            "story_topic": topic, "story_minutes": minutes,
            "story_music": bool(data.get("music")),
            "story_karaoke": bool(data.get("karaoke")),
+           "story_style": story_style,
            "story_text": text or None,
            "voice": voice, "voice_style": voice_style,
            "voice_label": voice_label,

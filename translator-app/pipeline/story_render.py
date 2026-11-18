@@ -48,6 +48,15 @@ set, piped into one x264 encode at the house spec. Shots
 with NO v2 fields keep the build-218 layered path below,
 unchanged; an animated-path failure falls back to it, so
 motion never breaks a render.
+
+Build 227: the Story style pack — the job's story_style
+(normal / whiteboard / newsreel / anime / pixel) grades
+the composited scene frames in BOTH paths (the animated
+path grades inside _anim_frame; a styled legacy shot is
+composited in PIL by _shot_clip_styled, since the ffmpeg
+graph leaves no frame to grade). The grade always lands
+before the subtitle burn, so subtitle and karaoke pixels
+are never graded; "normal" changes nothing at all.
 """
 import math
 import re
@@ -445,6 +454,123 @@ def _graded_bg(shot):
     return bg
 
 
+# ---------------- style pack (build 227) ----------------
+# The owner-approved Story looks: a named grade applied to
+# the COMPOSITED scene frame in both render paths (the
+# build-225 animated PIL path and the build-218 layered
+# path), always BEFORE the subtitle burn — the burn runs
+# on the finished video afterwards, so subtitle/karaoke
+# pixels are never graded. "normal" (or an absent/unknown
+# value) keeps the build-226 look exactly: neither path
+# calls apply_style at all.
+STYLES = ("normal", "whiteboard", "newsreel", "anime",
+          "pixel")
+
+
+def normalize_style(value):
+    """The job's stored style, fail-safe to "normal"."""
+    v = str(value or "normal").strip().lower()
+    return v if v in STYLES else "normal"
+
+
+def _style_pixel(img):
+    """Pixel Game: crush the frame to ~1/6 size and blow
+    it back up with NEAREST, so the scene renders in
+    chunky blocks; a slight saturation lift keeps it
+    gamey."""
+    from PIL import Image, ImageEnhance
+    w, h = img.size
+    small = img.resize((max(1, w // 6), max(1, h // 6)),
+                       Image.NEAREST)
+    out = small.resize((w, h), Image.NEAREST)
+    return ImageEnhance.Color(out).enhance(1.12)
+
+
+_vignette_masks = {}
+
+
+def _vignette_mask(size):
+    """A soft radial mask: full strength in the centre,
+    fading to zero at the corners (cached per size)."""
+    from PIL import Image, ImageDraw, ImageFilter
+    if size not in _vignette_masks:
+        w, h = size
+        mask = Image.new("L", size, 0)
+        ImageDraw.Draw(mask).ellipse(
+            [-w * 0.30, -h * 0.30, w * 1.30, h * 1.30],
+            fill=255)
+        _vignette_masks[size] = mask.filter(
+            ImageFilter.GaussianBlur(radius=max(w, h) * 0.18))
+    return _vignette_masks[size]
+
+
+def _style_newsreel(img, frame_idx=0):
+    """1920s Newsreel: monochrome, contrast up, corners
+    darkened by a vignette, and a light per-frame grain
+    (seeded by the frame index, so it shimmers cheaply at
+    12 fps without ever repeating inside a shot)."""
+    import random
+    from PIL import Image, ImageEnhance, ImageOps
+    g = ImageOps.grayscale(img)
+    g = ImageEnhance.Contrast(g).enhance(1.28)
+    dark = ImageEnhance.Brightness(g).enhance(0.42)
+    g = Image.composite(g, dark, _vignette_mask(img.size))
+    rgb = g.convert("RGB")
+    rng = random.Random(977 + int(frame_idx))
+    noise = Image.frombytes("L", img.size,
+                            rng.randbytes(img.size[0]
+                                          * img.size[1]))
+    return Image.blend(rgb, noise.convert("RGB"), 0.05)
+
+
+def _style_whiteboard(img):
+    """Whiteboard: a bright pale grade — a gamma lift and
+    brightness up, saturation strongly down, contrast up
+    so the characters' dark outlines stay readable. A
+    grade approximation, not a redraw."""
+    from PIL import ImageEnhance
+    out = img.point(lambda v: int(255 * (v / 255) ** 0.82))
+    out = ImageEnhance.Color(out).enhance(0.25)
+    out = ImageEnhance.Brightness(out).enhance(1.10)
+    out = ImageEnhance.Contrast(out).enhance(1.18)
+    return out
+
+
+def _style_anime(img):
+    """80s Anime: cel approximation — a slight warm tint,
+    saturation pushed up in HSV (per-channel RGB blends
+    and the posterize snap itself both drag saturation
+    DOWN, measured), then colours posterized to four
+    levels per channel so gradients become flat cel
+    bands."""
+    from PIL import Image
+    rgba = img.convert("RGBA")
+    _tint(rgba, (255, 130, 50, 26))
+    hsv = rgba.convert("RGB").convert("HSV")
+    h, s, v = hsv.split()
+    s = s.point(lambda x: min(255, int(x * 1.45)))
+    out = Image.merge("HSV", (h, s, v)).convert("RGB")
+    lut = [(i // 64) * 64 + 32 for i in range(256)]
+    return out.point(lut * 3)
+
+
+def apply_style(img, style, frame_idx=0):
+    """Grade ONE composited scene frame (a PIL RGB image)
+    with a build-227 style. "normal" returns the frame
+    untouched. Callers in both render paths invoke this
+    only for a non-normal style, so an unstyled job's
+    frames are byte-identical to build 226."""
+    if style == "pixel":
+        return _style_pixel(img)
+    if style == "newsreel":
+        return _style_newsreel(img, frame_idx)
+    if style == "whiteboard":
+        return _style_whiteboard(img)
+    if style == "anime":
+        return _style_anime(img)
+    return img
+
+
 def _sprite_img(name, expr):
     """A character's expression sprite at its stage height
     (build 218's _char_sprite picks the file)."""
@@ -558,7 +684,8 @@ def _with_alpha(img, factor):
     return out
 
 
-def _anim_frame(big, sprites, shot, t, dur):
+def _anim_frame(big, sprites, shot, t, dur, style="normal",
+                frame_idx=0):
     """Composite one animated frame: the camera-cropped set
     plus each character at its animated position / alpha.
     `sprites` = [(entry, sprite)] pre-loaded and pre-tinted.
@@ -589,7 +716,13 @@ def _anim_frame(big, sprites, shot, t, dur):
             black = Image.new("RGBA", (OUT_W, OUT_H),
                                (0, 0, 0, 255))
             frame = Image.blend(black, frame, f)
-    return frame.convert("RGB")
+    frame = frame.convert("RGB")
+    if style != "normal":
+        # Build 227: grade the composited scene frame —
+        # the subtitle burn happens later, on the finished
+        # video, so subtitle pixels are never graded.
+        frame = apply_style(frame, style, frame_idx)
+    return frame
 
 
 def _shot_clip_anim(shot, dur, out_path):
@@ -602,6 +735,11 @@ def _shot_clip_anim(shot, dur, out_path):
     motion never breaks a render."""
     import subprocess
     from PIL import Image
+    # Build 227: the render loop stamps the job's style
+    # onto the normalized shot (never onto the stored
+    # plan); absent means the normal look. Reading it here
+    # keeps this function's build-225 signature intact.
+    style = normalize_style(shot.get("style"))
     bg = _graded_bg(shot)
     big = bg.resize((int(OUT_W * CAM_SCALE),
                      int(OUT_H * CAM_SCALE)), Image.BILINEAR)
@@ -627,7 +765,8 @@ def _shot_clip_anim(shot, dur, out_path):
     try:
         for i in range(frames):
             frame = _anim_frame(big, sprites, shot,
-                                i / ANIM_FPS, dur)
+                                i / ANIM_FPS, dur, style=style,
+                                frame_idx=i)
             proc.stdin.write(frame.tobytes())
         proc.stdin.close()
         if proc.wait(timeout=1200) != 0:
@@ -639,6 +778,83 @@ def _shot_clip_anim(shot, dur, out_path):
             pass
         raise
     return out_path
+
+
+def _shot_clip_styled(bg_img, layer_img, dur, idx, out_path,
+                      style, still=None):
+    """Build 227: the build-218 layered shot with a style
+    grade. The ffmpeg graph composites inside the encoder,
+    where no per-frame grade can reach, so a styled legacy
+    shot is composited in PIL instead — the same zoompan
+    curve, layer slide-in and bob, and end fades — with
+    apply_style on every composited frame, piped into one
+    x264 encode at the house spec (the build-225 pattern).
+    Any failure falls back to a clip of the graded still,
+    so the style survives even when the motion cannot."""
+    import subprocess
+    from PIL import Image
+    try:
+        bg = bg_img.convert("RGB")
+        frames = max(2, int(round(dur * ANIM_FPS)))
+        if idx % 2 == 0:
+            slide, z0, dz = -34.0, 1.0, 0.0011
+        else:
+            slide, z0, dz = 34.0, 1.11, -0.0011
+        fd = min(0.35, dur / 3.0) if dur >= 1.0 else 0.0
+        cmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo",
+               "-pix_fmt", "rgb24", "-s", f"{OUT_W}x{OUT_H}",
+               "-r", str(ANIM_FPS), "-i", "-",
+               "-vf", f"fps={FPS},format=yuv420p",
+               "-t", f"{dur:.3f}", "-an",
+               "-c:v", "libx264", "-preset", "ultrafast",
+               "-crf", "24", "-threads", str(encode_threads()),
+               str(out_path)]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        try:
+            for i in range(frames):
+                t = i / ANIM_FPS
+                z = z0 + dz * (t * FPS)
+                z = min(1.11, z) if dz > 0 else max(1.0, z)
+                cw, ch = OUT_W / z, OUT_H / z
+                cx, cy = (OUT_W - cw) / 2, (OUT_H - ch) / 2
+                frame = bg.crop((int(cx), int(cy),
+                                 int(cx + cw),
+                                 int(cy + ch))).resize(
+                                     (OUT_W, OUT_H),
+                                     Image.BILINEAR)
+                x = slide * (1.0 - min(t / 0.6, 1.0))
+                y = 6 * math.sin(2 * math.pi * t / 2.3)
+                frame.paste(layer_img,
+                            (int(round(x)), int(round(y))),
+                            layer_img)
+                if fd:
+                    f = 1.0
+                    if t < fd:
+                        f = t / fd
+                    elif t > dur - fd:
+                        f = max(0.0, (dur - t) / fd)
+                    if f < 1.0:
+                        black = Image.new("RGB", (OUT_W, OUT_H),
+                                          (0, 0, 0))
+                        frame = Image.blend(black, frame, f)
+                frame = apply_style(frame, style, i)
+                proc.stdin.write(frame.tobytes())
+            proc.stdin.close()
+            if proc.wait(timeout=1200) != 0:
+                raise RuntimeError("styled encode failed")
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise
+        return out_path
+    except Exception:
+        if still is None:
+            raise
+        return _shot_clip_still(still, dur, idx, out_path)
 
 
 def _shot_still(shot, out_path):
@@ -814,6 +1030,9 @@ def render_story(workdir, job, progress=None):
     mark("tts", "done")
 
     mark("render", "running")
+    # Build 227: the job's style grade (normal = the
+    # build-226 look, neither path grades anything).
+    style = normalize_style(job.get("story_style"))
     spans, total = shot_spans(spoken, job.get("story_shots"))
     if not spans:
         raise RuntimeError(
@@ -821,6 +1040,13 @@ def render_story(workdir, job, progress=None):
             "(credit လုံးဝ မဖြတ်ပါ)")
     shots_dir = workdir / "story_shots"
     shots_dir.mkdir(exist_ok=True)
+    if style != "normal":
+        # Build 227: stamp the grade onto the normalized
+        # span shots (fresh dicts — the stored plan is
+        # never mutated) so the animated path picks it up
+        # through its build-225 signature.
+        for _shot, _a, _b in spans:
+            _shot["style"] = style
     clips = []
     for i, (shot, a, b) in enumerate(spans):
         clip_path = shots_dir / f"clip_{i:03d}.mp4"
@@ -840,8 +1066,25 @@ def render_story(workdir, job, progress=None):
         layer_png = shots_dir / f"shot_{i:03d}_layer.png"
         layer_img.save(layer_png)
         still = _shot_still(shot, shots_dir / f"shot_{i:03d}.png")
-        clips.append(_shot_clip(bg_still, layer_png, b - a, i,
-                                clip_path, still=still))
+        if style != "normal":
+            # Build 227: grade the composited frames in PIL
+            # (see _shot_clip_styled); the fallback still is
+            # graded too, so the look survives a motion
+            # failure. The legacy branch below also serves
+            # as the animated path's fallback — a styled
+            # v2 shot whose animation failed lands here and
+            # keeps its style.
+            from PIL import Image
+            graded = apply_style(
+                Image.open(still).convert("RGB"), style)
+            graded_still = shots_dir / f"shot_{i:03d}_styled.png"
+            graded.save(graded_still)
+            clips.append(_shot_clip_styled(
+                bg_img, layer_img, b - a, i, clip_path, style,
+                still=graded_still))
+        else:
+            clips.append(_shot_clip(bg_still, layer_png, b - a,
+                                    i, clip_path, still=still))
     video = _concat(clips, workdir / "story_video.mp4", workdir)
     narration = _concat([f for _t, _d, f in spoken],
                           workdir / "narration.m4a", workdir,
