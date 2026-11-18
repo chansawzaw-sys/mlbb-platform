@@ -1,0 +1,71 @@
+{
+ "id": "g5-music-en",
+ "genre": "music / song",
+ "lang": "en",
+ "file": "g5-music-en.mp4",
+ "captured_at": 1795014383,
+ "metrics": {
+  "seg_count": 4,
+  "src_chars": 239,
+  "my_chars": 293,
+  "total": 4,
+  "untranslated": 0,
+  "untranslated_ratio": 0.0,
+  "providers": {
+   "bing": 4
+  },
+  "dominant_provider": "bing"
+ },
+ "segments_en": [
+  {
+   "start": 0.0,
+   "end": 4.0,
+   "text": "We were dancing in the summer rain, laughing like we had no pain."
+  },
+  {
+   "start": 5.28,
+   "end": 8.88,
+   "text": "Every moment felt so true, all I ever wanted was you."
+  },
+  {
+   "start": 10.32,
+   "end": 13.84,
+   "text": "Now the seasons turn to gray, but your love is here to stay."
+  },
+  {
+   "start": 15.28,
+   "end": 19.36,
+   "text": "Hand in hand we'll face the night, you and I will be alright."
+  }
+ ],
+ "segments_my": [
+  {
+   "start": 0.0,
+   "end": 4.0,
+   "text": "We were dancing in the summer rain, laughing like we had no pain.",
+   "text_my": "ကျွန်တော်တို့တွေ နွေရာသီမိုးအောက်မှာ ကခုန်နေပြီး အနာမရှိသလို ရယ်နေကြတာပါ။",
+   "provider": "bing"
+  },
+  {
+   "start": 5.28,
+   "end": 8.88,
+   "text": "Every moment felt so true, all I ever wanted was you.",
+   "text_my": "တိုင်းအချိန်ကမှန်မယ်ထင်လိုက်တာပဲ၊ ငါအမြဲလိုချင်တာက မင်းပဲဖြစ်ပါတယ်။",
+   "provider": "bing"
+  },
+  {
+   "start": 10.32,
+   "end": 13.84,
+   "text": "Now the seasons turn to gray, but your love is here to stay.",
+   "text_my": "အခုအချိန်မှာရာသီဥတုများဟာမှုံမှုံနေပြန်တယ်၊ ဒါပေမဲ့ မင်းရဲ့ချစ်ခြင်းဟာအမြဲရှိနေမယ်။",
+   "provider": "bing"
+  },
+  {
+   "start": 15.28,
+   "end": 19.36,
+   "text": "Hand in hand we'll face the night, you and I will be alright.",
+   "text_my": "လက်ကိုလက်တွေ့မိထားပြီး ညကိုအမြဲတည့်ကြမယ်၊ မင်းနဲ့ငါ ကောင်းကောင်းနေမယ်။",
+   "provider": "bing"
+  }
+ ]
+}

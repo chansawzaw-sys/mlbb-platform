@@ -1,0 +1,107 @@
+{
+ "id": "g4-fast-en",
+ "genre": "fast speech",
+ "lang": "en",
+ "file": "g4-fast-en.mp4",
+ "captured_at": 1795014369,
+ "metrics": {
+  "seg_count": 7,
+  "src_chars": 406,
+  "my_chars": 564,
+  "total": 7,
+  "untranslated": 0,
+  "untranslated_ratio": 0.0,
+  "providers": {
+   "bing": 7
+  },
+  "dominant_provider": "bing"
+ },
+ "segments_en": [
+  {
+   "start": 0.0,
+   "end": 1.56,
+   "text": "And he's through the defense."
+  },
+  {
+   "start": 1.56,
+   "end": 4.84,
+   "text": "Two men beaten, he shoots from the edge of the box and it's in."
+  },
+  {
+   "start": 4.84,
+   "end": 7.08,
+   "text": "What an unbelievable goal in the 93rd minute."
+  },
+  {
+   "start": 7.08,
+   "end": 10.28,
+   "text": "The crowd is on its feet and the title race is wide open again."
+  },
+  {
+   "start": 10.28,
+   "end": 15.0,
+   "text": "Remember, this offer ends tonight at midnight, so call now while stocks last."
+  },
+  {
+   "start": 15.0,
+   "end": 18.44,
+   "text": "Terms and conditions apply, see our website for full details."
+  },
+  {
+   "start": 18.44,
+   "end": 21.32,
+   "text": "And don't miss your chance to save 50% on everything in store today."
+  }
+ ],
+ "segments_my": [
+  {
+   "start": 0.0,
+   "end": 1.56,
+   "text": "And he's through the defense.",
+   "text_my": "နှင့် သူသည် ကာကွယ်မှုကို ဖြတ်သန်းထားသည်။",
+   "provider": "bing"
+  },
+  {
+   "start": 1.56,
+   "end": 4.84,
+   "text": "Two men beaten, he shoots from the edge of the box and it's in.",
+   "text_my": "ယောက်ျားနှစ်ဦးကို ရိုက်ထုတ်ခဲ့ပြီး၊ သူက သေတ္တာခြေစွန်းကနေ ပစ်ခတ်လိုက်သလို ဘောလုံးထဲသွားပါတယ်။",
+   "provider": "bing"
+  },
+  {
+   "start": 4.84,
+   "end": 7.08,
+   "text": "What an unbelievable goal in the 93rd minute.",
+   "text_my": "၉၃ မိနစ်ပိုင်းမှာ မယုံနိုင်စရာဂိုးပါပဲ။",
+   "provider": "bing"
+  },
+  {
+   "start": 7.08,
+   "end": 10.28,
+   "text": "The crowd is on its feet and the title race is wide open again.",
+   "text_my": "လူအုပ်တွေ မြန်မီးထိုင်နေပြီး ချန်ပီယံရာထူးယှဉ်ပြိုင်ပွဲက လွှမ်းမိုးမှု ပြန်လည်ဖွင့်လှစ်နေပါပြီ။",
+   "provider": "bing"
+  },
+  {
+   "start": 10.28,
+   "end": 15.0,
+   "text": "Remember, this offer ends tonight at midnight, so call now while stocks last.",
+   "text_my": "သတိရပါ၊ ဒီအထူးပရိုမိုးရှင်းကို ဒီည ဝက်ဝက်နက်ထိသာ ရပ်တန့်မည်ဖြစ်ကြောင်း၊ ကြာကြာမီ ဆက်သွယ်ပါ။",
+   "provider": "bing"
+  },
+  {
+   "start": 15.0,
+   "end": 18.44,
+   "text": "Terms and conditions apply, see our website for full details.",
+   "text_my": "စည်းကမ်းချက်များနှင့် အခြေအနေများကို အသုံးပြုရမည်၊ အသေးစိတ်အချက်အလက်များအတွက် ကျွန်ုပ်တို့၏ ဝက်ဘ်ဆိုက်ကို ကြည့်ပါ။",
+   "provider": "bing"
+  },
+  {
+   "start": 18.44,
+   "end": 21.32,
+   "text": "And don't miss your chance to save 50% on everything in store today.",
+   "text_my": "ယနေ့ဆိုင်တွင်ရှိသမျှပစ္စည်းပေါင်းစုံတွင် ၅၀% လျှော့စျေးရနိုင်မည့်အခွင့်အရေးကို မလွတ်ကျောနဲ့။",
+   "provider": "bing"
+  }
+ ]
+}

@@ -59,7 +59,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 229"
+BUILD_TAG = "build 231"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -981,6 +981,27 @@ def _daily_job_limit():
         return 0
 
 
+# Build 231 pricing: 1 credit = 5 kyat. PACKAGES maps a
+# one-time kyat payment to (total credits credited on approval,
+# bonus credits inside that total): the 10,000+ tiers carry a
+# +5%/+10%/+15% bonus over the straight 5-kyat rate. Credits
+# NEVER expire — there is no expiry anywhere in the ledger.
+PACKAGES = {5000: (1000, 0), 10000: (2100, 100),
+            25000: (5500, 500), 50000: (11500, 1500)}
+
+
+def _standard_credits_per_min():
+    """Admin setting STANDARD_CREDITS_PER_MIN: the per-started-
+    minute rate for standard voices (Thiha/Nilar/clones) —
+    build 231's rate card sets it to 40 (= 200 kyat at the
+    5-kyat credit). Read live like DAILY_JOB_LIMIT."""
+    try:
+        return max(1, min(1000, int(
+            _env_value("STANDARD_CREDITS_PER_MIN") or 40)))
+    except (TypeError, ValueError):
+        return 40
+
+
 def _commentary_credits_per_min():
     """Admin setting COMMENTARY_CREDITS_PER_MIN: the standard
     per-started-minute rate for Commentary jobs (build 217),
@@ -990,10 +1011,36 @@ def _commentary_credits_per_min():
     ElevenLabs voices on a commentary job bill the premium
     rate + 1 (see _credits_per_min_for)."""
     try:
-        return max(1, min(100, int(
-            _env_value("COMMENTARY_CREDITS_PER_MIN") or 2)))
+        return max(1, min(1000, int(
+            _env_value("COMMENTARY_CREDITS_PER_MIN") or 80)))
     except (TypeError, ValueError):
-        return 2
+        return 80
+
+
+def _commentary_gemini_credits_per_min():
+    """Admin setting COMMENTARY_GEMINI_CREDITS_PER_MIN: the
+    per-started-minute rate for Commentary with a Gemini voice
+    — build 231's card sets it to 120 (= 600 kyat). An explicit
+    per-tier rate (build 229's std x Gemini-rate formula cannot
+    express the card in absolute new units)."""
+    try:
+        return max(1, min(1000, int(_env_value(
+            "COMMENTARY_GEMINI_CREDITS_PER_MIN") or 120)))
+    except (TypeError, ValueError):
+        return 120
+
+
+def _commentary_elevenlabs_credits_per_min():
+    """Admin setting COMMENTARY_ELEVENLABS_CREDITS_PER_MIN:
+    the per-started-minute rate for Commentary with an
+    ElevenLabs voice — build 231's card sets it to 160
+    (= 800 kyat). Explicit per-tier rate, like the Gemini
+    tier above."""
+    try:
+        return max(1, min(1000, int(_env_value(
+            "COMMENTARY_ELEVENLABS_CREDITS_PER_MIN") or 160)))
+    except (TypeError, ValueError):
+        return 160
 
 
 def _captions_credits_per_min():
@@ -1006,10 +1053,10 @@ def _captions_credits_per_min():
     pre-check and the final charge all go through
     _credits_for_minutes, so the three always agree exactly."""
     try:
-        return max(0.05, min(10.0, float(
-            _env_value("CAPTIONS_CREDITS_PER_MIN") or 0.5)))
+        return max(1, min(1000, int(
+            _env_value("CAPTIONS_CREDITS_PER_MIN") or 20)))
     except (TypeError, ValueError):
-        return 0.5
+        return 20
 
 
 def _referral_reward_credits():
@@ -1021,9 +1068,9 @@ def _referral_reward_credits():
     the one-time flag is only consumed by an actual payout)."""
     try:
         return max(0, min(1000, int(
-            _env_value("REFERRAL_REWARD_CREDITS") or 2)))
+            _env_value("REFERRAL_REWARD_CREDITS") or 60)))
     except (TypeError, ValueError):
-        return 2
+        return 60
 
 
 def _maybe_referral_reward(job):
@@ -1224,7 +1271,9 @@ def _tg_menu_step(msg, chat_id, text):
             return True
     if photos and flow and flow.get("step") == "topup_proof" and acct:
         amount = flow.get("amount") or 0
-        tid = accounts.create_topup(acct["id"], amount, None)
+        tid = accounts.create_topup(
+            acct["id"], amount, None,
+            package_kyat=flow.get("package"))
         tdir = ROOT / "topups"
         tdir.mkdir(exist_ok=True)
         proof = tdir / f"{tid}.jpg"
@@ -1238,6 +1287,11 @@ def _tg_menu_step(msg, chat_id, text):
         _TG_FLOW.pop(chat_id, None)
         cap = (f"💰 Credit ဖြည့် တောင်းဆိုချက် #{tid}\n"
                f"👤 {acct['username']} · {amount} credits")
+        if flow.get("package") and \
+                flow["package"] in PACKAGES:
+            cap += (f"\n📦 Package {flow['package']:,} ကျပ် "
+                    f"(bonus +"
+                    f"{PACKAGES[flow['package']][1]:,})")
         buttons = [[("✅ Approve", f"t:{tid}:ok"),
                     ("❌ ငြင်း", f"t:{tid}:no")]]
         try:
@@ -1289,7 +1343,7 @@ def _tg_menu_step(msg, chat_id, text):
             amount = int(text.strip())
             assert 1 <= amount <= 100000
         except Exception:
-            tg.send_message(chat_id, "🙏 နံပါတ် ပဲ ပို့ပေးပါ (ဥပမာ — 100)")
+            tg.send_message(chat_id, "🙏 နံပါတ် ပဲ ပို့ပေးပါ (ဥပမာ — 1000)")
             return True
         flow["amount"] = amount
         flow["step"] = "topup_proof"
@@ -1333,10 +1387,25 @@ def _tg_menu_step(msg, chat_id, text):
             return True
         _TG_FLOW[chat_id] = {"step": "topup_amount", "ts": time.time()}
         info = _pay_info()
+        # Build 231: package buttons ride on the prompt — a
+        # tap fills the amount with the package's TOTAL
+        # credits (base + bonus) via the p: callback; typing
+        # a number stays free-form. Credits never expire and
+        # the prompt says so.
         tg.send_message(chat_id, "💰 ငွေ လွှဲရန်:\n"
                         + (info or "နံပါတ် ကို admin ဆီ မေးပေးပါ")
-                        + "\n\nဘယ်နှစ် credits ဖြည့်ချင်ပါသလဲ — နံပါတ် ပဲ "
-                          "ပို့ပေးပါ (ဥပမာ 100)")
+                        + "\n\n📦 Package ရွေးပါ (bonus ပါပြီးသား) — "
+                          "သို့ ဘယ်နှစ် credits ဖြည့်ချင်လဲ နံပါတ် ပဲ "
+                          "ပို့ပေးပါ (ဥပမာ 1000)\n"
+                          "💳 credit က သက်တမ်း လုံးဝ မကုန်ပါ",
+                        buttons=[[("📦 5,000 ကျပ် → 1,000 cr",
+                                   "p:5000"),
+                                  ("📦 10,000 → 2,100 cr",
+                                   "p:10000")],
+                                 [("📦 25,000 → 5,500 cr",
+                                   "p:25000"),
+                                  ("📦 50,000 → 11,500 cr",
+                                   "p:50000")]])
         qr = ROOT / "payqr.png"
         if qr.exists():
             try:
@@ -1531,7 +1600,7 @@ def _tg_voice_step(chat_id, flow):
             label = "✨ " + e["label"]
             if e.get("tag"):
                 label += " · " + e["tag"]
-            if gm_rate != 1:
+            if gm_rate != _standard_credits_per_min():
                 label += f" ({gm_rate} credits/မိနစ်)"
             row.append((label, "gm:" + e["name"]))
         rows.append(row)
@@ -1585,6 +1654,20 @@ def _tg_after_logo(chat_id, flow):
                              [("💚 အစိမ်း", "c:green"),
                               ("❤️ အနီ", "c:red"),
                               ("🖤 အမဲ", "c:black")]])
+
+
+def _tg_karaoke_step(chat_id, flow):
+    """Karaoke yes/no step (build 231), right after the
+    subtitle-colour step — only flows that burn subtitles
+    (both / subs) ever reach it; dub-only skips colour AND
+    karaoke, exactly like the web wizard's subtitle step."""
+    from pipeline import telegram_send as tg
+    flow["step"] = "karaoke"
+    tg.send_message(
+        chat_id, "🎤 Karaoke စာတန်း ထည့်မလား "
+                 "(ဈေးနှုန်း မပြောင်းပါ)",
+        buttons=[[("🎤 ထည့်မယ်", "k:1"),
+                  ("မထည့်ဘူး", "k:0")]])
 
 
 def _tg_start_flow_job(chat_id, flow):
@@ -1666,6 +1749,7 @@ def _tg_start_flow_job(chat_id, flow):
                          or "https://telegram.org/file",
                          "mode": flow.get("mode") or "both",
                          "voice_style": flow.get("voice_style"),
+                         "karaoke": bool(flow.get("karaoke")),
                          "subs": ({"color": flow["sub_color"]}
                                   if flow.get("sub_color") else None),
                          "speed_cap": flow.get("speed_cap") or 1.3,
@@ -1764,6 +1848,27 @@ def _on_tg_callback(cq):
     if time.time() - flow.get("ts", 0) > 30 * 60:
         _TG_FLOW.pop(chat_id, None)
         tg.send_message(chat_id, "⏰ အချိန် ကုန်သွားပါပြီ — link ကို ပြန်ပို့ပေးပါ 🙏")
+        return
+    if data.startswith("p:") and flow.get("step") == \
+            "topup_amount":
+        # Build 231: a package tap. The amount is the package's
+        # TOTAL credits (base + bonus); the kyat price rides
+        # along so approval credits it as one package entry.
+        try:
+            kyat = int(data[2:])
+        except ValueError:
+            return
+        pkg = PACKAGES.get(kyat)
+        if not pkg:
+            return
+        flow["amount"] = pkg[0]
+        flow["package"] = kyat
+        flow["step"] = "topup_proof"
+        tg.send_message(
+            chat_id,
+            f"📦 Package {kyat:,} ကျပ် → {pkg[0]:,} credits"
+            + (f" (bonus +{pkg[1]:,})" if pkg[1] else "")
+            + "\n📸 ငွေ လွှဲပြီးရင် screenshot ပို့ပေးပါ 🙏")
         return
     if data.startswith("b:") and flow.get("step") == "blur":
         choice = data[2:]
@@ -1873,6 +1978,12 @@ def _on_tg_callback(cq):
     if data.startswith("c:") and flow.get("step") == "color":
         if data[2:] in _TG_SUB_COLORS:
             flow["sub_color"] = data[2:]
+        _tg_karaoke_step(chat_id, flow)
+        return
+    if data.startswith("k:") and flow.get("step") == "karaoke":
+        # Build 231: the karaoke tick, same place in the flow
+        # as the web wizard's subtitle step.
+        flow["karaoke"] = data == "k:1"
         if (flow.get("mode") or "both") == "both":
             _tg_voice_step(chat_id, flow)
             return
@@ -2092,28 +2203,24 @@ def _credits_per_min_for(job):
     and subtitles-only jobs, whose voice is never premium — is
     the standard 1 credit per started minute."""
     if job.get("type") == "commentary":
-        # Build 217: Commentary bills its own per-minute rate
-        # — the COMMENTARY_CREDITS_PER_MIN setting (default 2)
-        # for standard voices, the premium rate + 1 for
-        # ElevenLabs voices.
+        # Build 217: Commentary bills its own per-minute rates.
+        # Build 231: explicit per-tier rates from the approved
+        # card (std 80 / Gemini 120 / ElevenLabs 160) — build
+        # 229's std x Gemini-rate formula cannot express the
+        # card now that every tier is an absolute new-unit rate.
         if elevenlabs_tts.is_el_voice(job.get("voice")):
-            return elevenlabs_tts.credits_per_min() + 1
-        # Build 229: a Gemini voice bills the commentary
-        # standard rate × the Gemini rate (the amendment's
-        # rule — at the default Gemini rate of 1 this is
-        # exactly the standard commentary rate).
+            return _commentary_elevenlabs_credits_per_min()
         if gemini_tts.is_gm_voice(job.get("voice")):
-            return _commentary_credits_per_min() \
-                * gemini_tts.credits_per_min()
+            return _commentary_gemini_credits_per_min()
         return _commentary_credits_per_min()
     if elevenlabs_tts.is_el_voice(job.get("voice")):
         return elevenlabs_tts.credits_per_min()
     # Build 229: Gemini voices bill the GEMINI_CREDITS_PER_MIN
-    # setting (default 1) — read live at charge time, so the
-    # owner's price change needs no rebuild.
+    # setting (default 80 since build 231) — read live at
+    # charge time, so the owner's price change needs no rebuild.
     if gemini_tts.is_gm_voice(job.get("voice")):
         return gemini_tts.credits_per_min()
-    return 1
+    return _standard_credits_per_min()
 
 
 def _credits_for_minutes(job, minutes):
@@ -2125,7 +2232,13 @@ def _credits_for_minutes(job, minutes):
     rate is fractional (half the dub rate by default):
     ceil(minutes x rate), minimum 1 credit."""
     if job.get("type") == "captions":
-        return max(1, math.ceil(
+        # Build 231: the minimum charge is 30 credits
+        # (= 150 kyat — the same kyat value as the OLD
+        # code's 1-credit minimum: max(1, ceil(min x 0.5))
+        # could never charge less than 1 old credit). It
+        # binds below 1.5 started minutes; from 2 minutes
+        # the 20/min rate card takes over exactly.
+        return max(30, math.ceil(
             minutes * _captions_credits_per_min()))
     return minutes * _credits_per_min_for(job)
 
@@ -2235,7 +2348,8 @@ def _run_phase2(job):
                        subs=job.get("subs"),
                        max_speed=job.get("speed_cap") or 1.3,
                        quality=job.get("quality") or "hd",
-                       voice_name=job.get("voice_name"))
+                       voice_name=job.get("voice_name"),
+                       karaoke=bool(job.get("karaoke")))
 
 
 def _finish(job):
@@ -2449,7 +2563,19 @@ def voices():
         else []
     return jsonify({"voices": out,
                     "mine": _mine_entries(_current_user()),
-                    "favs": favs})
+                    "favs": favs,
+                    "rates": {
+                        "standard": _standard_credits_per_min(),
+                        "gemini": gemini_tts.credits_per_min(),
+                        "elevenlabs":
+                            elevenlabs_tts.credits_per_min(),
+                        "commentary":
+                            _commentary_credits_per_min(),
+                        "commentary_gemini":
+                            _commentary_gemini_credits_per_min(),
+                        "commentary_elevenlabs":
+                            _commentary_elevenlabs_credits_per_min(),
+                        "captions": _captions_credits_per_min()}})
 
 
 @app.post("/api/voices/fav")
@@ -3206,6 +3332,17 @@ def _build_fx(data):
                         "style": style if style in fx_mod.ASPECT_STYLES
                         else "blur"}
     return fx
+
+
+def _karaoke_from_data(data):
+    """Build 231: the karaoke tick, one parse for every create
+    (web JSON True, form "1"/"true"/"on"/"yes"). The Captions
+    create has carried this flag since build 220; 231 extends
+    it to Dub/Recap/Commentary with the same semantics."""
+    v = (data or {}).get("karaoke")
+    return v is True or (isinstance(v, str)
+                         and v.strip().lower()
+                         in ("1", "true", "on", "yes"))
 
 
 def _fx_from_data(data):
@@ -4203,27 +4340,15 @@ _BOOT_TS = time.time()
 
 def _run_translate_probe():
     """Live translation self-test (one short Chinese sentence):
-    can the free chain produce Myanmar right now, and can Gemini?
-    Result cached to .translate_probe.json for /api/auth/me."""
+    can the LLM engines produce Myanmar right now? Result
+    cached to .translate_probe.json for /api/auth/me. Build
+    231: the free-chain legs are gone with the chain itself —
+    the probe now covers the LLM routes only."""
     try:
-        from pipeline import gemini_translate, translate_segments
-        res = {"ts": time.time(), "gemini_ok": None, "free_ok": None,
-               "free_provider": None}
+        from pipeline import gemini_translate
+        res = {"ts": time.time(), "gemini_ok": None}
         sample = "你好，这是一个测试。"
-        try:
-            out, prov = translate_segments.translate_one(sample)
-            res["free_ok"] = bool(out) and out.strip() != sample \
-                and any("\u1000" <= c <= "\u109f" for c in out)
-            res["free_provider"] = prov
-        except Exception:
-            res["free_ok"] = False
-        try:
-            got = translate_segments._batch_google([sample])
-            out = (got[0] if got else "") or ""
-            res["free_batch_ok"] = bool(out) and \
-                any("\u1000" <= c <= "\u109f" for c in out)
-        except Exception:
-            res["free_batch_ok"] = False
+
         try:
             if gemini_translate.key_configured():
                 by = gemini_translate.translate_all(
@@ -4589,6 +4714,47 @@ def admin_timing_stats():
                     "counts": counts})
 
 
+@app.get("/api/admin/golden-check")
+def admin_golden_check():
+    """Golden Sample regression status + last report (build
+    230) — the fixed reference-clip set that catches silent
+    engine/TTS quality drift before customers do. Admin-only,
+    like the boards above; state lives in
+    pipeline/golden_check.py."""
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    from pipeline import golden_check
+    return jsonify(golden_check.status())
+
+
+@app.post("/api/admin/golden-check")
+def admin_golden_check_run():
+    """Start a Golden Sample regression run in the background
+    (build 230). A full run takes minutes (Whisper + translate
+    over 5 clips), so the request only starts it — poll the
+    GET for the report."""
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    from pipeline import golden_check
+    if not golden_check.start("check"):
+        return jsonify({"error": "စစ်ဆေးမှု လုပ်နေဆဲ ဖြစ်ပါတယ်"}), 409
+    return jsonify({"ok": True, "started": True})
+
+
+@app.post("/api/admin/golden-check/capture")
+def admin_golden_check_capture():
+    """Re-capture the Golden baselines from CURRENT code and
+    engines (build 230) — once on a new server so its baselines
+    match its engines, and after any intentional engine or
+    prompt change."""
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    from pipeline import golden_check
+    if not golden_check.start("capture"):
+        return jsonify({"error": "စစ်ဆေးမှု လုပ်နေဆဲ ဖြစ်ပါတယ်"}), 409
+    return jsonify({"ok": True, "started": True})
+
+
 @app.post("/api/topup")
 def topup_create():
     """Customer submits a credit top-up from the WEB app (build 156):
@@ -4599,12 +4765,25 @@ def topup_create():
     user = _current_user()
     if not user:
         return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
-    try:
-        amount = int(request.form.get("amount") or "")
-        assert 1 <= amount <= 100000
-    except Exception:
-        return jsonify({"error": "credit အရေအတွက် မှန်အောင် ထည့်ပါ "
-                                 "(ဥပမာ 100)"}), 400
+    # Build 231: a package pick derives the credited amount
+    # from the PACKAGES table (never from the client), so what
+    # approval credits is exactly base+bonus.
+    package_kyat = None
+    pkg_raw = (request.form.get("package") or "").strip()
+    if pkg_raw:
+        try:
+            package_kyat = int(pkg_raw)
+            assert package_kyat in PACKAGES
+        except Exception:
+            return jsonify({"error": "package မမှန်ပါ"}), 400
+        amount = PACKAGES[package_kyat][0]
+    else:
+        try:
+            amount = int(request.form.get("amount") or "")
+            assert 1 <= amount <= 100000
+        except Exception:
+            return jsonify({"error": "credit အရေအတွက် မှန်အောင် "
+                                     "ထည့်ပါ (ဥပမာ 1000)"}), 400
     f = request.files.get("proof")
     if not f or not f.filename:
         return jsonify({"error": "ငွေလွှဲ screenshot ထည့်ပါ"}), 400
@@ -4628,7 +4807,8 @@ def topup_create():
         return jsonify({"error": "ပုံ မဟုတ်ပါ (သို့) 10MB ထက် ကြီးနေပါတယ် — "
                                  "screenshot အစစ် ထည့်ပါ"}), 400
     raw.unlink(missing_ok=True)
-    tid = accounts.create_topup(user["id"], amount, None)
+    tid = accounts.create_topup(user["id"], amount, None,
+                                package_kyat=package_kyat)
     proof = tdir / f"{tid}.jpg"
     tmp.replace(proof)
     accounts.set_topup_proof(tid, proof.name)
@@ -4636,6 +4816,9 @@ def topup_create():
         from pipeline import telegram_send as tg
         cap = (f"💰 Credit ဖြည့် တောင်းဆိုချက် #{tid}\n"
                f"👤 {user['username']} · {amount} credits (web app)")
+        if package_kyat:
+            cap += (f"\n📦 Package {package_kyat:,} ကျပ် "
+                    f"(bonus +{PACKAGES[package_kyat][1]})")
         tg.send_photo(tg.FIXED_ADMIN_CHAT_ID, proof, caption=cap,
                       buttons=[[("✅ Approve", f"t:{tid}:ok"),
                                 ("❌ ငြင်း", f"t:{tid}:no")]])
@@ -5222,6 +5405,7 @@ def _new_job(data, user=None):
     # source height. Anything else falls back to "hd".
     quality = data.get("quality") if data.get("quality") in \
         ("hd", "720", "480") else "hd"
+    karaoke = _karaoke_from_data(data)
     if font not in FONT_LABELS:
         return None, "font မမှန်ပါ"
     if data.get("upload"):
@@ -5246,7 +5430,7 @@ def _new_job(data, user=None):
     job = {
         "id": uuid.uuid4().hex[:12], "url": url, "mode": mode,
         "voice": voice, "voice_style": voice_style,
-        "font": font, "subs": subs,
+        "font": font, "subs": subs, "karaoke": karaoke,
         "voice_rate": voice_rate, "voice_pitch": voice_pitch,
         "speed_cap": speed_cap, "quality": quality,
         "fx": _build_fx(data), "source_path": None,
@@ -6125,7 +6309,8 @@ def _recap_worker2(job):
                 subs=job.get("subs"),
                 max_speed=job.get("speed_cap") or 1.3,
                 quality=job.get("quality") or "hd",
-                voice_name=job.get("voice_name"))
+                voice_name=job.get("voice_name"),
+                karaoke=bool(job.get("karaoke")))
             _finish(job)
         except JobCancelled:
             _cancelled(job)
@@ -6198,6 +6383,7 @@ def create_recap():
         voice_rate, voice_pitch = style["rate"], style["pitch"]
     quality = data.get("quality") if data.get("quality") in \
         ("hd", "720", "480") else "hd"
+    karaoke = _karaoke_from_data(data)
     try:
         speed_cap = max(1.0, min(4.0,
                                  float(data.get("speed_cap") or 1.3)))
@@ -6218,6 +6404,7 @@ def create_recap():
            "voice_label": voice_label,
            "voice_rate": voice_rate, "voice_pitch": voice_pitch,
            "speed_cap": speed_cap, "quality": quality,
+           "karaoke": karaoke,
            "font": "noto", "subs": _build_subs(data), "fx": fx,
            "source_path": None,
            "status": "queued", "current": None, "error": None,
@@ -6866,7 +7053,8 @@ def _commentary_worker2(job):
                 subs=job.get("subs"),
                 max_speed=job.get("speed_cap") or 1.3,
                 quality=job.get("quality") or "hd",
-                voice_name=job.get("voice_name"))
+                voice_name=job.get("voice_name"),
+                karaoke=bool(job.get("karaoke")))
             if job.get("commentary_audio") != "off":
                 # Ducked bed (the default): the original
                 # audio under the narration at ~13%. The bed
@@ -6955,6 +7143,7 @@ def create_commentary():
         voice_rate, voice_pitch = style["rate"], style["pitch"]
     quality = data.get("quality") if data.get("quality") in \
         ("hd", "720", "480") else "hd"
+    karaoke = _karaoke_from_data(data)
     try:
         speed_cap = max(1.0, min(4.0,
                                  float(data.get("speed_cap") or 1.3)))
@@ -6978,6 +7167,7 @@ def create_commentary():
            "voice_label": voice_label,
            "voice_rate": voice_rate, "voice_pitch": voice_pitch,
            "speed_cap": speed_cap, "quality": quality,
+           "karaoke": karaoke,
            "font": "noto", "subs": _build_subs(data), "fx": fx,
            "source_path": None,
            "status": "queued", "current": None, "error": None,
@@ -7197,6 +7387,7 @@ def create_captions():
         return jsonify({"error": "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"}), 400
     quality = data.get("quality") if data.get("quality") in \
         ("hd", "720", "480") else "hd"
+    karaoke = _karaoke_from_data(data)
     # Karaoke subtitle style (build 220): a free style option,
     # ticked in the Captions view; JSON carries a bool, the
     # multipart form a string.
@@ -7979,8 +8170,14 @@ def api_v1_create_job():
             if voice and not elevenlabs_tts.is_el_voice(voice) \
                     and voice not in tts.STYLE_BY_KEY:
                 return jsonify({"error": "voice မမှန်ပါ"}), 400
+        _kar = data.get("karaoke")
+        _api_karaoke = _kar is True or (
+            isinstance(_kar, str)
+            and _kar.strip().lower()
+            in ("1", "true", "on", "yes"))
         job, err = _new_job({"url": url, "mode": "both",
                              "voice": voice or None,
+                             "karaoke": _api_karaoke,
                              **api_fx}, user=user)
         if err:
             return jsonify({"error": err}), 400
@@ -8014,16 +8211,16 @@ def api_v1_create_job():
     limit_msg = _daily_limit_message(user)
     if limit_msg:
         return jsonify({"error": limit_msg}), 429
-    if user["role"] != "admin" and (user["credits"] or 0) < 1:
-        # The cheapest any successful job can be is 1 credit
-        # (the captions minimum) — below that, no product can
-        # ever be afforded, so refuse up front like the web
-        # pre-check. Fuller quotes still happen after phase 1
-        # (_quote_for_job), exactly as web, once the duration
-        # is known.
+    if user["role"] != "admin" and (user["credits"] or 0) < 30:
+        # The cheapest any successful job can be is 30 credits
+        # (the captions minimum, build 231) — below that, no
+        # product can ever be afforded, so refuse up front like
+        # the web pre-check. Fuller quotes still happen after
+        # phase 1 (_quote_for_job), exactly as web, once the
+        # duration is known.
         return jsonify({"error": "credit မလောက်ပါ",
                         "balance": user["credits"] or 0,
-                        "needed": 1}), 402
+                        "needed": 30}), 402
     job["user_id"] = user["id"]
     job["via"] = "api"
     accounts.mark_has_job(user["id"])

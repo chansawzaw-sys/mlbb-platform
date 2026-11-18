@@ -1,0 +1,80 @@
+{
+ "id": "g1-narration-en",
+ "genre": "narration",
+ "lang": "en",
+ "file": "g1-narration-en.mp4",
+ "captured_at": 1795014310,
+ "metrics": {
+  "seg_count": 4,
+  "src_chars": 185,
+  "my_chars": 174,
+  "total": 4,
+  "untranslated": 0,
+  "untranslated_ratio": 0.0,
+  "providers": {
+   "bing": 4
+  },
+  "dominant_provider": "bing",
+  "tts": {
+   "voice": "my-MM-ThihaNeural",
+   "segments": 4,
+   "total_duration_s": 17.47,
+   "providers": {
+    "google-classic:my": 4
+   },
+   "failed_silent": 0
+  }
+ },
+ "segments_en": [
+  {
+   "start": 0.0,
+   "end": 4.0,
+   "text": "Alright so here we are, one of the elephants."
+  },
+  {
+   "start": 4.0,
+   "end": 12.0,
+   "text": "Cool thing about these guys is that they have really, really, really long trunks."
+  },
+  {
+   "start": 12.0,
+   "end": 14.0,
+   "text": "And that's cool."
+  },
+  {
+   "start": 16.0,
+   "end": 18.0,
+   "text": "And that's pretty much all there is to say."
+  }
+ ],
+ "segments_my": [
+  {
+   "start": 0.0,
+   "end": 4.0,
+   "text": "Alright so here we are, one of the elephants.",
+   "text_my": "အိုကေ၊ ဒါဆို ကျွန်တော်တို့ ဒီမှာ ရှိနေပြီ၊ ဆင်တွေထဲက တစ်ကောင်။",
+   "provider": "bing"
+  },
+  {
+   "start": 4.0,
+   "end": 12.0,
+   "text": "Cool thing about these guys is that they have really, really, really long trunks.",
+   "text_my": "ဒီလူတွေမှာမိုက်တဲ့အချက်က သူတို့ရဲ့ခုနှစ်တွေလုံးဝရှည်လျားတာပါပဲ။",
+   "provider": "bing"
+  },
+  {
+   "start": 12.0,
+   "end": 14.0,
+   "text": "And that's cool.",
+   "text_my": "ဒါကောင်းပါတယ်။",
+   "provider": "bing"
+  },
+  {
+   "start": 16.0,
+   "end": 18.0,
+   "text": "And that's pretty much all there is to say.",
+   "text_my": "ဒါနဲ့ဆိုရင်ပြောစရာတွေမှာမရှိတာပဲပါ။",
+   "provider": "bing"
+  }
+ ]
+}

@@ -82,7 +82,7 @@ ENV_PATH = PROJECT_ROOT / ".env"
 
 MODELS = ("eleven_v4_turbo", "eleven_v4")
 DEFAULT_MODEL = "eleven_v4_turbo"
-DEFAULT_CREDITS_PER_MIN = 2
+DEFAULT_CREDITS_PER_MIN = 100
 EL_PREFIX = "el:"
 STABILITY = 0.5
 SIMILARITY_BOOST = 0.75
@@ -168,7 +168,7 @@ def get_model():
 
 def credits_per_min():
     try:
-        return max(1, min(100, int(
+        return max(1, min(1000, int(
             _env_raw("ELEVENLABS_CREDITS_PER_MIN")
             or DEFAULT_CREDITS_PER_MIN)))
     except (TypeError, ValueError):

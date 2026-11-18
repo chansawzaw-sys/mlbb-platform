@@ -216,7 +216,7 @@ def get_model():
     return m or DEFAULT_MODEL
 
 
-DEFAULT_CREDITS_PER_MIN = 1
+DEFAULT_CREDITS_PER_MIN = 80
 
 
 def credits_per_min():
@@ -228,7 +228,7 @@ def credits_per_min():
     number; the charge path (app.py's rate helper, the
     Studio, the bot pre-check) reads it here."""
     try:
-        return max(1, min(100, int(
+        return max(1, min(1000, int(
             _env_raw("GEMINI_CREDITS_PER_MIN")
             or DEFAULT_CREDITS_PER_MIN)))
     except (TypeError, ValueError):

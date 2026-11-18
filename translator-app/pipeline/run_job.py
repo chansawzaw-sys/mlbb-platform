@@ -125,7 +125,7 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
             _rep = _json.loads((workdir / "translate_report.json")
                                .read_text(encoding="utf-8"))
             _parts = []
-            for _sec in ("batch", "chain", "fill"):
+            for _sec in ("rescue", "fill", "fill2"):
                 for _name, _r in (_rep.get(_sec) or {}).items():
                     _ok = _r.get("ok", 0)
                     _bad = _r.get("fail", _r.get("bad", 0))
@@ -163,9 +163,11 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
     `quality` (build 167) only sets the encode maxrate ceiling via
     maxrate_cap_k — an "hd" job's original rendition is not
     strangled back down by the build-102 cap.
-    `karaoke` (build 220) applies only to mode "subs" (the
-    Captions-only product): the burn uses the karaoke subtitle
-    style — a free style option, same price."""
+    `karaoke` (build 220) applies to every mode that burns
+    subtitles ("subs" and "both"): the burn uses the karaoke
+    subtitle style — a free style option, same price. Build
+    231 extended it from Captions-only to Dub/Recap/
+    Commentary as well."""
     workdir = Path(workdir)
     mark = _marks(progress)
     cap_k = maxrate_cap_k(quality)
@@ -222,7 +224,8 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
                 src, workdir / "subs_retimed.srt", font=font, subs=subs,
                 blur_box=(fxm or {}).get("blur"),
                 fx=fxm if fx_mod.has_fx(fxm) else None,
-                start="[outv]", logo="[2:v]")
+                start="[outv]", logo="[2:v]",
+                style="karaoke" if karaoke else None)
             return {"filters": filters, "out_label": out_label,
                     "logo_path": logo_path, "output": final}
         if fx_mod.has_fx(fxm):
@@ -257,7 +260,8 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
         # fx (if any) rides INSIDE the burn encode — no separate fx pass.
         burn.burn(base, workdir / "subs_retimed.srt", final, font=font,
                   subs=subs, blur_box=(fx or {}).get("blur"),
-                  fx=fx if fx_mod.has_fx(fx) else None, cap_k=cap_k)
+                  fx=fx if fx_mod.has_fx(fx) else None, cap_k=cap_k,
+                  style="karaoke" if karaoke else None)
     else:  # dub only — no burn, so fx gets its own (single) pass
         if fx_mod.has_fx(fx):
             fxed = workdir / "fx.mp4"

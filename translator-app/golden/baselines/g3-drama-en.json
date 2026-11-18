@@ -1,0 +1,95 @@
+{
+ "id": "g3-drama-en",
+ "genre": "drama dialogue",
+ "lang": "en",
+ "file": "g3-drama-en.mp4",
+ "captured_at": 1795014348,
+ "metrics": {
+  "seg_count": 6,
+  "src_chars": 325,
+  "my_chars": 400,
+  "total": 6,
+  "untranslated": 0,
+  "untranslated_ratio": 0.0,
+  "providers": {
+   "bing": 6
+  },
+  "dominant_provider": "bing"
+ },
+ "segments_en": [
+  {
+   "start": 0.0,
+   "end": 3.6,
+   "text": "Why didn't you call me? I waited all night by the phone."
+  },
+  {
+   "start": 4.32,
+   "end": 6.24,
+   "text": "I'm sorry, the train broke down and my phone was dead."
+  },
+  {
+   "start": 6.96,
+   "end": 11.04,
+   "text": "You always have an excuse. Do you even care about us anymore?"
+  },
+  {
+   "start": 11.92,
+   "end": 13.92,
+   "text": "Of course I care, you are the only thing that matters to me."
+  },
+  {
+   "start": 14.64,
+   "end": 18.32,
+   "text": "Then prove it, stay this time, no more running away."
+  },
+  {
+   "start": 18.96,
+   "end": 20.88,
+   "text": "I promise, this time I'm staying for good."
+  }
+ ],
+ "segments_my": [
+  {
+   "start": 0.0,
+   "end": 3.6,
+   "text": "Why didn't you call me? I waited all night by the phone.",
+   "text_my": "ဘာလို့ မခေါ်ထားဘူးလဲ? ငါ ဖုန်းကို ချိတ်ပြီး ညတစ်ညလုံးစောင့်ခဲ့ရတယ်။",
+   "provider": "bing"
+  },
+  {
+   "start": 4.32,
+   "end": 6.24,
+   "text": "I'm sorry, the train broke down and my phone was dead.",
+   "text_my": "စိတ်မကောင်းပါ၊ ရထားမီးမစောင့်တာကြောင့် ဖုန်းလည်း အားကုန်နေခဲ့ပါတယ်။",
+   "provider": "bing"
+  },
+  {
+   "start": 6.96,
+   "end": 11.04,
+   "text": "You always have an excuse. Do you even care about us anymore?",
+   "text_my": "နင်အမြဲတမ်း အမိန့်တခုခုရှိတယ်။ နင်တော့ ငါတို့ကို စောင့်ရှောက်စိတ်ဝင်စားသေးတယ်လား?",
+   "provider": "bing"
+  },
+  {
+   "start": 11.92,
+   "end": 13.92,
+   "text": "Of course I care, you are the only thing that matters to me.",
+   "text_my": "တစ်ကယ်ပဲ ငါစိတ်ပူပါတယ်၊ မင်းကပဲ ငါ့အတွက် အရေးကြီးဆုံးအရာပါ။",
+   "provider": "bing"
+  },
+  {
+   "start": 14.64,
+   "end": 18.32,
+   "text": "Then prove it, stay this time, no more running away.",
+   "text_my": "ပြီးတော့ အဲ့ဒါကို သက်သေပြပါ၊ ဒီတစ်ခါတော့ ရပ်နေပါ၊ ထွက်ပြေးမနေပါနဲ့။",
+   "provider": "bing"
+  },
+  {
+   "start": 18.96,
+   "end": 20.88,
+   "text": "I promise, this time I'm staying for good.",
+   "text_my": "ကျွန်တော်ကတိပေးပါတယ်၊ ဒီမိနစ်မှာတော့ ကျွန်တော် အမြဲနေမှာပါ။",
+   "provider": "bing"
+  }
+ ]
+}

@@ -87,6 +87,10 @@ CREATE TABLE IF NOT EXISTS cover_series (
   updated_at REAL NOT NULL,
   PRIMARY KEY (user_id, name_key)
 );
+CREATE TABLE IF NOT EXISTS app_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
 CREATE TABLE IF NOT EXISTS voice_favs (
   user_id INTEGER NOT NULL,
   voice_id TEXT NOT NULL,
@@ -154,6 +158,68 @@ def _db():
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_token "
         "ON users(api_token_hash) WHERE api_token_hash IS NOT NULL")
+    tcols = [r[1] for r in conn.execute(
+        "PRAGMA table_info(topups)")]
+    if "package_kyat" not in tcols:
+        conn.execute("ALTER TABLE topups ADD COLUMN "
+                     "package_kyat INTEGER")
+    # Build 231: THE CREDIT RESCALE. One credit was 150 kyat;
+    # from this build 1 credit = 5 kyat (owner's BV-style
+    # pricing), so every balance and every pending amount is
+    # re-expressed x30 and kyat prices hold exactly. Runs ONCE
+    # (app_meta marker), atomically: balances convert through
+    # APPEND-ONLY ledger entries (history is never edited —
+    # each non-zero balance gains one 'rescale-231' entry of
+    # 29x, bringing its ledger sum to the new balance), pending
+    # topups convert with them (decided rows are history and
+    # stay untouched), then the marker is set. A crash anywhere
+    # rolls the whole conversion back — a half-rescaled ledger
+    # can never ship.
+    if conn.execute("SELECT 1 FROM app_meta WHERE key = ?",
+                    ("rescale_231",)).fetchone() is None:
+        # Rate keys the owner may have saved are still in OLD
+        # units; rewrite any PRESENT key to the approved rate
+        # card first (idempotent values, outside the money
+        # transaction, so a crash simply retries next boot).
+        try:
+            from . import envfile as _envfile
+            _env_path = DB_PATH.parent / ".env"
+            _card = {"ELEVENLABS_CREDITS_PER_MIN": "100",
+                     "GEMINI_CREDITS_PER_MIN": "80",
+                     "COMMENTARY_CREDITS_PER_MIN": "80",
+                     "CAPTIONS_CREDITS_PER_MIN": "20",
+                     "REFERRAL_REWARD_CREDITS": "60"}
+            _present = set()
+            if _env_path.exists():
+                for _ln in _env_path.read_text(
+                        encoding="utf-8").splitlines():
+                    if "=" in _ln:
+                        _present.add(
+                            _ln.split("=", 1)[0].strip())
+            for _k, _v in _card.items():
+                if _k in _present:
+                    _envfile.update(_env_path, _k, _v)
+        except Exception:
+            pass
+        for _u in conn.execute(
+                "SELECT id, credits FROM users "
+                "WHERE credits != 0").fetchall():
+            conn.execute(
+                "INSERT INTO ledger (user_id, delta, reason, "
+                "ref, ts) VALUES (?, ?, 'rescale-231', ?, ?)",
+                (_u["id"], _u["credits"] * 29,
+                 "credit 150 kyat -> 5 kyat (x30)",
+                 time.time()))
+            conn.execute(
+                "UPDATE users SET credits = credits * 30 "
+                "WHERE id = ?", (_u["id"],))
+        conn.execute(
+            "UPDATE topups SET credits = credits * 30 "
+            "WHERE status = 'pending'")
+        conn.execute(
+            "INSERT INTO app_meta (key, value) "
+            "VALUES ('rescale_231', 'x30')")
+        conn.commit()
     missing = conn.execute(
         "SELECT id FROM users WHERE referral_code IS NULL").fetchall()
     for r in missing:
@@ -655,12 +721,15 @@ def ledger_for(user_id, limit=20):
     return [dict(r) for r in rows]
 
 
-def create_topup(user_id, credits, proof):
+def create_topup(user_id, credits, proof, package_kyat=None):
     with _LOCK, _db() as conn:
         cur = conn.execute(
-            "INSERT INTO topups (user_id, credits, proof, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (int(user_id), int(credits), proof, time.time()))
+            "INSERT INTO topups (user_id, credits, proof, "
+            "package_kyat, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (int(user_id), int(credits), proof,
+             int(package_kyat) if package_kyat else None,
+             time.time()))
         return cur.lastrowid
 
 
@@ -693,7 +762,8 @@ def topups_for(user_id, limit=10):
     list, build 156) — never exposes other users' rows."""
     with _db() as conn:
         rows = conn.execute(
-            "SELECT id, credits, status, created_at, decided_at "
+            "SELECT id, credits, package_kyat, status, "
+            "created_at, decided_at "
             "FROM topups WHERE user_id = ? ORDER BY id DESC LIMIT ?",
             (int(user_id), int(limit))).fetchall()
     return [dict(r) for r in rows]
@@ -755,12 +825,21 @@ def decide_topup(topup_id, ok):
         if cur.rowcount != 1:
             return None
         row = conn.execute(
-            "SELECT t.credits, t.user_id, u.tg_chat_id FROM topups t "
+            "SELECT t.credits, t.package_kyat, t.user_id, "
+            "u.tg_chat_id FROM topups t "
             "JOIN users u ON u.id = t.user_id WHERE t.id = ?",
             (int(topup_id),)).fetchone()
     if ok:
+        # Build 231: a package approval's ledger entry names
+        # the package and its bonus, so the one auditable entry
+        # shows base + bonus at a glance.
+        ref = f"topup:{topup_id}"
+        if row["package_kyat"]:
+            pkg = int(row["package_kyat"])
+            bonus = int(row["credits"]) - pkg // 5
+            ref = f"topup:{topup_id}:pkg{pkg}+bonus{bonus}"
         apply_credit(row["user_id"], row["credits"], "topup",
-                     f"topup:{topup_id}")
+                     ref)
     return {"user_id": row["user_id"], "credits": row["credits"],
             "tg_chat_id": row["tg_chat_id"]}
 
