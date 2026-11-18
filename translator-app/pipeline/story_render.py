@@ -110,7 +110,7 @@ STORY_SUB_BOTTOM_PCT = 3
 CUE_MAX_CHARS = 68
 _STORY_FONT_FAMILY = "Noto Sans Myanmar"
 
-_SENT_SPLIT = re.compile(r"(?<=[။!?…])\s*")
+_SENT_SPLIT = re.compile(r"(?<=[။!?…])\s*|(?<=\.)\s+")
 _CLAUSE_SPLIT = re.compile(r"(?<=[၊])\s*")
 
 
@@ -139,6 +139,40 @@ def _cue_fits(text, avail_w):
     return lines is None or lines <= 2
 
 
+def _force_split(text, avail_w):
+    """Build 226 (audit F-06): the last-resort splitter for a
+    run no sentence/clause/space boundary can break — a long
+    spaceless pasted sentence, common in social-media
+    Burmese and heavy script edits. Cut it into the longest
+    prefixes that still measure ≤2 lines at the story burn
+    size, never cutting right before a combining mark
+    (Unicode category M*) — the karaoke unit splitter's rule
+    (build 220), so a cut can never break a shaped syllable.
+    Cue timings follow automatically: _write_srt times every
+    cue by its character share of the chunk window."""
+    import unicodedata
+    pieces, rest = [], (text or "").strip()
+    while rest:
+        if len(rest) <= CUE_MAX_CHARS and _cue_fits(rest, avail_w):
+            pieces.append(rest)
+            break
+        # The cut must satisfy BOTH gates at once: the piece
+        # measures ≤2 lines AND the next piece does not start
+        # with a combining mark (searching downward from the
+        # cap — a shorter prefix that ends before the whole
+        # syllable keeps both true; extending a fitting cut
+        # over its combining marks could tip it back over the
+        # line limit, so the boundary moves earlier instead).
+        cut = min(len(rest), CUE_MAX_CHARS)
+        while cut > 1 and (not _cue_fits(rest[:cut], avail_w)
+                           or (cut < len(rest) and unicodedata
+                               .category(rest[cut]).startswith("M"))):
+            cut -= 1
+        pieces.append(rest[:cut])
+        rest = rest[cut:].lstrip()
+    return pieces
+
+
 def _split_units(text, avail_w):
     """Sentence-level pieces of a narration chunk, further
     split at clause commas and finally at spaces until every
@@ -161,6 +195,18 @@ def _split_units(text, avail_w):
                 continue
             cur = ""
             for w in clause.split():
+                if len(w) > CUE_MAX_CHARS \
+                        or not _cue_fits(w, avail_w):
+                    # Build 226 (F-06): a single unbreakable
+                    # run that cannot stand as a cue on its
+                    # own — flush what is packed and force-
+                    # split the run instead of letting it
+                    # become one wall cue.
+                    if cur:
+                        units.append(cur)
+                        cur = ""
+                    units.extend(_force_split(w, avail_w))
+                    continue
                 trial = (cur + " " + w).strip()
                 if cur and (len(trial) > CUE_MAX_CHARS
                             or not _cue_fits(trial, avail_w)):

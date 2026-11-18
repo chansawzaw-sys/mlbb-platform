@@ -57,7 +57,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 225"
+BUILD_TAG = "build 226"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -2963,6 +2963,76 @@ def preview_frame(pid):
     return send_file(frame, mimetype="image/jpeg")
 
 
+@app.post("/api/frame-upload")
+def frame_upload():
+    """Build 226 (audit F-04): ONE frame from an uploaded
+    video file, for the editors (the dub wizard, Recap,
+    Commentary) when the source is a file instead of a link —
+    the link path draws on /api/preview frames, but an upload
+    had no frame at all, so blur/logo boxes were placed
+    blind. Session-authenticated like every route here (the
+    accounts guard covers /api/*), rate-capped like previews;
+    the file passes the upload extension whitelist + a real
+    probe, serves this one grab (preview_frame's ffmpeg
+    verbatim), and is deleted — nothing is kept. Duration and
+    dimensions ride in headers for the editor."""
+    if not _preview_allowed():
+        return jsonify({"error": "ခဏ ခဏ မစမ်းပါနဲ့ — ခဏ စောင့်ပြီး "
+                                 "ပြန် စမ်းပါ"}), 429
+    f = request.files.get("file")
+    if f is None or not (f.filename or "").strip():
+        return jsonify({"error": "ဖိုင် မပါပါ"}), 400
+    name = (f.filename or "").strip()
+    ext = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext not in UPLOAD_EXTS:
+        return jsonify({"error": "ဒီ ဖိုင် အမျိုးအစား မရပါ — mp4, mkv, "
+                                 "mov, avi, webm ဖိုင် ပဲ ရပါတယ်"}), 400
+    tmp = PREVIEWS_DIR / ("frameup-" + uuid.uuid4().hex[:12])
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        dest = tmp / ("upload" + ext)
+        total = 0
+        too_big = False
+        with open(dest, "wb") as out:
+            while True:
+                chunk = f.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > dl_mod.MAX_DOWNLOAD_BYTES:
+                    too_big = True
+                    break
+                out.write(chunk)
+        if too_big:
+            return jsonify({"error": "ဖိုင် အရွယ် ကြီးလွန်းပါတယ် — "
+                                     "အများဆုံး 2 GB ပဲ ရပါတယ်"}), 400
+        try:
+            dur = probe_duration(dest)
+            w, h = fx_mod.video_size(dest)
+        except Exception:
+            dur, w, h = 0, 0, 0
+        if not dur or dur <= 0 or not w:
+            return jsonify({"error": "ဖိုင် ကို ဗီဒီယို အဖြစ် ဖတ်လို့ "
+                                     "မရပါ — ဗီဒီယို ဖိုင် အမှန် "
+                                     "ပြန်တင်ပါ"}), 400
+        try:
+            t = float(request.form.get("t") or 2)
+        except (TypeError, ValueError):
+            t = 2.0
+        t = min(max(t, 0.0), max(dur - 0.15, 0.0))
+        frame = tmp / "frame.jpg"
+        sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}",
+            "-i", str(dest), "-frames:v", "1", "-q:v", "3",
+            str(frame)])
+        resp = Response(frame.read_bytes(), mimetype="image/jpeg")
+        resp.headers["X-Video-Duration"] = f"{dur:.2f}"
+        resp.headers["X-Video-Width"] = str(w)
+        resp.headers["X-Video-Height"] = str(h)
+        return resp
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 @app.post("/api/logo")
 def upload_logo():
     f = request.files.get("logo")
@@ -3028,6 +3098,26 @@ def _build_fx(data):
                         "style": style if style in fx_mod.ASPECT_STYLES
                         else "blur"}
     return fx
+
+
+def _fx_from_data(data):
+    """Build 226: the fx for the products that gained the blur
+    editor in this build (Recap / Commentary / Captions and
+    the v1 API) — the SAME _build_fx normalizer the dub wizard
+    uses, with the build-209 box cap enforced the same way
+    _new_job enforces it. Returns (fx_or_None, error_or_None):
+    fx is None when the payload carries no usable effect, so
+    a job without blur keeps the exact pre-226 record shape.
+    Before 226 these products hardcoded "fx": None at creation
+    and again in their phase-2 workers, so a customer's boxes
+    could never reach the render (audit F-01/F-02/F-03)."""
+    _boxes_in = (data.get("fx") or {}).get("blur_boxes")
+    if isinstance(_boxes_in, list) \
+            and len(_boxes_in) > fx_mod.MAX_BLUR_BOXES:
+        return None, ("ဝါးမည့် အကွက် အများဆုံး ၅ ခု ပဲ ရပါတယ်"
+                      " — အကွက် လျှော့ပြီး ပြန်စမ်းပါ")
+    fx = _build_fx(data)
+    return (fx if fx_mod.has_fx(fx) else None), None
 
 
 FONT_LABELS = {
@@ -5827,7 +5917,7 @@ def _recap_worker2(job):
             save_segments(segs, workdir / "segments_my.json")
             run_job.run_phase2(
                 workdir, mode="both", voice=job["voice"],
-                progress=_progress_fn(job), fx=None,
+                progress=_progress_fn(job), fx=job.get("fx"),
                 font=job.get("font") or "noto",
                 voice_rate=job.get("voice_rate", 0),
                 voice_pitch=job.get("voice_pitch", 0),
@@ -5897,6 +5987,14 @@ def create_recap():
                                  float(data.get("speed_cap") or 1.3)))
     except (TypeError, ValueError):
         speed_cap = 1.3
+    # Build 226 (audit F-01): the Recap form's blur editor —
+    # the boxes ride in as data["fx"] and normalize through
+    # the same _build_fx path as the dub wizard. Before, fx
+    # was hardcoded None here and in _recap_worker2, so the
+    # original burned-in captions always survived.
+    fx, fx_err = _fx_from_data(data)
+    if fx_err:
+        return jsonify({"error": fx_err}), 400
     now = time.time()
     job = {"id": uuid.uuid4().hex[:12], "type": "recap",
            "url": url, "mode": "recap",
@@ -5904,7 +6002,7 @@ def create_recap():
            "voice_label": voice_label,
            "voice_rate": voice_rate, "voice_pitch": voice_pitch,
            "speed_cap": speed_cap, "quality": quality,
-           "font": "noto", "subs": _build_subs(data), "fx": None,
+           "font": "noto", "subs": _build_subs(data), "fx": fx,
            "source_path": None,
            "status": "queued", "current": None, "error": None,
            "created_at": now, "updated_at": now,
@@ -6174,6 +6272,17 @@ def create_story():
         minutes = 1
     if minutes not in STORY_MINUTES:
         minutes = 1
+    # Build 226 (audit F-05): the form's speed slider (rate,
+    # −50..+100 percent) — read at last. A nonzero value
+    # becomes the narration's voice_rate below; 0 / absent
+    # keeps the voice style's own preset rate. Before 226 the
+    # slider was sent but never read, so dragging it changed
+    # nothing.
+    try:
+        story_rate = int(data.get("rate") or 0)
+    except (TypeError, ValueError):
+        story_rate = 0
+    story_rate = max(-50, min(100, story_rate))
     # Voice resolution mirrors create_recap / _new_job exactly
     # (builds 200 / 205 / 206 / 212): an ElevenLabs pick must
     # resolve for the caller through _resolve_el_entry —
@@ -6205,6 +6314,10 @@ def create_story():
         voice_style = style["key"]
         voice_label = style["label"]
         voice_rate, voice_pitch = style["rate"], style["pitch"]
+        if story_rate:
+            # Build 226 (F-05): the slider overrides the
+            # style's preset rate; 0 kept the preset above.
+            voice_rate = story_rate
     now = time.time()
     job = {"id": uuid.uuid4().hex[:12], "type": "story",
            "url": "", "mode": "story",
@@ -6451,7 +6564,7 @@ def _commentary_worker2(job):
             save_segments(segs, workdir / "segments_my.json")
             run_job.run_phase2(
                 workdir, mode="both", voice=job["voice"],
-                progress=_progress_fn(job), fx=None,
+                progress=_progress_fn(job), fx=job.get("fx"),
                 font=job.get("font") or "noto",
                 voice_rate=job.get("voice_rate", 0),
                 voice_pitch=job.get("voice_pitch", 0),
@@ -6540,6 +6653,13 @@ def create_commentary():
     audio_mode = data.get("audio_mode") \
         if data.get("audio_mode") in COMMENTARY_AUDIO_MODES \
         else "ducked"
+    # Build 226 (audit F-02): the Commentary form's blur
+    # editor — same _build_fx normalization as the dub wizard
+    # (fx was hardcoded None here and in _commentary_worker2,
+    # so original captions always clashed, unblurred).
+    fx, fx_err = _fx_from_data(data)
+    if fx_err:
+        return jsonify({"error": fx_err}), 400
     now = time.time()
     job = {"id": uuid.uuid4().hex[:12], "type": "commentary",
            "url": url, "mode": "commentary",
@@ -6548,7 +6668,7 @@ def create_commentary():
            "voice_label": voice_label,
            "voice_rate": voice_rate, "voice_pitch": voice_pitch,
            "speed_cap": speed_cap, "quality": quality,
-           "font": "noto", "subs": _build_subs(data), "fx": None,
+           "font": "noto", "subs": _build_subs(data), "fx": fx,
            "source_path": None,
            "status": "queued", "current": None, "error": None,
            "created_at": now, "updated_at": now,
@@ -6633,7 +6753,9 @@ def render_commentary(jid):
 # the edits exactly like the main flow's job_review) ->
 # phase 2 burns the final segments into the ORIGINAL video
 # through the shared cinematic burn (run_phase2 mode "subs":
-# original audio untouched, NO TTS, no blur boxes) -> the
+# original audio untouched, NO TTS; build 226 added the
+# review-stage blur boxes, drawn on the real frame and sent
+# with the render request) -> the
 # done screen offers BOTH downloads: the subtitled MP4 (the
 # normal job route) and the Burmese .srt (subs_my.srt,
 # regenerated from the final edited segments at render time
@@ -6733,6 +6855,7 @@ def _captions_worker2(job):
             run_job.run_phase2(
                 workdir, mode="subs", progress=_progress_fn(job),
                 font=job.get("font") or "noto", subs=None,
+                fx=job.get("fx"),
                 quality=job.get("quality") or "hd",
                 karaoke=bool(job.get("karaoke")))
             _finish(job)
@@ -6768,10 +6891,21 @@ def create_captions():
     karaoke = _kar is True or (isinstance(_kar, str)
                                and _kar.strip().lower()
                                in ("1", "true", "on", "yes"))
+    # Build 226 (audit F-03): creation-time blur boxes are
+    # accepted too, normalized through the same _build_fx
+    # path — but the primary path is the review stage, where
+    # the boxes are drawn on the real downloaded frame and
+    # arrive with the render request (see render_captions).
+    # Before 226 fx was hardcoded None and phase 2 never
+    # received any, so original captions always showed
+    # through the product sold to cover them.
+    fx, fx_err = _fx_from_data(data)
+    if fx_err:
+        return jsonify({"error": fx_err}), 400
     now = time.time()
     job = {"id": uuid.uuid4().hex[:12], "type": "captions",
            "url": url, "mode": "captions",
-           "quality": quality, "font": "noto", "fx": None,
+           "quality": quality, "font": "noto", "fx": fx,
            "karaoke": karaoke,
            "source_path": None,
            "status": "queued", "current": None, "error": None,
@@ -6829,6 +6963,18 @@ def render_captions(jid):
                         "ဒီ job က စာတန်း အတည်ပြုရန် အဆင့် "
                         "မဟုတ်ပါ"}), 409
     data = request.get_json(force=True, silent=True) or {}
+    # Build 226 (audit F-03): blur boxes drawn on the real
+    # frame during the review park arrive WITH this request —
+    # normalized through the same _build_fx path and stored
+    # on the job, so _captions_worker2 burns them in. A
+    # request without fx keeps whatever creation stored
+    # (usually none). A bad fx refuses BEFORE any edit is
+    # applied, so the park survives for a corrected retry.
+    if isinstance(data.get("fx"), dict):
+        fx, fx_err = _fx_from_data(data)
+        if fx_err:
+            return jsonify({"error": fx_err}), 400
+        job["fx"] = fx
     edits = {}
     for e in data.get("edits") or []:
         if not isinstance(e, dict):
@@ -6884,6 +7030,38 @@ def download_captions_srt(jid):
     return send_file(srt, as_attachment=True,
                      download_name=f"myanmar-{jid}.srt",
                      conditional=True)
+
+
+@app.get("/api/captions/<jid>/frame")
+def captions_frame(jid):
+    """Build 226: one frame of the parked job's OWN source,
+    for the review-stage blur editor — the boxes are drawn on
+    the real downloaded frame, exactly like the wizard's
+    preview frames. Owner-scoped like every captions route;
+    the grab is preview_frame's ffmpeg verbatim, and the
+    source duration rides in a header for the editor's
+    scrubber."""
+    job = _load_job(jid)
+    if not job or job.get("type") != "captions" \
+            or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    src = JOBS_DIR / jid / "source.mp4"
+    if not src.exists():
+        return jsonify({"error": "video မတွေ့ပါ"}), 404
+    try:
+        t = float(request.args.get("t", "2"))
+    except ValueError:
+        t = 2.0
+    dur = probe_duration(src)
+    t = min(max(t, 0.0), max(dur - 0.15, 0.0))
+    frame = JOBS_DIR / jid / f"capframe_{t:.1f}.jpg"
+    if not frame.exists():
+        sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}",
+            "-i", str(src), "-frames:v", "1", "-q:v", "3",
+            str(frame)])
+    resp = send_file(frame, mimetype="image/jpeg")
+    resp.headers["X-Video-Duration"] = f"{dur:.2f}"
+    return resp
 
 
 # ---------- Title + hashtag helper (build 222, roadmap 6) -----
@@ -7376,6 +7554,7 @@ def _api_captions_worker(job):
             run_job.run_phase2(
                 workdir, mode="subs", progress=_progress_fn(job),
                 font=job.get("font") or "noto", subs=None,
+                fx=job.get("fx"),
                 quality=job.get("quality") or "hd",
                 karaoke=bool(job.get("karaoke")))
             _finish(job)
@@ -7448,6 +7627,33 @@ def api_v1_create_job():
         return jsonify({"error": "လင့်ခ် မမှန်ပါ"}), 400
     if not _public_url_ok(url):
         return jsonify({"error": "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"}), 400
+    # Build 226: optional blur_boxes — the same normalized
+    # boxes the web editor produces ({x, y, w, h} as frame
+    # fractions, optional strength). Strict like every v1
+    # field: a bad shape is a 400, never a silent drop; the
+    # boxes then normalize through the web path (_new_job for
+    # dub, _fx_from_data for captions) and reach the render
+    # exactly as a web customer's do. Charges unchanged.
+    boxes_in = data.get("blur_boxes")
+    if boxes_in is not None:
+        if not isinstance(boxes_in, list):
+            return jsonify({"error": "blur_boxes မမှန်ပါ"}), 400
+        if len(boxes_in) > fx_mod.MAX_BLUR_BOXES:
+            return jsonify({"error":
+                            "ဝါးမည့် အကွက် အများဆုံး ၅ ခု ပဲ "
+                            "ရပါတယ်"}), 400
+        for b in boxes_in:
+            if not isinstance(b, dict):
+                return jsonify({"error": "blur_boxes မမှန်ပါ"}), 400
+            try:
+                _vals = [float(b[k]) for k in ("x", "y", "w", "h")]
+                if "strength" in b:
+                    float(b["strength"])
+            except (KeyError, TypeError, ValueError):
+                return jsonify({"error": "blur_boxes မမှန်ပါ"}), 400
+            if _vals[2] <= 0 or _vals[3] <= 0:
+                return jsonify({"error": "blur_boxes မမှန်ပါ"}), 400
+    api_fx = {"fx": {"blur_boxes": boxes_in}} if boxes_in else {}
     if mode == "dub":
         voice = data.get("voice")
         if voice is not None:
@@ -7461,7 +7667,8 @@ def api_v1_create_job():
                     and voice not in tts.STYLE_BY_KEY:
                 return jsonify({"error": "voice မမှန်ပါ"}), 400
         job, err = _new_job({"url": url, "mode": "both",
-                             "voice": voice or None}, user=user)
+                             "voice": voice or None,
+                             **api_fx}, user=user)
         if err:
             return jsonify({"error": err}), 400
         job["api_mode"] = "dub"
@@ -7471,10 +7678,11 @@ def api_v1_create_job():
         karaoke = _kar is True or (isinstance(_kar, str)
                                    and _kar.strip().lower()
                                    in ("1", "true", "on", "yes"))
+        api_job_fx, _api_fx_err = _fx_from_data(api_fx)
         now = time.time()
         job = {"id": uuid.uuid4().hex[:12], "type": "captions",
                "url": url, "mode": "captions",
-               "quality": "hd", "font": "noto", "fx": None,
+               "quality": "hd", "font": "noto", "fx": api_job_fx,
                "karaoke": karaoke, "api_mode": "captions",
                "source_path": None,
                "status": "queued", "current": None, "error": None,
