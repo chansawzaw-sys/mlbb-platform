@@ -57,7 +57,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 227"
+BUILD_TAG = "build 228"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -6106,8 +6106,14 @@ STORY_MINUTES = (1, 2, 3)    # offered target lengths
 _STORY_RENDER_SEM = threading.Semaphore(1)
 
 
-def _story_steps():
-    return [{"key": "script", "label": "Story စာသား ရေးရန်",
+def _story_steps(mode="topic"):
+    # Build 228 (story-text audit F1): in own-text mode the
+    # customer's words are used verbatim — the first step
+    # plans the cartoon scenes, it does not "write text",
+    # and the label must not claim it does.
+    first = "Scene ခွဲရန်" if mode == "text" \
+        else "Story စာသား ရေးရန်"
+    return [{"key": "script", "label": first,
              "state": "pending"},
             {"key": "tts", "label": STEP_LABELS["tts"],
              "state": "pending"},
@@ -6120,7 +6126,8 @@ def _story_view(job):
             ("id", "type", "status", "current", "error",
              "voice", "voice_label", "quote_minutes",
              "quote_credits", "charged_minutes", "story_edited",
-             "story_topic", "story_minutes", "story_music",
+             "story_topic", "story_minutes", "story_mode",
+             "story_music",
              "story_karaoke", "story_style", "title_tags",
              "created_at", "finished_at")}
     view["timings"] = _timings_of(job)  # build 213
@@ -6251,27 +6258,52 @@ def create_story():
     data = request.get_json(force=True, silent=True) or {}
     topic = (data.get("topic") or "").strip()
     text = (data.get("text") or "").strip()
-    if text:
+    # Build 228 (story-text audit F5): the mode is EXPLICIT
+    # state sent by the form — never inferred from whichever
+    # box happens to be non-empty, so text left in a hidden
+    # box can no longer silently override the topic. Only
+    # the active mode's input is read; the other is dropped.
+    # A caller that sends no mode keeps the pre-228
+    # inference, so older clients do not break.
+    mode_in = (data.get("mode") or "").strip().lower()
+    if mode_in in ("text", "topic"):
+        story_mode = mode_in
+    else:
+        story_mode = "text" if text else "topic"
+    if story_mode == "text":
+        if not text:
+            return jsonify({"error": "စာသား အရင် ထည့်ပါ"}), 400
         if len(text) > STORY_TEXT_CAP:
             return jsonify({"error":
                             f"စာသား အရှည်ဆုံး {STORY_TEXT_CAP} "
                             "လုံး ပဲ ရပါတယ် — လျှော့ပြီး "
                             "ပြန်စမ်းပါ"}), 400
-        topic = topic[:STORY_TOPIC_CAP]
-    elif topic:
+        topic = ""
+    else:
+        text = ""
+        if not topic:
+            return jsonify({"error": "ခေါင်းစဉ် အရင် ထည့်ပါ"}), 400
         if len(topic) > STORY_TOPIC_CAP:
             return jsonify({"error":
                             f"ခေါင်းစဉ် အရှည်ဆုံး "
                             f"{STORY_TOPIC_CAP} လုံး ပဲ ရပါတယ်"}), \
                 400
-    else:
-        return jsonify({"error": "ခေါင်းစဉ် အရင် ထည့်ပါ"}), 400
     try:
         minutes = int(data.get("minutes") or 1)
     except (TypeError, ValueError):
         minutes = 1
     if minutes not in STORY_MINUTES:
         minutes = 1
+    if story_mode == "text":
+        # Build 228 (audit F2/F3): a pasted text's length IS
+        # its duration — the length chips do not apply (the
+        # form hides them in this mode). The estimate, on the
+        # app's narration basis (~700 chars per finished
+        # minute), replaces the chip figure everywhere: the
+        # admission quote, the review-screen quote and the
+        # planner's shot density all read story_minutes.
+        minutes = max(1, math.ceil(len(text)
+                                   / story_mod.CHARS_PER_MIN))
     # Build 226 (audit F-05): the form's speed slider (rate,
     # −50..+100 percent) — read at last. A nonzero value
     # becomes the narration's voice_rate below; 0 / absent
@@ -6315,7 +6347,14 @@ def create_story():
         voice = "el:" + el_entry["id"]
         voice_style = voice
         voice_label = el_entry["name"]
-        voice_rate, voice_pitch = 0, 0
+        # Build 228 (audit F4): the speed slider applies to
+        # Premium voices too — stored as voice_rate exactly
+        # like the built-in branch below, and the renderer
+        # applies it to the EL narration (atempo — the same
+        # conversion the Studio uses for both engines).
+        # Before 228 this branch zeroed it, so the slider
+        # was a dead control whenever an EL voice was picked.
+        voice_rate, voice_pitch = story_rate, 0
     else:
         style = tts.resolve_style(voice_in)
         voice = style["voice"]
@@ -6330,6 +6369,7 @@ def create_story():
     job = {"id": uuid.uuid4().hex[:12], "type": "story",
            "url": "", "mode": "story",
            "story_topic": topic, "story_minutes": minutes,
+           "story_mode": story_mode,
            "story_music": bool(data.get("music")),
            "story_karaoke": bool(data.get("karaoke")),
            "story_style": story_style,
@@ -6341,7 +6381,7 @@ def create_story():
            "status": "queued", "current": None, "error": None,
            "created_at": now, "updated_at": now,
            "finished_at": None,
-           "steps": _story_steps()}
+           "steps": _story_steps(story_mode)}
     if el_entry is not None:
         job["tts_engine"] = "elevenlabs"
         job["voice_name"] = el_entry["name"]
@@ -6394,6 +6434,14 @@ def render_story(jid):
         return jsonify({"error":
                         f"စာသား အရှည်ဆုံး {STORY_TEXT_CAP} လုံး "
                         "ပဲ ရပါတယ် — လျှော့ပြီး ပြန်စမ်းပါ"}), 400
+    if job.get("story_mode") == "text":
+        # Build 228 (audit F2/F3): refresh the text-length
+        # estimate from the FINAL text (the customer may
+        # have edited it at the park) so this re-check — like
+        # the admission quote — prices the text's own
+        # minutes, never a stale chip figure.
+        job["story_minutes"] = max(
+            1, math.ceil(len(text) / story_mod.CHARS_PER_MIN))
     uid = job.get("user_id")
     if uid:
         acct = accounts.get_user(uid)

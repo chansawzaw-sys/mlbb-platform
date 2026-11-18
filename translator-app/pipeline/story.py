@@ -464,33 +464,96 @@ def generate_story(topic, target_chars):
     return script, shots, provider
 
 
+PLAN_WINDOW = 8000           # chars of script per plan call
+
+
+def _plan_windows(text, size=PLAN_WINDOW):
+    """Split a pasted story into <= size-char windows for
+    planning, cutting at the last sentence end / newline /
+    space inside the back half of the window (a hard cut
+    only when the window holds no boundary at all). The
+    windows concatenate back to the exact input text."""
+    wins = []
+    rest = text or ""
+    while len(rest) > size:
+        cut = -1
+        for sep in ("။", "\n", " "):
+            i = rest.rfind(sep, 0, size)
+            if i > size // 2:
+                cut = i + len(sep)
+                break
+        if cut < 0:
+            cut = size
+        wins.append(rest[:cut])
+        rest = rest[cut:]
+    if rest:
+        wins.append(rest)
+    return wins
+
+
+def _plan_one(window, target, cap):
+    """One planning call for one window of script. Raises
+    (via _chain_generate) when every gateway fails or
+    answers junk for this window."""
+    prompt = (PROMPT_PLAN
+              .replace("__SHOTS__", str(target))
+              .replace("__SCRIPT__", window))
+
+    def extract(raw):
+        _script, shots_raw = _parse_reply(raw)
+        if not shots_raw:
+            return None
+        return sanitize_shots(shots_raw, cap)
+
+    return _chain_generate(prompt, extract)
+
+
 def plan_for_text(text, minutes=None):
     """Shot plan for a customer-pasted story: (shots,
     provider_label). The script is the customer's own, so a
     total gateway failure falls back to the default plan
     instead of failing their text. `minutes` is the job's
     target length (the shot-density cap follows it); when
-    omitted it is estimated from the text length."""
+    omitted it is estimated from the text length.
+
+    Build 228 (story-text audit F6): the plan prompt used
+    to embed only text[:8000] while the paste cap is
+    20,000 chars, so the tail of a long story was planned
+    blind. The text is now planned in <= 8000-char windows
+    (one chain call per window, shot target/cap shared out
+    by character share) and the window plans concatenate
+    in story order under the same total cap."""
+    text = text or ""
     if not minutes:
-        minutes = max(1, int(round(len(text or "")
+        minutes = max(1, int(round(len(text)
                                    / CHARS_PER_MIN)))
-    prompt = (PROMPT_PLAN
-              .replace("__SHOTS__",
-                       str(shots_target_for_minutes(minutes)))
-              .replace("__SCRIPT__", text[:8000]))
-
-    def extract(raw):
-        _script, shots_raw = _parse_reply(raw)
-        if not shots_raw:
-            return None
-        return sanitize_shots(
-            shots_raw, max_shots_for_minutes(minutes))
-
-    try:
-        shots, provider = _chain_generate(prompt, extract)
-        return shots, provider
-    except Exception:
+    total_target = shots_target_for_minutes(minutes)
+    total_cap = max_shots_for_minutes(minutes)
+    windows = _plan_windows(text)
+    if len(windows) <= 1:
+        try:
+            return _plan_one(text, total_target, total_cap)
+        except Exception:
+            return default_shots(), "default"
+    all_shots, providers = [], []
+    for w in windows:
+        share = len(w) / len(text)
+        w_target = max(1, int(round(total_target * share)))
+        w_cap = max(1, int(round(total_cap * share)))
+        try:
+            shots, provider = _plan_one(w, w_target, w_cap)
+            all_shots.extend(shots)
+            providers.append(provider)
+        except Exception:
+            # One dead window must not sink the others —
+            # the surviving windows still cover their parts
+            # of the story; the total fallback below covers
+            # the all-windows-dead case.
+            pass
+    if not all_shots:
         return default_shots(), "default"
+    return sanitize_shots(all_shots, total_cap), \
+        (providers[0] if providers else "default")
 
 
 def split_script(text, limit=450):

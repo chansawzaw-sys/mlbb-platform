@@ -57,6 +57,14 @@ composited in PIL by _shot_clip_styled, since the ffmpeg
 graph leaves no frame to grade). The grade always lands
 before the subtitle burn, so subtitle and karaoke pixels
 are never graded; "normal" changes nothing at all.
+
+Build 228: an ElevenLabs story job's voice_rate (the
+form's speed slider, stored by create_story for Premium
+picks too since 228) is applied to the synthesized
+segments with atempo before the timeline is measured —
+the same one-speed-pass conversion the Studio uses for
+both engines; built-in voices keep taking the rate
+natively in their synthesize call.
 """
 import math
 import re
@@ -250,6 +258,44 @@ def split_cues(text, avail_w):
     return cues
 
 
+def _apply_el_rate(workdir, rate):
+    """Build 228 (story-text audit F4): apply the customer's
+    speed-slider rate to ElevenLabs narration. The EL
+    synthesize contract carries no rate (the built-in
+    engine takes it natively), so — exactly like the
+    Studio, which applies ONE atempo pass for both engines
+    (build 215) — the rate lands here as an atempo pass
+    over each synthesized segment, and the segment
+    durations are re-measured so the shot timeline, built
+    from those durations, stays in sync. rate is the
+    slider's percent (-50..+100) -> factor 0.5..2.0, the
+    range a single atempo instance accepts. A zero rate
+    touches nothing."""
+    try:
+        rate = int(rate or 0)
+    except (TypeError, ValueError):
+        rate = 0
+    if not rate:
+        return
+    factor = min(2.0, max(0.5, 1.0 + rate / 100.0))
+    seg_path = Path(workdir) / "segments_my.json"
+    segs = load_segments(seg_path)
+    changed = False
+    for seg in segs:
+        f = seg.get("tts_file")
+        if not f or not Path(f).exists():
+            continue
+        tmp = str(f) + ".rate.mp3"
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(f),
+             "-filter:a", f"atempo={factor:.4f}", tmp],
+            timeout=300)
+        Path(tmp).replace(f)
+        seg["tts_duration"] = round(probe_duration(f), 3)
+        changed = True
+    if changed:
+        save_segments(segs, seg_path)
+
+
 def synthesize_narration(workdir, job):
     """Chunk the final script, synthesize it with the job's
     voice (the shared dub contracts), and return the spoken
@@ -275,6 +321,10 @@ def synthesize_narration(workdir, job):
         elevenlabs_tts.synthesize(
             workdir, elevenlabs_tts.voice_id_of(job["voice"]),
             voice_name=job.get("voice_name"))
+        # Build 228 (audit F4): the slider's rate, applied
+        # to the EL segments before their durations are
+        # read into the timeline below.
+        _apply_el_rate(workdir, job.get("voice_rate", 0))
     else:
         tts.synthesize(workdir, job["voice"],
                        rate=job.get("voice_rate", 0),
