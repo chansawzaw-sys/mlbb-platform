@@ -55,26 +55,32 @@ VOICE_NILAR = "my-MM-NilarNeural"
 # consumes.
 VOICE_STYLES = [
     {"key": "thiha", "label": "Thiha (မူလ)",
+     "roles": ["narration", "news"],
      "voice": VOICE_THIHA, "pitch": 0, "rate": 0,
      "name": "Thiha", "tag": "ပုံမှန်",
      "desc": "ယောက်ျား အသံ — မူလ လေသံ၊ ဇာတ်ကြောင်း ပြောရန် သင့်တော်"},
     {"key": "thiha-deep", "label": "Thiha အသံနက်",
+     "roles": ["narration", "horror"],
      "voice": VOICE_THIHA, "pitch": -8, "rate": 0,
      "name": "Thiha", "tag": "အသံနက်",
      "desc": "Thiha အသံကို နိမ့်နက်အောင် လုပ်ထားတာ — တည်ငြိမ်တဲ့ ဇာတ်ကြောင်း အတွက်"},
     {"key": "thiha-light", "label": "Thiha အသံပါး",
+     "roles": ["narration", "cheerful"],
      "voice": VOICE_THIHA, "pitch": 8, "rate": 0,
      "name": "Thiha", "tag": "အသံပါး",
      "desc": "Thiha အသံကို မြင့်ပေါ့အောင် လုပ်ထားတာ — ပေါ့ပါးတဲ့ အကြောင်းအရာ အတွက်"},
     {"key": "nilar", "label": "Nilar (မူလ)",
+     "roles": ["narration"],
      "voice": VOICE_NILAR, "pitch": 0, "rate": 0,
      "name": "Nilar", "tag": "ပုံမှန်",
      "desc": "မိန်းကလေး အသံ — မူလ လေသံ၊ ဇာတ်ကြောင်း ပြောရန် သင့်တော်"},
     {"key": "nilar-deep", "label": "Nilar အသံနက်",
+     "roles": ["narration", "horror"],
      "voice": VOICE_NILAR, "pitch": -8, "rate": 0,
      "name": "Nilar", "tag": "အသံနက်",
      "desc": "Nilar အသံကို နိမ့်နက်အောင် လုပ်ထားတာ — တည်ငြိမ်တဲ့ လေသံ အတွက်"},
     {"key": "nilar-high", "label": "Nilar အသံမြင့်",
+     "roles": ["cheerful", "kids"],
      "voice": VOICE_NILAR, "pitch": 8, "rate": 0,
      "name": "Nilar", "tag": "အသံမြင့်",
      "desc": "Nilar အသံကို မြင့်အောင် လုပ်ထားတာ — ရွှင်လန်းတဲ့ အကြောင်းအရာ အတွက်"},
@@ -113,9 +119,13 @@ def style_library():
     style, for the picker's library rows. The styles are pitch
     variants of the two my-MM voices — the descriptions say so
     honestly."""
+    # Build 229: each style also carries picker role tags
+    # (the shared role vocabulary in pipeline.gemini_tts).
     return [{"key": s["key"], "label": s["label"],
              "name": s.get("name", ""), "tag": s.get("tag", ""),
-             "desc": s.get("desc", "")} for s in VOICE_STYLES]
+             "desc": s.get("desc", ""),
+             "roles": list(s.get("roles") or ["narration"])}
+            for s in VOICE_STYLES]
 
 
 def synthesize_sample(text, style_key, out_path):

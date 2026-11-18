@@ -9,7 +9,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import burn, download, elevenlabs_tts, fx as fx_mod, retime, transcribe, translate_segments, tts
+from . import burn, download, elevenlabs_tts, fx as fx_mod, gemini_tts, retime, transcribe, translate_segments, tts
 from .common import maxrate_cap_k
 
 ALL_STEPS = ["download", "transcribe", "translate", "tts", "retime", "finalize"]
@@ -191,6 +191,16 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
         elevenlabs_tts.synthesize(
             workdir, elevenlabs_tts.voice_id_of(voice),
             voice_name=voice_name)
+    elif gemini_tts.is_gm_voice(voice):
+        # Build 229: a Gemini pick ("gm:<Name>") synthesizes
+        # through the Gemini key pool. Same loud-failure rule
+        # as premium: any failure raises and fails the job —
+        # never silently re-voiced. (voice_rate is 0 for
+        # engine picks in the video products, exactly like
+        # "el:"; the rate pass lives in the Story/Studio
+        # paths where the slider actually feeds it.)
+        gemini_tts.synthesize(
+            workdir, gemini_tts.voice_name_of(voice))
     else:
         tts.synthesize(workdir, voice, rate=voice_rate, pitch=voice_pitch)
     mark("tts", "done")

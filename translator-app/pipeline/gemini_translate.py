@@ -1,7 +1,8 @@
 """Gemini Flash translator — FIRST choice when a key is configured.
 
-Key handling (security): the key is read ONLY from the server-side env var
-GEMINI_API_KEY or from the git-ignored `.env` file in the project root.
+Key handling (security): keys come from the shared pool
+(pipeline.gemini_pool, build 229) — the server-side .env's
+GEMINI_API_KEYS list, or the legacy GEMINI_API_KEY as a pool of one.
 The user saves it via the app's own settings endpoint (behind the app
 login; see app.py) — it never travels through chat, is never returned in
 any API payload, and is never written to logs or segment files.
@@ -25,7 +26,7 @@ import re
 import time
 from pathlib import Path
 
-from . import tunnel
+from . import gemini_pool, tunnel
 from .common import PROJECT_ROOT
 
 DEFAULT_MODEL = "gemini-2.0-flash"
@@ -100,20 +101,16 @@ def _prompt_for(style):
 
 
 def get_api_key():
-    key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    if key:
-        return key
-    env_file = PROJECT_ROOT / ".env"
-    if env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line.startswith("GEMINI_API_KEY="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return ""
+    """The pool's first key (build 229: keys live in the
+    shared pool now — pipeline.gemini_pool; a lone
+    GEMINI_API_KEY still reads as a pool of one). Kept for
+    the callers that only need "a" key (diagnostics)."""
+    keys = gemini_pool.get_keys()
+    return keys[0] if keys else ""
 
 
 def key_configured():
-    return bool(get_api_key())
+    return gemini_pool.key_configured()
 
 
 def list_models():
@@ -129,8 +126,8 @@ def list_models():
     success."""
     import requests
 
-    key = get_api_key()
-    if not key:
+    keys = gemini_pool.ordered_keys()
+    if not keys:
         return [], "no GEMINI_API_KEY configured"
     url = "https://generativelanguage.googleapis.com/v1beta/models"
     last = ""
@@ -139,28 +136,42 @@ def list_models():
     # tunnel as generateContent when the tunnel is verified up.
     # Build 196: kwargs come from the one shared helper, like
     # every Gemini/OpenAI call site.
-    for use_query in (False, True):
-        try:
-            resp = requests.get(
-                url + (f"?key={key}" if use_query else ""),
-                **tunnel.request_kwargs(
-                    timeout=30,
-                    headers={} if use_query else
-                    {"x-goog-api-key": key}))
-        except Exception as e:
-            last = f"net:{e}"[:120]
-            continue
-        if resp.status_code == 200:
-            names = []
-            for m in resp.json().get("models") or []:
-                methods = m.get("supportedGenerationMethods") or []
-                if methods and "generateContent" not in methods:
-                    continue
-                name = str(m.get("name") or "").replace("models/", "")
-                if name:
-                    names.append(name)
-            return names, ""
-        last = f"{resp.status_code}: {resp.text[:150]}"
+    # Build 229: the listing walks the key POOL — a quota-dead
+    # or invalid key classifies, rotates, and the next key is
+    # tried (this is a diagnostic path; trying every key is
+    # the informative behaviour).
+    for key in keys:
+        for use_query in (False, True):
+            try:
+                resp = requests.get(
+                    url + (f"?key={key}" if use_query else ""),
+                    **tunnel.request_kwargs(
+                        timeout=30,
+                        headers={} if use_query else
+                        {"x-goog-api-key": key}))
+            except Exception as e:
+                last = f"net:{e}"[:120]
+                continue
+            if resp.status_code == 200:
+                names = []
+                for m in resp.json().get("models") or []:
+                    methods = m.get("supportedGenerationMethods") or []
+                    if methods and "generateContent" not in methods:
+                        continue
+                    name = str(m.get("name") or "").replace(
+                        "models/", "")
+                    if name:
+                        names.append(name)
+                return names, ""
+            last = f"{resp.status_code}: {resp.text[:150]}"
+            cls = gemini_pool.classify_error(resp.status_code,
+                                             resp.text)
+            if cls == "quota":
+                gemini_pool.mark_cooling(key)
+                break
+            if cls == "invalid":
+                gemini_pool.mark_disabled(key)
+                break
     return [], last
 
 
@@ -265,43 +276,32 @@ def _validated_result(text_out, segments, name):
     return result
 
 
-def translate_all(segments, style="subs"):
-    """segments: list of dicts with 'text'. Returns {index: burmese_text}.
+def _walk(key, body, validate):
+    """ONE key's full model/version/auth walk (the builds
+    163/197 semantics, shared by translate_all and
+    generate_text since build 229): returns (result,
+    attempts, fail_class). validate(text_out) parses one
+    reply or raises — a raise is a bad-format reply: the
+    walk moves to the next MODEL (retrying the same model
+    under another version or auth shape would return the
+    same text). HTTP errors never short-circuit the auth
+    loop (build 197: a model/version whose header attempt
+    404s may still answer to query-param auth).
 
-    style: "subs" = faithful + idiomatic (subtitle jobs);
-    "dub" = storytelling narration (anything that will be spoken).
-
-    Raises on ANY problem (no key, HTTP error, quota, bad/invalid JSON) so
-    the caller can fall back to the free provider chain.
-    """
+    fail_class is the pool's verdict on this key — "quota",
+    "invalid" or None (build 229). An "invalid" seen on any
+    attempt wins over "quota": the key itself is dead,
+    whatever else happened."""
     import requests
 
-    key = get_api_key()
-    if not key:
-        raise RuntimeError("no GEMINI_API_KEY configured")
-    # Build 189: direct Gemini is location-blocked from this
-    # server, so when the owner's VPN tunnel is verified up the
-    # calls leave through it (per-call `proxies`, nothing global;
-    # None — requests' default — whenever the tunnel is down).
-    # Build 196: the kwargs of every attempt come from the one
-    # shared helper (tunnel.request_kwargs), as at every other
-    # Gemini/OpenAI call site.
-    model = os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
-    payload_in = [{"id": i, "text": (s.get("text") or "").strip()}
-                  for i, s in enumerate(segments)]
-    body = {
-        "contents": [{"parts": [{"text": _prompt_for(style).replace(
-            "__SEGMENTS_JSON__", json.dumps(payload_in, ensure_ascii=False))}]}],
-        "generationConfig": {"responseMimeType": "application/json",
-                             "temperature": 0.3},
-    }
-    result = None
     attempts = []
+    fail_class = None
 
     def _clean(text):
-        # Diagnostic snippets must never carry the key: an error
-        # body shouldn't contain it, but a network exception for a
-        # query-auth attempt can embed the full ?key= URL.
+        # Diagnostic snippets must never carry the key: an
+        # error body shouldn't contain it, but a network
+        # exception for a query-auth attempt can embed the
+        # full ?key= URL.
         s = str(text or "")
         if key:
             s = s.replace(key, "***")
@@ -327,44 +327,85 @@ def translate_all(segments, style="subs"):
                         f"{mdl}@{ver}[{auth}]=net: {_clean(e)[:120]}")
                     continue
                 if resp.status_code == 200:
-                    # Build 163: validate NOW, inside the walk —
-                    # a bad-shape reply moves to the next MODEL
-                    # (retrying this model under another version
-                    # or auth shape would return the same text).
+                    # Validate NOW, inside the walk (build
+                    # 163): a bad-shape reply moves to the
+                    # next MODEL.
                     try:
                         text_out = resp.json()["candidates"][0][
                             "content"]["parts"][0]["text"]
-                        result = _validated_result(
-                            text_out, segments, "Gemini")
+                        return validate(text_out), attempts, None
                     except Exception as e:
                         attempts.append(
                             f"{mdl}@{ver}[{auth}]=badformat: "
                             f"{_clean(e)[:120]}")
                         badfmt = True
                     break
-                # Build 197: record EVERY attempt with its own
-                # body snippet — the FIRST attempt's body (e.g.
-                # gemini-2.5-flash@v1beta) is the discriminating
-                # one, and the old code kept only the last. And
-                # NEVER short-circuit the auth loop on an HTTP
-                # error (the old code broke out on 400/404): a
-                # model/version whose header attempt 404s may
-                # still answer to query-param auth, so both
-                # shapes are tried before moving on. (401/403 on
-                # the header shape already fell through to query
-                # auth; that is now simply the general rule.)
+                cls = gemini_pool.classify_error(resp.status_code,
+                                                 resp.text)
+                if cls == "invalid":
+                    fail_class = "invalid"
+                elif cls == "quota" and fail_class is None:
+                    fail_class = "quota"
+                # Record EVERY attempt with its own body
+                # snippet (build 197).
                 attempts.append(
                     f"{mdl}@{ver}[{auth}]={resp.status_code}: "
                     f"{_clean(resp.text)[:120]}")
-            if result is not None or badfmt:
+            if badfmt:
                 break
+    return None, attempts, fail_class
+
+
+def _run_pool(body, validate, what):
+    """Run one request body across the key pool (build 229):
+    a quota failure cools that key down and retries with
+    the next; an invalid failure disables that key for good
+    and retries with the next; any OTHER failure keeps the
+    pre-229 behaviour — stop at once and let the caller
+    fall back to the other engines. Raises RuntimeError
+    when no key produces a result. Build 189's tunnel rule
+    is unchanged: every attempt's kwargs come from
+    tunnel.request_kwargs via _walk."""
+    keys = gemini_pool.ordered_keys()
+    if not keys:
+        raise RuntimeError("no GEMINI_API_KEY configured")
+    all_attempts = []
+    for key in keys:
+        result, attempts, fail_class = _walk(key, body, validate)
+        all_attempts += attempts
         if result is not None:
-            break
-    if result is None:
-        msg = "Gemini failed: " + "; ".join(attempts)
-        _note_error(msg)
-        raise RuntimeError(msg)
-    return result
+            return result
+        if fail_class == "quota":
+            gemini_pool.mark_cooling(key)
+            continue
+        if fail_class == "invalid":
+            gemini_pool.mark_disabled(key)
+            continue
+        break
+    msg = f"Gemini {what}failed: " + "; ".join(all_attempts)
+    _note_error(msg)
+    raise RuntimeError(msg)
+
+
+def translate_all(segments, style="subs"):
+    """segments: list of dicts with 'text'. Returns {index: burmese_text}.
+
+    style: "subs" = faithful + idiomatic (subtitle jobs);
+    "dub" = storytelling narration (anything that will be spoken).
+
+    Raises on ANY problem (no key, HTTP error, quota, bad/invalid JSON) so
+    the caller can fall back to the free provider chain.
+    """
+    payload_in = [{"id": i, "text": (s.get("text") or "").strip()}
+                  for i, s in enumerate(segments)]
+    body = {
+        "contents": [{"parts": [{"text": _prompt_for(style).replace(
+            "__SEGMENTS_JSON__", json.dumps(payload_in, ensure_ascii=False))}]}],
+        "generationConfig": {"responseMimeType": "application/json",
+                             "temperature": 0.3},
+    }
+    return _run_pool(
+        body, lambda t: _validated_result(t, segments, "Gemini"), "")
 
 
 def generate_text(prompt):
@@ -375,68 +416,18 @@ def generate_text(prompt):
     out — no JSON mime type, no array validation. Returns the
     model's raw text. Raises on ANY problem so the caller can
     fall back."""
-    import requests
-
-    key = get_api_key()
-    if not key:
-        raise RuntimeError("no GEMINI_API_KEY configured")
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.7},
     }
-    result = None
-    attempts = []
 
-    def _clean(text):
-        s = str(text or "")
-        if key:
-            s = s.replace(key, "***")
-        return s
+    def _validate(text_out):
+        if not (text_out or "").strip():
+            raise ValueError("empty generation")
+        return text_out
 
-    for mdl in _models():
-        badfmt = False
-        for ver in ("v1beta", "v1"):
-            url = _API_TMPL.format(ver=ver, model=mdl)
-            for use_query in (False, True):
-                auth = "query" if use_query else "header"
-                try:
-                    resp = requests.post(
-                        url + (f"?key={key}" if use_query else ""),
-                        **tunnel.request_kwargs(
-                            json=body, timeout=120,
-                            headers={**({} if use_query else
-                                        {"x-goog-api-key": key}),
-                                     "Content-Type":
-                                         "application/json"}))
-                except Exception as e:  # network-level: next shape
-                    attempts.append(
-                        f"{mdl}@{ver}[{auth}]=net: {_clean(e)[:120]}")
-                    continue
-                if resp.status_code == 200:
-                    try:
-                        text_out = resp.json()["candidates"][0][
-                            "content"]["parts"][0]["text"]
-                        if not (text_out or "").strip():
-                            raise ValueError("empty generation")
-                        result = text_out
-                    except Exception as e:
-                        attempts.append(
-                            f"{mdl}@{ver}[{auth}]=badformat: "
-                            f"{_clean(e)[:120]}")
-                        badfmt = True
-                    break
-                attempts.append(
-                    f"{mdl}@{ver}[{auth}]={resp.status_code}: "
-                    f"{_clean(resp.text)[:120]}")
-            if result is not None or badfmt:
-                break
-        if result is not None:
-            break
-    if result is None:
-        msg = "Gemini generation failed: " + "; ".join(attempts)
-        _note_error(msg)
-        raise RuntimeError(msg)
-    return result
+    return _run_pool(body, _validate, "generation ")
+
 
 
 if __name__ == "__main__":

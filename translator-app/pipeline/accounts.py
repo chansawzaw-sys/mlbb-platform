@@ -87,6 +87,12 @@ CREATE TABLE IF NOT EXISTS cover_series (
   updated_at REAL NOT NULL,
   PRIMARY KEY (user_id, name_key)
 );
+CREATE TABLE IF NOT EXISTS voice_favs (
+  user_id INTEGER NOT NULL,
+  voice_id TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  PRIMARY KEY (user_id, voice_id)
+);
 """
 
 
@@ -908,6 +914,40 @@ def delete_clone(user_id, voice_id):
             "DELETE FROM clones WHERE user_id = ? AND voice_id = ?",
             (int(user_id), str(voice_id)))
     return cur.rowcount == 1
+
+
+# ---------------- voice favourites (build 229) ----------------
+# A signed-in user can star any voice in the picker (built-in
+# styles, ElevenLabs registry voices, their own clones,
+# Gemini voices). The rows are keyed by user_id and read ONLY
+# for that user — one account's stars are never visible to
+# another. voice_id is the picker's own id vocabulary (a
+# style key, "el:<voice_id>", "gm:<Name>").
+
+def fav_voices(user_id):
+    """The account's starred voice ids, in starring order."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT voice_id FROM voice_favs WHERE user_id = ? "
+            "ORDER BY created_at, voice_id",
+            (int(user_id),)).fetchall()
+    return [r["voice_id"] for r in rows]
+
+
+def add_fav(user_id, voice_id):
+    with _LOCK, _db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO voice_favs "
+            "(user_id, voice_id, created_at) VALUES (?, ?, ?)",
+            (int(user_id), str(voice_id), time.time()))
+
+
+def remove_fav(user_id, voice_id):
+    with _LOCK, _db() as conn:
+        conn.execute(
+            "DELETE FROM voice_favs WHERE user_id = ? "
+            "AND voice_id = ?",
+            (int(user_id), str(voice_id)))
 
 
 # ---------------- cover series (build 223) ----------------

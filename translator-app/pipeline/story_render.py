@@ -70,7 +70,7 @@ import math
 import re
 from pathlib import Path
 
-from . import burn, elevenlabs_tts, recap as recap_mod, tts
+from . import burn, elevenlabs_tts, gemini_tts, recap as recap_mod, tts
 from . import story as story_mod
 from .common import (PROJECT_ROOT, encode_threads, load_segments,
                      maxrate_cap_k, probe_duration, run,
@@ -325,6 +325,14 @@ def synthesize_narration(workdir, job):
         # to the EL segments before their durations are
         # read into the timeline below.
         _apply_el_rate(workdir, job.get("voice_rate", 0))
+    elif gemini_tts.is_gm_voice(job.get("voice")):
+        # Build 229: a Gemini pick synthesizes through the
+        # key pool; the slider's rate rides INSIDE the call
+        # (the same atempo pattern, applied by the engine —
+        # the Gemini API has no rate parameter).
+        gemini_tts.synthesize(
+            workdir, gemini_tts.voice_name_of(job["voice"]),
+            rate=job.get("voice_rate", 0))
     else:
         tts.synthesize(workdir, job["voice"],
                        rate=job.get("voice_rate", 0),

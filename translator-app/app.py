@@ -33,6 +33,8 @@ from pipeline import accounts
 from pipeline import download as dl_mod
 from pipeline import elevenlabs_tts
 from pipeline import envfile
+from pipeline import gemini_pool
+from pipeline import gemini_tts
 from pipeline import fx as fx_mod
 from pipeline import commentary as commentary_mod
 from pipeline import recap as recap_mod
@@ -57,7 +59,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 228"
+BUILD_TAG = "build 229"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1515,6 +1517,24 @@ def _tg_voice_step(chat_id, flow):
         for c in accounts.clones_for(acct["id"]):
             rows.append([(f"🎙 {c['name']} ({rate} credits/မိနစ်)",
                           "e:" + c["voice_id"])])
+    # Build 229: the Gemini voices join the step too (empty
+    # unless a Gemini key is configured), two per row like the
+    # built-ins; the callback "gm:<Name>" stores the same
+    # "gm:<Name>" pick the web wizard sends. The rate suffix
+    # only shows when the owner raised the Gemini rate above
+    # the default 1.
+    gm_entries = gemini_tts.picker_entries()
+    gm_rate = gemini_tts.credits_per_min()
+    for i in range(0, len(gm_entries), 2):
+        row = []
+        for e in gm_entries[i:i + 2]:
+            label = "✨ " + e["label"]
+            if e.get("tag"):
+                label += " · " + e["tag"]
+            if gm_rate != 1:
+                label += f" ({gm_rate} credits/မိနစ်)"
+            row.append((label, "gm:" + e["name"]))
+        rows.append(row)
     tg.send_message(chat_id, "အသံ ရွေးပေးပါ", buttons=rows)
 
 
@@ -1616,6 +1636,10 @@ def _tg_start_flow_job(chat_id, flow):
             # admin-set per-minute rate — the same quote math as
             # the web surface.
             need *= elevenlabs_tts.credits_per_min()
+        if gemini_tts.is_gm_voice(flow.get("voice_style")):
+            # Build 229: a Gemini pick bills the Gemini rate
+            # (default 1 — a no-op until the owner raises it).
+            need *= gemini_tts.credits_per_min()
         if (acct["credits"] or 0) < need:
             _TG_FLOW.pop(chat_id, None)
             tg.send_message(chat_id,
@@ -1890,6 +1914,16 @@ def _on_tg_callback(cq):
         flow["voice_style"] = "el:" + entry["id"]
         _tg_speed_step(chat_id, flow)
         return
+    if data.startswith("gm:") and flow.get("step") == "voice":
+        # Build 229: a Gemini tap. The voice must still be in
+        # the 30-voice table — a stale tap is ignored, never
+        # substituted with another voice (the EL rule).
+        entry = gemini_tts.find_voice(data[3:])
+        if not entry:
+            return
+        flow["voice_style"] = "gm:" + entry["name"]
+        _tg_speed_step(chat_id, flow)
+        return
     if data.startswith("s:") and flow.get("step") == "speed":
         try:
             speed = float(data[2:])
@@ -2064,9 +2098,21 @@ def _credits_per_min_for(job):
         # ElevenLabs voices.
         if elevenlabs_tts.is_el_voice(job.get("voice")):
             return elevenlabs_tts.credits_per_min() + 1
+        # Build 229: a Gemini voice bills the commentary
+        # standard rate × the Gemini rate (the amendment's
+        # rule — at the default Gemini rate of 1 this is
+        # exactly the standard commentary rate).
+        if gemini_tts.is_gm_voice(job.get("voice")):
+            return _commentary_credits_per_min() \
+                * gemini_tts.credits_per_min()
         return _commentary_credits_per_min()
     if elevenlabs_tts.is_el_voice(job.get("voice")):
         return elevenlabs_tts.credits_per_min()
+    # Build 229: Gemini voices bill the GEMINI_CREDITS_PER_MIN
+    # setting (default 1) — read live at charge time, so the
+    # owner's price change needs no rebuild.
+    if gemini_tts.is_gm_voice(job.get("voice")):
+        return gemini_tts.credits_per_min()
     return 1
 
 
@@ -2354,6 +2400,7 @@ def _mine_entries(user):
              "name": c["name"], "tag": "Clone",
              "desc": "ကိုယ်ပိုင် clone အသံ",
              "preview": elevenlabs_tts.preview_url_usr(c["voice_id"]),
+             "roles": ["narration"],
              "premium": True, "rate": rate}
             for c in accounts.clones_for(user["id"])]
 
@@ -2372,6 +2419,7 @@ def voices():
     # std-<key>.mp3 and are generated lazily on first request.
     out = [{"id": s["key"], "label": s["label"], "name": s["name"],
             "tag": s["tag"], "desc": s["desc"],
+            "roles": s.get("roles") or ["narration"],
             "preview": f"/voice-previews/std-{s['key']}.mp3"}
            for s in tts.style_library()]
     # Build 205: ElevenLabs premium voices join the picker ONLY
@@ -2383,6 +2431,10 @@ def voices():
     # receive the premium entries; everyone else (including
     # logged-out page loads) gets exactly the standard list.
     out += elevenlabs_tts.picker_entries(_current_user())
+    # Build 229: Gemini voices join whenever a Gemini key is
+    # configured (their picker_entries() is empty otherwise) —
+    # standard-rate entries with role tags, in the same list.
+    out += gemini_tts.picker_entries()
     # Build 208: the payload is an object. "voices" is the
     # catalogue above (built-ins + gate-filtered registry
     # voices — the picker's Ready-made tab). "mine" is the
@@ -2390,8 +2442,37 @@ def voices():
     # Voice Clone store is live, so "mine" now reads the
     # caller's real clone rows (still [] for logged-out
     # callers and while ElevenLabs is unconfigured).
+    # Build 229: "favs" is the CALLER's own starred voice ids
+    # (per-account — never another user's; [] logged out).
+    me = _current_user()
+    favs = accounts.fav_voices(me["id"]) if me and me.get("id") \
+        else []
     return jsonify({"voices": out,
-                    "mine": _mine_entries(_current_user())})
+                    "mine": _mine_entries(_current_user()),
+                    "favs": favs})
+
+
+@app.post("/api/voices/fav")
+def voice_fav():
+    """Star/unstar a picker voice for the CALLER (build 229).
+    Login required; the row is keyed by the caller's user id,
+    so favourites are strictly per-account. The voice id is
+    the picker's own vocabulary (style key / "el:<id>" /
+    "gm:<Name>") — it is stored as-is and only ever read back
+    for the same account."""
+    user = _current_user()
+    if not user or not user.get("id"):
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    voice_id = str(data.get("voice_id") or "").strip()
+    if not voice_id or len(voice_id) > 80:
+        return jsonify({"error": "voice_id မမှန်ပါ"}), 400
+    if data.get("on"):
+        accounts.add_fav(user["id"], voice_id)
+    else:
+        accounts.remove_fav(user["id"], voice_id)
+    return jsonify({"ok": True,
+                    "favs": accounts.fav_voices(user["id"])})
 
 
 _STD_PREVIEW_LOCK = threading.Lock()
@@ -2452,6 +2533,31 @@ def _ensure_el_preview(voice_id):
     return path if path.exists() else None
 
 
+_GM_PREVIEW_LOCK = threading.Lock()
+
+
+def _ensure_gm_preview(vname):
+    """Lazily synthesize a Gemini voice's preview clip ONCE
+    (build 229) — the same first-play pattern as the std-/el-
+    clips, and for the same reason: 30 voices are never
+    bulk-generated (free-tier quota). Only names in the
+    30-voice table ever generate (an unknown name is a plain
+    404 and never costs an API call). Returns the path, or
+    None when generation failed (no key / every key down) —
+    the caller then serves the same plain 404 as a missing
+    clip, and a later request may retry."""
+    path = gemini_tts.preview_path_gm(vname)
+    if path.exists():
+        return path
+    if not gemini_tts.find_voice(vname):
+        return None
+    with _GM_PREVIEW_LOCK:
+        if path.exists():
+            return path
+        gemini_tts.generate_preview(vname)
+    return path if path.exists() else None
+
+
 @app.get("/voice-previews/<name>")
 def voice_preview_file(name):
     """Serve a voice-library preview clip (build 207). Strict
@@ -2461,7 +2567,7 @@ def voice_preview_file(name):
     request; registry el- clips do too since build 214 (the
     bulk import never generates); usr- clips exist only if
     one was generated, so a missing file is a plain 404."""
-    if not re.fullmatch(r"(?:el|std|usr)-[A-Za-z0-9_-]{1,64}\.mp3",
+    if not re.fullmatch(r"(?:el|std|usr|gm)-[A-Za-z0-9_-]{1,64}\.mp3",
                         name or ""):
         return jsonify({"error": "မရှိပါ"}), 404
     path = elevenlabs_tts.PREVIEW_DIR / name
@@ -2469,6 +2575,8 @@ def voice_preview_file(name):
         _ensure_std_preview(name[4:-4])
     elif not path.exists() and name.startswith("el-"):
         _ensure_el_preview(name[3:-4])
+    elif not path.exists() and name.startswith("gm-"):
+        _ensure_gm_preview(name[3:-4])
     if not path.exists():
         return jsonify({"error": "မရှိပါ"}), 404
     return send_file(path, mimetype="audio/mpeg")
@@ -3142,29 +3250,71 @@ def fonts():
 
 @app.get("/api/settings/gemini-key")
 def gemini_key_status():
-    from pipeline import gemini_translate
-    return jsonify({"configured": gemini_translate.key_configured()})
+    # Build 229: the status reports COUNTS only (pool size,
+    # disabled keys, the voice rate) — key values are never
+    # returned, exactly as before.
+    return jsonify({
+        "configured": gemini_pool.key_configured(),
+        "count": gemini_pool.key_count(),
+        "disabled": gemini_pool.disabled_count(),
+        "credits_per_min": gemini_tts.credits_per_min()})
 
 
 @app.post("/api/settings/gemini-key")
 def gemini_key_save():
+    # Build 229: the card saves a POOL — up to 30 keys, bulk
+    # paste one per line (a one-line paste is a pool of one,
+    # the pre-229 behaviour). Both Gemini key formats are
+    # valid: legacy "AIza…" keys and the "AQ.…" auth keys AI
+    # Studio has issued since May 2026 (~53 chars) — the
+    # format rule lives in gemini_pool.parse_keys. The pool
+    # replaces the old value wholesale (the card's standing
+    # rule) and clears any disabled marks: a fresh paste is
+    # a fresh start.
     data = request.get_json(force=True) or {}
-    key = (data.get("key") or "").strip()
-    # Both Gemini key formats are valid: legacy "AIza…" keys and the
-    # "AQ.…" auth keys AI Studio has issued since May 2026 (~53 chars).
-    ok_format = (key.startswith("AIza") or key.startswith("AQ.")) \
-        and 20 <= len(key) <= 80 \
-        and all(ch.isalnum() or ch in "._-" for ch in key)
-    if not ok_format:
-        return jsonify({"error": "key မမှန်ပါ — Gemini key (AQ. သို့ AIza နဲ့ စတာ) ဖြစ်ရပါမယ်"}), 400
-    _env_write("GEMINI_API_KEY", key)
-    return jsonify({"ok": True, "configured": True})
+    raw = data.get("keys") if "keys" in data else data.get("key")
+    keys, err = gemini_pool.parse_keys(raw)
+    if err:
+        return jsonify({"error": err}), 400
+    _env_write("GEMINI_API_KEYS", ",".join(keys))
+    _env_remove("GEMINI_API_KEY")
+    gemini_pool.reset_disabled()
+    return jsonify({"ok": True, "configured": True,
+                    "count": len(keys), "disabled": 0,
+                    "credits_per_min": gemini_tts.credits_per_min()})
 
 
 @app.delete("/api/settings/gemini-key")
 def gemini_key_delete():
+    _env_remove("GEMINI_API_KEYS")
     _env_remove("GEMINI_API_KEY")
-    return jsonify({"ok": True, "configured": False})
+    gemini_pool.reset_disabled()
+    return jsonify({"ok": True, "configured": False,
+                    "count": 0, "disabled": 0})
+
+
+@app.post("/api/settings/gemini")
+def gemini_save():
+    """Gemini voice settings (build 229) — partial saves in
+    the elevenlabs_save pattern: each PRESENT field is
+    validated then written. Today: the per-minute credit
+    rate for Gemini voices (GEMINI_CREDITS_PER_MIN)."""
+    data = request.get_json(force=True) or {}
+    writes = {}
+    if "credits_per_min" in data:
+        try:
+            rate = int(data["credits_per_min"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "credit နှုန်း မမှန်ပါ"}), 400
+        if not 1 <= rate <= 100:
+            return jsonify({"error": "credit နှုန်း 1–100 အတွင်း ဖြစ်ရပါမယ်"}), 400
+        writes["GEMINI_CREDITS_PER_MIN"] = str(rate)
+    if not writes:
+        return jsonify({"error": "သိမ်းစရာ ဆက်တင် မပါပါ"}), 400
+    for k, v in writes.items():
+        _env_write(k, v)
+    return jsonify({"ok": True,
+                    "credits_per_min": gemini_tts.credits_per_min()})
 
 
 # ---------- OpenAI key (server-side only, same rules as Gemini) ----------
@@ -5006,6 +5156,7 @@ def _new_job(data, user=None):
     # (tts.DEFAULT_VOICE, မူလ variant, knobs applying).
     style_in = data.get("voice_style") or data.get("voice")
     el_entry = None
+    gm_entry = None
     if style_in and elevenlabs_tts.is_el_voice(str(style_in).strip()):
         # Build 205: an ElevenLabs premium pick ("el:<voice_id>").
         # It must still resolve for this caller — a removed
@@ -5031,6 +5182,20 @@ def _new_job(data, user=None):
                           "သုံးလို့ရပါသေးတယ် — မကြာခင် အားလုံး "
                           "အတွက် ဖွင့်ပေးပါမယ်")
         voice = "el:" + el_entry["id"]
+        voice_style = voice
+        voice_rate, voice_pitch = 0, 0
+    elif style_in and gemini_tts.is_gm_voice(str(style_in).strip()):
+        # Build 229: a Gemini pick ("gm:<Name>"). It must
+        # resolve against the 30-voice table — an unknown
+        # name refuses the job HERE, and it NEVER falls back
+        # to an edge-tts style: the customer picked THIS
+        # voice. No access gate (a standard-rate group).
+        gm_entry = gemini_tts.find_voice(
+            gemini_tts.voice_name_of(str(style_in).strip()))
+        if gm_entry is None:
+            return None, ("ရွေးထားတဲ့ Gemini အသံ မရှိတော့ပါ — "
+                          "အသံ ပြန်ရွေးပေးပါ")
+        voice = "gm:" + gm_entry["name"]
         voice_style = voice
         voice_rate, voice_pitch = 0, 0
     elif style_in and str(style_in).strip() in tts.STYLE_BY_KEY:
@@ -5099,6 +5264,12 @@ def _new_job(data, user=None):
         # per segment at synthesis time).
         job["tts_engine"] = "elevenlabs"
         job["voice_name"] = el_entry["name"]
+    if gm_entry is not None:
+        # Build 229: record the Gemini engine + display name
+        # on the job (the segments record the same facts at
+        # synthesis time).
+        job["tts_engine"] = "gemini"
+        job["voice_name"] = gm_entry["name"]
     return job, None
 
 
@@ -5642,6 +5813,13 @@ def _run_tts_job(job, text, speed):
         elevenlabs_tts.synthesize(
             workdir, elevenlabs_tts.voice_id_of(job["voice"]),
             voice_name=job.get("voice_name"))
+    elif job.get("tts_engine") == "gemini":
+        # Build 229: a Gemini pick synthesizes through the
+        # key pool at natural speed — the studio speed is
+        # applied ONCE on the assembled audio below, for
+        # every engine (the build-215 rule).
+        gemini_tts.synthesize(
+            workdir, gemini_tts.voice_name_of(job["voice"]))
     else:
         style = tts.resolve_style(job["voice_style"])
         # Build 215: the studio speed is applied ONCE, on the
@@ -5680,8 +5858,14 @@ def _run_tts_job(job, text, speed):
     job["duration"] = round(dur, 3)
     job["output_size"] = out.stat().st_size
     minutes = max(1, math.ceil(dur / 60.0))
-    rate = elevenlabs_tts.credits_per_min() \
-        if job.get("tts_engine") == "elevenlabs" else 1
+    if job.get("tts_engine") == "elevenlabs":
+        rate = elevenlabs_tts.credits_per_min()
+    elif job.get("tts_engine") == "gemini":
+        # Build 229: the Gemini rate, read live at charge
+        # time (GEMINI_CREDITS_PER_MIN, default 1).
+        rate = gemini_tts.credits_per_min()
+    else:
+        rate = 1
     job["quote_minutes"] = minutes
     job["quote_credits"] = minutes * rate
     _tts_charge(job, minutes * rate)
@@ -5717,6 +5901,7 @@ def create_tts():
     # product default style.
     voice_in = data.get("voice")
     el_entry = None
+    gm_entry = None
     if voice_in and elevenlabs_tts.is_el_voice(str(voice_in).strip()):
         el_entry, el_blocked = _resolve_el_entry(
             user, elevenlabs_tts.voice_id_of(str(voice_in).strip()))
@@ -5734,6 +5919,19 @@ def create_tts():
         voice_style = voice
         voice_label = el_entry["name"]
         rate = elevenlabs_tts.credits_per_min()
+    elif voice_in and gemini_tts.is_gm_voice(str(voice_in).strip()):
+        # Build 229: a Gemini pick — the GEMINI_CREDITS_PER_MIN
+        # rate (default 1), read live like the premium rate.
+        gm_entry = gemini_tts.find_voice(
+            gemini_tts.voice_name_of(str(voice_in).strip()))
+        if gm_entry is None:
+            return jsonify({"error":
+                            "ရွေးထားတဲ့ Gemini အသံ မရှိတော့ပါ — "
+                            "အသံ ပြန်ရွေးပေးပါ"}), 400
+        voice = "gm:" + gm_entry["name"]
+        voice_style = voice
+        voice_label = gm_entry["name"]
+        rate = gemini_tts.credits_per_min()
     else:
         style = tts.resolve_style(voice_in)
         voice = style["voice"]
@@ -5768,6 +5966,9 @@ def create_tts():
     if el_entry is not None:
         job["tts_engine"] = "elevenlabs"
         job["voice_name"] = el_entry["name"]
+    if gm_entry is not None:
+        job["tts_engine"] = "gemini"
+        job["voice_name"] = gm_entry["name"]
     JOBS[job["id"]] = job
     _save(job)
     try:
@@ -5957,6 +6158,7 @@ def create_recap():
     # style.
     voice_in = data.get("voice")
     el_entry = None
+    gm_entry = None
     if voice_in and elevenlabs_tts.is_el_voice(str(voice_in).strip()):
         el_entry, el_blocked = _resolve_el_entry(
             user, elevenlabs_tts.voice_id_of(str(voice_in).strip()))
@@ -5973,6 +6175,20 @@ def create_recap():
         voice = "el:" + el_entry["id"]
         voice_style = voice
         voice_label = el_entry["name"]
+        voice_rate, voice_pitch = 0, 0
+    elif voice_in and gemini_tts.is_gm_voice(str(voice_in).strip()):
+        # Build 229: a Gemini pick ("gm:<Name>") — resolves
+        # against the 30-voice table; no gate (a standard-rate
+        # group, open once a key is configured).
+        gm_entry = gemini_tts.find_voice(
+            gemini_tts.voice_name_of(str(voice_in).strip()))
+        if gm_entry is None:
+            return jsonify({"error":
+                            "ရွေးထားတဲ့ Gemini အသံ မရှိတော့ပါ — "
+                            "အသံ ပြန်ရွေးပေးပါ"}), 400
+        voice = "gm:" + gm_entry["name"]
+        voice_style = voice
+        voice_label = gm_entry["name"]
         voice_rate, voice_pitch = 0, 0
     else:
         style = tts.resolve_style(voice_in)
@@ -6012,6 +6228,9 @@ def create_recap():
     if el_entry is not None:
         job["tts_engine"] = "elevenlabs"
         job["voice_name"] = el_entry["name"]
+    if gm_entry is not None:
+        job["tts_engine"] = "gemini"
+        job["voice_name"] = gm_entry["name"]
     if user:
         # Same admission gates as a dub job, in the same order:
         # one-time setup, then the daily limit — both refuse
@@ -6331,6 +6550,7 @@ def create_story():
     # table; anything else fails safe to the product default.
     voice_in = data.get("voice")
     el_entry = None
+    gm_entry = None
     if voice_in and elevenlabs_tts.is_el_voice(str(voice_in).strip()):
         el_entry, el_blocked = _resolve_el_entry(
             user, elevenlabs_tts.voice_id_of(str(voice_in).strip()))
@@ -6354,6 +6574,21 @@ def create_story():
         # conversion the Studio uses for both engines).
         # Before 228 this branch zeroed it, so the slider
         # was a dead control whenever an EL voice was picked.
+        voice_rate, voice_pitch = story_rate, 0
+    elif voice_in and gemini_tts.is_gm_voice(str(voice_in).strip()):
+        # Build 229: a Gemini pick — and the speed slider
+        # applies to it exactly like the EL branch above
+        # (build 228): stored as voice_rate, applied by the
+        # renderer as an atempo pass.
+        gm_entry = gemini_tts.find_voice(
+            gemini_tts.voice_name_of(str(voice_in).strip()))
+        if gm_entry is None:
+            return jsonify({"error":
+                            "ရွေးထားတဲ့ Gemini အသံ မရှိတော့ပါ — "
+                            "အသံ ပြန်ရွေးပေးပါ"}), 400
+        voice = "gm:" + gm_entry["name"]
+        voice_style = voice
+        voice_label = gm_entry["name"]
         voice_rate, voice_pitch = story_rate, 0
     else:
         style = tts.resolve_style(voice_in)
@@ -6385,6 +6620,9 @@ def create_story():
     if el_entry is not None:
         job["tts_engine"] = "elevenlabs"
         job["voice_name"] = el_entry["name"]
+    if gm_entry is not None:
+        job["tts_engine"] = "gemini"
+        job["voice_name"] = gm_entry["name"]
     if user:
         # Same admission gates as a recap job, in the same
         # order — both refuse before the job exists.
@@ -6677,6 +6915,7 @@ def create_commentary():
     # else fails safe to the product default style.
     voice_in = data.get("voice")
     el_entry = None
+    gm_entry = None
     if voice_in and elevenlabs_tts.is_el_voice(str(voice_in).strip()):
         el_entry, el_blocked = _resolve_el_entry(
             user, elevenlabs_tts.voice_id_of(str(voice_in).strip()))
@@ -6693,6 +6932,20 @@ def create_commentary():
         voice = "el:" + el_entry["id"]
         voice_style = voice
         voice_label = el_entry["name"]
+        voice_rate, voice_pitch = 0, 0
+    elif voice_in and gemini_tts.is_gm_voice(str(voice_in).strip()):
+        # Build 229: a Gemini pick ("gm:<Name>") — resolves
+        # against the 30-voice table; no gate (a standard-rate
+        # group, open once a key is configured).
+        gm_entry = gemini_tts.find_voice(
+            gemini_tts.voice_name_of(str(voice_in).strip()))
+        if gm_entry is None:
+            return jsonify({"error":
+                            "ရွေးထားတဲ့ Gemini အသံ မရှိတော့ပါ — "
+                            "အသံ ပြန်ရွေးပေးပါ"}), 400
+        voice = "gm:" + gm_entry["name"]
+        voice_style = voice
+        voice_label = gm_entry["name"]
         voice_rate, voice_pitch = 0, 0
     else:
         style = tts.resolve_style(voice_in)
@@ -6734,6 +6987,9 @@ def create_commentary():
     if el_entry is not None:
         job["tts_engine"] = "elevenlabs"
         job["voice_name"] = el_entry["name"]
+    if gm_entry is not None:
+        job["tts_engine"] = "gemini"
+        job["voice_name"] = gm_entry["name"]
     if user:
         # Same admission gates as a recap job, in the same
         # order — both refuse before the job exists.

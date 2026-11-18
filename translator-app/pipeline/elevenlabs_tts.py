@@ -271,6 +271,37 @@ def voice_id_of(value):
     return str(value)[len(EL_PREFIX):]
 
 
+# ---------- Picker role tags (build 229) ----------
+# The picker's role filter chips use one shared vocabulary
+# (narration / horror / sports / news / cheerful / kids).
+# Registry voices carry free-text tag/desc, so their roles
+# are mapped from those words where obvious — a voice whose
+# text mentions horror/sports/news/kids/cheer joins that
+# filter; every registry voice is at least a narration
+# voice (that is what the library is for).
+_EL_ROLE_WORDS = (
+    ("horror", ("ကြောက်", "သရဲ", "horror", "scary", "ghost",
+                "dark", "မှောင်", "ခြောက်ခြား")),
+    ("sports", ("အားကစား", "sport", "ဘောလုံး", "football")),
+    ("news", ("သတင်း", "news")),
+    ("kids", ("ကလေး", "kid", "child")),
+    ("cheerful", ("ပျော်", "ရွှင်", "cheerful", "happy",
+                  "သွက်လက်", "တက်ကြွ")),
+    ("narration", ("ဇာတ်ကြောင်း", "ပုံပြင်", "narration",
+                   "narrator", "story")),
+)
+
+
+def roles_for_entry(entry):
+    text = " ".join(str(entry.get(k) or "") for k in
+                    ("name", "tag", "desc")).lower()
+    roles = [role for role, words in _EL_ROLE_WORDS
+             if any(w in text for w in words)]
+    if "narration" not in roles:
+        roles.insert(0, "narration")
+    return roles
+
+
 def picker_entries(user=None):
     """Picker entries for /api/voices and the bot voice step.
     EMPTY unless a key is set AND the registry has voices — an
@@ -287,6 +318,7 @@ def picker_entries(user=None):
              "name": v["name"], "tag": v.get("tag", ""),
              "desc": v.get("desc", ""),
              "preview": preview_url_el(v["id"]),
+             "roles": roles_for_entry(v),
              "premium": True, "rate": rate} for v in get_voices()]
 
 
