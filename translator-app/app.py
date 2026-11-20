@@ -59,7 +59,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 235"
+BUILD_TAG = "build 236"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -4041,6 +4041,80 @@ def tunnel_delete():
     from pipeline import tunnel
     tunnel.clear()
     info = tunnel.status()
+    info["ok"] = True
+    return jsonify(info)
+
+
+# ---------- Bilibili login session (build 236) ----------
+# Bilibili's risk control refuses this server in every
+# anonymous shape tried (direct IP, impersonated ladder,
+# Singapore tunnel — builds 233/235); the one credential
+# that passes is a logged-in session (the extractor checks
+# for a SESSDATA cookie). The owner logs HIS OWN Bilibili
+# account in here — by scanning a passport QR with the
+# Bilibili app, or by pasting a cookies.txt export — and
+# pipeline/download.py hands the stored cookies to yt-dlp
+# for bilibili URLs only. Same rules as the tunnel card:
+# admin-only (see _accounts_guard — every /api/settings/*
+# route needs the admin role), the session lives server-
+# side only (bilibili-cookies.txt, chmod 600, never in
+# git), and NO endpoint ever returns a cookie value — the
+# status surface is {configured, logged_in_as} with the
+# account id masked. The QR scan URL is transient (it
+# dies with the passport key in ~3 minutes) and is not
+# the credential; the cookies are, and they never leave.
+
+@app.get("/api/settings/bilibili")
+def bilibili_status():
+    from pipeline import bilibili_auth
+    return jsonify(bilibili_auth.status())
+
+
+@app.post("/api/settings/bilibili/qr")
+def bilibili_qr_start():
+    from pipeline import bilibili_auth
+    try:
+        return jsonify(bilibili_auth.qr_start())
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.get("/api/settings/bilibili/qr/image")
+def bilibili_qr_image():
+    from pipeline import bilibili_auth
+    try:
+        png = bilibili_auth.qr_image_png()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    resp = Response(png, mimetype="image/png")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.get("/api/settings/bilibili/qr/poll")
+def bilibili_qr_poll():
+    from pipeline import bilibili_auth
+    return jsonify(bilibili_auth.qr_poll())
+
+
+@app.post("/api/settings/bilibili/cookies")
+def bilibili_cookies_save():
+    from pipeline import bilibili_auth
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        res = bilibili_auth.save_pasted(data.get("cookies") or "")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    info = bilibili_auth.status()
+    info.update({"ok": True, **res})
+    return jsonify(info)
+
+
+@app.delete("/api/settings/bilibili")
+def bilibili_delete():
+    from pipeline import bilibili_auth
+    bilibili_auth.clear()
+    info = bilibili_auth.status()
     info["ok"] = True
     return jsonify(info)
 

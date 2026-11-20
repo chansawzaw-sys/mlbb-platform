@@ -12,7 +12,7 @@ from urllib.parse import urljoin, urlparse
 
 import yt_dlp
 
-from . import tunnel
+from . import bilibili_auth, tunnel
 from .common import ensure_system_ca
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
@@ -970,7 +970,8 @@ def _is_bilibili(url):
 
 
 def _bilibili_fallback(url: str, workdir: Path,
-                       quality: str = "hd") -> dict:
+                       quality: str = "hd",
+                       cookiefile: str = None) -> dict:
     """Bilibili route (build 233): the generic yt-dlp ladder
     again, but egressed through the owner's tunnel.
 
@@ -996,7 +997,15 @@ def _bilibili_fallback(url: str, workdir: Path,
     tunnelled attempt is served Bilibili's risk-control
     page (trueCode -403, surfaced by yt-dlp as a spurious
     "login required"), so the fingerprint-shaped attempts
-    lead here and the plain one is this route's fallback."""
+    lead here and the plain one is this route's fallback.
+
+    Build 236: even the impersonated tunnel attempts were
+    served the risk-control state live (the Singapore exit
+    is flagged too) — the one credential that passes is a
+    logged-in session. When the owner has stored one
+    (pipeline/bilibili_auth.py, Admin card), EVERY attempt
+    here carries it as yt-dlp's "cookiefile" opt; with no
+    session stored this route is byte-for-byte build 235."""
     proxy = tunnel.proxy_url()
     if not proxy:
         raise _BilibiliNoTunnel("tunnel proxy not verified up")
@@ -1013,6 +1022,8 @@ def _bilibili_fallback(url: str, workdir: Path,
         "proxy": proxy,
         "http_headers": {"Referer": "https://www.bilibili.com/"},
     }
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
     last_err = None
     for target in ("chrome", "safari", None):
         attempt_opts = dict(opts)
@@ -1046,6 +1057,16 @@ def download(url: str, workdir: Path, quality: str = "hd") -> Path:
     # the quality a job asked for.
     quality = norm_quality(quality)
     out = workdir / "source.mp4"
+    # Build 236: the owner's stored Bilibili login session
+    # (Admin card, pipeline/bilibili_auth.py) rides EVERY
+    # bilibili attempt below as yt-dlp's "cookiefile" opt —
+    # the tunnel route, the generic ladder and the caption
+    # fast-path. It is computed for bilibili URLs ONLY: no
+    # other host ever sees the key, and with no session
+    # stored this is None and every opt dict below is
+    # byte-for-byte build 235.
+    bili_cookiefile = bilibili_auth.cookiefile_path() \
+        if _is_bilibili(url) else None
     opts = {
         # Per-quality selectors (_FORMAT_SELECTORS): "720" keeps the
         # build-80 light renditions first — at the same resolution,
@@ -1066,6 +1087,8 @@ def download(url: str, workdir: Path, quality: str = "hd") -> Path:
         # one by default; 4 at a time is a large, safe win on this link.
         "concurrent_fragment_downloads": 8,
     }
+    if bili_cookiefile:
+        opts["cookiefile"] = bili_cookiefile
     info = None
     first_err = None
     if _is_bilibili(url):
@@ -1076,7 +1099,8 @@ def download(url: str, workdir: Path, quality: str = "hd") -> Path:
         # backup. A tunnel-down decline is not a failure and
         # is never recorded as first_err.
         try:
-            info = _bilibili_fallback(url, workdir, quality)
+            info = _bilibili_fallback(url, workdir, quality,
+                                      cookiefile=bili_cookiefile)
         except _BilibiliNoTunnel:
             pass
         except Exception as e:
@@ -1173,6 +1197,11 @@ def download(url: str, workdir: Path, quality: str = "hd") -> Path:
             "noplaylist": True, "quiet": True, "no_warnings": True,
             "socket_timeout": 15, "retries": 2,
         }
+        if bili_cookiefile:
+            # Build 236: bilibili subtitles are login-gated
+            # too — the stored session rides the caption
+            # fast-path exactly like the download attempts.
+            sub_opts["cookiefile"] = bili_cookiefile
         with yt_dlp.YoutubeDL(sub_opts) as ydl:
             ydl.extract_info(url, download=True)
     except Exception:

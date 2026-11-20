@@ -16,6 +16,10 @@ tun-singbox.json
 # Build 192 failover candidates cache (subscription body — a
 # credential like the config)
 tun-candidates.cache
+# Build 236 Bilibili login session (the owner's Bilibili
+# cookies — a credential, exactly like the tunnel config)
+bilibili-cookies.txt
+bilibili-cookies.txt.tmp
 # Build 190 runtime state: tunnel activation diagnosis + markers
 tun-status.json
 .settings-activated.tg.sha
