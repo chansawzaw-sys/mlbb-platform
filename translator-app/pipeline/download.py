@@ -400,6 +400,19 @@ def polite_error(err, url=""):
         cat = "network"
     else:
         cat = "default"
+    # Build 235: Bilibili's risk control is NOT a login gate.
+    # When the site blocks this server's IP, the video page's
+    # __INITIAL_STATE__ carries error.trueCode == -403 and
+    # yt-dlp's extractor answers with raise_login_required()
+    # — a "login"-family string (with a --cookies hint) for
+    # what is really an IP block of a PUBLIC video. For
+    # bilibili hosts only, a login verdict is therefore
+    # reported as blocked; every other host keeps the login
+    # mapping byte-for-byte (Facebook/Instagram's host rule
+    # and YouTube's "Sign in to confirm" included).
+    if cat == "login" and any(h in host
+                               for h in ("bilibili.com", "b23.tv")):
+        cat = "blocked"
     return _POLITE[cat]
 
 
@@ -886,19 +899,30 @@ def _xhs_fallback(url: str, workdir: Path, quality: str = "hd") -> dict:
     }
     last_err = None
     for cand in cands:
-        try:
-            attempt = dict(dl_opts)
+        # Build 235: per candidate, a plain attempt first and
+        # a chrome-impersonated attempt second (the generic
+        # ladder's order). Until 235 the impersonated attempt
+        # was dead code — it imported ImpersonateTarget from a
+        # module path that does not exist in the pinned yt-dlp
+        # (networking.impersonation; the class lives in
+        # networking.impersonate), so the import inside the
+        # try/except always failed and every candidate silently
+        # got the plain attempt only.
+        for target in (None, "chrome"):
             try:
-                from yt_dlp.networking.impersonation import ImpersonateTarget
-                attempt["impersonate"] = ImpersonateTarget("chrome")
-            except Exception:
-                pass
-            with yt_dlp.YoutubeDL(attempt) as ydl:
-                info = ydl.extract_info(cand, download=True)
-            if info:
-                return info
-        except Exception as e:
-            last_err = e
+                attempt = dict(dl_opts)
+                if target is not None:
+                    try:
+                        from yt_dlp.networking.impersonate import ImpersonateTarget
+                        attempt["impersonate"] = ImpersonateTarget(target)
+                    except Exception:
+                        continue
+                with yt_dlp.YoutubeDL(attempt) as ydl:
+                    info = ydl.extract_info(cand, download=True)
+                if info:
+                    return info
+            except Exception as e:
+                last_err = e
     # page-state parse: the note page embeds the video URL directly
     try:
         from curl_cffi import requests as creq
@@ -956,12 +980,23 @@ def _bilibili_fallback(url: str, workdir: Path,
     fails (and the 412 used to be misreported to customers as
     "login required"). The tunnel (build 189, Singapore exit,
     verified for the Gemini/OpenAI engines) is a different
-    vantage point, so the ladder — plain, then chrome
-    impersonation, then safari, the generic ladder's own
-    order — runs through it with Bilibili's own Referer. The
-    generic direct ladder in download() stays as the final
-    backup. When the tunnel is not verified up this raises
-    _BilibiliNoTunnel at once, before any attempt is made."""
+    vantage point, so the ladder runs through it with
+    Bilibili's own Referer. The generic direct ladder in
+    download() stays as the final backup. When the tunnel is
+    not verified up this raises _BilibiliNoTunnel at once,
+    before any attempt is made.
+
+    Build 235: the ladder now runs IMPERSONATED first —
+    chrome, then safari, plain last (the reverse of the
+    generic ladder's order). Two reasons: the impersonation
+    import used by every ladder named a module that does
+    not exist in the pinned yt-dlp, so until 235 those
+    attempts silently never ran at all; and the live
+    evidence of 2026-11-20 (build 234) is that the plain
+    tunnelled attempt is served Bilibili's risk-control
+    page (trueCode -403, surfaced by yt-dlp as a spurious
+    "login required"), so the fingerprint-shaped attempts
+    lead here and the plain one is this route's fallback."""
     proxy = tunnel.proxy_url()
     if not proxy:
         raise _BilibiliNoTunnel("tunnel proxy not verified up")
@@ -979,11 +1014,11 @@ def _bilibili_fallback(url: str, workdir: Path,
         "http_headers": {"Referer": "https://www.bilibili.com/"},
     }
     last_err = None
-    for target in (None, "chrome", "safari"):
+    for target in ("chrome", "safari", None):
         attempt_opts = dict(opts)
         if target is not None:
             try:
-                from yt_dlp.networking.impersonation import ImpersonateTarget
+                from yt_dlp.networking.impersonate import ImpersonateTarget
                 attempt_opts["impersonate"] = ImpersonateTarget(target)
             except Exception:
                 continue
@@ -1094,11 +1129,18 @@ def download(url: str, workdir: Path, quality: str = "hd") -> Path:
         # above — is NOT egress-validated hop by hop. Closing that
         # needs a validating egress proxy in front of the worker;
         # recorded as a documented residual in proof202 NOTES.
+        # Build 235: the impersonation import below now names
+        # the module that actually exists in the pinned yt-dlp
+        # (networking.impersonate) — builds <=234 imported a
+        # non-existent networking.impersonation, so the chrome /
+        # safari attempts silently never ran. The order is
+        # unchanged: plain first (production-proven), then the
+        # impersonated attempts as real second/third tries.
         for target in (None, "chrome", "safari"):
             attempt_opts = dict(opts)
             if target is not None:
                 try:
-                    from yt_dlp.networking.impersonation import ImpersonateTarget
+                    from yt_dlp.networking.impersonate import ImpersonateTarget
                     attempt_opts["impersonate"] = ImpersonateTarget(target)
                 except Exception:
                     continue
