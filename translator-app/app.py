@@ -59,7 +59,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 231"
+BUILD_TAG = "build 234"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -71,6 +71,9 @@ STEP_LABELS = {
     "tts": "မြန်မာ အသံထုတ်",
     "retime": "အချိန်ကိုက် ညှိ (လိုရင် ဖရိမ်ရပ်)",
     "finalize": "စာတန်းထိုး (ရုပ်ရှင်ပုံစံ) + Logo/Blur + ဗီဒီယို ပေါင်းစပ်",
+    # Build 234: the download-only product's second step — the
+    # downloaded file is measured, quoted and made ready.
+    "save": "ဖိုင် အဆင်သင့် လုပ်ရန်",
 }
 
 
@@ -1057,6 +1060,20 @@ def _captions_credits_per_min():
             _env_value("CAPTIONS_CREDITS_PER_MIN") or 20)))
     except (TypeError, ValueError):
         return 20
+
+
+def _download_credits_per_min():
+    """Admin setting DOWNLOAD_CREDITS_PER_MIN: the per-started-
+    minute rate for the download-only product (build 234),
+    default 10 (= 50 kyat/min at the build-231 rate card —
+    the owner's price, 2026-11-20). Read live like
+    CAPTIONS_CREDITS_PER_MIN. The quote and the charge both
+    go through _credits_for_minutes, so they always agree."""
+    try:
+        return max(1, min(1000, int(
+            _env_value("DOWNLOAD_CREDITS_PER_MIN") or 10)))
+    except (TypeError, ValueError):
+        return 10
 
 
 def _referral_reward_credits():
@@ -2117,7 +2134,8 @@ def _job_dispatcher():
                           "commentary2": _commentary_worker2,
                           "captions1": _captions_worker,
                           "captions2": _captions_worker2,
-                          "captions_api": _api_captions_worker}.get(
+                          "captions_api": _api_captions_worker,
+                          "download1": _download_worker}.get(
                               kind, _worker)
                 wt = threading.Thread(target=target, args=(job,),
                                       daemon=True)
@@ -2231,6 +2249,12 @@ def _credits_for_minutes(job, minutes):
     per-minute rate except Captions-only (build 219), whose
     rate is fractional (half the dub rate by default):
     ceil(minutes x rate), minimum 1 credit."""
+    if job.get("type") == "download":
+        # Build 234: the download-only product bills started
+        # minutes x its own flat per-minute rate (default 10
+        # credits = 50 kyat/min, owner-set 2026-11-20). No
+        # minimum: a sub-minute clip is exactly 1 minute.
+        return minutes * _download_credits_per_min()
     if job.get("type") == "captions":
         # Build 231: the minimum charge is 30 credits
         # (= 150 kyat — the same kyat value as the OLD
@@ -2243,21 +2267,43 @@ def _credits_for_minutes(job, minutes):
     return minutes * _credits_per_min_for(job)
 
 
-def _quote_for_job(job):
+def _job_is_admin(job):
+    """Build 232: True when the job belongs to an ADMIN account
+    — the exact lookup the charge path uses to exempt a job
+    (_quote_for_job / _charge_for_job below): the job's user_id
+    resolved through accounts, role == "admin". Anonymous jobs
+    (no user_id) are never charged either, but they are NOT
+    admin and return False here. The flag only steers the
+    translation walk order for the main video job path (admin
+    jobs lead with Gemini, then OpenAI — see
+    pipeline.translate_segments)."""
+    uid = job.get("user_id")
+    if not uid:
+        return False
+    user = accounts.get_user(uid)
+    return bool(user) and user["role"] == "admin"
+
+
+def _quote_for_job(job, minutes=None):
     """Admission check after phase 1 (the duration is known): a
     non-admin account must COVER the job's credits — started
     minutes × its per-minute rate (1 standard; the admin-set
     premium rate for ElevenLabs voices, build 205) — but nothing
     is deducted here. Owner rule (2026-11-09): credits move only
     when the video is actually produced; a job that fails or is
-    cancelled is never charged."""
+    cancelled is never charged. `minutes` (build 234) lets a
+    caller that measured the duration itself (the download-only
+    worker, from source_info.json / ffprobe) quote on ITS
+    figure; every existing caller leaves it None and keeps the
+    _job_minutes probe of source.mp4."""
     uid = job.get("user_id")
     if not uid:
         return
     user = accounts.get_user(uid)
     if not user or user["role"] == "admin":
         return
-    minutes = _job_minutes(job)
+    if minutes is None:
+        minutes = _job_minutes(job)
     job["quote_minutes"] = minutes
     # Build 205: the quote is in CREDITS — minutes × the job's
     # per-minute rate (premium ElevenLabs voices cost more than
@@ -2290,10 +2336,14 @@ def _charge_for_job(job):
     minutes = job.get("quote_credits") or job.get("quote_minutes") \
         or _credits_for_minutes(job, _job_minutes(job))
     paid = minutes
-    if not accounts.charge(uid, minutes, job["id"]):
+    # Build 234: the ledger kind distinguishes the product —
+    # download-only jobs record "download", everything else
+    # keeps the historical "job".
+    reason = "download" if job.get("type") == "download" else "job"
+    if not accounts.charge(uid, minutes, job["id"], reason=reason):
         paid = max(0, min(user["credits"] or 0, minutes))
         if paid:
-            accounts.charge(uid, paid, job["id"])
+            accounts.charge(uid, paid, job["id"], reason=reason)
         if paid < minutes:
             job["charge_shortfall"] = minutes - paid
     job["charged_minutes"] = paid
@@ -2427,7 +2477,8 @@ def _worker(job):
                                progress=_progress_fn(job),
                                style="subs" if job["mode"] == "subs" else "dub",
                                quality=job.get("quality") or "hd",
-                               force_source=bool(job.get("upload")))
+                               force_source=bool(job.get("upload")),
+                               admin=_job_is_admin(job))
             if job.get("upload"):
                 # Build 215: an uploaded source has no download
                 # stage at all — the timing says so exactly.
@@ -3558,6 +3609,7 @@ def elevenlabs_status():
         "test_users": elevenlabs_tts.get_test_users(),
         "commentary_credits_per_min": _commentary_credits_per_min(),
         "captions_credits_per_min": _captions_credits_per_min(),
+        "download_credits_per_min": _download_credits_per_min(),
         "referral_reward_credits": _referral_reward_credits(),
         "voices": _el_status_voices()})
 
@@ -3624,6 +3676,16 @@ def elevenlabs_save():
                             "credit နှုန်း 0.05–10 အတွင်း "
                             "ဖြစ်ရပါမယ်"}), 400
         writes["CAPTIONS_CREDITS_PER_MIN"] = str(caprate)
+    if "download_credits_per_min" in data:
+        try:
+            dlrate = int(data["download_credits_per_min"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "credit နှုန်း မမှန်ပါ"}), 400
+        if not 1 <= dlrate <= 1000:
+            return jsonify({"error":
+                            "credit နှုန်း 1–1000 အတွင်း "
+                            "ဖြစ်ရပါမယ်"}), 400
+        writes["DOWNLOAD_CREDITS_PER_MIN"] = str(dlrate)
     if "referral_reward_credits" in data:
         try:
             refamt = int(data["referral_reward_credits"])
@@ -3654,6 +3716,8 @@ def elevenlabs_save():
                         _commentary_credits_per_min(),
                     "captions_credits_per_min":
                         _captions_credits_per_min(),
+                    "download_credits_per_min":
+                        _download_credits_per_min(),
                     "referral_reward_credits":
                         _referral_reward_credits()})
 
@@ -7566,6 +7630,168 @@ def captions_frame(jid):
     resp = send_file(frame, mimetype="image/jpeg")
     resp.headers["X-Video-Duration"] = f"{dur:.2f}"
     return resp
+
+
+# ---------- Download-only product (build 234) ----------
+# Owner order 2026-11-20: a standalone service for customers
+# who only want the FILE — link in, raw video out (watch in
+# place, download, Telegram send through the ordinary job
+# routes). NO transcription, NO translation, NO TTS, NO
+# review park. It exists because Preview refuses videos over
+# 60 minutes; this service has NO duration cap (the 2 GiB
+# ceiling inside download() still applies). The record is a
+# normal job (type "download"), so the queue, the jobs
+# listing, the stream/download/Telegram routes, the ownership
+# checks and the single 24h retention rule all serve it
+# unchanged — the worker promotes the downloaded source.mp4
+# to output.mp4, the name every one of those routes serves.
+# Pricing (owner-set): DOWNLOAD_CREDITS_PER_MIN per STARTED
+# minute (default 10 = 50 kyat/min), through
+# _credits_for_minutes so the quote and the charge agree
+# exactly. The duration is knowable only AFTER the download,
+# so the admission quote runs inside the worker, right after
+# download() returns: a non-exempt customer who cannot cover
+# it fails there with the polite insufficient-credit message
+# and is charged zero. Charge-on-success only: _finish is
+# the single charge point, and the ledger records the charge
+# under the distinct kind "download" (see _charge_for_job).
+
+DOWNLOAD_STEPS = ["download", "save"]
+
+
+def _download_view(job):
+    view = {k: job.get(k) for k in
+            ("id", "type", "url", "status", "current", "error",
+             "quality", "duration_s", "output_size",
+             "quote_minutes", "quote_credits", "charged_minutes",
+             "created_at", "finished_at")}
+    view["timings"] = _timings_of(job)  # build 213
+    view["steps"] = job.get("steps") or []
+    if job.get("status") == "queued":
+        waiting = [q for q, _k in _JOB_QUEUE]
+        if job["id"] in waiting:
+            view["queue_pos"] = waiting.index(job["id"]) + 1
+    return view
+
+
+def _download_duration_s(workdir):
+    """The downloaded video's duration in seconds: the
+    resolver's own figure first (source_info.json, written by
+    download()), ffprobe on the file when the resolver gave
+    none. 0.0 when neither knows — the caller then bills the
+    1-minute floor, exactly like _job_minutes' fallback."""
+    try:
+        info = json.loads(
+            (Path(workdir) / "source_info.json").read_text(
+                encoding="utf-8"))
+        secs = float(info.get("duration") or 0)
+        if secs > 0:
+            return secs
+    except Exception:
+        pass
+    try:
+        return float(probe_duration(Path(workdir) / "source.mp4"))
+    except Exception:
+        return 0.0
+
+
+def _download_minutes(seconds):
+    """Started minutes for a measured duration (the house
+    convention, same as _job_minutes): ceil(seconds / 60),
+    minimum 1 — an unknown duration bills the floor."""
+    if not seconds or seconds <= 0:
+        return 1
+    return max(1, math.ceil(seconds / 60.0))
+
+
+def _download_worker(job):
+    """The uninterrupted download-only run: download ->
+    measure -> quote -> promote source.mp4 to output.mp4 ->
+    _finish (the only place a download job is ever charged).
+    The quote sits between the download and the promotion, so
+    an insufficient balance fails the job BEFORE the file is
+    made servable — and the failure is _fail's ordinary one
+    (polite message, zero charged, 24h cleanup), never a
+    charge. The "save" step is marked running before the
+    quote so _fail does not remap the credit message through
+    the download-error categories (its current == "download"
+    branch is for download failures proper)."""
+    workdir = JOBS_DIR / job["id"]
+    threading.Thread(target=_heartbeat, args=(job,),
+                     daemon=True).start()
+    with job_context(job["id"]):
+        try:
+            job["status"] = "running"
+            _timing_start(job)  # build 213
+            _save(job)
+            progress = _progress_fn(job)
+            src = run_job.run_download(
+                workdir, job["url"], progress=progress,
+                quality=job.get("quality") or "hd")
+            progress("save", "running")
+            seconds = _download_duration_s(workdir)
+            job["duration_s"] = round(seconds, 1) if seconds else None
+            _quote_for_job(job, _download_minutes(seconds))
+            src.replace(workdir / "output.mp4")
+            progress("save", "done")
+            _finish(job)
+        except JobCancelled:
+            _cancelled(job)
+        except Exception as e:
+            if job.get("cancel_requested"):
+                _cancelled(job)
+            else:
+                _fail(job, e)
+
+
+@app.post("/api/downloads")
+def create_download():
+    user = _current_user()
+    data = request.get_json(force=True, silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"error": "လင့်ခ် မမှန်ပါ"}), 400
+    if not _public_url_ok(url):
+        return jsonify({"error": "ဒီ လင့်ခ် ကို သုံးလို့ မရပါ"}), 400
+    quality = data.get("quality") if data.get("quality") in \
+        ("hd", "720", "480") else "hd"
+    now = time.time()
+    job = {"id": uuid.uuid4().hex[:12], "type": "download",
+           "url": url, "mode": "download",
+           "quality": quality,
+           "source_path": None,
+           "status": "queued", "current": None, "error": None,
+           "created_at": now, "updated_at": now,
+           "finished_at": None,
+           "steps": [{"key": k, "label": STEP_LABELS[k],
+                      "state": "pending"} for k in DOWNLOAD_STEPS]}
+    if user:
+        # Same admission gates as a captions job, in the same
+        # order — both refuse before the job exists. (No
+        # balance pre-check is possible here: the price needs
+        # the downloaded duration, so the quote runs inside
+        # the worker and fails the job there, zero charged.)
+        setup_msg = _setup_gate_message(user)
+        if setup_msg:
+            return jsonify({"error": setup_msg}), 400
+        job["user_id"] = user["id"]
+        accounts.mark_has_job(user["id"])
+        limit_msg = _daily_limit_message(user)
+        if limit_msg:
+            return jsonify({"error": limit_msg}), 400
+    JOBS[job["id"]] = job
+    _save(job)
+    _enqueue_job(job, kind="download1")
+    return jsonify(_download_view(job))
+
+
+@app.get("/api/downloads/<jid>")
+def get_download(jid):
+    job = _load_job(jid)
+    if not job or job.get("type") != "download" \
+            or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    return jsonify(_download_view(job))
 
 
 # ---------- Title + hashtag helper (build 222, roadmap 6) -----

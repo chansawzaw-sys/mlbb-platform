@@ -12,10 +12,15 @@ from urllib.parse import urljoin, urlparse
 
 import yt_dlp
 
+from . import tunnel
 from .common import ensure_system_ca
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
-_SHORT_HOSTS = ("vt.tiktok.com", "vm.tiktok.com", "xhslink.com")
+# Build 233: b23.tv (Bilibili's share shortener) joins the short
+# hosts — its redirect target is a plain bilibili.com video URL,
+# which _resolve_short's non-TikTok path already accepts.
+_SHORT_HOSTS = ("vt.tiktok.com", "vm.tiktok.com", "xhslink.com",
+                "b23.tv")
 
 # Download quality (build 167, owner order 2026-11-13): the customer
 # picks the source rendition — "hd" = the original/best available
@@ -327,6 +332,15 @@ class DownloadFailed(Exception):
         self.raw = raw
 
 
+class _BilibiliNoTunnel(Exception):
+    """The bilibili route declined to run (build 233): the
+    tunnel proxy is not verified up, so there is no second
+    vantage point to try from. NOT a download failure —
+    download() swallows it without touching first_err, which
+    keeps tunnel-down behaviour byte-for-byte the pre-233
+    generic ladder."""
+
+
 _POLITE = {
     "parse": "ဒီ link ကနေ video ကို ဆွဲလို့ မရသေးပါ။ "
              "Link အပြည့် ဖြစ်ရပါမယ် — Share → Copy link နဲ့ "
@@ -373,8 +387,11 @@ def polite_error(err, url=""):
     elif "429" in s or "too many requests" in s \
             or "rate limit" in s or "rate-limit" in s:
         cat = "throttle"
-    elif "403" in s or "blocked" in s or "forbidden" in s \
-            or "unexpected response" in s:
+    # Build 233: "412" is Bilibili's risk-control status — it
+    # belongs to blocked, and it is checked HERE, after parse /
+    # login / gone / throttle, so it can never shadow them.
+    elif "403" in s or "412" in s or "blocked" in s \
+            or "forbidden" in s or "unexpected response" in s:
         cat = "blocked"
     elif any(k in s for k in ("timed out", "timeout", "connection",
                               "network", "ssl", "certificate",
@@ -915,6 +932,70 @@ def _xhs_fallback(url: str, workdir: Path, quality: str = "hd") -> dict:
     raise RuntimeError(f"XHS resolver found no downloadable video: {last_err}")
 
 
+_BILIBILI_HOSTS = ("bilibili.com", "b23.tv")
+
+
+def _is_bilibili(url):
+    """Bilibili page or share-short URL (build 233), matched on
+    the netloc the same loose way the TikTok/XHS checks are."""
+    try:
+        return any(h in urlparse(url).netloc
+                   for h in _BILIBILI_HOSTS)
+    except Exception:
+        return False
+
+
+def _bilibili_fallback(url: str, workdir: Path,
+                       quality: str = "hd") -> dict:
+    """Bilibili route (build 233): the generic yt-dlp ladder
+    again, but egressed through the owner's tunnel.
+
+    Bilibili's risk control answers this server's Hong Kong
+    datacenter IP with HTTP 412 even for PUBLIC videos, and
+    the generic ladder has no second vantage point — it just
+    fails (and the 412 used to be misreported to customers as
+    "login required"). The tunnel (build 189, Singapore exit,
+    verified for the Gemini/OpenAI engines) is a different
+    vantage point, so the ladder — plain, then chrome
+    impersonation, then safari, the generic ladder's own
+    order — runs through it with Bilibili's own Referer. The
+    generic direct ladder in download() stays as the final
+    backup. When the tunnel is not verified up this raises
+    _BilibiliNoTunnel at once, before any attempt is made."""
+    proxy = tunnel.proxy_url()
+    if not proxy:
+        raise _BilibiliNoTunnel("tunnel proxy not verified up")
+    opts = {
+        "format": _FORMAT_SELECTORS[quality],
+        "merge_output_format": "mp4",
+        "outtmpl": str(workdir / "source.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 15,
+        "retries": 3,
+        "concurrent_fragment_downloads": 8,
+        "proxy": proxy,
+        "http_headers": {"Referer": "https://www.bilibili.com/"},
+    }
+    last_err = None
+    for target in (None, "chrome", "safari"):
+        attempt_opts = dict(opts)
+        if target is not None:
+            try:
+                from yt_dlp.networking.impersonation import ImpersonateTarget
+                attempt_opts["impersonate"] = ImpersonateTarget(target)
+            except Exception:
+                continue
+        try:
+            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                return ydl.extract_info(url, download=True)
+        except Exception as e:
+            last_err = e
+    raise last_err if last_err is not None else RuntimeError(
+        "bilibili route: every tunnelled attempt failed")
+
+
 def download(url: str, workdir: Path, quality: str = "hd") -> Path:
     ensure_system_ca()
     workdir = Path(workdir)
@@ -952,6 +1033,19 @@ def download(url: str, workdir: Path, quality: str = "hd") -> Path:
     }
     info = None
     first_err = None
+    if _is_bilibili(url):
+        # Build 233: Bilibili risk control 412s this server's
+        # direct IP even for public videos — the tunnelled
+        # route goes first (see _bilibili_fallback); the
+        # generic direct ladder below stays as the final
+        # backup. A tunnel-down decline is not a failure and
+        # is never recorded as first_err.
+        try:
+            info = _bilibili_fallback(url, workdir, quality)
+        except _BilibiliNoTunnel:
+            pass
+        except Exception as e:
+            first_err = e
     if any(h in urlparse(url).netloc for h in _XHS_HOSTS):
         # RedNote share links redirect into a login wall; the XHS
         # resolver harvests the note URL from the chain first. The

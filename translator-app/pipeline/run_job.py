@@ -55,7 +55,7 @@ def _marks(progress):
 
 
 def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
-               quality="hd", force_source=False):
+               quality="hd", force_source=False, admin=False):
     """Phase 1: download -> transcribe -> translate. Then the job waits for
     human review/edit of the Myanmar segments before phase 2.
     `quality` (build 167) is the download rendition choice; the
@@ -63,7 +63,11 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
     fetched at this same quality, so a fresh download here honours
     the choice. `force_source` (build 215) marks a user-UPLOADED
     file: it was already ffprobe-validated at admission, so the
-    50 KB preview-integrity floor below does not apply to it."""
+    50 KB preview-integrity floor below does not apply to it.
+    `admin` (build 232) is the job account's admin flag — the
+    same role lookup that exempts the job from charging —
+    and only steers the translation walk order (admin jobs
+    lead with Gemini, then OpenAI; see translate_segments)."""
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     mark = _marks(progress)
@@ -109,7 +113,8 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
     mark("transcribe", "done")
 
     mark("translate", "running")
-    _segs = translate_segments.translate_segments(workdir, style=style)
+    _segs = translate_segments.translate_segments(workdir, style=style,
+                                                  admin=admin)
     _st = translate_segments.translation_stats(_segs or [])
     if _st["total"] >= 4 and _st["untranslated"] * 2 > _st["total"]:
         # Every translation route failed and the source text stood
@@ -274,10 +279,12 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
 
 def run_job(workdir, url, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
             fx=None, source_path=None, font=burn.DEFAULT_FONT,
-            voice_rate=0, voice_pitch=0, subs=None, quality="hd"):
+            voice_rate=0, voice_pitch=0, subs=None, quality="hd",
+            admin=False):
     """Uninterrupted run (CLI/back-compat): phase 1 + phase 2, no review."""
     run_phase1(workdir, url, source_path=source_path, progress=progress,
-               style="subs" if mode == "subs" else "dub", quality=quality)
+               style="subs" if mode == "subs" else "dub", quality=quality,
+               admin=admin)
     return run_phase2(workdir, mode=mode, voice=voice, progress=progress,
                       fx=fx, font=font, voice_rate=voice_rate,
                       voice_pitch=voice_pitch, subs=subs, quality=quality)
@@ -313,4 +320,23 @@ def run_recap_phase1(workdir, url, progress=None, quality="hd",
     # otherwise — the same rule as run_phase1.
     transcribe.transcribe(src, workdir, use_captions=True)
     mark("transcribe", "done")
+    return src
+
+
+def run_download(workdir, url, progress=None, quality="hd"):
+    """Download-only product (build 234): fetch the source
+    through the same guarded chain as every other product and
+    STOP there — no transcribe, no translate, no render. The
+    deliverable is the downloaded file itself. download() has
+    already written source_info.json beside source.mp4; the
+    app worker reads the duration from it (ffprobe fallback)
+    to quote the per-minute price. NO duration cap here: the
+    60-minute ceiling is a Preview-only rule, and this product
+    exists precisely for the videos Preview refuses."""
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    mark = _marks(progress)
+    mark("download", "running")
+    src = download.download(url, workdir, quality=quality)
+    mark("download", "done")
     return src

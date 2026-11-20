@@ -700,11 +700,14 @@ def apply_credit(user_id, delta, reason, ref=None):
     return new
 
 
-def charge(user_id, amount, ref):
-    """Charge `amount` credits for a job; False when insufficient."""
+def charge(user_id, amount, ref, reason="job"):
+    """Charge `amount` credits for a job; False when insufficient.
+    `reason` is the ledger kind: "job" for every video product,
+    "download" for the download-only product (build 234) — the
+    append-only ledger keeps the products distinguishable."""
     if amount <= 0:
         return True
-    return apply_credit(user_id, -int(amount), "job", ref) is not None
+    return apply_credit(user_id, -int(amount), reason, ref) is not None
 
 
 def refund(user_id, amount, ref):

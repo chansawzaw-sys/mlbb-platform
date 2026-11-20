@@ -26,6 +26,17 @@ shipping source-language subtitles):
      engines stop burning time ahead of the working
      gateways; the probe skip (build 186) removes a
      region-blocked engine while its verdict stays fresh.
+  Build 232 (owner order 2026-11-20): ADMIN jobs walk a
+     different order — Gemini FIRST (the probe's region-block
+     skip still applies), OpenAI SECOND, then the order above
+     as further fallback; the per-segment rescue follows the
+     same preference. The owner runs his own jobs on the admin
+     account and wants Gemini quality first on them, with his
+     prepaid OpenAI balance as the second route. Non-admin
+     jobs keep the order above byte for byte. The flag is the
+     job account's role — the same lookup that exempts admin
+     jobs from charging — threaded app.py -> run_phase1 ->
+     here; every other caller keeps the default.
 
 CLI: python -m pipeline.translate_segments <workdir>
 Reads segments_en.json, writes segments_my.json + subs_my.srt (original timings).
@@ -59,10 +70,14 @@ class _Rescue:
     call's outcome is recorded in self.report for the job's
     translate_report.json. Gemini's lead rules are
     preserved (configured + the probe's fresh region-block
-    skip); OpenAI keeps the same skip."""
+    skip); OpenAI keeps the same skip. Build 232: an admin
+    job's rescue follows the admin batch preference —
+    Gemini, then OpenAI, then the remaining engines in
+    their usual relative order."""
 
-    def __init__(self, style="subs"):
+    def __init__(self, style="subs", admin=False):
         self.style = style
+        self.admin = admin
         self.fails = {}
         self.report = {}
 
@@ -79,16 +94,20 @@ class _Rescue:
     def _attempts(self):
         """(engine, fn) pairs in walk order; fn(seg) returns
         (text, provider_label). Unconfigured or
-        probe-skipped engines are simply absent."""
-        out = []
+        probe-skipped engines are simply absent. Build 232:
+        the availability probes below are order-free — the
+        walk order is applied at the end, so an admin pass
+        promotes OpenAI to second while the remaining
+        engines keep their relative order."""
+        found = {}
         try:
             from . import gemini_translate
             if gemini_translate.key_configured() \
                     and not _probe_blocked("gemini"):
-                out.append(("gemini", lambda seg:
-                            (gemini_translate.translate_all(
-                                [seg], style=self.style)[0],
-                             "gemini")))
+                found["gemini"] = lambda seg: \
+                    (gemini_translate.translate_all(
+                        [seg], style=self.style)[0],
+                     "gemini")
         except Exception:
             pass
         try:
@@ -98,7 +117,7 @@ class _Rescue:
                     by = _m.translate_all(
                         [seg], style=self.style)
                     return by[0], _m.last_label()
-                out.append(("openrouter", _or))
+                found["openrouter"] = _or
         except Exception:
             pass
         try:
@@ -108,20 +127,24 @@ class _Rescue:
                     by = _m.translate_all(
                         [seg], style=self.style)
                     return by[0], _m.last_label()
-                out.append(("xkiro", _xk))
+                found["xkiro"] = _xk
         except Exception:
             pass
         try:
             from . import openai_translate
             if openai_translate.key_configured() \
                     and not _probe_blocked("openai"):
-                out.append(("openai", lambda seg:
-                            (openai_translate.translate_all(
-                                [seg], style=self.style)[0],
-                             "openai")))
+                found["openai"] = lambda seg: \
+                    (openai_translate.translate_all(
+                        [seg], style=self.style)[0],
+                     "openai")
         except Exception:
             pass
-        return out
+        order = ("gemini", "openai", "openrouter", "xkiro") \
+            if self.admin else \
+            ("gemini", "openrouter", "xkiro", "openai")
+        return [(name, found[name]) for name in order
+                if name in found]
 
     def one(self, seg):
         """(myanmar_text, provider) for ONE segment; on
@@ -229,13 +252,14 @@ def _probe_engine_ok(engine):
     return data.get(f"{engine}_ok") is True
 
 
-def _gemini_attempt(segs, style, report):
+def _gemini_attempt(segs, style, report, admin=False):
     """ONE Gemini attempt with the chain's usual report
     semantics; the translated segment list, or None when the
     engine is unconfigured / probe-skipped / failed (the error
     lands in report["gemini_err"]). Called from the build-189
     lead slot and from Gemini's historical fallback slot — the
-    caller guarantees it runs at most once per job."""
+    caller guarantees it runs at most once per job. Build
+    232: `admin` only steers the fill rescue's walk order."""
     try:
         from . import gemini_translate
         if gemini_translate.key_configured() \
@@ -243,13 +267,14 @@ def _gemini_attempt(segs, style, report):
             by_idx = gemini_translate.translate_all(segs, style=style)
             out = [{**seg, "text_my": by_idx[i], "provider": "gemini"}
                    for i, seg in enumerate(segs)]
-            return _fill_missing(out, report, style=style)
+            return _fill_missing(out, report, style=style,
+                                 admin=admin)
     except Exception as e:
         report["gemini_err"] = str(e)[:120]
     return None
 
 
-def _openai_attempt(segs, style, report):
+def _openai_attempt(segs, style, report, admin=False):
     """ONE OpenAI attempt; same contract as _gemini_attempt."""
     try:
         from . import openai_translate
@@ -258,13 +283,14 @@ def _openai_attempt(segs, style, report):
             by_idx = openai_translate.translate_all(segs, style=style)
             out = [{**seg, "text_my": by_idx[i], "provider": "openai"}
                    for i, seg in enumerate(segs)]
-            return _fill_missing(out, report, style=style)
+            return _fill_missing(out, report, style=style,
+                                 admin=admin)
     except Exception as e:
         report["openai_err"] = str(e)[:120]
     return None
 
 
-def _fill_missing(out, report=None, style="subs"):
+def _fill_missing(out, report=None, style="subs", admin=False):
     """No silent gaps (owner complaint 2026-11-09: subtitle lines
     missing from the finished video). Batch endpoints — Gemini
     included — sometimes return an EMPTY string for a segment, and
@@ -293,7 +319,7 @@ def _fill_missing(out, report=None, style="subs"):
         failed = (seg.get("provider") or "").startswith("fallback-source")
         if empty or echoed or failed:
             if rescue is None:
-                rescue = _Rescue(style)
+                rescue = _Rescue(style, admin=admin)
             new_my, new_prov = rescue.one(seg)
             # Keep whichever result is actually translated.
             if not _seg_untranslated({**seg, "text_my": new_my,
@@ -342,7 +368,7 @@ def _write_report(workdir, report):
         pass
 
 
-def translate_segments(workdir, style="subs"):
+def translate_segments(workdir, style="subs", admin=False):
     ensure_system_ca()
     workdir = Path(workdir)
     segs = load_segments(workdir / "segments_en.json")
@@ -359,9 +385,41 @@ def translate_segments(workdir, style="subs"):
     # The attempt is remembered so Gemini's historical slot
     # further down never retries it within the same job.
     gemini_tried = False
+    openai_tried = False
     if segs and _probe_engine_ok("gemini"):
         gemini_tried = True
-        out = _gemini_attempt(segs, style, report)
+        out = _gemini_attempt(segs, style, report, admin=admin)
+        if out is not None:
+            _write_report(workdir, report)
+            save_segments(out, workdir / "segments_my.json")
+            write_srt(out, workdir / "subs_my.srt")
+            return out
+    # Build 232: ADMIN jobs lead with Gemini, then OpenAI —
+    # ahead of the gateways below. Probe rules still bind: a
+    # fresh region-block verdict skips Gemini here exactly
+    # like its historical slot does, and an unconfigured
+    # engine is simply absent (the attempt returns None and
+    # the walk moves on). Both attempts are remembered, so
+    # the historical slots below never retry them within the
+    # job; whatever they cannot carry falls through to the
+    # existing gateway order untouched.
+    if admin and segs:
+        if not gemini_tried:
+            if _probe_blocked("gemini"):
+                report["gemini_skipped"] = \
+                    "region-blocked (fresh probe)"
+            gemini_tried = True
+            out = _gemini_attempt(segs, style, report, admin=True)
+            if out is not None:
+                _write_report(workdir, report)
+                save_segments(out, workdir / "segments_my.json")
+                write_srt(out, workdir / "subs_my.srt")
+                return out
+        if _probe_blocked("openai"):
+            report["openai_skipped"] = \
+                "region-blocked (fresh probe)"
+        openai_tried = True
+        out = _openai_attempt(segs, style, report, admin=True)
         if out is not None:
             _write_report(workdir, report)
             save_segments(out, workdir / "segments_my.json")
@@ -387,7 +445,8 @@ def translate_segments(workdir, style="subs"):
                 out = [{**seg, "text_my": by_idx[i],
                         "provider": label}
                        for i, seg in enumerate(segs)]
-                out = _fill_missing(out, report, style=style)
+                out = _fill_missing(out, report, style=style,
+                                    admin=admin)
                 _write_report(workdir, report)
                 save_segments(out, workdir / "segments_my.json")
                 write_srt(out, workdir / "subs_my.srt")
@@ -411,7 +470,8 @@ def translate_segments(workdir, style="subs"):
                 out = [{**seg, "text_my": by_idx[i],
                         "provider": label}
                        for i, seg in enumerate(segs)]
-                out = _fill_missing(out, report, style=style)
+                out = _fill_missing(out, report, style=style,
+                                    admin=admin)
                 _write_report(workdir, report)
                 save_segments(out, workdir / "segments_my.json")
                 write_srt(out, workdir / "subs_my.srt")
@@ -432,7 +492,7 @@ def translate_segments(workdir, style="subs"):
     if segs and _probe_blocked("gemini") and not gemini_tried:
         report["gemini_skipped"] = "region-blocked (fresh probe)"
     if segs and not gemini_tried:
-        out = _gemini_attempt(segs, style, report)
+        out = _gemini_attempt(segs, style, report, admin=admin)
         if out is not None:
             _write_report(workdir, report)
             save_segments(out, workdir / "segments_my.json")
@@ -448,10 +508,13 @@ def translate_segments(workdir, style="subs"):
     # Build 189: OpenAI keeps exactly this slot — after Gemini,
     # never promoted above it; through the tunnel it answers
     # here on the days Gemini itself is down.
-    if segs and _probe_blocked("openai"):
+    # Build 232: for ADMIN jobs the pre-walk above already ran
+    # this attempt in second place; openai_tried keeps it to
+    # one attempt per job, whichever slot it came from.
+    if segs and _probe_blocked("openai") and not openai_tried:
         report["openai_skipped"] = "region-blocked (fresh probe)"
-    if segs:
-        out = _openai_attempt(segs, style, report)
+    if segs and not openai_tried:
+        out = _openai_attempt(segs, style, report, admin=admin)
         if out is not None:
             _write_report(workdir, report)
             save_segments(out, workdir / "segments_my.json")
@@ -470,7 +533,7 @@ def translate_segments(workdir, style="subs"):
     # rescue itself, and whatever still fails keeps its
     # source text under a fallback-source label for
     # run_job's guard to reject loudly.
-    rescue = _Rescue(style)
+    rescue = _Rescue(style, admin=admin)
     out = []
     for seg in segs:
         if not (seg.get("text") or "").strip():
@@ -481,7 +544,7 @@ def translate_segments(workdir, style="subs"):
             out.append({**seg, "text_my": _my,
                         "provider": _prov})
     report["rescue"] = rescue.report
-    out = _fill_missing(out, report, style=style)
+    out = _fill_missing(out, report, style=style, admin=admin)
     # D2 "second wind": the 21:19 job died with 24 of ~50
     # segments translated — the working route was throttled
     # mid-job and the first fill pass ran while it was still
@@ -499,7 +562,7 @@ def translate_segments(workdir, style="subs"):
             "pause_s": pause}
         time.sleep(pause)
         tmp = {}
-        out = _fill_missing(out, tmp, style=style)
+        out = _fill_missing(out, tmp, style=style, admin=admin)
         report["fill2"] = tmp.get("fill", {})
         report["second_wind"]["remaining_after"] = \
             translation_stats(out)["untranslated"]
