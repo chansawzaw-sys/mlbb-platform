@@ -1,4 +1,4 @@
-"""Bilibili login session for downloads — build 236.
+"""Bilibili login session for downloads — build 237.
 
 Bilibili's risk control refuses this server outright: the
 Hong Kong datacenter IP, the browser-impersonated ladder
@@ -18,12 +18,28 @@ bilibili* — admin-only via the accounts guard, exactly
 like the tunnel card):
   * QR login (primary): the card asks this module for a
     passport QR (passport.bilibili.com/x/passport-login/
-    web/qrcode/generate), shows it as an image, and polls
-    qr_poll(); the owner scans it with the Bilibili app
-    and confirms on his phone. On success the poll
-    response's Set-Cookie headers carry the session
-    (SESSDATA / bili_jct / DedeUserID / ...) — captured
-    from the response cookie jar and stored. On a single
+    web/qrcode/generate) and shows it as an image; a
+    server-side background thread then polls passport
+    until the login resolves (build 237 — polling used
+    to ride on the card's own status hits, which stalled
+    whenever the owner switched to the Bilibili app to
+    scan and the browser tab was suspended). The owner
+    scans the QR with the Bilibili app and confirms on
+    his phone. On success the session does NOT reliably
+    arrive as Set-Cookie headers: Bilibili delivers it
+    inside the poll payload's data.url — a crossDomain
+    URL whose QUERY PARAMETERS carry the values
+    (DedeUserID, DedeUserID__ckMd5, SESSDATA, bili_jct,
+    sid, ...). Build 236 read only the cookie jar, the
+    jar was empty, and a confirmed scan stored NOTHING
+    (live failure, 2026-11-20). Capture now merges BOTH
+    sources (jar first, URL parameters overriding), then
+    fires one best-effort GET of that crossDomain URL
+    with the assembled cookies and merges any Set-Cookie
+    it returns; a non-empty SESSDATA is required before
+    anything is stored, and a success with no SESSDATA
+    anywhere surfaces as the loud state "capture_failed"
+    instead of silently waiting forever. On a single
     phone he can screenshot the QR and pick it from the
     album inside the Bilibili app's scanner.
   * Paste fallback: a Netscape cookies.txt export for
@@ -50,10 +66,17 @@ The pending QR (qrcode_key + scan URL) is process-local
 state BY DESIGN, like app.py's registration throttle:
 the app runs as a single Waitress process, the key dies
 with the passport-side TTL anyway (~3 minutes), and
-nothing about it may touch disk.
+nothing about it may touch disk. The background poller
+is a daemon thread guarded by a generation counter: a
+second qr_start (or a delete) bumps the generation, and
+a stale thread checks it before every poll and again
+before it may store, so it can never write a session
+for a superseded key. The card's poll endpoint is a
+pure state read — it never calls passport itself.
 """
 import io
 import os
+import urllib.parse
 import threading
 import time
 
@@ -72,7 +95,9 @@ _HEADERS = {"User-Agent": _UA,
             "Referer": "https://www.bilibili.com/"}
 
 _PENDING_TTL_S = 300  # the passport key itself lives ~180 s
-_PENDING = {"key": None, "url": None, "ts": 0.0}
+_POLL_INTERVAL_S = 2.0  # background poller cadence
+_PENDING = {"key": None, "url": None, "ts": 0.0,
+            "state": None, "gen": 0}
 _PENDING_LOCK = threading.Lock()
 
 _MAX_PASTE_CHARS = 500_000
@@ -114,7 +139,7 @@ def _parse_netscape(text):
 
 def _to_netscape(records):
     lines = ["# Netscape HTTP Cookie File",
-             "# Bilibili login session (build 236) — a "
+             "# Bilibili login session (build 237) — a "
              "credential; never share or commit this file."]
     for r in records:
         lines.append("\t".join([
@@ -208,8 +233,7 @@ def clear():
         _path().unlink(missing_ok=True)
     except Exception:
         pass
-    with _PENDING_LOCK:
-        _PENDING.update({"key": None, "url": None, "ts": 0.0})
+    _reset_pending()
 
 
 # ---------------- paste fallback ----------------
@@ -238,6 +262,7 @@ def save_pasted(text):
     return {"logged_in_as": _mask(_account_id(records))}
 
 
+# ---------------- passport QR login ----------------
 # ---------------- passport QR login ----------------
 
 def _passport_get(path, params=None):
@@ -270,14 +295,31 @@ def _passport_get(path, params=None):
         "passport request failed")
 
 
+def _reset_pending():
+    """Drop the pending login and invalidate any poller
+    thread still working on it (generation bump — a
+    stale thread checks the generation before every poll
+    and again before it may store, so it can never write
+    a session for a superseded key)."""
+    with _PENDING_LOCK:
+        _PENDING.update({"key": None, "url": None,
+                         "ts": 0.0, "state": None,
+                         "gen": _PENDING["gen"] + 1})
+
+
 def qr_start():
-    """Ask passport for a login QR and keep its key as
-    the process-local pending login. Returns {"ok",
-    "state", "scan_url"} — the scan URL is transient
-    (it dies with the key) and is returned so the card
-    can still offer it as text when QR rendering is
-    unavailable; it is NOT the credential (the stored
-    cookies are, and those are never returned)."""
+    """Ask passport for a login QR, keep its key as the
+    process-local pending login, and spawn the daemon
+    thread that polls passport until it resolves (build
+    237 — the card no longer has to stay awake for the
+    login to land). Returns {"ok", "state", "scan_url"}
+    — the scan URL is transient (it dies with the key)
+    and is returned so the card can still offer it as
+    text when QR rendering is unavailable; it is NOT the
+    credential (the stored cookies are, and those are
+    never returned). A second call replaces the pending
+    login cleanly: the generation bump retires the old
+    poller."""
     resp = _passport_get("/qrcode/generate")
     try:
         payload = resp.json() or {}
@@ -290,85 +332,246 @@ def qr_start():
         raise ValueError("Bilibili က QR ထုတ်မပေးပါ — ခဏနေ "
                          "ပြန်စမ်းပါ")
     with _PENDING_LOCK:
+        gen = _PENDING["gen"] + 1
         _PENDING.update({"key": key, "url": url,
-                         "ts": time.time()})
+                         "ts": time.time(),
+                         "state": "waiting", "gen": gen})
+        ts = _PENDING["ts"]
+    try:
+        threading.Thread(target=_poll_loop,
+                         args=(gen, key, ts), daemon=True,
+                         name="bili-qr-poll").start()
+    except Exception:
+        pass  # the pending state still expires cleanly
     return {"ok": True, "state": "waiting", "scan_url": url}
 
 
-def _pending_fresh():
+def _finish_pending(gen, key, state):
+    """Record a terminal state (expired / capture_failed)
+    for the pending login IF it is still the current
+    one; the key is dropped so nothing polls it again."""
     with _PENDING_LOCK:
-        key, ts = _PENDING["key"], _PENDING["ts"]
-    if not key or time.time() - ts > _PENDING_TTL_S:
-        return None
-    return key
+        if (_PENDING["gen"] == gen
+                and _PENDING["key"] == key):
+            _PENDING.update({"key": None, "state": state})
 
 
-def _drop_pending():
-    with _PENDING_LOCK:
-        _PENDING.update({"key": None, "url": None, "ts": 0.0})
+def _poll_loop(gen, key, ts):
+    """The pending login's owner poller: one daemon
+    thread per qr_start, polling passport every
+    _POLL_INTERVAL_S until the login resolves, the local
+    TTL runs out, or the generation moves on (a newer
+    qr_start, or clear()). Single-writer discipline: this
+    thread is the ONLY caller of the passport poll and
+    the only writer of the stored session on the QR path;
+    the card endpoint just reads the recorded state.
+    Defensive by construction — any unexpected failure
+    degrades to the transient "error" state and the loop
+    carries on until the TTL, so the thread never dies
+    silently with a login still pending."""
+    while True:
+        try:
+            with _PENDING_LOCK:
+                current = (_PENDING["gen"] == gen
+                           and _PENDING["key"] == key)
+            if not current:
+                return
+            if time.time() - ts > _PENDING_TTL_S:
+                _finish_pending(gen, key, "expired")
+                return
+            state, records = _poll_once(key)
+        except Exception:
+            state, records = "error", None
+        if state == "done":
+            with _PENDING_LOCK:
+                if (_PENDING["gen"] != gen
+                        or _PENDING["key"] != key):
+                    return  # superseded mid-poll: discard
+                _write(records)
+                _PENDING.update({"key": None,
+                                 "state": "done"})
+            return
+        if state in ("expired", "capture_failed"):
+            _finish_pending(gen, key, state)
+            return
+        with _PENDING_LOCK:
+            if (_PENDING["gen"] == gen
+                    and _PENDING["key"] == key):
+                _PENDING["state"] = state
+        time.sleep(_POLL_INTERVAL_S)
 
 
-def _capture_session(resp):
-    """The poll success response's cookies -> stored
-    records. requests exposes them as a cookie jar of
-    http.cookiejar.Cookie objects (built from the
-    Set-Cookie headers); every one of them belongs to
-    the bilibili session. Returns the records, or []
-    when the jar carries no SESSDATA (a "success" we
-    cannot use — nothing is stored then)."""
+def _poll_once(key):
+    """ONE passport poll of the pending key -> (state,
+    records). States: waiting (86101, not scanned yet),
+    scanned (86090, scanned, awaiting the phone
+    confirm), expired (86038), done (code 0 with a
+    captured session — records are ready to store),
+    capture_failed (code 0 but NO SESSDATA could be
+    assembled from any source — a loud dead end, never a
+    silent wait), error (anything else; transient — the
+    poller keeps the login and tries again)."""
+    try:
+        resp = _passport_get("/qrcode/poll",
+                             params={"qrcode_key": key})
+        payload = resp.json() or {}
+    except Exception:
+        return "error", None
+    data = payload.get("data") or {}
+    code = data.get("code")
+    if code == 0:
+        records = _assemble_session(resp, data)
+        if not records:
+            return "capture_failed", None
+        return "done", records
+    if code == 86101:
+        return "waiting", None
+    if code == 86090:
+        return "scanned", None
+    if code == 86038:
+        return "expired", None
+    return "error", None
+
+
+def _jar_records(resp):
+    """A response's cookie jar -> records. requests
+    exposes the jar as http.cookiejar.Cookie objects
+    built from the Set-Cookie headers; every one of them
+    belongs to the bilibili session."""
     records = []
     try:
         jar = list(resp.cookies)
     except Exception:
         jar = []
     for c in jar:
-        records.append({
-            "domain": getattr(c, "domain", "") or ".bilibili.com",
-            "path": getattr(c, "path", "") or "/",
-            "secure": bool(getattr(c, "secure", False)),
-            "expires": int(getattr(c, "expires", 0) or 0),
-            "name": getattr(c, "name", ""),
-            "value": getattr(c, "value", "")})
-    records = [r for r in records if r["name"]]
+        rec = {"domain": getattr(c, "domain", "")
+               or ".bilibili.com",
+               "path": getattr(c, "path", "") or "/",
+               "secure": bool(getattr(c, "secure", False)),
+               "expires": int(getattr(c, "expires", 0)
+                              or 0),
+               "name": getattr(c, "name", ""),
+               "value": getattr(c, "value", "")}
+        if rec["name"]:
+            records.append(rec)
+    return records
+
+
+def _url_records(url):
+    """The crossDomain session URL -> records. On QR
+    success Bilibili delivers the session as QUERY
+    PARAMETERS of data.url (DedeUserID,
+    DedeUserID__ckMd5, SESSDATA, bili_jct, sid, ...) —
+    the values are the credential, planted on the
+    sibling domains when a browser follows the URL.
+    Written here as .bilibili.com records (path /,
+    session expiry — the jar the app hands yt-dlp lives
+    for the process, exactly like a browser session)."""
+    records = []
+    if not url:
+        return records
+    try:
+        query = urllib.parse.urlparse(url).query
+        pairs = urllib.parse.parse_qsl(query)
+    except Exception:
+        return records
+    for name, value in pairs:
+        if not name or not value:
+            continue
+        records.append({"domain": ".bilibili.com",
+                        "path": "/", "secure": True,
+                        "expires": 0, "name": name,
+                        "value": value})
+    return records
+
+
+def _crossdomain_records(url, records):
+    """ONE best-effort GET of the crossDomain URL with
+    the assembled cookies (direct first, then the tunnel
+    proxies — the _passport_get route order), merging
+    whatever Set-Cookie it answers with: following the
+    URL is how the session gets planted, and the plant
+    can carry cookies the parameters did not. Failures
+    NEVER block: no URL, a non-bilibili host, a transport
+    error or a non-200 all just return []."""
+    if not url:
+        return []
+    try:
+        parts = urllib.parse.urlparse(url)
+    except Exception:
+        return []
+    host = parts.hostname or ""
+    if parts.scheme not in ("http", "https"):
+        return []
+    if host != "bilibili.com" \
+            and not host.endswith(".bilibili.com"):
+        return []
+    cookies = {r["name"]: r["value"] for r in records
+               if r["name"]}
+    attempts = [None]
+    proxies = tunnel.requests_proxies()
+    if proxies:
+        attempts.append(proxies)
+    for prox in attempts:
+        try:
+            resp = requests.get(url, headers=_HEADERS,
+                                timeout=15, proxies=prox,
+                                cookies=cookies or None)
+        except Exception:
+            continue
+        if resp.status_code == 200:
+            return _jar_records(resp)
+    return []
+
+
+def _assemble_session(resp, data):
+    """The poll success -> the session records, from
+    EVERY source Bilibili uses (build 237): the response
+    cookie jar first, then the data.url query parameters
+    overriding/adding, then the Set-Cookie of one
+    best-effort crossDomain GET. Returns [] when no
+    SESSDATA can be assembled from any of them — the
+    caller turns that into "capture_failed" and stores
+    NOTHING."""
+    merged = {}
+    for r in _jar_records(resp):
+        merged[r["name"]] = r
+    url = (data or {}).get("url") or ""
+    for r in _url_records(url):
+        merged[r["name"]] = r
+    for r in _crossdomain_records(url,
+                                  list(merged.values())):
+        merged[r["name"]] = r
+    records = list(merged.values())
     if not _sessdata(records):
         return []
     return records
 
 
 def qr_poll():
-    """One poll of the pending login. States: waiting
-    (86101, not scanned yet), scanned (86090, scanned,
-    awaiting the phone confirm), expired (86038, or the
-    local pending TTL ran out), done (code 0 — session
-    captured + stored), error (anything else; the
-    pending login is KEPT so the card can keep polling
-    through a transient failure)."""
-    key = _pending_fresh()
-    if not key:
-        return {"state": "expired"}
-    try:
-        resp = _passport_get("/qrcode/poll",
-                             params={"qrcode_key": key})
-        payload = resp.json() or {}
-    except Exception:
-        return {"state": "error"}
-    data = payload.get("data") or {}
-    code = data.get("code")
-    if code == 0:
-        records = _capture_session(resp)
-        if not records:
-            return {"state": "error"}
-        _write(records)
-        _drop_pending()
+    """The card's status read — PURE state, no passport
+    call (build 237: the background poller owns polling,
+    so a suspended browser tab can no longer stall a
+    login; this only reports what the poller recorded).
+    States: waiting / scanned (login in flight), error
+    (transient — the poller is still trying), done
+    (session captured + stored), expired (the key died,
+    or nothing is pending — the build-236 shape),
+    capture_failed (the scan was accepted but no session
+    could be captured — retry with a fresh QR)."""
+    with _PENDING_LOCK:
+        key = _PENDING["key"]
+        ts = _PENDING["ts"]
+        state = _PENDING["state"]
+    if state == "done":
         return {"state": "done", **status()}
-    if code == 86101:
-        return {"state": "waiting"}
-    if code == 86090:
-        return {"state": "scanned"}
-    if code == 86038:
-        _drop_pending()
+    if state == "capture_failed":
+        return {"state": "capture_failed"}
+    if state == "expired":
         return {"state": "expired"}
-    return {"state": "error"}
+    if key and time.time() - ts <= _PENDING_TTL_S:
+        return {"state": state or "waiting"}
+    return {"state": "expired"}
 
 
 def qr_image_png():
@@ -377,8 +580,10 @@ def qr_image_png():
     qrcode package is unavailable (the card then falls
     back to the scan URL as text)."""
     with _PENDING_LOCK:
+        key = _PENDING["key"]
         url, ts = _PENDING["url"], _PENDING["ts"]
-    if not url or time.time() - ts > _PENDING_TTL_S:
+    if not key or not url \
+            or time.time() - ts > _PENDING_TTL_S:
         raise ValueError("QR မရှိသေးပါ — အရင် QR ထုတ်ပါ")
     try:
         import qrcode
