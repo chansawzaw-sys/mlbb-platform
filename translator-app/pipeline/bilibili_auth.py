@@ -1,4 +1,4 @@
-"""Bilibili login session for downloads — build 237.
+"""Bilibili login session for downloads — build 238.
 
 Bilibili's risk control refuses this server outright: the
 Hong Kong datacenter IP, the browser-impersonated ladder
@@ -57,10 +57,30 @@ returns them — the status surface is {configured,
 logged_in_as} with the account id masked. Deleting
 clears the file and downloads go back to anonymous.
 
-The passport calls try direct first, then the tunnel
+The passport calls route per purpose (build 238): the
+generate call tries direct first, then the tunnel
 proxy (pipeline.tunnel.requests_proxies) when one is
-verified up — the passport host can itself be risk-
-controlled from Hong Kong.
+verified up; the POLL tries the tunnel FIRST — passport
+is a mainland host, the tunnel is the natural route
+from this server, and live on build 237 the poll path
+failed from the VPS (the card sat in the "error" state
+from the start and no session was ever captured) while
+the same contract answered fine from a clean network.
+A leg that answers with ANY HTTP status ends a poll
+attempt — fall-through happens only on transport
+exceptions.
+
+Build 238 also gives the card eyes: the pending login
+carries admin-visible diagnostics (last_error — an HTTP
+status or an exception class + truncated message, the
+pending key scrubbed out, NEVER a cookie value — and
+last_via, the leg that answered), qr_start performs
+ONE synchronous poll before returning so a broken poll
+path shows its error on the card instantly instead of
+after a scan, and an HTTP 412 poll answer is recorded
+as the risk-control diagnostic it is while the login's
+state stays waiting/scanned — the poller keeps trying
+until the TTL instead of degrading to a bare "error".
 
 The pending QR (qrcode_key + scan URL) is process-local
 state BY DESIGN, like app.py's registration throttle:
@@ -97,7 +117,8 @@ _HEADERS = {"User-Agent": _UA,
 _PENDING_TTL_S = 300  # the passport key itself lives ~180 s
 _POLL_INTERVAL_S = 2.0  # background poller cadence
 _PENDING = {"key": None, "url": None, "ts": 0.0,
-            "state": None, "gen": 0}
+            "state": None, "gen": 0,
+            "last_error": "", "last_via": ""}
 _PENDING_LOCK = threading.Lock()
 
 _MAX_PASTE_CHARS = 500_000
@@ -139,7 +160,7 @@ def _parse_netscape(text):
 
 def _to_netscape(records):
     lines = ["# Netscape HTTP Cookie File",
-             "# Bilibili login session (build 237) — a "
+             "# Bilibili login session (build 238) — a "
              "credential; never share or commit this file."]
     for r in records:
         lines.append("\t".join([
@@ -295,6 +316,54 @@ def _passport_get(path, params=None):
         "passport request failed")
 
 
+def _diag_text(exc, key=None):
+    """An exception -> the admin-visible diagnostic
+    (build 238): the exception class + message, the
+    pending qrcode_key scrubbed out (a requests error
+    can quote the request URL, key and all), flattened
+    and hard-truncated to ~120 chars. Passport transport
+    errors never carry a cookie value, and the key is
+    the only secret-shaped string they could quote —
+    so what lands here is safe for the admin card."""
+    if exc is None:
+        return ""
+    s = f"{type(exc).__name__}: {exc}"
+    s = s.replace("\n", " ").replace("\r", " ").strip()
+    if key:
+        s = s.replace(key, "***")
+    return s[:120]
+
+
+def _passport_poll(key):
+    """ONE passport poll GET, tunnel-first (build 238):
+    passport is a mainland host and the tunnel is the
+    natural route from this server, so when a tunnel
+    proxy is verified up it is tried FIRST and the
+    direct leg is the fallback. A leg that answers with
+    ANY HTTP status ends the attempt — fall-through
+    happens only on transport exceptions. Returns
+    (resp, via, exc): resp None + exc set when every
+    leg failed in transport; via names the leg that
+    answered ("tunnel" / "direct", "" when none did)."""
+    url = _PASSPORT + "/qrcode/poll"
+    legs = []
+    proxies = tunnel.requests_proxies()
+    if proxies:
+        legs.append(("tunnel", proxies))
+    legs.append(("direct", None))
+    last_exc = None
+    for via, prox in legs:
+        try:
+            resp = requests.get(
+                url, params={"qrcode_key": key},
+                headers=_HEADERS, timeout=15, proxies=prox)
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            continue
+        return resp, via, None
+    return None, "", last_exc
+
+
 def _reset_pending():
     """Drop the pending login and invalidate any poller
     thread still working on it (generation bump — a
@@ -304,7 +373,8 @@ def _reset_pending():
     with _PENDING_LOCK:
         _PENDING.update({"key": None, "url": None,
                          "ts": 0.0, "state": None,
-                         "gen": _PENDING["gen"] + 1})
+                         "gen": _PENDING["gen"] + 1,
+                         "last_error": "", "last_via": ""})
 
 
 def qr_start():
@@ -335,25 +405,109 @@ def qr_start():
         gen = _PENDING["gen"] + 1
         _PENDING.update({"key": key, "url": url,
                          "ts": time.time(),
-                         "state": "waiting", "gen": gen})
+                         "state": "waiting", "gen": gen,
+                         "last_error": "", "last_via": ""})
         ts = _PENDING["ts"]
+    # Build 238: ONE synchronous poll on this request
+    # thread, BEFORE the daemon poller is spawned — it
+    # is the login's first poll (the thread continues
+    # from the second, one interval later), and its
+    # outcome + diagnostics are already recorded when
+    # this returns, so a broken poll path shows its
+    # error on the card instantly instead of after a
+    # scan. A transient failure here is SOFT: the
+    # diagnostics are recorded but the state stays
+    # "waiting" — the poller keeps trying regardless.
     try:
-        threading.Thread(target=_poll_loop,
-                         args=(gen, key, ts), daemon=True,
-                         name="bili-qr-poll").start()
+        finished = _poll_step(gen, key, soft_error=True)
     except Exception:
-        pass  # the pending state still expires cleanly
-    return {"ok": True, "state": "waiting", "scan_url": url}
+        finished = False
+    if not finished:
+        try:
+            threading.Thread(target=_poll_loop,
+                             args=(gen, key, ts), daemon=True,
+                             name="bili-qr-poll").start()
+        except Exception:
+            pass  # the pending state still expires cleanly
+    with _PENDING_LOCK:
+        state = _PENDING["state"] \
+            if _PENDING["gen"] == gen else None
+    return {"ok": True, "state": state or "waiting",
+            "scan_url": url}
 
 
-def _finish_pending(gen, key, state):
+def _finish_pending(gen, key, state, err=None, via=None):
     """Record a terminal state (expired / capture_failed)
     for the pending login IF it is still the current
-    one; the key is dropped so nothing polls it again."""
+    one; the key is dropped so nothing polls it again.
+    err/via, when given, update the diagnostics in the
+    same write (None leaves them as they were)."""
     with _PENDING_LOCK:
         if (_PENDING["gen"] == gen
                 and _PENDING["key"] == key):
             _PENDING.update({"key": None, "state": state})
+            if err is not None:
+                _PENDING["last_error"] = err
+            if via is not None:
+                _PENDING["last_via"] = via
+
+
+def _record_state(gen, key, state, err, via):
+    """Record a non-terminal poll outcome IF the login
+    is still the current one: state (None = leave the
+    recorded state untouched — the HTTP 412 shape) plus
+    the diagnostics, in one locked write."""
+    with _PENDING_LOCK:
+        if (_PENDING["gen"] == gen
+                and _PENDING["key"] == key):
+            if state is not None:
+                _PENDING["state"] = state
+            _PENDING["last_error"] = err
+            _PENDING["last_via"] = via
+
+
+def _poll_step(gen, key, soft_error=False):
+    """ONE poll of the pending login + recording of its
+    outcome (state and diagnostics). Returns True when
+    the login is finished — done (stored, or discarded
+    as superseded), expired, capture_failed — and False
+    while it is still in flight. Single-writer
+    discipline (build 237): the caller — qr_start's
+    synchronous first poll, then the daemon thread — is
+    the only passport poller and the only writer of the
+    stored session on the QR path; every write is
+    generation-checked under the lock, so a superseded
+    login can never store. soft_error (the synchronous
+    first poll only): a transient "error" outcome
+    records ONLY the diagnostics and leaves the state
+    at "waiting" — the card shows the failure detail
+    under a still-pending login, and the poller keeps
+    trying on its own cadence."""
+    try:
+        state, records, err, via = _poll_once(key)
+    except Exception as e:  # _poll_once is total by
+        # construction; this is belt + braces so a step
+        # can never kill the poller thread silently.
+        state, records, err, via = \
+            "error", None, _diag_text(e, key), ""
+    if state == "done":
+        with _PENDING_LOCK:
+            if (_PENDING["gen"] != gen
+                    or _PENDING["key"] != key):
+                return True  # superseded mid-poll: discard
+            _write(records)
+            _PENDING.update({"key": None, "state": "done",
+                             "last_error": "",
+                             "last_via": via})
+        return True
+    if state in ("expired", "capture_failed"):
+        _finish_pending(gen, key, state, err, via)
+        return True
+    if state == "error" and soft_error:
+        _record_state(gen, key, None, err, via)
+        return False
+    _record_state(gen, key, state, err, via)
+    return False
 
 
 def _poll_loop(gen, key, ts):
@@ -361,14 +515,14 @@ def _poll_loop(gen, key, ts):
     thread per qr_start, polling passport every
     _POLL_INTERVAL_S until the login resolves, the local
     TTL runs out, or the generation moves on (a newer
-    qr_start, or clear()). Single-writer discipline: this
-    thread is the ONLY caller of the passport poll and
-    the only writer of the stored session on the QR path;
-    the card endpoint just reads the recorded state.
-    Defensive by construction — any unexpected failure
-    degrades to the transient "error" state and the loop
-    carries on until the TTL, so the thread never dies
-    silently with a login still pending."""
+    qr_start, or clear()). The thread's first poll is
+    one interval out — qr_start's synchronous poll was
+    the login's first (build 238), so the cadence is
+    unchanged, just owned by two callers of the one
+    _poll_step. Defensive by construction — any
+    unexpected failure degrades to recorded diagnostics
+    and the loop carries on until the TTL, so the
+    thread never dies silently with a login pending."""
     while True:
         try:
             with _PENDING_LOCK:
@@ -379,58 +533,59 @@ def _poll_loop(gen, key, ts):
             if time.time() - ts > _PENDING_TTL_S:
                 _finish_pending(gen, key, "expired")
                 return
-            state, records = _poll_once(key)
         except Exception:
-            state, records = "error", None
-        if state == "done":
-            with _PENDING_LOCK:
-                if (_PENDING["gen"] != gen
-                        or _PENDING["key"] != key):
-                    return  # superseded mid-poll: discard
-                _write(records)
-                _PENDING.update({"key": None,
-                                 "state": "done"})
             return
-        if state in ("expired", "capture_failed"):
-            _finish_pending(gen, key, state)
-            return
-        with _PENDING_LOCK:
-            if (_PENDING["gen"] == gen
-                    and _PENDING["key"] == key):
-                _PENDING["state"] = state
         time.sleep(_POLL_INTERVAL_S)
+        try:
+            if _poll_step(gen, key):
+                return
+        except Exception as e:
+            _record_state(gen, key, None,
+                          _diag_text(e, key), "")
 
 
 def _poll_once(key):
     """ONE passport poll of the pending key -> (state,
-    records). States: waiting (86101, not scanned yet),
-    scanned (86090, scanned, awaiting the phone
-    confirm), expired (86038), done (code 0 with a
-    captured session — records are ready to store),
-    capture_failed (code 0 but NO SESSDATA could be
-    assembled from any source — a loud dead end, never a
-    silent wait), error (anything else; transient — the
-    poller keeps the login and tries again)."""
+    records, last_error, last_via). States: waiting
+    (86101, not scanned yet), scanned (86090, scanned,
+    awaiting the phone confirm), expired (86038), done
+    (code 0 with a captured session — records are ready
+    to store), capture_failed (code 0 but NO SESSDATA
+    could be assembled from any source — a loud dead
+    end, never a silent wait), error (anything else;
+    transient — the poller keeps the login and tries
+    again), and None — NO state change (build 238: an
+    HTTP 412 answer is Bilibili's risk control, recorded
+    as the diagnostic "HTTP 412 (Bilibili risk control)"
+    while the login's last real state stands). A clean
+    200 answer clears last_error; last_via always names
+    the leg that answered ("" when none did)."""
+    resp, via, exc = _passport_poll(key)
+    if resp is None:
+        return "error", None, _diag_text(exc, key), ""
+    if resp.status_code == 412:
+        return None, None, \
+            "HTTP 412 (Bilibili risk control)", via
+    if resp.status_code != 200:
+        return "error", None, f"HTTP {resp.status_code}", via
     try:
-        resp = _passport_get("/qrcode/poll",
-                             params={"qrcode_key": key})
         payload = resp.json() or {}
-    except Exception:
-        return "error", None
+    except Exception as e:
+        return "error", None, _diag_text(e, key), via
     data = payload.get("data") or {}
     code = data.get("code")
     if code == 0:
         records = _assemble_session(resp, data)
         if not records:
-            return "capture_failed", None
-        return "done", records
+            return "capture_failed", None, "", via
+        return "done", records, "", via
     if code == 86101:
-        return "waiting", None
+        return "waiting", None, "", via
     if code == 86090:
-        return "scanned", None
+        return "scanned", None, "", via
     if code == 86038:
-        return "expired", None
-    return "error", None
+        return "expired", None, "", via
+    return "error", None, "", via
 
 
 def _jar_records(resp):
@@ -558,20 +713,26 @@ def qr_poll():
     (session captured + stored), expired (the key died,
     or nothing is pending — the build-236 shape),
     capture_failed (the scan was accepted but no session
-    could be captured — retry with a fresh QR)."""
+    could be captured — retry with a fresh QR). Every
+    shape also carries the build-238 diagnostics
+    (last_error / last_via) — admin-only, and scrubbed
+    by construction (see _diag_text): never a cookie
+    value, never the qrcode_key."""
     with _PENDING_LOCK:
         key = _PENDING["key"]
         ts = _PENDING["ts"]
         state = _PENDING["state"]
+        diag = {"last_error": _PENDING["last_error"],
+                "last_via": _PENDING["last_via"]}
     if state == "done":
-        return {"state": "done", **status()}
+        return {"state": "done", **status(), **diag}
     if state == "capture_failed":
-        return {"state": "capture_failed"}
+        return {"state": "capture_failed", **diag}
     if state == "expired":
-        return {"state": "expired"}
+        return {"state": "expired", **diag}
     if key and time.time() - ts <= _PENDING_TTL_S:
-        return {"state": state or "waiting"}
-    return {"state": "expired"}
+        return {"state": state or "waiting", **diag}
+    return {"state": "expired", **diag}
 
 
 def qr_image_png():
