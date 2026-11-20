@@ -1,4 +1,4 @@
-"""Bilibili login session for downloads — build 238.
+"""Bilibili login session for downloads — build 239.
 
 Bilibili's risk control refuses this server outright: the
 Hong Kong datacenter IP, the browser-impersonated ladder
@@ -81,6 +81,21 @@ after a scan, and an HTTP 412 poll answer is recorded
 as the risk-control diagnostic it is while the login's
 state stays waiting/scanned — the poller keeps trying
 until the TTL instead of degrading to a bare "error".
+
+Build 239 closes the one blind spot 238 left: a poll
+can answer 200 carrying Bilibili's risk-control
+ENVELOPE — a top-level {"code": -412, ...} with NO
+data object at all (the shape the VPS actually gets).
+Its data.code read as None, fell through every known
+code, and returned a bare "error" with an EMPTY
+diagnostic — so the card showed the ⚠️ state line
+with no 🔎 line under it (live, 2026-11-21). The
+envelope now gets the HTTP 412 treatment (no state
+change; "Bilibili risk control (code -412)"), and the
+fall-through for any other unexpected reply records
+what Bilibili actually said — top-level code, data
+code, message — so no error state can render without
+its diagnostic again.
 
 The pending QR (qrcode_key + scan URL) is process-local
 state BY DESIGN, like app.py's registration throttle:
@@ -316,6 +331,18 @@ def _passport_get(path, params=None):
         "passport request failed")
 
 
+def _scrub_diag(s, key=None):
+    """Flatten + key-scrub + ~120-char truncate: the
+    ONE discipline every admin-visible diagnostic goes
+    through. Factored out of _diag_text (build 239) so
+    a diagnostic built from a poll PAYLOAD rather than
+    an exception gets exactly the same treatment."""
+    s = s.replace("\n", " ").replace("\r", " ").strip()
+    if key:
+        s = s.replace(key, "***")
+    return s[:120]
+
+
 def _diag_text(exc, key=None):
     """An exception -> the admin-visible diagnostic
     (build 238): the exception class + message, the
@@ -327,11 +354,7 @@ def _diag_text(exc, key=None):
     so what lands here is safe for the admin card."""
     if exc is None:
         return ""
-    s = f"{type(exc).__name__}: {exc}"
-    s = s.replace("\n", " ").replace("\r", " ").strip()
-    if key:
-        s = s.replace(key, "***")
-    return s[:120]
+    return _scrub_diag(f"{type(exc).__name__}: {exc}", key)
 
 
 def _passport_poll(key):
@@ -557,12 +580,21 @@ def _poll_once(key):
     again), and None — NO state change (build 238: an
     HTTP 412 answer is Bilibili's risk control, recorded
     as the diagnostic "HTTP 412 (Bilibili risk control)"
-    while the login's last real state stands). A clean
-    200 answer clears last_error; last_via always names
-    the leg that answered ("" when none did)."""
+    while the login's last real state stands; build
+    239: the same treatment for a 200 carrying the
+    risk-control ENVELOPE — a top-level code of -412
+    or -352, typically with no data object at all).
+    A clean 200 answer clears last_error; last_via
+    always names the leg that answered ("" when none
+    did). Every non-clean return carries a NON-EMPTY
+    last_error (build 239 audit; capture_failed is
+    the single exception, by design — its state text
+    is self-explanatory on the card)."""
     resp, via, exc = _passport_poll(key)
     if resp is None:
-        return "error", None, _diag_text(exc, key), ""
+        return "error", None, \
+            _diag_text(exc, key) or \
+            "Passport poll failed (no answer)", ""
     if resp.status_code == 412:
         return None, None, \
             "HTTP 412 (Bilibili risk control)", via
@@ -572,6 +604,16 @@ def _poll_once(key):
         payload = resp.json() or {}
     except Exception as e:
         return "error", None, _diag_text(e, key), via
+    # Build 239: Bilibili's risk control can ride
+    # INSIDE a 200 as a top-level envelope code (-412
+    # / -352) with NO data object at all — checked
+    # BEFORE data.code is read, and given the HTTP 412
+    # treatment: no state change, the diagnostic names
+    # it, the poller keeps trying until the TTL.
+    top = payload.get("code")
+    if top in (-412, -352):
+        return None, None, \
+            f"Bilibili risk control (code {top})", via
     data = payload.get("data") or {}
     code = data.get("code")
     if code == 0:
@@ -585,7 +627,18 @@ def _poll_once(key):
         return "scanned", None, "", via
     if code == 86038:
         return "expired", None, "", via
-    return "error", None, "", via
+    # Build 239: an answer none of the known codes
+    # claims — record what Bilibili actually said (top
+    # code, data code, message) through the same scrub
+    # discipline as the exception diagnostics, so this
+    # error state can never render on the card without
+    # its 🔎 line again.
+    msg = payload.get("message") or data.get("message") \
+        or ""
+    err = _scrub_diag(
+        f"Unexpected poll reply: top={top!r} "
+        f"data_code={code!r} msg={msg}", key)
+    return "error", None, err, via
 
 
 def _jar_records(resp):
