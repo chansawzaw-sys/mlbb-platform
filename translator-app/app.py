@@ -59,7 +59,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 240"
+BUILD_TAG = "build 241"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -3086,7 +3086,11 @@ def _preview_quality(pdir):
 # per-user 30/hour admission cap and the login gate are unchanged.
 _PREVIEW_SEM = threading.Semaphore(2)
 _PREVIEW_DEADLINE_S = 180
-_PREVIEW_MAX_DURATION_S = 3600  # 60 minutes
+_PREVIEW_MAX_DURATION_S = 10800  # 3 hours (build 241: was 60 min —
+# ~2-hour dramas are the core content, so the old cap refused the
+# main use. The cap bounds only this DOWNLOAD path; uploaded files
+# take /api/frame-upload, which never had a duration cap — the
+# file is already local and an ffmpeg seek is O(1) in duration)
 
 
 def _preview_download_bounded(url, pdir, quality):
@@ -3210,7 +3214,7 @@ def make_preview():
                 (serve_dir / "source_info.json").unlink(missing_ok=True)
                 return jsonify({"error": "ဒီ video က အရမ်း ရှည်နေလို့ "
                                          "preview မရပါ (အများဆုံး "
-                                         "၆၀ မိနစ်) — preview မပါဘဲ job "
+                                         "၃ နာရီ) — preview မပါဘဲ job "
                                          "တိုက်ရိုက် တင်လို့ ရပါတယ်"}), 400
             w, h = fx_mod.video_size(src)
         except Exception as e:
@@ -3262,14 +3266,18 @@ def frame_upload():
     verbatim), and is deleted — nothing is kept. Duration and
     dimensions ride in headers for the editor."""
     if not _preview_allowed():
+        print("[frame-upload] FAILED rate cap hit", flush=True)
         return jsonify({"error": "ခဏ ခဏ မစမ်းပါနဲ့ — ခဏ စောင့်ပြီး "
                                  "ပြန် စမ်းပါ"}), 429
     f = request.files.get("file")
     if f is None or not (f.filename or "").strip():
+        print("[frame-upload] FAILED no file in request", flush=True)
         return jsonify({"error": "ဖိုင် မပါပါ"}), 400
     name = (f.filename or "").strip()
     ext = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
     if ext not in UPLOAD_EXTS:
+        print(f"[frame-upload] FAILED bad extension {name!r} "
+              f"ext={ext!r}", flush=True)
         return jsonify({"error": "ဒီ ဖိုင် အမျိုးအစား မရပါ — mp4, mkv, "
                                  "mov, avi, webm ဖိုင် ပဲ ရပါတယ်"}), 400
     tmp = PREVIEWS_DIR / ("frameup-" + uuid.uuid4().hex[:12])
@@ -3289,14 +3297,23 @@ def frame_upload():
                     break
                 out.write(chunk)
         if too_big:
+            print(f"[frame-upload] FAILED too big {name!r} "
+                  f"bytes>{dl_mod.MAX_DOWNLOAD_BYTES}", flush=True)
             return jsonify({"error": "ဖိုင် အရွယ် ကြီးလွန်းပါတယ် — "
                                      "အများဆုံး 2 GB ပဲ ရပါတယ်"}), 400
+        probe_err = ""
         try:
             dur = probe_duration(dest)
             w, h = fx_mod.video_size(dest)
-        except Exception:
+        except Exception as e:
             dur, w, h = 0, 0, 0
+            probe_err = str(e)[:200]
         if not dur or dur <= 0 or not w:
+            # Build 241: log it — this return used to be the only
+            # trace of an unreadable upload, and the client could
+            # not tell it apart from any other preview failure.
+            print(f"[frame-upload] FAILED unreadable {name}: "
+                  f"dur={dur} w={w} err={probe_err}", flush=True)
             return jsonify({"error": "ဖိုင် ကို ဗီဒီယို အဖြစ် ဖတ်လို့ "
                                      "မရပါ — ဗီဒီယို ဖိုင် အမှန် "
                                      "ပြန်တင်ပါ"}), 400
@@ -3306,10 +3323,23 @@ def frame_upload():
             t = 2.0
         t = min(max(t, 0.0), max(dur - 0.15, 0.0))
         frame = tmp / "frame.jpg"
-        sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}",
-            "-i", str(dest), "-frames:v", "1", "-q:v", "3",
-            str(frame)])
-        resp = Response(frame.read_bytes(), mimetype="image/jpeg")
+        try:
+            sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}",
+                "-i", str(dest), "-frames:v", "1", "-q:v", "3",
+                str(frame)])
+            payload = frame.read_bytes()
+        except Exception as e:
+            # Build 241: a failed grab used to escape as a bare
+            # Flask 500 (an HTML page), which the wizard could
+            # only collapse into the generic "preview မရပါ".
+            # Log it server-side and answer JSON like every
+            # other failure on this route.
+            print(f"[frame-upload] FAILED frame grab {name}: "
+                  f"{str(e)[:300]}", flush=True)
+            return jsonify({"error": "ဒီ ဖိုင်ကနေ preview ပုံ "
+                                     "ယူလို့ မရပါ — ဖိုင် ပြန်စစ်ပြီး "
+                                     "ပြန် စမ်းပါ"}), 500
+        resp = Response(payload, mimetype="image/jpeg")
         resp.headers["X-Video-Duration"] = f"{dur:.2f}"
         resp.headers["X-Video-Width"] = str(w)
         resp.headers["X-Video-Height"] = str(h)

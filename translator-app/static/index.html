@@ -2988,6 +2988,21 @@ function xhrUpload(url, fd, bar) {
     try { xhr.send(fd); } catch (e) { fail(); }
   });
 }
+// Build 241: a preview failure must say WHY whenever there
+// is a why to show. The server's own error text wins (the
+// 3-hour link cap, an unreadable upload, a failed frame
+// grab); a failure whose body carries no reason (a proxy
+// error page, a reset — not JSON at all) keeps the generic
+// label PLUS the HTTP status, so it never surfaces as a
+// bare "preview မရပါ" with no clue attached. A transfer
+// that never completes rejects earlier with the network
+// message (xhrUpload's, or the link branches' .catch).
+async function pvFailText(res) {
+  const d = await res.json().catch(() => ({}));
+  if (d && d.error) return d.error;
+  return T("preview မရပါ")
+    + (res.status ? " (HTTP " + res.status + ")" : "");
+}
 function wirePickerPreview(picker, btnId, errId, src, urlId) {
   $(btnId).onclick = async () => {
     const btn = $(btnId);
@@ -3003,10 +3018,7 @@ function wirePickerPreview(picker, btnId, errId, src, urlId) {
         fd.append("file", src.file);
         const res = await xhrUpload("/api/frame-upload", fd,
                                     upBarAfter($(errId)));
-        if (!res.ok) {
-          const d = await res.json().catch(() => ({}));
-          throw new Error(d.error || T("preview မရပါ"));
-        }
+        if (!res.ok) throw new Error(await pvFailText(res));
         const dur = parseFloat(
           res.headers.get("X-Video-Duration") || "0");
         const blob = await res.blob();
@@ -3017,9 +3029,11 @@ function wirePickerPreview(picker, btnId, errId, src, urlId) {
         if (!url) throw new Error(T("လင့်ခ် အရင် ထည့်ပါ"));
         const res = await fetch("/api/preview", {method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({url, quality: "hd"})});
+          body: JSON.stringify({url, quality: "hd"})})
+          .catch(() => { throw new Error(T(
+            "ကွန်ရက် အဆင်မပြေပါ — နောက်တစ်ခါ ပြန်ကြိုးစားပါ")); });
+        if (!res.ok) throw new Error(await pvFailText(res));
         const pv = await res.json();
-        if (!res.ok) throw new Error(pv.error || T("preview မရပါ"));
         picker.pvId = pv.preview_id;
         const t0 = Math.min(2, Math.max(pv.duration - 0.2, 0));
         picker.setFrame("/api/preview/" + pv.preview_id
@@ -3101,10 +3115,7 @@ $("previewBtn").onclick = async () => {
       fd.append("file", dubSrc.file);
       const res = await xhrUpload("/api/frame-upload", fd,
                                   upBarAfter($("pvErr")));
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({}));
-        throw new Error(d.error || T("preview မရပါ"));
-      }
+      if (!res.ok) throw new Error(await pvFailText(res));
       previewDur = parseFloat(
         res.headers.get("X-Video-Duration") || "0");
       const blob = await res.blob();
@@ -3127,9 +3138,11 @@ $("previewBtn").onclick = async () => {
   try {
     const res = await fetch("/api/preview", {method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({url, quality: W.quality})});
+      body: JSON.stringify({url, quality: W.quality})})
+      .catch(() => { throw new Error(T(
+        "ကွန်ရက် အဆင်မပြေပါ — နောက်တစ်ခါ ပြန်ကြိုးစားပါ")); });
+    if (!res.ok) throw new Error(await pvFailText(res));
     const pv = await res.json();
-    if (!res.ok) throw new Error(pv.error || T("preview မရပါ"));
     previewId = pv.preview_id; previewDur = pv.duration; previewUrl = url;
     previewKey = url;
     const t0 = Math.min(2, Math.max(pv.duration - 0.2, 0));
@@ -5783,6 +5796,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 240</p>
+<p class="hint" id="buildTag" style="text-align:center">build 241</p>
 </body>
 </html>
