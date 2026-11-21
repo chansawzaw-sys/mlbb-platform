@@ -59,7 +59,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 241"
+BUILD_TAG = "build 242"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -3264,17 +3264,40 @@ def frame_upload():
     the file passes the upload extension whitelist + a real
     probe, serves this one grab (preview_frame's ffmpeg
     verbatim), and is deleted — nothing is kept. Duration and
-    dimensions ride in headers for the editor."""
+    dimensions ride in headers for the editor. Build 242: an
+    upload_token form field names a finished chunked upload
+    instead of the file part — the grab reads the staged
+    file in place and keeps it (only a job spends a token)."""
     if not _preview_allowed():
         print("[frame-upload] FAILED rate cap hit", flush=True)
         return jsonify({"error": "ခဏ ခဏ မစမ်းပါနဲ့ — ခဏ စောင့်ပြီး "
                                  "ပြန် စမ်းပါ"}), 429
     f = request.files.get("file")
+    staged = None
     if f is None or not (f.filename or "").strip():
-        print("[frame-upload] FAILED no file in request", flush=True)
-        return jsonify({"error": "ဖိုင် မပါပါ"}), 400
-    name = (f.filename or "").strip()
-    ext = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        # Build 242: the file may already be on the server
+        # as a finished chunked upload — the token names it
+        # and the grab below reads the staged file IN PLACE
+        # (no copy, and a frame grab never spends the token;
+        # the job that follows is what spends it).
+        token = (request.form.get("upload_token") or "").strip()
+        if token:
+            staged = _upload_for_token(token, _current_user())
+            if staged is None:
+                print("[frame-upload] FAILED upload token "
+                      "unresolvable", flush=True)
+                return jsonify({"error": "တင်ထားတဲ့ ဖိုင် "
+                                         "မတွေ့တော့ပါ — ဖိုင် "
+                                         "ပြန် တင်ပါ"}), 400
+        if staged is None:
+            print("[frame-upload] FAILED no file in request", flush=True)
+            return jsonify({"error": "ဖိုင် မပါပါ"}), 400
+    if staged is not None:
+        name = staged["name"]
+        ext = staged["ext"]
+    else:
+        name = (f.filename or "").strip()
+        ext = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
     if ext not in UPLOAD_EXTS:
         print(f"[frame-upload] FAILED bad extension {name!r} "
               f"ext={ext!r}", flush=True)
@@ -3283,24 +3306,27 @@ def frame_upload():
     tmp = PREVIEWS_DIR / ("frameup-" + uuid.uuid4().hex[:12])
     tmp.mkdir(parents=True, exist_ok=True)
     try:
-        dest = tmp / ("upload" + ext)
-        total = 0
-        too_big = False
-        with open(dest, "wb") as out:
-            while True:
-                chunk = f.stream.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > dl_mod.MAX_DOWNLOAD_BYTES:
-                    too_big = True
-                    break
-                out.write(chunk)
-        if too_big:
-            print(f"[frame-upload] FAILED too big {name!r} "
-                  f"bytes>{dl_mod.MAX_DOWNLOAD_BYTES}", flush=True)
-            return jsonify({"error": "ဖိုင် အရွယ် ကြီးလွန်းပါတယ် — "
-                                     "အများဆုံး 2 GB ပဲ ရပါတယ်"}), 400
+        if staged is not None:
+            dest = Path(staged["path"])
+        else:
+            dest = tmp / ("upload" + ext)
+            total = 0
+            too_big = False
+            with open(dest, "wb") as out:
+                while True:
+                    chunk = f.stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > dl_mod.MAX_DOWNLOAD_BYTES:
+                        too_big = True
+                        break
+                    out.write(chunk)
+            if too_big:
+                print(f"[frame-upload] FAILED too big {name!r} "
+                      f"bytes>{dl_mod.MAX_DOWNLOAD_BYTES}", flush=True)
+                return jsonify({"error": "ဖိုင် အရွယ် ကြီးလွန်းပါတယ် — "
+                                         "အများဆုံး 2 GB ပဲ ရပါတယ်"}), 400
         probe_err = ""
         try:
             dur = probe_duration(dest)
@@ -5344,6 +5370,338 @@ def _resolve_el_entry(user, voice_id):
     return None, False
 
 
+# ---------- chunked upload (build 242) ----------
+# A single POST of a very large file can be refused by an
+# intermediary the app does not control: on 2026-11-21 the
+# owner's ~865 MB upload was answered HTTP 413 by a proxy
+# on HIS network path, while the server provably accepted
+# a 996 MB POST from a clean network (no MAX_CONTENT_LENGTH
+# in the app, no body limit in the Caddy block; the app's
+# own ceiling is the download chain's 2 GiB, with its own
+# Burmese error). Per-request size caps on consumer ISP
+# proxies are outside our control, so large files now
+# travel in slices: start declares the file (extension
+# whitelist + the same 2 GiB ceiling), chunk posts land
+# at their index offsets (a retried chunk rewrites the
+# same bytes — idempotent), finish verifies the assembly
+# exactly (every chunk present at its exact length, the
+# total equal to the declaration) plus the same ffprobe
+# readability check the direct path runs, and hands back
+# an unguessable upload_token. The file-consuming routes
+# then accept the token INSTEAD of the file part and
+# proceed exactly as if the file had been posted: a job
+# spends the token (the staged file is dropped once
+# _accept_upload has copied it into the job dir), while
+# frame-upload only reads it in place and never spends
+# it. Records are memory-only, bound to the account that
+# started them; a sweeper reaps anything untouched for
+# _UPLOAD_TTL, and staging dirs orphaned by a restart are
+# reaped by mtime.
+CHUNKED_DIR = UPLOADS_DIR / "chunked"
+CHUNKED_DIR.mkdir(exist_ok=True)
+_UPLOAD_TTL = 2 * 3600
+_UPLOAD_CHUNK_MAX = 16 * 1024 * 1024
+_UPLOAD_CHUNK_DEFAULT = 8 * 1024 * 1024
+_UPLOAD_CHUNK_MIN = 64 * 1024
+_UPLOADS = {}        # upload_id -> record
+_UPLOAD_TOKENS = {}  # upload_token -> upload_id
+_UPLOADS_LOCK = threading.Lock()
+_UPLOAD_ADMIT = {}   # admission key -> [post timestamps]
+
+
+def _upload_admit(kind):
+    """Per-user admission for the chunked-upload posts, in
+    the _preview_allowed shape: starts are capped like
+    previews (30/hour); chunk posts get a far higher cap
+    (a 2 GiB file at the 8 MiB default is 256 posts, and
+    two concurrent uploads plus retries must fit) — the
+    hard bounds stay the per-chunk ceiling, the 2 GiB
+    total, and the concurrent-upload cap in upload_start."""
+    me = _current_user()
+    key = f"u{me['id']}" if me else f"ip:{_client_ip()}"
+    cap = 30 if kind == "start" else 2000
+    now = time.time()
+    hits = [t for t in _UPLOAD_ADMIT.get(key, [])
+            if now - t < 3600]
+    if len(hits) >= cap:
+        _UPLOAD_ADMIT[key] = hits
+        return False
+    hits.append(now)
+    _UPLOAD_ADMIT[key] = hits
+    return True
+
+
+def _upload_owner_ok(rec, user):
+    """A record belongs to the account that started it.
+    With accounts off there is no caller identity (user
+    is None) and the unguessable id/token is itself the
+    capability, as everywhere else in this app."""
+    if user is None:
+        return True
+    return rec.get("owner") == user.get("id")
+
+
+def _upload_for_token(token, user):
+    """Resolve a finished upload_token to its record for
+    consumption, or None (unknown, unfinished, not the
+    caller's, or the staged file already gone)."""
+    if not token:
+        return None
+    with _UPLOADS_LOCK:
+        uid = _UPLOAD_TOKENS.get(token)
+        rec = _UPLOADS.get(uid) if uid else None
+    if rec is None or rec.get("state") != "ready":
+        return None
+    if not _upload_owner_ok(rec, user):
+        return None
+    if not Path(rec["path"]).exists():
+        return None
+    return rec
+
+
+def _drop_upload(rec):
+    with _UPLOADS_LOCK:
+        _UPLOADS.pop(rec["id"], None)
+        if rec.get("token"):
+            _UPLOAD_TOKENS.pop(rec["token"], None)
+    shutil.rmtree(rec["dir"], ignore_errors=True)
+
+
+def _spend_upload(rec):
+    """A job consumed the token: _accept_upload has already
+    copied the bytes into the job dir, so the staged file
+    and the record go away — the token can never be
+    spent twice."""
+    _drop_upload(rec)
+
+
+def _expire_uploads():
+    now = time.time()
+    with _UPLOADS_LOCK:
+        dead = [r for r in _UPLOADS.values()
+                if now - r.get("touched", 0) > _UPLOAD_TTL]
+        for r in dead:
+            _UPLOADS.pop(r["id"], None)
+            if r.get("token"):
+                _UPLOAD_TOKENS.pop(r["token"], None)
+    for r in dead:
+        shutil.rmtree(r["dir"], ignore_errors=True)
+
+
+def _upload_sweeper():
+    """Reap expired uploads, plus staging dirs orphaned by
+    a restart (records are memory-only, so a restart
+    orphans every staged file; mtime is the only clock
+    they have left)."""
+    time.sleep(120)
+    while True:
+        try:
+            _expire_uploads()
+        except Exception:
+            pass
+        try:
+            live = set(_UPLOADS)
+            for d in list(CHUNKED_DIR.iterdir()):
+                try:
+                    if d.is_dir() and d.name not in live \
+                            and time.time() - d.stat().st_mtime \
+                            > _UPLOAD_TTL:
+                        shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(600)
+
+
+@app.post("/api/upload/start")
+def upload_start():
+    """Declare a chunked upload: {filename, size,
+    chunk_size?} -> {upload_id}. Session-authenticated by
+    the accounts guard like every /api route; the record
+    is bound to the caller and at most two uploads may be
+    open (still receiving) per account at once."""
+    if not _upload_admit("start"):
+        return jsonify({"error": "ခဏ ခဏ မစမ်းပါနဲ့ — ခဏ စောင့်ပြီး "
+                                 "ပြန် စမ်းပါ"}), 429
+    me = _current_user()
+    data = request.get_json(force=True, silent=True) or {}
+    name = (data.get("filename") or "").strip()
+    ext = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext not in UPLOAD_EXTS:
+        return jsonify({"error": "ဒီ ဖိုင် အမျိုးအစား မရပါ — mp4, mkv, "
+                                 "mov, avi, webm ဖိုင် ပဲ ရပါတယ်"}), 400
+    try:
+        size = int(data.get("size"))
+    except (TypeError, ValueError):
+        size = 0
+    if size <= 0:
+        return jsonify({"error": "ဖိုင် အရွယ် မမှန်ပါ"}), 400
+    if size > dl_mod.MAX_DOWNLOAD_BYTES:
+        return jsonify({"error": "ဖိုင် အရွယ် ကြီးလွန်းပါတယ် — "
+                                 "အများဆုံး 2 GB ပဲ ရပါတယ်"}), 400
+    try:
+        chunk_size = int(data.get("chunk_size")
+                         or _UPLOAD_CHUNK_DEFAULT)
+    except (TypeError, ValueError):
+        chunk_size = 0
+    if not (_UPLOAD_CHUNK_MIN <= chunk_size
+            <= _UPLOAD_CHUNK_MAX):
+        return jsonify({"error": "chunk အရွယ် မမှန်ပါ"}), 400
+    owner = me["id"] if me else None
+    with _UPLOADS_LOCK:
+        open_n = sum(1 for r in _UPLOADS.values()
+                     if r.get("owner") == owner
+                     and r.get("state") == "open")
+        if open_n >= 2:
+            return jsonify({"error": "upload နှစ်ခု တပြိုင်တည်း "
+                                     "တင်နေပါတယ် — တစ်ခု ပြီးမှ "
+                                     "နောက်တစ်ခု စပါ"}), 429
+        uid = uuid.uuid4().hex
+        sdir = CHUNKED_DIR / uid
+        sdir.mkdir(parents=True, exist_ok=True)
+        path = sdir / ("data" + ext)
+        path.touch()
+        _UPLOADS[uid] = {
+            "id": uid, "owner": owner, "name": name[:120],
+            "ext": ext, "size": size, "chunk_size": chunk_size,
+            "dir": sdir, "path": path, "state": "open",
+            "lens": {}, "created": time.time(),
+            "touched": time.time(), "token": None,
+        }
+    return jsonify({"upload_id": uid})
+
+
+@app.post("/api/upload/chunk")
+def upload_chunk():
+    """One slice: multipart {upload_id, index, chunk}. The
+    bytes land at index * chunk_size, so a retried chunk
+    rewrites the same bytes; per-chunk ceiling 16 MB, and
+    a chunk may never reach past the declared total."""
+    if not _upload_admit("chunk"):
+        return jsonify({"error": "ခဏ ခဏ မစမ်းပါနဲ့ — ခဏ စောင့်ပြီး "
+                                 "ပြန် စမ်းပါ"}), 429
+    me = _current_user()
+    uid = (request.form.get("upload_id") or "").strip()
+    try:
+        index = int(request.form.get("index"))
+    except (TypeError, ValueError):
+        index = -1
+    f = request.files.get("chunk")
+    with _UPLOADS_LOCK:
+        rec = _UPLOADS.get(uid)
+    if rec is None or rec.get("state") != "open":
+        return jsonify({"error": "upload မတွေ့ပါ — အစက ပြန် "
+                                 "တင်ပါ"}), 400
+    if not _upload_owner_ok(rec, me):
+        return jsonify({"error": "ဒီ upload က သင့်ဟာ "
+                                 "မဟုတ်ပါ"}), 403
+    n = -(-rec["size"] // rec["chunk_size"])
+    if index < 0 or index >= n or f is None:
+        return jsonify({"error": "chunk မမှန်ပါ"}), 400
+    data = f.stream.read(_UPLOAD_CHUNK_MAX + 1)
+    if len(data) > _UPLOAD_CHUNK_MAX:
+        return jsonify({"error": "chunk ကြီးလွန်းပါတယ် — အများဆုံး "
+                                 "16 MB ပဲ ရပါတယ်"}), 400
+    if len(data) > rec["chunk_size"]:
+        return jsonify({"error": "chunk မမှန်ပါ"}), 400
+    offset = index * rec["chunk_size"]
+    if offset + len(data) > rec["size"]:
+        return jsonify({"error": "chunk မမှန်ပါ — ဖိုင် အရွယ် "
+                                 "ကျော်နေပါတယ်"}), 400
+    with _UPLOADS_LOCK:
+        if _UPLOADS.get(uid) is not rec:
+            return jsonify({"error": "upload မတွေ့ပါ — အစက ပြန် "
+                                     "တင်ပါ"}), 400
+        with open(rec["path"], "r+b") as out:
+            out.seek(offset)
+            out.write(data)
+        rec["lens"][index] = len(data)
+        rec["touched"] = time.time()
+        got = sum(rec["lens"].values())
+    return jsonify({"ok": True, "received": got})
+
+
+@app.post("/api/upload/finish")
+def upload_finish():
+    """Close an upload: the assembly must be exact (every
+    chunk present at its exact length, the file's size
+    equal to the declaration — a short middle chunk leaves
+    a hole the bare size could not catch) and readable by
+    the same ffprobe gate the direct path runs. Success
+    returns the unguessable {upload_token} the consuming
+    posts carry instead of the file part."""
+    me = _current_user()
+    data = request.get_json(force=True, silent=True) or {}
+    uid = (data.get("upload_id") or "").strip()
+    with _UPLOADS_LOCK:
+        rec = _UPLOADS.get(uid)
+    if rec is None:
+        return jsonify({"error": "upload မတွေ့ပါ — အစက ပြန် "
+                                 "တင်ပါ"}), 400
+    if not _upload_owner_ok(rec, me):
+        return jsonify({"error": "ဒီ upload က သင့်ဟာ "
+                                 "မဟုတ်ပါ"}), 403
+    if rec.get("state") == "ready" and rec.get("token"):
+        return jsonify({"upload_token": rec["token"]})
+    size, cs = rec["size"], rec["chunk_size"]
+    n = -(-size // cs)
+    lens = rec["lens"]
+    complete = len(lens) == n and all(
+        lens.get(i) == cs for i in range(n - 1)) \
+        and lens.get(n - 1) == size - (n - 1) * cs
+    actual = rec["path"].stat().st_size \
+        if Path(rec["path"]).exists() else -1
+    if not complete or actual != size:
+        return jsonify({"error": "ဖိုင် မပြည့်စုံပါ — ပြန် "
+                                 "တင်ပါ"}), 400
+    from pipeline.common import probe_streams
+    try:
+        dur = probe_duration(rec["path"])
+        streams = probe_streams(rec["path"])
+        has_video = any(st.get("codec_type") == "video"
+                        for st in streams)
+    except Exception:
+        dur, has_video = 0, False
+    if not dur or dur <= 0 or not has_video:
+        return jsonify({"error": "ဖိုင် ကို ဗီဒီယို အဖြစ် ဖတ်လို့ "
+                                 "မရပါ — ဗီဒီယို ဖိုင် အမှန် "
+                                 "ပြန်တင်ပါ"}), 400
+    token = uuid.uuid4().hex
+    with _UPLOADS_LOCK:
+        rec["token"] = token
+        rec["state"] = "ready"
+        rec["touched"] = time.time()
+        _UPLOAD_TOKENS[token] = rec["id"]
+    return jsonify({"upload_token": token})
+
+
+class _TokenUpload:
+    """Marker _request_upload returns when the file arrived
+    via chunked upload: it carries only the token. Nothing
+    reads .filename/.stream before _accept_upload resolves
+    it into a _StagedUpload — resolution lives there
+    because that is where the caller's account is in hand
+    for the ownership check."""
+
+    def __init__(self, token):
+        self._upload_token = token
+        self.filename = ""
+
+
+class _StagedUpload:
+    """FileStorage-shaped adapter over a finished chunked
+    upload, so _accept_upload consumes it exactly like a
+    posted file (same stream copy, same probe, same quote
+    check). _chunked_record marks it for spending once the
+    copy into the job dir has succeeded."""
+
+    def __init__(self, rec):
+        self.filename = rec["name"]
+        self.stream = open(rec["path"], "rb")
+        self._chunked_record = rec
+
+
 # ---------- web video-file upload (build 215, item 7) ----------
 # Both web video flows (the dub wizard and Recap) accept a video
 # FILE as the source, not only a link — the Telegram bot has
@@ -5400,6 +5758,16 @@ def _request_upload():
             data = _form_data()
             data["upload"] = True
             return data, f
+    # Build 242: a chunked upload posts the same form fields
+    # with an upload_token instead of the file part. The
+    # marker resolves inside _accept_upload (ownership is
+    # judged there, with the caller's account in hand).
+    if request.form:
+        token = (request.form.get("upload_token") or "").strip()
+        if token:
+            data = _form_data()
+            data["upload"] = True
+            return data, _TokenUpload(token)
     return (request.get_json(force=True, silent=True) or {}), None
 
 
@@ -5410,6 +5778,17 @@ def _accept_upload(job, file_storage, user):
     error string; on ANY refusal the job dir — file included —
     is deleted and nothing is charged or registered."""
     from pipeline.common import probe_streams
+    token = getattr(file_storage, "_upload_token", None)
+    if token is not None:
+        # Build 242: resolve the chunked-upload token into
+        # the staged file (ownership + readiness judged
+        # here); from this line on the staged file is
+        # consumed exactly like a posted one.
+        rec = _upload_for_token(token, user)
+        if rec is None:
+            return ("တင်ထားတဲ့ ဖိုင် မတွေ့တော့ပါ — ဖိုင် "
+                    "ပြန် တင်ပါ")
+        file_storage = _StagedUpload(rec)
     name = (file_storage.filename or "").strip()
     ext = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
     if ext not in UPLOAD_EXTS:
@@ -5466,6 +5845,16 @@ def _accept_upload(job, file_storage, user):
             return (f"credit မလောက်ပါ — ဒီ video အတွက် {need} "
                     f"credits လိုပါတယ်, လက်ကျန် {user['credits']} "
                     "credits ပဲ ရှိပါတယ်")
+    rec = getattr(file_storage, "_chunked_record", None)
+    if rec is not None:
+        # Build 242: the job now owns its copy in the job
+        # dir — spend the token and drop the staged
+        # original, so a token can never create two jobs.
+        try:
+            file_storage.stream.close()
+        except Exception:
+            pass
+        _spend_upload(rec)
     return None
 
 
@@ -8819,7 +9208,7 @@ except Exception:
 
 # Each background loop gets its own guard: one failure must never
 # silently take the others down with it.
-for _target in (_backup_loop, _job_dispatcher):
+for _target in (_backup_loop, _job_dispatcher, _upload_sweeper):
     try:
         threading.Thread(target=_target, daemon=True).start()
     except Exception:

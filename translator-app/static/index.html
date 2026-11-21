@@ -2017,12 +2017,11 @@ $("recapGo").onclick = async () => {
     const rFx = recapBlur.payload();
     if (recapSrc.file) {
       const fd = new FormData();
-      fd.append("file", recapSrc.file);
       fd.append("voice", W.voice);
       fd.append("karaoke", $("recapKaraoke").checked ? "1" : "");
       if (rFx.fx) fd.append("fx", JSON.stringify(rFx.fx));
-      res = await xhrUpload("/api/recap", fd,
-                            upBarAfter($("recapFileCard")));
+      res = await postFile("/api/recap", fd, recapSrc.file,
+                           upBarAfter($("recapFileCard")));
     } else {
       res = await fetch("/api/recap", {method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -2381,13 +2380,12 @@ $("commGo").onclick = async () => {
     const cFx = commBlur.payload();
     if (commSrc.file) {
       const fd = new FormData();
-      fd.append("file", commSrc.file);
       fd.append("voice", W.voice);
       fd.append("audio_mode", commAudioMode);
       fd.append("karaoke", $("commKaraoke").checked ? "1" : "");
       if (cFx.fx) fd.append("fx", JSON.stringify(cFx.fx));
-      res = await xhrUpload("/api/commentary", fd,
-                            upBarAfter($("commFileCard")));
+      res = await postFile("/api/commentary", fd, commSrc.file,
+                           upBarAfter($("commFileCard")));
     } else {
       res = await fetch("/api/commentary", {method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -2526,10 +2524,9 @@ $("capGo").onclick = async () => {
     let res;
     if (capSrc.file) {
       const fd = new FormData();
-      fd.append("file", capSrc.file);
       fd.append("karaoke", $("capKaraoke").checked ? "1" : "");
-      res = await xhrUpload("/api/captions", fd,
-                            upBarAfter($("capFileCard")));
+      res = await postFile("/api/captions", fd, capSrc.file,
+                           upBarAfter($("capFileCard")));
     } else {
       res = await fetch("/api/captions", {method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -2988,6 +2985,72 @@ function xhrUpload(url, fd, bar) {
     try { xhr.send(fd); } catch (e) { fail(); }
   });
 }
+/* Build 242: chunked upload. A single POST of a very
+   large file can be refused by an intermediary the app
+   does not control (the owner's 865 MB upload was
+   answered HTTP 413 by a proxy on his own network path,
+   while the server accepted a ~1 GB POST from a clean
+   network). Files over 32 MB therefore travel in 8 MB
+   slices: start declares the file, each slice posts on
+   its own small request, finish verifies the assembly
+   server-side and hands back an upload_token; the
+   job/preview post then carries the token INSTEAD of
+   the file part. The bar shows overall progress across
+   all slices. Any failed step rejects with the server's
+   own error text (pvFailText conventions), or the polite
+   network message when a transfer never completes.
+   postFile() is the ONE branch point every file post
+   goes through: at or under 32 MB the direct xhrUpload
+   path runs byte-for-byte as before; over it, chunk
+   first, then post the (tiny) form as-is. */
+const CHUNKED_MIN = 32 * 1024 * 1024;
+const CHUNK_SIZE = 8 * 1024 * 1024;
+async function chunkUpload(file, bar) {
+  const netErr = () => new Error(
+    T("ကွန်ရက် အဆင်မပြေပါ — နောက်တစ်ခါ ပြန်ကြိုးစားပါ"));
+  const sres = await fetch("/api/upload/start", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({filename: file.name, size: file.size,
+                          chunk_size: CHUNK_SIZE})})
+    .catch(() => { throw netErr(); });
+  if (!sres.ok) throw new Error(await pvFailText(sres));
+  const started = await sres.json();
+  const uid = started.upload_id;
+  if (bar) bar.show();
+  try {
+    const n = Math.ceil(file.size / CHUNK_SIZE);
+    for (let i = 0; i < n; i++) {
+      const beg = i * CHUNK_SIZE;
+      const end = Math.min(file.size, beg + CHUNK_SIZE);
+      const fd = new FormData();
+      fd.append("upload_id", uid);
+      fd.append("index", String(i));
+      fd.append("chunk", file.slice(beg, end), "chunk");
+      const sub = {show() {}, hide() {},
+        update(loaded) {
+          if (bar) bar.update(beg + loaded, file.size);
+        }};
+      const cres = await xhrUpload("/api/upload/chunk", fd, sub);
+      if (!cres.ok) throw new Error(await pvFailText(cres));
+      if (bar) bar.update(end, file.size);
+    }
+  } finally { if (bar) bar.hide(); }
+  const fres = await fetch("/api/upload/finish", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({upload_id: uid})})
+    .catch(() => { throw netErr(); });
+  if (!fres.ok) throw new Error(await pvFailText(fres));
+  const fin = await fres.json();
+  return fin.upload_token;
+}
+async function postFile(url, fd, file, bar) {
+  if (file.size > CHUNKED_MIN) {
+    fd.append("upload_token", await chunkUpload(file, bar));
+    return xhrUpload(url, fd, null);
+  }
+  fd.append("file", file);
+  return xhrUpload(url, fd, bar);
+}
 // Build 241: a preview failure must say WHY whenever there
 // is a why to show. The server's own error text wins (the
 // 3-hour link cap, an unreadable upload, a failed frame
@@ -3015,9 +3078,9 @@ function wirePickerPreview(picker, btnId, errId, src, urlId) {
         // dedicated one-frame endpoint — before, Preview
         // demanded a URL and file sources placed boxes blind.
         const fd = new FormData();
-        fd.append("file", src.file);
-        const res = await xhrUpload("/api/frame-upload", fd,
-                                    upBarAfter($(errId)));
+        const res = await postFile("/api/frame-upload", fd,
+                                   src.file,
+                                   upBarAfter($(errId)));
         if (!res.ok) throw new Error(await pvFailText(res));
         const dur = parseFloat(
           res.headers.get("X-Video-Duration") || "0");
@@ -3112,9 +3175,9 @@ $("previewBtn").onclick = async () => {
     $("previewBtn").textContent = T("🔄 Preview ယူနေပြီ… ခဏစောင့်ပါ");
     try {
       const fd = new FormData();
-      fd.append("file", dubSrc.file);
-      const res = await xhrUpload("/api/frame-upload", fd,
-                                  upBarAfter($("pvErr")));
+      const res = await postFile("/api/frame-upload", fd,
+                                 dubSrc.file,
+                                 upBarAfter($("pvErr")));
       if (!res.ok) throw new Error(await pvFailText(res));
       previewDur = parseFloat(
         res.headers.get("X-Video-Duration") || "0");
@@ -3614,7 +3677,6 @@ $("go").onclick = async () => {
     // the same fields; the server saves + probes the file and
     // skips the download stage.
     const fd = new FormData();
-    fd.append("file", dubSrc.file);
     fd.append("mode", payload.mode);
     fd.append("voice_style", payload.voice_style);
     fd.append("font", payload.font);
@@ -3625,7 +3687,20 @@ $("go").onclick = async () => {
     fd.append("subs", JSON.stringify(payload.subs));
     fd.append("fx", JSON.stringify(fx));
     fd.append("karaoke", payload.karaoke ? "1" : "");
-    res = await xhrUpload("/api/jobs", fd, upBarAfter($("go")));
+    // Build 242: a chunked upload REJECTS on a failed step
+    // (postFile throws the server's error text) where the
+    // direct path resolved with the error Response — this
+    // handler has no outer try/catch, so land that failure
+    // on the same error line + re-enabled button the
+    // !res.ok tail below uses.
+    try {
+      res = await postFile("/api/jobs", fd, dubSrc.file,
+                           upBarAfter($("go")));
+    } catch (e) {
+      $("err").textContent = e.message;
+      $("go").disabled = false;
+      return;
+    }
   } else {
     res = await fetch("/api/jobs", {method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify(payload)});
@@ -5796,6 +5871,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 241</p>
+<p class="hint" id="buildTag" style="text-align:center">build 242</p>
 </body>
 </html>
