@@ -59,7 +59,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 242"
+BUILD_TAG = "build 243"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -5674,6 +5674,35 @@ def upload_finish():
         rec["touched"] = time.time()
         _UPLOAD_TOKENS[token] = rec["id"]
     return jsonify({"upload_token": token})
+
+
+@app.get("/api/upload/<uid>/status")
+def upload_status(uid):
+    """Build 243: which chunks of an in-progress upload
+    the server already holds, so a client whose page was
+    refreshed (or whose tab Android killed mid-upload)
+    can resume instead of starting from zero. The answer
+    comes straight from the record's per-chunk length
+    map — the same source of truth upload_finish verifies
+    against. Ownership is judged exactly like chunk and
+    finish; asking also counts as activity, so a resume
+    in progress is never reaped mid-flight."""
+    me = _current_user()
+    with _UPLOADS_LOCK:
+        rec = _UPLOADS.get(uid)
+        if rec is None:
+            return jsonify({"error": "upload မတွေ့ပါ — အစက ပြန် "
+                                     "တင်ပါ"}), 400
+        if not _upload_owner_ok(rec, me):
+            return jsonify({"error": "ဒီ upload က သင့်ဟာ "
+                                     "မဟုတ်ပါ"}), 403
+        rec["touched"] = time.time()
+        return jsonify({
+            "received": sorted(rec["lens"].keys()),
+            "chunk_size": rec["chunk_size"],
+            "size": rec["size"],
+            "state": rec["state"],
+        })
 
 
 class _TokenUpload:
