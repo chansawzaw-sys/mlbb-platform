@@ -465,6 +465,33 @@ def send_photo(chat_id, photo_path, caption="", buttons=None):
     return payload["result"]
 
 
+def send_document(chat_id, path, caption="", buttons=None):
+    """Upload a small file as a document (build 244: the
+    review flow's TXT exports). Mirrors send_photo's shape;
+    like every delivery send it is NOT covered by the
+    duplicate guard above — an explicit re-pull must always
+    really send."""
+    tok = token()
+    if not tok:
+        raise RuntimeError("telegram bot token မရှိပါ")
+    import requests
+    path = Path(path)
+    data = {"chat_id": str(chat_id), "caption": caption[:1024]}
+    if buttons:
+        data["reply_markup"] = _markup(buttons)
+    with open(path, "rb") as fh:
+        r = requests.post(_api_url(tok, "sendDocument"),
+                          data=data,
+                          files={"document": (path.name, fh,
+                                              "text/plain")},
+                          timeout=120)
+    payload = r.json()
+    if not payload.get("ok"):
+        raise RuntimeError(
+            f"telegram sendDocument: {payload.get('description')}")
+    return payload["result"]
+
+
 def answer_callback(callback_query_id):
     tok = token()
     if not tok:
@@ -501,6 +528,41 @@ def start_poller():
     _POLLER_THREAD.start()
 
 
+# Build 244: with a LOCAL Bot API server, getFile can take
+# far longer than the shared _call default (30 s) to answer
+# for a very large file — the server is still pulling it
+# down from Telegram (the owner's 2-hour video died exactly
+# there: "Read timed out. (read timeout=30)"). The local
+# getFile therefore gets send_video's 600 s timeout and up
+# to 3 attempts on a timeout / connection failure — the
+# server keeps fetching in the background, so a later
+# attempt can succeed once the file lands. Cloud mode is
+# unchanged: one attempt at the default timeout (cloud
+# getFile refuses >20 MB anyway, and callers check
+# download_cap() first).
+_GETFILE_TIMEOUT_S = 600
+_GETFILE_ATTEMPTS = 3
+_GETFILE_RETRY_PAUSE_S = 5
+
+
+def _get_file(tok, file_id):
+    import requests
+    if not is_local():
+        return _call(tok, "getFile", file_id=str(file_id))
+    last_err = None
+    for attempt in range(_GETFILE_ATTEMPTS):
+        try:
+            return _call(tok, "getFile",
+                         timeout=_GETFILE_TIMEOUT_S,
+                         file_id=str(file_id))
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError) as e:
+            last_err = e
+            if attempt + 1 < _GETFILE_ATTEMPTS:
+                time.sleep(_GETFILE_RETRY_PAUSE_S)
+    raise last_err
+
+
 def download_file(file_id, dest_path):
     """Bot file download (getFile). The cloud endpoint refuses bot
     downloads over 20 MB — the caller checks tg.download_cap()
@@ -514,7 +576,7 @@ def download_file(file_id, dest_path):
     tok = token()
     if not tok:
         raise RuntimeError("telegram bot token မရှိပါ")
-    info = _call(tok, "getFile", file_id=str(file_id))
+    info = _get_file(tok, file_id)
     path = info.get("file_path")
     if not path:
         raise RuntimeError("telegram file မရပါ")

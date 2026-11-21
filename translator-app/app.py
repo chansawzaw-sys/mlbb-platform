@@ -59,7 +59,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 243"
+BUILD_TAG = "build 244"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -807,6 +807,280 @@ def _tg_error_async(job):
     threading.Thread(target=go, daemon=True).start()
 
 
+# ---------- Telegram review flow (build 244) ----------
+# The web review loop brought to the bot: a job parked at
+# waiting_review notifies its chat (the job's TG origin chat,
+# else its owner's linked chat — the build-159 rule, never
+# any other chat) with the ORIGINAL transcript and the
+# current Myanmar draft attached as .txt documents, plus
+# re-pull buttons. A .txt document sent back to that chat
+# while the job is parked is the edited full text: it is
+# split with the SAME _split_bulk_units the web bulk-paste
+# uses, applied through the SAME _apply_bulk_assign, and —
+# only on an EXACT segment-count match — resumed through
+# the SAME _resume_review_job tail the web confirm uses.
+
+_TG_REVIEW_PENDING = {}  # chat_id -> {"file_id", "file_name", "ts"}
+
+
+def _review_chat_for(job):
+    """The ONE chat a job's review flow belongs to: its
+    Telegram origin chat if it has one, else its owner's
+    linked chat. None when neither exists."""
+    if job.get("tg_chat_id"):
+        return int(job["tg_chat_id"])
+    uid = job.get("user_id")
+    if uid:
+        try:
+            user = accounts.get_user(uid)
+        except Exception:
+            user = None
+        if user and user.get("tg_chat_id"):
+            return int(user["tg_chat_id"])
+    return None
+
+
+def _review_jobs_for_chat(chat_id):
+    """Jobs parked at waiting_review whose review chat is
+    this one, oldest first."""
+    out = [j for j in JOBS.values()
+           if j.get("status") == "waiting_review"
+           and _review_chat_for(j) == chat_id]
+    out.sort(key=lambda j: j.get("created_at") or 0)
+    return out
+
+
+def _review_export_files(job):
+    """Write the review TXT files into the job dir and return
+    [(kind, path)]: the original transcript ("src", segment
+    key "text") always; the Myanmar draft ("my", key
+    "text_my") only when a draft exists. Bodies come from
+    _export_txt_body — the exact builder the web TXT
+    download uses, under the web route's file names."""
+    from pipeline.common import load_segments
+    seg_path = JOBS_DIR / job["id"] / "segments_my.json"
+    if not seg_path.exists():
+        return []
+    segs = load_segments(seg_path)
+    out = []
+    src = JOBS_DIR / job["id"] / f"{job['id']}_src.txt"
+    src.write_text(_export_txt_body(segs, "text"),
+                   encoding="utf-8")
+    out.append(("src", src))
+    if any((s.get("text_my") or "").strip() for s in segs):
+        my = JOBS_DIR / job["id"] / f"{job['id']}_my.txt"
+        my.write_text(_export_txt_body(segs, "text_my"),
+                      encoding="utf-8")
+        out.append(("my", my))
+    return out
+
+
+_REVIEW_TXT_CAPS = {
+    "src": "📄 မူရင်း စာသား (မူရင်း ဘာသာစကား)",
+    "my": "📄 မြန်မာ မူကြမ်း (လက်ရှိ ဘာသာပြန်)",
+}
+
+
+def _tg_review_send_files(chat_id, job):
+    """Send the review TXT files to the job's chat (the park
+    notification and the rv: re-pull share this)."""
+    from pipeline import telegram_send as tg
+    files = _review_export_files(job)
+    for kind, path in files:
+        tg.send_document(chat_id, path,
+                         caption=_REVIEW_TXT_CAPS[kind])
+    return files
+
+
+def _tg_review_notify_async(job):
+    """A job just parked at waiting_review: tell its review
+    chat, with both TXT files attached and re-pull buttons
+    on the message. Exactly-once per park — the record is
+    set and saved BEFORE the thread fires (the
+    _web_tg_autosend pattern), so a re-park or a restart
+    can never send it twice."""
+    chat_id = _review_chat_for(job)
+    if not chat_id or job.get("review_tg"):
+        return
+    job["review_tg"] = {"state": "sending", "to": chat_id}
+    _save(job)
+
+    def go():
+        from pipeline import telegram_send as tg
+        try:
+            from pipeline.common import load_segments
+            seg_path = JOBS_DIR / job["id"] / "segments_my.json"
+            n = (len(load_segments(seg_path))
+                 if seg_path.exists() else 0)
+            tg.send_message(
+                chat_id,
+                "✏️ စာသား စစ်ပြင် အဆင့် ရောက်ပါပြီ\n"
+                f"အပိုင်း {n} ပိုင်း ရှိပါတယ် — မူရင်း စာသား နဲ့ "
+                "မြန်မာ မူကြမ်း TXT တွေ ပို့ထားပါတယ်။\n"
+                "ပြင်ပြီးသား စာသား အပြည့်အစုံ ကို .txt file "
+                "အဖြစ် ဒီ chat ထဲ ပြန်ပို့ပေးပါ — အပိုင်း "
+                f"အရေအတွက် {n} ပိုင်း အတိအကျ ဖြစ်ရပါမယ် 🙏",
+                buttons=[[("📄 မူရင်း TXT",
+                           f"rv:{job['id']}:src"),
+                          ("📄 မူကြမ်း TXT",
+                           f"rv:{job['id']}:my")]])
+            _tg_review_send_files(chat_id, job)
+            job["review_tg"] = {"state": "sent", "to": chat_id}
+        except Exception as e:
+            job["review_tg"] = {"state": "failed", "to": chat_id,
+                                "error": str(e)[:200]}
+        _save(job)
+
+    threading.Thread(target=go, daemon=True).start()
+
+
+def _tg_review_apply_doc(chat_id, job, file_id):
+    """Download a returned .txt, validate it, apply it and
+    resume the job. Every refusal leaves the job parked and
+    its segments untouched."""
+    from pipeline import telegram_send as tg
+    from pipeline.common import load_segments
+    jid = job["id"]
+    dest = JOBS_DIR / jid / "review_in.txt"
+    try:
+        tg.download_file(file_id, dest)
+        raw = dest.read_bytes()
+    except Exception:
+        tg.send_message(chat_id, "⚠️ တောင်းပန်ပါတယ် — file ကို "
+                                 "ယူလို့ မရပါ။ နောက်တစ်ခါ "
+                                 "ပြန်ပို့ပေးပါ 🙏")
+        return
+    finally:
+        dest.unlink(missing_ok=True)
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        tg.send_message(chat_id, "⚠️ ဒီ file ကို စာသား အဖြစ် "
+                                 "ဖတ်လို့ မရပါ — UTF-8 .txt file "
+                                 "ပြန်ပို့ပေးပါ 🙏")
+        return
+    text = text.strip()
+    if not text:
+        tg.send_message(chat_id, "⚠️ file က ဗလာ ဖြစ်နေပါတယ် — "
+                                 "စာသား အပြည့် ထည့်ပြီး "
+                                 "ပြန်ပို့ပေးပါ 🙏")
+        return
+    seg_path = JOBS_DIR / jid / "segments_my.json"
+    if not seg_path.exists():
+        tg.send_message(chat_id, "⚠️ တောင်းပန်ပါတယ် — ဒီ job ရဲ့ "
+                                 "အပိုင်းတွေ မတွေ့တော့ပါ 🙏")
+        return
+    segs = load_segments(seg_path)
+    units = _split_bulk_units(text, len(segs))
+    if len(units) != len(segs):
+        tg.send_message(
+            chat_id,
+            f"⚠️ အပိုင်း အရေအတွက် မကိုက်ပါ — လိုအပ်တာ "
+            f"{len(segs)} ပိုင်း, ရရှိတာ {len(units)} ပိုင်း "
+            "ဖြစ်နေပါတယ်။ အပိုင်း အရေအတွက် အတိအကျ ပြင်ပြီး "
+            "ပြန်ပို့ပေးပါ 🙏 (job က ဒီအဆင့်မှာပဲ ရှိနေပါတယ်)")
+        return
+    changed = _apply_bulk_assign(
+        job, segs, _bulk_assign(units, len(segs)))
+    kind = "captions2" if job.get("type") == "captions" else "rerun"
+    _resume_review_job(job, changed, kind)
+    tg.send_message(
+        chat_id,
+        f"✅ စာသား လက်ခံပြီးပါပြီ — အပိုင်း {len(segs)} ပိုင်း "
+        f"({changed} ပိုင်း ပြင်ထား) နဲ့ job ပြန်စ ပါပြီ 🙏")
+
+
+def _tg_review_doc_step(msg, chat_id, doc):
+    """A non-video, non-image document arrived in a chat.
+    While one of the chat's jobs is parked at waiting_review
+    the document is that job's edited full text coming back
+    (build 244). Returns True when the document was handled
+    here; False when no job is parked for this chat, so the
+    bot's normal handling continues untouched."""
+    from pipeline import telegram_send as tg
+    parked = _review_jobs_for_chat(chat_id)
+    if not parked:
+        return False
+    fname = doc.get("file_name") or ""
+    if not fname.lower().endswith(".txt"):
+        tg.send_message(
+            chat_id,
+            "✏️ စစ်ပြင် အဆင့် ရောက်နေတဲ့ job ရှိပါတယ် — "
+            "ပြင်ထားတဲ့ စာသား ကို .txt file အဖြစ် "
+            "ပို့ပေးပါ 🙏")
+        return True
+    if (doc.get("file_size") or 0) > tg.download_cap():
+        cap_mb = tg.download_cap() // 1_000_000
+        tg.send_message(
+            chat_id,
+            f"⚠️ တောင်းပန်ပါတယ် — ဒီ file က {cap_mb}MB ထက် "
+            "ကြီးနေလို့ bot က လက်ခံလို့ မရပါ 🙏")
+        return True
+    if len(parked) > 1:
+        # Never guess which job a text belongs to: stash the
+        # document and let the user bind it with a tap.
+        _TG_REVIEW_PENDING[chat_id] = {
+            "file_id": doc.get("file_id"), "file_name": fname,
+            "ts": time.time()}
+        rows = [[(f"✏️ {j.get('type') or 'dub'} · {j['id'][:8]}",
+                  f"rd:{j['id']}")] for j in parked]
+        tg.send_message(
+            chat_id,
+            "✏️ စစ်ပြင် စောင့်နေတဲ့ job တွေ တစ်ခုထက် ပိုရှိနေပါတယ် — "
+            "ဒီ file က ဘယ် job အတွက်လဲ ရွေးပေးပါ",
+            buttons=rows)
+        return True
+    _tg_review_apply_doc(chat_id, parked[0], doc.get("file_id"))
+    return True
+
+
+def _tg_review_callback(chat_id, data):
+    """Review-flow button taps (build 244): rv:<jid>:<src|my>
+    re-pulls one TXT file; rd:<jid> binds the chat's pending
+    returned document to one of several parked jobs. Both
+    are fenced to the job's own review chat — a tap from any
+    other chat is ignored entirely."""
+    from pipeline import telegram_send as tg
+    parts = data.split(":")
+    if len(parts) < 2:
+        return
+    job = _load_job(parts[1])
+    if not job or _review_chat_for(job) != chat_id:
+        return
+    if parts[0] == "rv":
+        if job.get("status") != "waiting_review":
+            tg.send_message(chat_id, "ဒီ job က စစ်ပြင် အဆင့် "
+                                     "မရှိတော့ပါ 🙏")
+            return
+        kind = parts[2] if len(parts) > 2 else "src"
+        path = dict(_review_export_files(job)).get(kind)
+        if not path:
+            tg.send_message(chat_id,
+                            "📄 မူကြမ်း မရှိသေးပါ 🙏"
+                            if kind == "my" else
+                            "📄 file မရှိတော့ပါ 🙏")
+            return
+        try:
+            tg.send_document(chat_id, path,
+                             caption=_REVIEW_TXT_CAPS[kind])
+        except Exception:
+            pass
+        return
+    # rd:<jid> — the pending document goes to this job.
+    pend = _TG_REVIEW_PENDING.get(chat_id)
+    if not pend or time.time() - pend.get("ts", 0) > 30 * 60:
+        _TG_REVIEW_PENDING.pop(chat_id, None)
+        tg.send_message(chat_id, "⏰ အချိန် ကုန်သွားပါပြီ — file ကို "
+                                 "ပြန်ပို့ပေးပါ 🙏")
+        return
+    if job.get("status") != "waiting_review":
+        tg.send_message(chat_id, "ဒီ job က စစ်ပြင် အဆင့် "
+                                 "မရှိတော့ပါ 🙏")
+        return
+    _TG_REVIEW_PENDING.pop(chat_id, None)
+    _tg_review_apply_doc(chat_id, job, pend.get("file_id"))
+
+
 def _on_tg_message(msg):
     """A Telegram user sent something to the bot: a video link becomes
     a job (queued behind whatever is running); anything else gets a
@@ -826,6 +1100,16 @@ def _on_tg_message(msg):
     text = (msg.get("text") or msg.get("caption") or "").strip()
     if _tg_menu_step(msg, chat_id, text):
         return
+    # Build 244: a document that is neither a video (a
+    # submission, handled below) nor an image (logo/topup
+    # flows, handled in the menu step) may be a parked job's
+    # edited text coming back — but only while a job really
+    # is parked for this chat; otherwise normal handling.
+    _doc = msg.get("document") or {}
+    if _doc and not (_doc.get("mime_type") or "").startswith(
+            ("video/", "image/")):
+        if _tg_review_doc_step(msg, chat_id, _doc):
+            return
     if vid:
         if not _may_submit(chat_id):
             _deny_submit(chat_id)
@@ -1858,6 +2142,12 @@ def _on_tg_callback(cq):
                                      "ဖြစ်နိုင်သလို screenshot မရောက်သေးတာ "
                                      "လည်း ဖြစ်နိုင်ပါတယ် (screenshot မရှိရင် "
                                      "approve ပိတ်ထားပါတယ်)")
+        return
+    if data.startswith("rv:") or data.startswith("rd:"):
+        # Review flow (build 244): TXT re-pulls and parked-job
+        # binding. These live outside the choice flow, so they
+        # are handled before the flow gate below.
+        _tg_review_callback(chat_id, data)
         return
     flow = _TG_FLOW.get(chat_id)
     if not flow:
@@ -6288,6 +6578,26 @@ def job_segments(jid):
         for i, s in enumerate(segs)]})
 
 
+def _resume_review_job(job, changed, kind):
+    """The shared review-resume tail: the web job_review, the
+    captions render confirm and the Telegram review return
+    (build 244) all finish a review park exactly this way —
+    record the edit count, drop any pending auto-cleanup of
+    the old result, and queue the phase-2 worker (build 180:
+    a re-render queues for a worker slot like any other job;
+    it used to jump the queue with its own thread). `kind` is
+    the worker kind the web route for this job type uses
+    ("rerun" for dub, "captions2" for captions)."""
+    job["edited_count"] = changed
+    old_timer = CLEANUP_TIMERS.pop(job["id"], None)
+    if old_timer:
+        old_timer.cancel()
+    job.pop("cleanup_at", None)
+    job["status"] = "queued"
+    _save(job)
+    _enqueue_job(job, kind=kind)
+
+
 @app.post("/api/jobs/<jid>/review")
 def job_review(jid):
     """Submit edits (or none) and (re-)run phase 2.
@@ -6317,17 +6627,8 @@ def job_review(jid):
             changed += 1
     save_segments(segs, seg_path)
     write_srt(segs, JOBS_DIR / jid / "subs_my.srt")  # keep subs-mode SRT in sync
-    job["edited_count"] = changed
     # A re-render supersedes the pending auto-cleanup of the old result.
-    old_timer = CLEANUP_TIMERS.pop(jid, None)
-    if old_timer:
-        old_timer.cancel()
-    job.pop("cleanup_at", None)
-    # Build 180: the re-render queues for a worker slot like any
-    # other job (it used to jump the queue with its own thread).
-    job["status"] = "queued"
-    _save(job)
-    _enqueue_job(job, kind="rerun")
+    _resume_review_job(job, changed, "rerun")
     return jsonify({"ok": True, "edited_count": changed})
 
 
@@ -7911,6 +8212,9 @@ def _captions_worker(job):
             # (build 213, same as recap).
             _timing_close(job)
             _save(job)
+            # Build 244: the park is also announced to the
+            # job's Telegram chat with the review TXT files.
+            _tg_review_notify_async(job)
         except JobCancelled:
             _cancelled(job)
         except Exception as e:
@@ -8090,17 +8394,10 @@ def render_captions(jid):
             changed += 1
     save_segments(segs, seg_path)
     write_srt(segs, JOBS_DIR / jid / "subs_my.srt")
-    job["edited_count"] = changed
     # A render supersedes any pending auto-cleanup (a parked
     # job has none today; the mirror of job_review stays
-    # exact).
-    old_timer = CLEANUP_TIMERS.pop(jid, None)
-    if old_timer:
-        old_timer.cancel()
-    job.pop("cleanup_at", None)
-    job["status"] = "queued"
-    _save(job)
-    _enqueue_job(job, kind="captions2")
+    # exact) — the shared tail in _resume_review_job.
+    _resume_review_job(job, changed, "captions2")
     return jsonify({"ok": True, "edited_count": changed})
 
 
@@ -9062,6 +9359,15 @@ def _export_lang():
     return ("text_my" if lang == "my" else "text"), lang
 
 
+def _export_txt_body(segs, key):
+    """The TXT export body: one segment per paragraph, a blank
+    line between paragraphs, a trailing newline. Shared by the
+    web download route and the Telegram review flow (build
+    244) so both hand the user the identical file."""
+    paras = [(s.get(key) or "").strip() for s in segs]
+    return "\n\n".join(p for p in paras if p) + "\n"
+
+
 @app.get("/api/jobs/<jid>/export/txt")
 def export_txt(jid):
     """Plain text of a job's segments — one segment per paragraph.
@@ -9074,8 +9380,7 @@ def export_txt(jid):
     if not got:
         return jsonify({"error": "lang မမှန်ပါ"}), 400
     key, lang = got
-    paras = [(s.get(key) or "").strip() for s in segs]
-    body = "\n\n".join(p for p in paras if p) + "\n"
+    body = _export_txt_body(segs, key)
     return Response(body, mimetype="text/plain; charset=utf-8", headers={
         "Content-Disposition": f'attachment; filename="{jid}_{lang}.txt"'})
 
@@ -9121,6 +9426,42 @@ def _split_bulk_units(text, n_segments):
     return sents or lines
 
 
+def _bulk_assign(units, n_segments):
+    """Distribute split units over the segments, in order (the
+    assignment half of the web bulk-paste; see _split_bulk_units
+    for how units are made): extra units beyond the segment
+    count are joined into the LAST segment; fewer units leave
+    the remaining segments with their current text."""
+    assign = {}
+    if len(units) >= n_segments:
+        for i in range(n_segments - 1):
+            assign[i] = units[i]
+        assign[n_segments - 1] = " ".join(units[n_segments - 1:])
+    else:
+        for i, u in enumerate(units):
+            assign[i] = u
+    return assign
+
+
+def _apply_bulk_assign(job, segs, assign):
+    """Write an assignment into the segments as review edits
+    (edited=True), save segments_my.json and keep subs_my.srt
+    in sync; returns how many segments changed. Shared by the
+    web bulk-paste route and the Telegram review return
+    (build 244) so both apply text identically."""
+    from pipeline.common import save_segments, write_srt
+    changed = 0
+    for i, new_text in assign.items():
+        if new_text and new_text != (segs[i].get("text_my") or ""):
+            segs[i]["text_my"] = new_text
+            segs[i]["edited"] = True
+            changed += 1
+    seg_path = JOBS_DIR / job["id"] / "segments_my.json"
+    save_segments(segs, seg_path)
+    write_srt(segs, JOBS_DIR / job["id"] / "subs_my.srt")
+    return changed
+
+
 @app.post("/api/jobs/<jid>/review/bulk")
 def job_review_bulk(jid):
     """Paste a whole translated text at once; it is distributed over the
@@ -9148,24 +9489,8 @@ def job_review_bulk(jid):
     if not segs:
         return jsonify({"error": "အပိုင်းတွေ မရှိပါ"}), 409
     units = _split_bulk_units(text, len(segs))
-    assign = {}
-    if len(units) >= len(segs):
-        for i in range(len(segs) - 1):
-            assign[i] = units[i]
-        assign[len(segs) - 1] = " ".join(units[len(segs) - 1:])
-    else:
-        for i, u in enumerate(units):
-            assign[i] = u
-    from pipeline.common import save_segments, write_srt
-    changed = 0
-    for i, new_text in assign.items():
-        if new_text and new_text != (segs[i].get("text_my") or ""):
-            segs[i]["text_my"] = new_text
-            segs[i]["edited"] = True
-            changed += 1
-    seg_path = JOBS_DIR / jid / "segments_my.json"
-    save_segments(segs, seg_path)
-    write_srt(segs, JOBS_DIR / jid / "subs_my.srt")  # keep SRT in sync
+    changed = _apply_bulk_assign(job, segs,
+                                 _bulk_assign(units, len(segs)))
     return jsonify({"ok": True, "changed": changed, "segments": [
         {"idx": i, "text_my": s.get("text_my")} for i, s in enumerate(segs)]})
 
