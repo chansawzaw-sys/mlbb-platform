@@ -28,6 +28,7 @@ import re
 import shutil
 import threading
 import time
+import traceback
 from pathlib import Path
 
 _LOCK = threading.Lock()
@@ -46,6 +47,16 @@ WELCOME = ("မင်္ဂလာပါ 🙏 မှတ်ပုံတင် ပ�
 # Diagnostics for the settings card: when the poller last completed
 # a poll and what it last choked on (if anything).
 LAST_POLL = {"at": 0.0, "error": ""}
+
+# Build 245 (bot went deaf 2026-11-21): queue-regression self-heal
+# state. _EMPTY_POLLS counts CONSECUTIVE successful getUpdates
+# passes that returned zero updates; at _EMPTY_POLL_LIMIT the
+# poller reconciles its persisted offset/seen_max against the
+# server's actual newest update (see _reconcile_queue_inner).
+# _LAST_SKIP_LOG throttles the all-skipped-batch log line.
+_EMPTY_POLLS = 0
+_EMPTY_POLL_LIMIT = 20
+_LAST_SKIP_LOG = 0.0
 
 
 _POLLER_THREAD = None
@@ -247,6 +258,7 @@ def poll_once():
 
 
 def _poll_once_inner():
+    global _EMPTY_POLLS, _LAST_SKIP_LOG
     tok = token()
     if not tok:
         return 0
@@ -265,6 +277,19 @@ def _poll_once_inner():
     LAST_POLL["at"] = time.time()
     LAST_POLL["error"] = ""
     updates = data.get("result") or []
+    # Build 245: a sustained run of successful-but-empty polls is
+    # the signature of our persisted offset having jumped past the
+    # server's queue (the queue regressed — e.g. the local Bot API
+    # server restarted and renumbered its updates). Reconcile
+    # against the server's newest update; a healthy queue makes
+    # this a strict no-op. Runs under poll_once's flock.
+    if updates:
+        _EMPTY_POLLS = 0
+    else:
+        _EMPTY_POLLS += 1
+        if _EMPTY_POLLS >= _EMPTY_POLL_LIMIT:
+            _EMPTY_POLLS = 0
+            _reconcile_queue_inner()
     seen_max = store.get("seen_max", 0)
     fresh = []
     new_users = []
@@ -311,6 +336,17 @@ def _poll_once_inner():
     if updates:
         with _LOCK:
             _save_store(store)
+    if updates and not fresh:
+        # Build 245: the server returned updates but the seen_max
+        # watermark swallowed EVERY one — the exact signature of
+        # the 2026-11-21 deaf bot. Log it (throttled to one line
+        # a minute) so the journal shows the swallow happening
+        # instead of the bot eating updates in silence.
+        _now = time.time()
+        if _now - _LAST_SKIP_LOG >= 60:
+            _LAST_SKIP_LOG = _now
+            print(f"TG POLL skipped {len(updates)} update(s): "
+                  f"all <= seen_max {seen_max}", flush=True)
     for cid in new_users:
         if MESSAGE_HANDLER and cid in start_chats:
             continue  # the handler answers /start itself (with menu)
@@ -329,6 +365,106 @@ def _poll_once_inner():
             if cq:
                 _dispatch(CALLBACK_HANDLER, cq)
     return len(updates)
+
+
+# ---------------- Build 245: queue-regression self-heal --------
+# The 2026-11-21 deaf bot: polls returned ok+empty forever while
+# users' messages never dispatched. The persisted offset/seen_max
+# live in the APP's id space, but the server queue (the LOCAL Bot
+# API server especially — it can restart/reset, plausibly OOMing
+# on a ~900 MB file) has its OWN update-id sequence. If that
+# sequence ever regresses below our stored offset, every real
+# update is either never returned (our offset points past the
+# whole queue) or skipped as "already dispatched"
+# (update_id <= seen_max) — permanently, with no error anywhere.
+# Reconciliation peeks at the server's newest update and, only
+# when our offset provably points past it, rewinds the store so
+# normal polling can see the queue again.
+
+def _probe_latest_update_id(tok):
+    """The server's newest update id (getUpdates offset=-1), or
+    None when the queue is totally empty or the probe fails. A
+    failed probe is evidence of NOTHING and must never cause a
+    state change."""
+    import requests
+    try:
+        r = requests.get(_api_url(tok, "getUpdates"),
+                         params={"offset": -1, "limit": 1},
+                         timeout=10)
+        data = r.json()
+    except Exception:
+        return None
+    if not data.get("ok"):
+        return None
+    res = data.get("result") or []
+    if not res:
+        return None
+    return max(u["update_id"] for u in res)
+
+
+def _reconcile_queue_inner():
+    """Reset the store if — and only if — the queue regressed.
+    The caller holds poll_once's flock (or is reconcile_queue,
+    which takes it). Returns True when a reset happened.
+
+    Healthy test: our stored offset can still see the server's
+    newest update (offset <= latest + 1). If offset points PAST
+    the newest update, a monotonic queue could never have got
+    there — the server's id sequence must have restarted below
+    us. The reset rewinds offset AND seen_max to 0 (preserving
+    users and every other store key) so the next normal poll
+    re-fetches whatever the server still holds and dispatches
+    it exactly once through the usual watermark path; the store
+    then re-advances to (latest + 1, latest) on its own. Simply
+    parking the counters AT latest + 1 / latest instead would
+    silently discard any backlog the server still holds —
+    tonight those were real user messages."""
+    tok = token()
+    if not tok:
+        return False
+    with _LOCK:
+        store = _load_store()
+    latest = _probe_latest_update_id(tok)
+    if latest is None:
+        return False  # empty queue or failed probe: no conclusion
+    offset = store.get("offset", 0)
+    if offset <= latest + 1:
+        return False  # healthy: the newest update is reachable
+    store["offset"] = 0
+    store["seen_max"] = 0
+    with _LOCK:
+        _save_store(store)
+    print(f"TG POLL queue regressed: offset {offset} -> 0 "
+          f"(server latest {latest}); store reset", flush=True)
+    return True
+
+
+def reconcile_queue():
+    """Flock-wrapped reconciliation for the poller thread start
+    (start_poller). While another process holds the poll lock
+    this is a no-op — that process's poller reconciles on its
+    own schedule. Never raises."""
+    try:
+        lf = open(_poll_lock_path(), "a+")
+    except Exception:
+        lf = None  # lock file unusable: reconcile anyway
+    if lf is not None:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lf.close()
+            return False  # another poller is mid-cycle
+    try:
+        return _reconcile_queue_inner()
+    except Exception:
+        return False
+    finally:
+        if lf is not None:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lf.close()
 
 
 _CHAT_LOCKS = {}
@@ -363,7 +499,14 @@ def _dispatch(handler, payload):
             try:
                 handler(payload)
             except Exception:
-                pass
+                # Build 245: never swallow silently again. A
+                # handler that always throws is indistinguishable
+                # from a dead bot from outside (2026-11-21: hours
+                # of unanswered taps, nothing in the journal).
+                # Log the traceback; dispatch still never raises
+                # into the poll loop.
+                print(f"TG handler error chat={cid}: "
+                      f"{traceback.format_exc()}", flush=True)
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -513,6 +656,15 @@ def start_poller():
         return
 
     def loop():
+        # Build 245: reconcile once when the poller thread starts
+        # — a queue regression that happened while the app was
+        # down (or that took the previous process down) is healed
+        # before the first poll, not after 20 empty ones.
+        try:
+            if token():
+                reconcile_queue()
+        except Exception:
+            pass
         while True:
             try:
                 if token():
