@@ -384,6 +384,10 @@ def synthesize(workdir, voice=DEFAULT_VOICE, rate=0, pitch=0):
             provider = "FAILED-silent"
             failed.append(i)
         seg["tts_file"] = str(out)
+        # Build 246: fingerprint of the exact text synthesized — the
+        # run_job resume gate only reuses this audio when the segment
+        # text is unchanged (a review edit forces re-synthesis).
+        seg["tts_text"] = text
         seg["tts_duration"] = round(probe_duration(out), 3)
         seg["tts_provider"] = provider
         seg["tts_rate"] = rate

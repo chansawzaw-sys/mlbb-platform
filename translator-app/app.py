@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import tempfile
 import threading
 import time
@@ -59,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 245"
+BUILD_TAG = "build 246"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -145,6 +146,72 @@ def _save(job):
 
 class JobCancelled(Exception):
     """Raised inside a worker when the user asked to stop the job."""
+
+
+# ---------- build 246: graceful shutdown ----------
+# A deploy restart (SIGTERM from systemd) must never kill a job
+# mid-stage with no trace: the handler below only SETS a flag.
+# Workers notice it at the next progress mark (between stages),
+# stop WITHOUT failing or charging, and leave the job "running"
+# on disk — the startup recovery then resumes it from its first
+# incomplete stage. A reaper thread gives running workers a
+# bounded grace window to reach that clean stop before the
+# process exits, so systemd's restart proceeds promptly instead
+# of waiting for its SIGKILL timeout.
+_SHUTDOWN = {"requested": False}
+
+
+class _ShutdownInterrupt(Exception):
+    """Raised inside a worker when a shutdown was requested —
+    deliberately NOT a JobCancelled: the job is not cancelled,
+    it is parked on disk for resume after the restart."""
+
+
+def _on_sigterm(signum, frame):
+    _SHUTDOWN["requested"] = True
+
+
+def _shutdown_reaper():
+    while not _SHUTDOWN["requested"]:
+        time.sleep(0.5)
+    deadline = time.time() + 75
+    while time.time() < deadline:
+        if not any(t.is_alive() for t in list(_WORKER_THREADS)):
+            break
+        time.sleep(0.5)
+    os._exit(0)
+
+
+def _install_shutdown_hook():
+    """Production only: serve.py imports this module with
+    TRANSLATOR_APP_DIR set (a plain `python app.py` run counts
+    too). Proof harnesses import the module with neither, so the
+    hook stays inert there and they drive _SHUTDOWN directly."""
+    if not (os.environ.get("TRANSLATOR_APP_DIR")
+            or __name__ == "__main__"):
+        return
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except Exception:
+        return
+    threading.Thread(target=_shutdown_reaper, daemon=True,
+                     name="shutdown-reaper").start()
+
+
+def _shutdown_stop(job):
+    """A worker's clean stop on shutdown: settle the active-time
+    span, persist the job exactly as it stands (status stays
+    "running", nothing failed, nothing charged) and return —
+    startup recovery resumes it after the restart."""
+    try:
+        _timing_close(job)
+    except Exception:
+        pass
+    job.pop("_run_t0", None)
+    try:
+        _save(job)
+    except Exception:
+        pass
 
 
 # ---------- per-stage job timings (build 213) ----------
@@ -241,6 +308,11 @@ def _progress_fn(job):
     def progress(step, state, note="", phase_s=None):
         if job.get("cancel_requested"):
             raise JobCancelled()
+        if _SHUTDOWN["requested"]:
+            # Build 246: a deploy restart is not a cancellation —
+            # stop at this stage boundary and let startup
+            # recovery resume the job afterwards.
+            raise _ShutdownInterrupt()
         job["updated_at"] = time.time()
         for s in job["steps"]:
             if s["key"] == step:
@@ -283,7 +355,8 @@ def _heartbeat(job):
     alive, so stale-job detection — here and in the launcher gate — can
     tell a genuinely running job from a wedged one."""
     while job.get("status") in ("queued", "running") \
-            and not job.get("cancel_requested"):
+            and not job.get("cancel_requested") \
+            and not _SHUTDOWN["requested"]:
         job["updated_at"] = time.time()
         try:
             _save(job)
@@ -334,6 +407,104 @@ _TG_PENDING = []  # job ids created from Telegram, waiting for a free slot
 _JOB_QUEUE = []   # (jid, kind) FIFO for the dispatcher; kind "main" or "rerun"
 MAX_CONCURRENT_JOBS = 4  # build 180: four heavy jobs at once (YTA 3, 4 cores)
 _TG_FLOW = {}     # chat_id -> bot choice flow state (blur spot, mode)
+
+# ---------- build 246: bot conversation state survives restarts ----
+# _TG_FLOW used to live only in memory: every deploy restart wiped
+# a mid-conversation flow (blur choice, top-up amount step, …) and
+# the user had to start over. The dict is now mirrored to
+# .tg_flows.json under the app root (beside the recipients store)
+# whenever it changes, and reloaded at startup. The existing
+# 30-minute expiry (from each flow's "ts") is enforced on load as
+# well as on use; a flow whose referenced source/preview files
+# are gone is dropped silently at load. The one non-JSON value in
+# a flow — the blurpick "pick" SET of piece indexes — is stored
+# as a list and restored as a set via the "_set_keys" marker.
+_TG_FLOW_TTL = 30 * 60
+_TG_FLOW_SAVE_STATE = {"snapshot": None}
+
+
+def _tg_flow_path():
+    return ROOT / ".tg_flows.json"
+
+
+def _tg_flow_serialized():
+    out = {}
+    for cid, flow in _TG_FLOW.items():
+        try:
+            f = dict(flow)
+        except Exception:
+            continue
+        set_keys = []
+        for k, v in list(f.items()):
+            if isinstance(v, (set, frozenset)):
+                f[k] = sorted(v)
+                set_keys.append(k)
+        if set_keys:
+            f["_set_keys"] = set_keys
+        out[str(cid)] = f
+    return out
+
+
+def _tg_flow_save():
+    """Persist _TG_FLOW atomically; never raises."""
+    try:
+        data = _tg_flow_serialized()
+        snap = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        if snap == _TG_FLOW_SAVE_STATE["snapshot"]:
+            return
+        p = _tg_flow_path()
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(snap, encoding="utf-8")
+        os.replace(tmp, p)
+        _TG_FLOW_SAVE_STATE["snapshot"] = snap
+    except Exception:
+        pass
+
+
+def _tg_flow_load():
+    """Reload flows saved before a restart. Drops — silently —
+    flows past the 30-minute expiry and flows whose referenced
+    source files no longer exist."""
+    try:
+        data = json.loads(_tg_flow_path().read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    now = time.time()
+    for cid, f in data.items():
+        try:
+            if not isinstance(f, dict):
+                continue
+            if now - float(f.get("ts") or 0) > _TG_FLOW_TTL:
+                continue  # expired while the server was down
+            gone = False
+            for key in ("src", "logo_file"):
+                v = f.get(key)
+                if v and not Path(str(v)).exists():
+                    gone = True
+                    break
+            if gone:
+                continue
+            for k in f.pop("_set_keys", []) or []:
+                if isinstance(f.get(k), list):
+                    f[k] = set(f[k])
+            _TG_FLOW[int(cid)] = f
+        except Exception:
+            continue
+    _TG_FLOW_SAVE_STATE["snapshot"] = None
+    _tg_flow_save()  # persist the pruned set
+
+
+def _tg_flow_saver():
+    """Catch-all persistence for the many in-place flow edits:
+    every few seconds, save when the serialized form changed.
+    Explicit _tg_flow_save() calls at flow transitions shrink
+    the window further."""
+    while True:
+        time.sleep(5)
+        _tg_flow_save()
+
 _TG_DAILY_CAP = int(os.environ.get("VT_TG_DAILY_CAP", "30"))
 _TG_DAILY_FILE = ROOT / ".tg_daily.json"
 
@@ -454,6 +625,14 @@ def _enqueue_job(job, kind="main"):
     Build 186 (audit fix #7): the enqueue instant is stamped so
     the dispatcher can record how long the job actually waited."""
     job["enqueued_at"] = time.time()
+    # Build 246: persist WHICH worker owns this job — after a
+    # restart the in-memory queue is gone, and startup recovery
+    # re-queues the job under this kind.
+    job["worker_kind"] = kind
+    try:
+        _save(job)
+    except Exception:
+        pass
     _JOB_QUEUE.append((job["id"], kind))
 
 
@@ -807,6 +986,29 @@ def _tg_error_async(job):
     threading.Thread(target=go, daemon=True).start()
 
 
+def _tg_resume_note_async(job):
+    """Build 246: when a job is auto-resumed after a restart, tell
+    its Telegram chat plainly that the server restarted and the
+    job is CONTINUING from where it stopped — a reassurance,
+    not an error. Mirrors _tg_error_async's shape."""
+    chat_id = job.get("tg_chat_id")
+    if not chat_id:
+        return
+
+    def go():
+        try:
+            from pipeline import telegram_send as tg
+            tg.send_message(
+                chat_id,
+                "🔄 ဆာဗာ ပြန်စတင်ခဲ့ရလို့ ဒီ video အလုပ်ကို "
+                "ရပ်သွားတဲ့နေရာကနေ ပြန်ဆက်လုပ်နေပါပြီ — "
+                "ခဏစောင့်ပေးပါ 🙏")
+        except Exception:
+            pass
+
+    threading.Thread(target=go, daemon=True).start()
+
+
 # ---------- Telegram review flow (build 244) ----------
 # The web review loop brought to the bot: a job parked at
 # waiting_review notifies its chat (the job's TG origin chat,
@@ -1131,6 +1333,7 @@ def _on_tg_message(msg):
             "file_id": vid["file_id"], "step": "prepare",
             "from": frm.get("username") or frm.get("first_name"),
             "ts": time.time()}
+        _tg_flow_save()
         tg.send_message(chat_id, "⏳ file ကို ယူနေပါတယ် — ခဏ စောင့်ပေးပါ။ ဝါးမယ့် နေရာ "
                                  "ရွေးဖို့ ပုံ ပို့ပေးပါမယ်")
         threading.Thread(target=_tg_flow_prepare, args=(chat_id,),
@@ -1180,6 +1383,7 @@ def _on_tg_message(msg):
         "url": m.group(0), "step": "prepare",
         "from": frm.get("username") or frm.get("first_name"),
         "ts": time.time()}
+    _tg_flow_save()
     tg.send_message(chat_id,
                     "⏳ video ကို ယူနေပါတယ် — ခဏ စောင့်ပေးပါ။ ဝါးမယ့် နေရာ ရွေးဖို့ ပုံ ပို့ပေးပါမယ်")
     threading.Thread(target=_tg_flow_prepare, args=(chat_id,),
@@ -1677,6 +1881,7 @@ def _tg_menu_step(msg, chat_id, text):
                                      "ချိတ်ပြီးသား ဖြစ်ပါတယ်")
         else:
             _TG_FLOW[chat_id] = {"step": "link", "ts": time.time()}
+            _tg_flow_save()
             tg.send_message(chat_id, "🔑 web app ရဲ့ 👤 account card မှာ "
                                      "«TG ချိတ်ရန် code» ထုတ်ပြီး အဲဒီ "
                                      "code ကို ဒီမှာ ပို့ပေးပါ" + _LINK_HINT)
@@ -1687,6 +1892,7 @@ def _tg_menu_step(msg, chat_id, text):
                                      "" + _LINK_HINT)
             return True
         _TG_FLOW[chat_id] = {"step": "topup_amount", "ts": time.time()}
+        _tg_flow_save()
         info = _pay_info()
         # Build 231: package buttons ride on the prompt — a
         # tap fills the amount with the package's TOTAL
@@ -2387,7 +2593,7 @@ def _job_dispatcher():
     as cancelled without burning a worker slot."""
     while True:
         try:
-            while _JOB_QUEUE and \
+            while _JOB_QUEUE and not _SHUTDOWN["requested"] and \
                     _active_worker_count() < MAX_CONCURRENT_JOBS:
                 jid, kind = _JOB_QUEUE.pop(0)
                 job = JOBS.get(jid)
@@ -2776,6 +2982,8 @@ def _worker(job):
             _quote_for_job(job)
             _run_phase2(job)
             _finish(job)
+        except _ShutdownInterrupt:
+            _shutdown_stop(job)
         except JobCancelled:
             _cancelled(job)
         except Exception as e:
@@ -2798,6 +3006,8 @@ def _worker2(job):
             _save(job)
             _run_phase2(job)
             _finish(job)
+        except _ShutdownInterrupt:
+            _shutdown_stop(job)
         except JobCancelled:
             _cancelled(job)
         except Exception as e:
@@ -6456,21 +6666,119 @@ def _all_jobs():
     return res
 
 
+# ---------- build 246: restart resume ----------
+# A restart must never kill a job. Jobs found on disk in an
+# active state are RESUMED — re-queued under their persisted
+# worker kind — and each worker's stage gates (pipeline.run_job)
+# skip the stages whose artifacts already landed, so only the
+# first incomplete stage runs again. Charge-on-success is
+# untouched: _finish remains the single charge point and its
+# charged_minutes guard keeps it exactly-once across attempts.
+# A job may be auto-resumed at most RESUME_MAX times (persisted
+# as resume_count); beyond that — or when the artifacts its next
+# stage needs are gone — it fails honestly with the same
+# Burmese restart message the pre-246 heal used.
+RESUME_MAX = 3
+_PHASE2_KINDS = ("rerun", "captions2", "recap2", "commentary2")
+_PHASE1_KINDS = ("main", "captions1", "recap1", "commentary1",
+                 "captions_api", "download1")
+
+
+def _infer_worker_kind(j):
+    """Worker kind for a job persisted before build 246 stamped
+    worker_kind at enqueue (or if the stamp was lost). Returns
+    None when no worker can own the job (e.g. the synchronous
+    Studio TTS jobs, which were never queued)."""
+    t = j.get("type")
+    wd = JOBS_DIR / str(j.get("id") or "")
+    if t == "download":
+        return "download1"
+    if t == "captions":
+        if j.get("api_mode") == "captions" or j.get("via") == "api":
+            return "captions_api"
+        return "captions2" if "edited_count" in j else "captions1"
+    if t == "recap":
+        if (wd / "segments_my.json").exists():
+            return "recap2"
+        return "recap1"
+    if t == "commentary":
+        if (wd / "segments_my.json").exists():
+            return "commentary2"
+        return "commentary1"
+    if t == "story":
+        if j.get("story_shots") and (wd / "segments_my.json").exists():
+            return "story2"
+        return "story1"
+    if t == "tts":
+        return None
+    return "rerun" if "edited_count" in j else "main"
+
+
+def _resume_blocker(j, kind):
+    """A plain-language reason the job cannot resume, or None.
+    Only checks the artifacts the NEXT stage cannot recreate:
+    phase-2 workers need the downloaded source; an upload-fed
+    phase-1 job needs its source file to still exist somewhere."""
+    wd = JOBS_DIR / str(j.get("id") or "")
+    if kind in _PHASE2_KINDS:
+        if not (wd / "source.mp4").exists():
+            return "source gone"
+    elif kind == "story2":
+        if not j.get("story_text"):
+            return "story text gone"
+    elif kind in _PHASE1_KINDS and j.get("upload"):
+        sp = j.get("source_path")
+        if not (wd / "source.mp4").exists() \
+                and not (sp and Path(str(sp)).exists()):
+            return "source gone"
+    return None
+
+
+def _resume_job(j):
+    """Re-queue a disk-found active job for its worker. Returns
+    True when resumed; False refuses (the caller then applies
+    the honest-failure heal). 'queued' jobs never started, so
+    re-queueing them costs no resume attempt; 'running' jobs
+    consume one, capped at RESUME_MAX."""
+    kind = j.get("worker_kind") or _infer_worker_kind(j)
+    if not kind:
+        return False
+    if j.get("status") == "running":
+        if int(j.get("resume_count") or 0) >= RESUME_MAX:
+            return False
+        if _resume_blocker(j, kind):
+            return False
+        j["resume_count"] = int(j.get("resume_count") or 0) + 1
+    j.pop("_run_t0", None)  # a dead process's monotonic stamp
+    j["status"] = "queued"
+    j["worker_started"] = False
+    j["error"] = None
+    JOBS[j["id"]] = j
+    _save(j)
+    _enqueue_job(j, kind)
+    if j.get("tg_chat_id") and not j.get("cancel_requested"):
+        _tg_resume_note_async(j)
+    return True
+
+
 def _scan_disk_jobs():
     """Recovery pass over jobs/ — the disk half of the pre-204
     _all_jobs, run at startup and from the periodic backup loop
     instead of on every list request.
 
     A job that exists only on disk cannot be running (the process
-    that ran it is gone), so a disk-only 'active' status is healed
-    to error rather than lying to the UI — and blocking the gate —
-    forever. Finished disk-only jobs are loaded and whatever is
-    left of their retention window is re-armed (cleanup timers
-    are in-memory, so a restart would otherwise strand them);
-    one whose window already passed is deleted at once. Jobs
-    already in memory are this process's own and are skipped —
-    in a single-process app, disk-only jobs can only appear
-    across a restart."""
+    that ran it is gone). Build 246: instead of healing a
+    disk-only 'active' status to error, the job is RESUMED from
+    its first incomplete stage (see _resume_job) — only a job
+    that cannot resume (resume cap reached, source artifacts
+    gone, no owning worker) is healed to error with the restart
+    message, exactly as before. Finished disk-only jobs are
+    loaded and whatever is left of their retention window is
+    re-armed (cleanup timers are in-memory, so a restart would
+    otherwise strand them); one whose window already passed is
+    deleted at once. Jobs already in memory are this process's
+    own and are skipped — in a single-process app, disk-only
+    jobs can only appear across a restart."""
     for p in sorted(JOBS_DIR.glob("*/job.json")):
         try:
             j = json.loads(p.read_text(encoding="utf-8"))
@@ -6480,6 +6788,8 @@ def _scan_disk_jobs():
         if not jid or jid in JOBS or _tombstoned(jid):
             continue
         if j.get("status") in ("queued", "running"):
+            if _resume_job(j):
+                continue
             j["status"] = "error"
             j["error"] = "server ပြန်စ၍ ရပ်သွား"
             j["finished_at"] = j.get("finished_at") or time.time()
@@ -6487,8 +6797,9 @@ def _scan_disk_jobs():
             _save(j)
             _schedule_cleanup(j)
             if j.get("tg_chat_id"):
-                # A queued bot job died with the restart — the
-                # customer must be TOLD, not left waiting forever.
+                # A bot job that could not resume died with the
+                # restart — the customer must be TOLD, not left
+                # waiting forever.
                 _tg_error_async(j)
         elif j.get("status") in ("done", "error", "cancelled"):
             JOBS[jid] = j
@@ -7114,6 +7425,36 @@ def _recap_view(job):
     return view
 
 
+def _carry_tts(workdir, segs):
+    """Build 246: recap/commentary phase 2 rebuilds segments_my.json
+    from the parked script on every run — which would erase the
+    TTS fingerprints a previous attempt recorded and force a full
+    re-synthesis after a restart. When the rebuilt segments carry
+    the SAME texts in the SAME order as the file on disk, carry
+    the old tts_* fields over so run_phase2's resume gate can
+    reuse the audio. Any mismatch leaves the fresh segments
+    untouched (the stage simply runs for real)."""
+    try:
+        from pipeline.common import load_segments
+        old = load_segments(workdir / "segments_my.json")
+    except Exception:
+        return segs
+    if not old or len(old) != len(segs):
+        return segs
+    keys = ("tts_file", "tts_duration", "tts_provider", "tts_text",
+            "tts_engine", "tts_voice", "tts_voice_name", "tts_rate",
+            "tts_pitch")
+    for new, prev in zip(segs, old):
+        if (new.get("text_my") or "").strip() \
+                != (prev.get("text_my") or "").strip():
+            return segs
+    for new, prev in zip(segs, old):
+        for k in keys:
+            if k in prev:
+                new[k] = prev[k]
+    return segs
+
+
 def _recap_worker(job):
     """Phase 1: download -> transcribe -> quote -> script.
     Parks the job at waiting_script; nothing is charged."""
@@ -7134,9 +7475,17 @@ def _recap_worker(job):
             _quote_for_job(job)
             progress = _progress_fn(job)
             progress("script", "running")
-            target = recap_mod.target_chars_for(workdir)
-            script, provider = recap_mod.generate_script(
-                workdir, target)
+            if job.get("recap_text"):
+                # Build 246 resume: a previous attempt already
+                # generated the script and it is persisted on the
+                # job — never regenerate (the user may be about
+                # to review THIS text), just park again.
+                script, provider = job["recap_text"], \
+                    job.get("recap_provider")
+            else:
+                target = recap_mod.target_chars_for(workdir)
+                script, provider = recap_mod.generate_script(
+                    workdir, target)
             progress("script", "done")
             job["recap_text"] = script
             job["recap_provider"] = provider
@@ -7157,6 +7506,8 @@ def _recap_worker(job):
                     [{"text": "recap", "provider": provider}])
             except Exception:
                 pass
+        except _ShutdownInterrupt:
+            _shutdown_stop(job)
         except JobCancelled:
             _cancelled(job)
         except Exception as e:
@@ -7186,6 +7537,7 @@ def _recap_worker2(job):
                 raise RuntimeError(
                     "Recap စာသား မရှိပါ — စာသား ပြန်ထည့်ပြီး "
                     "ပြန်စမ်းပါ (credit လုံးဝ မဖြတ်ပါ)")
+            segs = _carry_tts(workdir, segs)
             save_segments(segs, workdir / "segments_my.json")
             run_job.run_phase2(
                 workdir, mode="both", voice=job["voice"],
@@ -7199,6 +7551,8 @@ def _recap_worker2(job):
                 voice_name=job.get("voice_name"),
                 karaoke=bool(job.get("karaoke")))
             _finish(job)
+        except _ShutdownInterrupt:
+            _shutdown_stop(job)
         except JobCancelled:
             _cancelled(job)
         except Exception as e:
@@ -7476,7 +7830,13 @@ def _story_worker(job):
             _quote_for_story(job)
             progress = _progress_fn(job)
             progress("script", "running")
-            if job.get("story_text"):
+            if job.get("story_shots"):
+                # Build 246 resume: the shot plan from a previous
+                # attempt is persisted on the job — park again
+                # without regenerating anything.
+                shots, provider = job["story_shots"], \
+                    job.get("story_provider")
+            elif job.get("story_text"):
                 shots, provider = story_mod.plan_for_text(
                     job["story_text"],
                     minutes=int(job.get("story_minutes") or 1))
@@ -7503,6 +7863,8 @@ def _story_worker(job):
                     [{"text": "story", "provider": provider}])
             except Exception:
                 pass
+        except _ShutdownInterrupt:
+            _shutdown_stop(job)
         except JobCancelled:
             _cancelled(job)
         except Exception as e:
@@ -7526,16 +7888,23 @@ def _story_worker2(job):
             job["status"] = "running"
             _timing_start(job)  # build 213
             _save(job)
-            with _STORY_RENDER_SEM:
-                story_render.render_story(
-                    workdir, job, progress=_progress_fn(job))
             out = workdir / "output.mp4"
+            # Build 246 resume: the render is one whole stage —
+            # a valid output.mp4 from a previous attempt (the
+            # render killed between finishing and _finish) is
+            # reused as-is; anything less re-renders wholesale.
+            if not run_job._video_ok(out):
+                with _STORY_RENDER_SEM:
+                    story_render.render_story(
+                        workdir, job, progress=_progress_fn(job))
             minutes = max(1, math.ceil(
                 probe_duration(out) / 60.0))
             job["quote_minutes"] = minutes
             job["quote_credits"] = minutes \
                 * _credits_per_min_for(job)
             _finish(job)
+        except _ShutdownInterrupt:
+            _shutdown_stop(job)
         except JobCancelled:
             _cancelled(job)
         except Exception as e:
@@ -7879,9 +8248,15 @@ def _commentary_worker(job):
             _quote_for_job(job)
             progress = _progress_fn(job)
             progress("script", "running")
-            target = recap_mod.target_chars_for(workdir)
-            script, provider = commentary_mod.generate_script(
-                workdir, target)
+            if job.get("commentary_text"):
+                # Build 246 resume: reuse the persisted script
+                # from the previous attempt; just park again.
+                script, provider = job["commentary_text"], \
+                    job.get("commentary_provider")
+            else:
+                target = recap_mod.target_chars_for(workdir)
+                script, provider = commentary_mod.generate_script(
+                    workdir, target)
             progress("script", "done")
             job["commentary_text"] = script
             job["commentary_provider"] = provider
@@ -7899,6 +8274,8 @@ def _commentary_worker(job):
                       "provider": provider}])
             except Exception:
                 pass
+        except _ShutdownInterrupt:
+            _shutdown_stop(job)
         except JobCancelled:
             _cancelled(job)
         except Exception as e:
@@ -7930,19 +8307,32 @@ def _commentary_worker2(job):
                     "Commentary စာသား မရှိပါ — စာသား "
                     "ပြန်ထည့်ပြီး ပြန်စမ်းပါ "
                     "(credit လုံးဝ မဖြတ်ပါ)")
+            segs = _carry_tts(workdir, segs)
             save_segments(segs, workdir / "segments_my.json")
-            run_job.run_phase2(
-                workdir, mode="both", voice=job["voice"],
-                progress=_progress_fn(job), fx=job.get("fx"),
-                font=job.get("font") or "noto",
-                voice_rate=job.get("voice_rate", 0),
-                voice_pitch=job.get("voice_pitch", 0),
-                subs=job.get("subs"),
-                max_speed=job.get("speed_cap") or 1.3,
-                quality=job.get("quality") or "hd",
-                voice_name=job.get("voice_name"),
-                karaoke=bool(job.get("karaoke")))
-            if job.get("commentary_audio") != "off":
+            # Build 246 resume: when a previous attempt already
+            # produced a valid output AND finished the bed mix
+            # (or the job never wanted one), phase 2 + mix are
+            # both complete — go straight to _finish. A valid
+            # output with the bed still outstanding runs ONLY
+            # the mix below (re-mixing a mixed file would
+            # double-duck the original audio).
+            _out_done = run_job._video_ok(workdir / "output.mp4")
+            _bed_done = job.get("commentary_audio") == "off" \
+                or job.get("commentary_bed") is True
+            if not (_out_done and _bed_done):
+                run_job.run_phase2(
+                    workdir, mode="both", voice=job["voice"],
+                    progress=_progress_fn(job), fx=job.get("fx"),
+                    font=job.get("font") or "noto",
+                    voice_rate=job.get("voice_rate", 0),
+                    voice_pitch=job.get("voice_pitch", 0),
+                    subs=job.get("subs"),
+                    max_speed=job.get("speed_cap") or 1.3,
+                    quality=job.get("quality") or "hd",
+                    voice_name=job.get("voice_name"),
+                    karaoke=bool(job.get("karaoke")))
+            if job.get("commentary_audio") != "off" \
+                    and job.get("commentary_bed") is not True:
                 # Ducked bed (the default): the original
                 # audio under the narration at ~13%. The bed
                 # is garnish — a mix failure leaves the
@@ -7959,6 +8349,8 @@ def _commentary_worker2(job):
                     job["commentary_bed"] = False
                 progress("finalize", "done")
             _finish(job)
+        except _ShutdownInterrupt:
+            _shutdown_stop(job)
         except JobCancelled:
             _cancelled(job)
         except Exception as e:
@@ -8215,6 +8607,8 @@ def _captions_worker(job):
             # Build 244: the park is also announced to the
             # job's Telegram chat with the review TXT files.
             _tg_review_notify_async(job)
+        except _ShutdownInterrupt:
+            _shutdown_stop(job)
         except JobCancelled:
             _cancelled(job)
         except Exception as e:
@@ -8252,6 +8646,8 @@ def _captions_worker2(job):
                 quality=job.get("quality") or "hd",
                 karaoke=bool(job.get("karaoke")))
             _finish(job)
+        except _ShutdownInterrupt:
+            _shutdown_stop(job)
         except JobCancelled:
             _cancelled(job)
         except Exception as e:
@@ -8554,6 +8950,8 @@ def _download_worker(job):
             src.replace(workdir / "output.mp4")
             progress("save", "done")
             _finish(job)
+        except _ShutdownInterrupt:
+            _shutdown_stop(job)
         except JobCancelled:
             _cancelled(job)
         except Exception as e:
@@ -9107,6 +9505,8 @@ def _api_captions_worker(job):
                 quality=job.get("quality") or "hd",
                 karaoke=bool(job.get("karaoke")))
             _finish(job)
+        except _ShutdownInterrupt:
+            _shutdown_stop(job)
         except JobCancelled:
             _cancelled(job)
         except Exception as e:
@@ -9539,6 +9939,89 @@ def _startup_sweep():
             pass
 
 
+# ---------- build 246: bot watchdog + admin alerts ----------
+# A silent bot death (the 2026-11-21 incident) must reach the
+# owner within minutes, not via a customer's complaint. Every
+# _WATCHDOG_TICK_S the tick checks the poller's health and
+# whether a queue reconciliation (build 245) fired; a NEW anomaly
+# sends ONE plain-Burmese alert to the fixed admin chat (via
+# tg.send_alert, which falls back to the cloud API when the
+# local base is the thing that died). The same anomaly re-alerts
+# at most once an hour; when health returns after an alert, one
+# short recovery note is sent. While everything is healthy the
+# watchdog sends nothing, and it can never raise into the app.
+_WATCHDOG_TICK_S = 300
+_WATCHDOG_ALERT_GAP_S = 3600
+_WATCHDOG_STALE_S = 600
+
+
+def _watchdog_tick(st):
+    """One watchdog pass over the shared state dict `st`
+    ({"alerted": {key: ts}, "reconcile_seen": int,
+    "unhealthy": bool, "alert_sent": bool}). Factored out of the
+    loop so proofs can drive ticks directly."""
+    try:
+        from pipeline import telegram_send as tg
+        if not tg.token():
+            return
+        now = time.time()
+        anomalies = []
+        ps = tg.poller_status()
+        if not ps.get("alive"):
+            anomalies.append((
+                "poller_dead",
+                "⚠️ Bot poller ရပ်သွားပါတယ် — message အသစ်တွေ "
+                "ဝင်မှာ မဟုတ်ပါ။ ဆာဗာ စစ်ကြည့်ပေးပါ 🙏"))
+        ago = ps.get("last_poll_ago")
+        if ago is None or ago > _WATCHDOG_STALE_S:
+            anomalies.append((
+                "poll_stale",
+                "⚠️ Bot poller က ၁၀ မိနစ်ကျော် မလည်တော့ပါ — "
+                "message တွေ နောက်ကျနေနိုင်ပါတယ်။ ဆာဗာ "
+                "စစ်ကြည့်ပေးပါ 🙏"))
+        rc = tg.reconcile_status()
+        if rc.get("count", 0) > st["reconcile_seen"]:
+            st["reconcile_seen"] = rc["count"]
+            anomalies.append((
+                "queue_reset",
+                "ℹ️ Bot message queue လွဲသွားလို့ အလိုအလျောက် "
+                "ပြန်ညှိလိုက်ပါတယ် (self-heal) — အလုပ် "
+                "ဆက်လုပ်နေပါတယ်။"))
+        for key, text in anomalies:
+            last = st["alerted"].get(key, 0)
+            if now - last < _WATCHDOG_ALERT_GAP_S:
+                continue
+            if tg.send_alert(text):
+                st["alerted"][key] = now
+                st["alert_sent"] = True
+                if key != "queue_reset":
+                    st["unhealthy"] = True
+        if not anomalies:
+            if st["alert_sent"] and st["unhealthy"]:
+                if tg.send_alert(
+                        "✅ Bot ပြန် ကောင်းသွားပါပြီ — message "
+                        "တွေ ပုံမှန် ပြန်ဝင်နေပါပြီ။"):
+                    st["alert_sent"] = False
+                    st["unhealthy"] = False
+            elif st["alert_sent"]:
+                st["alert_sent"] = False
+    except Exception:
+        pass
+
+
+def _watchdog_loop():
+    st = {"alerted": {}, "reconcile_seen": 0,
+          "unhealthy": False, "alert_sent": False}
+    try:
+        from pipeline import telegram_send as tg
+        st["reconcile_seen"] = tg.reconcile_status().get("count", 0)
+    except Exception:
+        pass
+    while True:
+        time.sleep(_WATCHDOG_TICK_S)
+        _watchdog_tick(st)
+
+
 try:
     _startup_sweep()
 except Exception:
@@ -9549,6 +10032,13 @@ try:
     # disk jobs (heal / re-arm / expire) that _all_jobs used to
     # redo on every list request.
     _scan_disk_jobs()
+except Exception:
+    pass
+
+try:
+    # Build 246: restore bot conversation state saved before the
+    # restart (expired / file-less flows are dropped inside).
+    _tg_flow_load()
 except Exception:
     pass
 
@@ -9567,6 +10057,19 @@ for _target in (_backup_loop, _job_dispatcher, _upload_sweeper):
         threading.Thread(target=_target, daemon=True).start()
     except Exception:
         pass
+
+# Build 246: production-only loops (the flow saver + the bot
+# watchdog) and the SIGTERM grace hook. Gated on the same
+# production signal as the shutdown hook so proof harnesses —
+# which import this module — never grow real timers or signal
+# handlers; they drive _tg_flow_save / _watchdog_tick directly.
+if os.environ.get("TRANSLATOR_APP_DIR") or __name__ == "__main__":
+    for _target in (_tg_flow_saver, _watchdog_loop):
+        try:
+            threading.Thread(target=_target, daemon=True).start()
+        except Exception:
+            pass
+    _install_shutdown_hook()
 
 
 if __name__ == "__main__":

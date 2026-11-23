@@ -67,6 +67,7 @@ both engines; built-in voices keep taking the rate
 natively in their synthesize call.
 """
 import math
+import os
 import re
 from pathlib import Path
 
@@ -1171,8 +1172,13 @@ def render_story(workdir, job, progress=None):
     subs = _story_subs(job)
     srt = _write_srt(spoken, workdir / "story_subs.srt", subs)
     final = workdir / "output.mp4"
-    burn.burn(av, srt, final, font=job.get("font") or "noto",
+    # Build 246: burn to the temp name and rename over output.mp4
+    # only when complete, so a kill mid-burn never leaves a torn
+    # output.mp4 that a resumed job would mistake for finished.
+    tmp_final = workdir / "output.mp4.tmp"
+    burn.burn(av, srt, tmp_final, font=job.get("font") or "noto",
               subs=subs, cap_k=maxrate_cap_k("hd"),
               style="karaoke" if job.get("story_karaoke") else None)
+    os.replace(tmp_final, final)
     mark("render", "done")
     return final

@@ -58,6 +58,16 @@ _EMPTY_POLLS = 0
 _EMPTY_POLL_LIMIT = 20
 _LAST_SKIP_LOG = 0.0
 
+# Build 246: reconciliation observability for the app watchdog —
+# every ACTUAL queue reset bumps this counter, so the watchdog
+# can tell the owner a self-heal happened (it is otherwise
+# invisible until a user complains).
+RECONCILE_STATE = {"count": 0, "last_at": 0.0}
+
+
+def reconcile_status():
+    return dict(RECONCILE_STATE)
+
 
 _POLLER_THREAD = None
 
@@ -434,6 +444,8 @@ def _reconcile_queue_inner():
     store["seen_max"] = 0
     with _LOCK:
         _save_store(store)
+    RECONCILE_STATE["count"] += 1
+    RECONCILE_STATE["last_at"] = time.time()
     print(f"TG POLL queue regressed: offset {offset} -> 0 "
           f"(server latest {latest}); store reset", flush=True)
     return True
@@ -552,6 +564,33 @@ def send_message(chat_id, text, buttons=None, keyboard=None):
                       if v[0] < cutoff]:
                 _SENT_GUARD.pop(k, None)
     return result
+
+
+def send_alert(text):
+    """Build 246 (watchdog): one plain-text alert to the FIXED
+    admin chat. Deliberately bypasses send_message's duplicate
+    guard (an alert must never be swallowed as a 'duplicate'),
+    and when the configured API base fails — e.g. the LOCAL
+    Bot API server is itself the thing that died — retries the
+    same text ONCE via the cloud base. Returns True on delivery
+    by either route; never raises."""
+    tok = token()
+    if not tok:
+        return False
+    try:
+        _call(tok, "sendMessage", chat_id=str(FIXED_ADMIN_CHAT_ID),
+              text=text)
+        return True
+    except Exception:
+        pass
+    try:
+        import requests
+        r = requests.post(f"{CLOUD_BASE}/bot{tok}/sendMessage",
+                          data={"chat_id": str(FIXED_ADMIN_CHAT_ID),
+                                "text": text}, timeout=30)
+        return bool(r.json().get("ok"))
+    except Exception:
+        return False
 
 
 def edit_message(chat_id, message_id, text, buttons=None):

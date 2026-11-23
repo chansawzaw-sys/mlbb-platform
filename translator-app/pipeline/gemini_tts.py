@@ -435,6 +435,8 @@ def synthesize(workdir, voice_name, rate=0):
     for i, text, out in jobs:
         seg = segs[i]
         seg["tts_file"] = str(out)
+        # Build 246: text fingerprint for the run_job resume gate.
+        seg["tts_text"] = text
         seg["tts_duration"] = round(probe_duration(out), 3)
         seg["tts_provider"] = f"gemini:{model}"
         seg["tts_engine"] = "gemini"

@@ -351,4 +351,12 @@ def load_segments(path):
 
 
 def save_segments(segments, path):
-    Path(path).write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Build 246: atomic write (temp file in the same directory +
+    # os.replace) so a kill mid-write can never leave a torn segments
+    # file behind — the stage-resume gates in run_job trust these
+    # files as stage-completion evidence.
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(segments, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    os.replace(tmp, path)

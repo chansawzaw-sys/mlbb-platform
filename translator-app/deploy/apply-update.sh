@@ -78,6 +78,16 @@ log_tick() {
 }
 
 job_active() {
+  # Build 246: the check lives in deploy/job_gate.py (a standalone,
+  # directly testable helper reading the app's real on-disk job
+  # state — jobs/*/job.json under $APP). The first 246 deploy still
+  # has the pre-246 tree in $APP, and the legacy single-file wget
+  # flow has no helper at all, so fall back to the original inline
+  # check (identical semantics) when the helper is absent.
+  if [ -f "$APP/deploy/job_gate.py" ]; then
+    python3 "$APP/deploy/job_gate.py" "$APP" >/dev/null 2>&1
+    return $?
+  fi
   python3 - "$APP" <<'PYEOF'
 import json
 import sys
@@ -102,25 +112,24 @@ sys.exit(1)
 PYEOF
 }
 
-if [ "$AUTO" -eq 1 ]; then
-  # Never restart the app out from under a running job: skip this tick
-  # entirely (the pull is retried next tick, so nothing is lost).
-  if job_active; then
-    echo "A job is running; deferring the update to the next tick."
+# Build 246: NEVER change files or restart while a job is active —
+# in EITHER mode. A restart mid-job used to kill the job outright;
+# jobs are resumable now, but a deploy still waits for a quiet
+# moment instead of interrupting a customer. Deferring changes
+# NOTHING (no pull, no writes) and exits successfully; the next
+# timer tick retries. A manual run that truly cannot wait may set
+# APPLY_UPDATE_FORCE=1 — the job then stops cleanly at its next
+# stage boundary and resumes after the restart.
+if job_active; then
+  if [ "${APPLY_UPDATE_FORCE:-}" = "1" ]; then
+    echo "WARNING: a job is running; APPLY_UPDATE_FORCE=1 — updating anyway (the job resumes after the restart)."
+  elif [ "$AUTO" -eq 1 ]; then
+    echo "deferred: job running — update skipped this tick, will retry next tick."
     log_tick "deferred (job running)"
     exit 0
-  fi
-else
-  # Manual runs used to restart mid-job without a word (a stalled
-  # job died this way). Warn and require an explicit yes.
-  if job_active; then
-    echo "WARNING: a job is running right now. Updating restarts the app and will STOP that job."
-    printf 'Type yes to update anyway, anything else to cancel: '
-    read -r FORCE
-    if [ "$FORCE" != "yes" ]; then
-      echo "Cancelled — the job was left alone."
-      exit 0
-    fi
+  else
+    echo "deferred: job running — nothing was changed. Re-run when the job finishes, or set APPLY_UPDATE_FORCE=1 to update anyway."
+    exit 0
   fi
 fi
 
