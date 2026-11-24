@@ -488,9 +488,11 @@ def run_download(workdir, url, progress=None, quality="hd"):
     deliverable is the downloaded file itself. download() has
     already written source_info.json beside source.mp4; the
     app worker reads the duration from it (ffprobe fallback)
-    to quote the per-minute price. NO duration cap here: the
-    60-minute ceiling is a Preview-only rule, and this product
-    exists precisely for the videos Preview refuses."""
+    to quote the per-minute price. NO duration cap in THIS
+    function — but since build 247 the app worker's quote
+    (_quote_for_job) refuses a NON-ADMIN job over the
+    admin-set MAX_VIDEO_MINUTES right after this download,
+    before the file is promoted; admins are exempt."""
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     mark = _marks(progress)

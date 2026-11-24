@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 246"
+BUILD_TAG = "build 247"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1564,6 +1564,32 @@ def _download_credits_per_min():
         return 10
 
 
+def _max_video_minutes():
+    """Admin setting MAX_VIDEO_MINUTES: the longest video a
+    NON-ADMIN account may submit, in started minutes (the
+    house ceil convention, same as billing), default 25
+    (build 247). Read live like DOWNLOAD_CREDITS_PER_MIN, so
+    an admin edit moves enforcement immediately. Admin
+    accounts are exempt at every enforcement point: the
+    web pre-checks, _accept_upload, the bot submit, and
+    the _quote_for_job backstop."""
+    try:
+        return max(1, min(100000, int(
+            _env_value("MAX_VIDEO_MINUTES") or 25)))
+    except (TypeError, ValueError):
+        return 25
+
+
+def _too_long_msg(minutes):
+    """The one polite refusal every over-cap path returns
+    (build 247): names the measured length and the CURRENT
+    admin-set limit — the figure is read from the setting
+    at refusal time, never hard-coded."""
+    return (f"ဒီ video က {minutes} မိနစ် ရှည်နေပါတယ် — "
+            f"အများဆုံး {_max_video_minutes()} မိနစ် အထိပဲ "
+            "လက်ခံပါတယ်")
+
+
 def _referral_reward_credits():
     """Admin setting REFERRAL_REWARD_CREDITS: the one-time
     credit reward an inviter earns when a referred account
@@ -2220,6 +2246,18 @@ def _tg_start_flow_job(chat_id, flow):
             tg.send_message(chat_id, setup_msg +
                             " web page ထဲမှာ ဝင်ပြီး ပြင်ပေးပါ 🙏")
             return
+        # Build 247: the customer length cap — the duration was
+        # probed in _tg_flow_prepare (flow["minutes"]), so refuse
+        # HERE, at the same up-front point as the balance check
+        # below and before any job exists. Admin-role accounts
+        # are exempt (the fixed admin chat never enters this
+        # block at all).
+        if acct["role"] != "admin" \
+                and (flow.get("minutes") or 1) > _max_video_minutes():
+            _TG_FLOW.pop(chat_id, None)
+            tg.send_message(chat_id, "🙏 တောင်းပန်ပါတယ် — "
+                            + _too_long_msg(flow.get("minutes") or 1))
+            return
         need = flow.get("minutes") or 1
         if elevenlabs_tts.is_el_voice(flow.get("voice_style")):
             # Build 205: ElevenLabs premium voices bill at the
@@ -2800,6 +2838,15 @@ def _quote_for_job(job, minutes=None):
         return
     if minutes is None:
         minutes = _job_minutes(job)
+    if minutes > _max_video_minutes():
+        # Build 247: the universal length-cap backstop. Every
+        # product's worker quotes HERE once the duration is
+        # measured (admin and anonymous jobs returned above),
+        # so a job whose length only became known after the
+        # download — a link job with no preview, a download-
+        # only job, a reseller API job — still dies before
+        # phase 2 (TTS / burn / script) and is never charged.
+        raise RuntimeError(_too_long_msg(minutes))
     job["quote_minutes"] = minutes
     # Build 205: the quote is in CREDITS — minutes × the job's
     # per-minute rate (premium ElevenLabs voices cost more than
@@ -3126,7 +3173,9 @@ def voices():
                             _commentary_gemini_credits_per_min(),
                         "commentary_elevenlabs":
                             _commentary_elevenlabs_credits_per_min(),
-                        "captions": _captions_credits_per_min()}})
+                        "captions": _captions_credits_per_min(),
+                        "max_video_minutes":
+                            _max_video_minutes()}})
 
 
 @app.post("/api/voices/fav")
@@ -3581,8 +3630,10 @@ def _preview_quality(pdir):
 # preview downloads run at once (overflow gets an immediate 429),
 # each download runs under a hard total deadline, and a source
 # longer than _PREVIEW_MAX_DURATION_S is refused as a preview
-# (jobs themselves have no such ceiling — the wizard's skip
-# button still lets the customer submit the job directly). The
+# (the wizard's skip button still lets the customer submit the
+# job directly, where build 247's MAX_VIDEO_MINUTES customer
+# cap then applies; build 247 also exempts ADMIN accounts
+# from this preview cap — see make_preview). The
 # per-user 30/hour admission cap and the login gate are unchanged.
 _PREVIEW_SEM = threading.Semaphore(2)
 _PREVIEW_DEADLINE_S = 180
@@ -3630,6 +3681,7 @@ def make_preview():
     """Download (once, cached by URL+quality) and report
     size/duration for the editor."""
     data = request.get_json(force=True)
+    _me = _current_user()  # build 247: the preview cap exempts admins
     url = dl_mod.clean_url(data.get("url") or "")
     if not url.startswith(("http://", "https://")):
         return jsonify({"error": "လင့်ခ် မမှန်ပါ"}), 400
@@ -3706,10 +3758,13 @@ def make_preview():
                 os.rename(staging, pdir)
                 src = pdir / "source.mp4"
             dur = probe_duration(src)
-            if dur > _PREVIEW_MAX_DURATION_S:
+            if dur > _PREVIEW_MAX_DURATION_S and not (
+                    _me and _me["role"] == "admin"):
                 # A preview exists to pick a blur spot; an overlong
                 # source is refused (and not kept cached) — the job
                 # itself is unaffected and can be submitted directly.
+                # Build 247: ADMIN accounts are exempt — the owner's
+                # own long videos preview like any other source.
                 src.unlink(missing_ok=True)
                 (serve_dir / "source_info.json").unlink(missing_ok=True)
                 return jsonify({"error": "ဒီ video က အရမ်း ရှည်နေလို့ "
@@ -4167,6 +4222,7 @@ def elevenlabs_status():
         "captions_credits_per_min": _captions_credits_per_min(),
         "download_credits_per_min": _download_credits_per_min(),
         "referral_reward_credits": _referral_reward_credits(),
+        "max_video_minutes": _max_video_minutes(),
         "voices": _el_status_voices()})
 
 
@@ -4252,6 +4308,17 @@ def elevenlabs_save():
                             "credit ဆု 0–1000 အတွင်း "
                             "ဖြစ်ရပါမယ်"}), 400
         writes["REFERRAL_REWARD_CREDITS"] = str(refamt)
+    if "max_video_minutes" in data:
+        try:
+            maxmin = int(data["max_video_minutes"])
+        except (TypeError, ValueError):
+            return jsonify({"error":
+                            "video အရှည် ကန့်သတ် မမှန်ပါ"}), 400
+        if not 1 <= maxmin <= 10000:
+            return jsonify({"error":
+                            "video အရှည် ကန့်သတ် 1–10000 "
+                            "အတွင်း ဖြစ်ရပါမယ်"}), 400
+        writes["MAX_VIDEO_MINUTES"] = str(maxmin)
     if "test_users" in data:
         users, uerr = elevenlabs_tts.parse_test_users(
             data["test_users"])
@@ -4275,7 +4342,9 @@ def elevenlabs_save():
                     "download_credits_per_min":
                         _download_credits_per_min(),
                     "referral_reward_credits":
-                        _referral_reward_credits()})
+                        _referral_reward_credits(),
+                    "max_video_minutes":
+                        _max_video_minutes()})
 
 
 def _el_validate_entry(data):
@@ -6368,6 +6437,13 @@ def _accept_upload(job, file_storage, user):
     # instead of burning server work the quote would reject.
     if ACCOUNTS_ENFORCED and user and user["role"] != "admin":
         mins = max(1, math.ceil(dur / 60.0))
+        if mins > _max_video_minutes():
+            # Build 247: the customer length cap, at the same
+            # probe point — the refusal deletes the file and no
+            # job is ever registered, exactly like the balance
+            # refusal below.
+            shutil.rmtree(workdir, ignore_errors=True)
+            return _too_long_msg(mins)
         need = _credits_for_minutes(job, mins)
         if (user["credits"] or 0) < need:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -6605,6 +6681,13 @@ def create_job():
                 probe_duration(job["source_path"]) / 60.0))
         except Exception:
             _mins = None
+        if _mins and _mins > _max_video_minutes():
+            # Build 247: the customer length cap — the duration
+            # is already known from the reused preview, so refuse
+            # HERE, before the job (and any charge) exists. A job
+            # whose duration is not known yet is still caught by
+            # the _quote_for_job backstop after phase 1.
+            return jsonify({"error": _too_long_msg(_mins)}), 400
         _need = _mins * _credits_per_min_for(job) if _mins else None
         if _need and (me["credits"] or 0) < _need:
             return jsonify({
