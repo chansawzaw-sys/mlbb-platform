@@ -19,8 +19,8 @@ from pathlib import Path
 
 from . import tunnel
 from .common import PROJECT_ROOT
-from .gemini_translate import (_extract_json_array, _prompt_for,
-                               _validated_result)
+from .gemini_translate import (_build_prompt, _extract_json_array,
+                               _prompt_for, _validated_result)
 
 _API_URL = "https://api.openai.com/v1/chat/completions"
 
@@ -61,8 +61,12 @@ def _note_error(msg):
         pass
 
 
-def translate_all(segments, style="subs"):
+def translate_all(segments, style="subs", context=None):
     """segments: list of dicts with 'text'. Returns {index: burmese}.
+
+    context (build 248): optional chunk carry-over block,
+    threaded into the shared prompt builder; None keeps the
+    pre-248 prompt byte for byte.
 
     Raises on ANY problem so the caller can fall back."""
     import requests
@@ -76,10 +80,7 @@ def translate_all(segments, style="subs"):
     # None — requests' default — whenever the tunnel is down).
     # Build 196: kwargs from the one shared helper, like every
     # Gemini/OpenAI call site.
-    payload_in = [{"id": i, "text": (s.get("text") or "").strip()}
-                  for i, s in enumerate(segments)]
-    prompt = _prompt_for(style).replace(
-        "__SEGMENTS_JSON__", json.dumps(payload_in, ensure_ascii=False))
+    prompt = _build_prompt(style, segments, context)
     body = {"messages": [{"role": "user", "content": prompt}]}
     attempts = []
     last_body = ""

@@ -100,6 +100,35 @@ def _prompt_for(style):
     return PROMPT_DUB if style == "dub" else PROMPT_SUBS
 
 
+def _build_prompt(style, segments, context=None):
+    """The full request prompt for one batch (build 248).
+
+    With context=None this is byte-identical to the pre-248
+    construction — the style template with the segments JSON
+    substituted in — so a context-free call behaves exactly
+    as before. When the caller passes a carry-over context
+    (build 248 chunked translation: the story so far plus the
+    established names glossary for a later chunk of a long
+    video), the block is inserted immediately before the
+    "Segments:" section, after every standing rule, so the
+    rules keep the last word on names/format and the block
+    reads as background for the segments that follow it."""
+    payload_in = [{"id": i, "text": (s.get("text") or "").strip()}
+                  for i, s in enumerate(segments)]
+    prompt = _prompt_for(style).replace(
+        "__SEGMENTS_JSON__", json.dumps(payload_in,
+                                         ensure_ascii=False))
+    if context:
+        block = str(context).strip()
+        if "\nSegments:\n" in prompt:
+            prompt = prompt.replace(
+                "\nSegments:\n",
+                "\n" + block + "\n\nSegments:\n", 1)
+        else:  # template drifted: never drop the context
+            prompt = prompt + "\n\n" + block
+    return prompt
+
+
 def get_api_key():
     """The pool's first key (build 229: keys live in the
     shared pool now — pipeline.gemini_pool; a lone
@@ -387,20 +416,23 @@ def _run_pool(body, validate, what):
     raise RuntimeError(msg)
 
 
-def translate_all(segments, style="subs"):
+def translate_all(segments, style="subs", context=None):
     """segments: list of dicts with 'text'. Returns {index: burmese_text}.
 
     style: "subs" = faithful + idiomatic (subtitle jobs);
     "dub" = storytelling narration (anything that will be spoken).
 
+    context (build 248): an optional carry-over block from
+    translate_segments' chunked walk — inserted into the
+    prompt by _build_prompt; None keeps the pre-248 prompt
+    byte for byte.
+
     Raises on ANY problem (no key, HTTP error, quota, bad/invalid JSON) so
     the caller can fall back to the free provider chain.
     """
-    payload_in = [{"id": i, "text": (s.get("text") or "").strip()}
-                  for i, s in enumerate(segments)]
     body = {
-        "contents": [{"parts": [{"text": _prompt_for(style).replace(
-            "__SEGMENTS_JSON__", json.dumps(payload_in, ensure_ascii=False))}]}],
+        "contents": [{"parts": [{"text": _build_prompt(
+            style, segments, context)}]}],
         "generationConfig": {"responseMimeType": "application/json",
                              "temperature": 0.3},
     }
