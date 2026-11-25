@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 248"
+BUILD_TAG = "build 249"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -2087,57 +2087,153 @@ def _tg_el_subject(chat_id):
     return acct
 
 
-def _tg_voice_step(chat_id, flow):
-    from pipeline import telegram_send as tg
-    flow["step"] = "voice"
-    styles = tts.VOICE_STYLES
-    rows = [[("🎙 " + s["label"], "v:" + s["key"])
-             for s in styles[i:i + 2]]
-            for i in range(0, len(styles), 2)]
-    # Build 205: ElevenLabs premium voices join the step ONLY
-    # when the owner configured a key + registry (picker_entries
-    # is empty otherwise). Their callback is "e:<voice_id>" —
-    # distinct from the "v:<style>" buttons — and the stored pick
-    # is the same "el:<voice_id>" value the web wizard sends.
-    # Build 206: picker_entries also judges the chat's linked
-    # account through the access gate — in test mode a customer
-    # chat never sees these buttons at all. Build 207: the
-    # button shows "Name · Tag" when the voice carries a tag.
-    for e in elevenlabs_tts.picker_entries(_tg_el_subject(chat_id)):
-        label = "🌟 " + e["label"]
-        if e.get("tag"):
-            label += " · " + e["tag"]
-        rows.append([(label + f" ({e['rate']} credits/မိနစ်)",
-                      "e:" + elevenlabs_tts.voice_id_of(e["id"]))])
-    # Build 212: the chat's OWN clones join the step too (the
-    # linked account's rows from the clone store — ownership is
-    # the permission, so they show even in test mode; the
-    # callback is the same "e:<voice_id>" as a registry pick).
-    acct = accounts.user_for_tg(chat_id)
-    if acct and elevenlabs_tts.key_configured():
-        rate = elevenlabs_tts.credits_per_min()
-        for c in accounts.clones_for(acct["id"]):
-            rows.append([(f"🎙 {c['name']} ({rate} credits/မိနစ်)",
-                          "e:" + c["voice_id"])])
-    # Build 229: the Gemini voices join the step too (empty
-    # unless a Gemini key is configured), two per row like the
-    # built-ins; the callback "gm:<Name>" stores the same
-    # "gm:<Name>" pick the web wizard sends. The rate suffix
-    # only shows when the owner raised the Gemini rate above
-    # the default 1.
+# Build 249: the voice step is TWO levels — a category menu,
+# then one category's voices paginated. The pre-249 step sent
+# the WHOLE library as ONE message (with the owner's live
+# configuration: 6 standard + 58 ElevenLabs + 30 Gemini +
+# clones = 94+ buttons, ~12.6 KB of markup); Telegram refuses
+# a send that big, the poller swallowed the error, and the
+# flow died silently right after the karaoke/logo step. No
+# voice message now ever carries more than 20 buttons, nav
+# included. flow["vcat"] / flow["vpage"] / flow["vroot"] are
+# plain JSON values, so build-246 flow persistence keeps
+# working across restarts.
+_VOICE_PER_PAGE = 16
+
+_VOICE_FAIL_TEXT = ("🙏 တောင်းပန်ပါတယ် — အသံ စာရင်းကို ပြလို့ "
+                    "မရပါ ဖြစ်သွားပါတယ်။ ခဏနေ ပြန် နှိပ်ကြည့်ပါ — "
+                    "ဒါမှမဟုတ် web app မှာ အသံ ရွေးလို့လည်း ရပါတယ်")
+
+
+def _tg_voice_categories(chat_id):
+    """The voice step's categories as (key, menu label, buttons
+    per row, [(button label, callback), ...]) — only NON-EMPTY
+    groups the chat may actually use, in menu order. Every
+    group's gate is the one it already had, and button labels
+    keep each group's existing format:
+    - std: the shared pipeline.tts styles (build 200), two
+      per row, callback "v:<style key>".
+    - gm: Gemini voices (build 229), empty unless a key is
+      configured, two per row, callback "gm:<Name>"; the rate
+      suffix only shows when the Gemini rate differs from the
+      standard rate.
+    - el: ElevenLabs premium voices (build 205), one per row,
+      callback "e:<voice_id>"; picker_entries is empty unless
+      a key + registry exist AND the chat's linked account
+      passes the build-206 access gate (in test mode a
+      customer chat never sees these at all). Build 207: the
+      button shows "Name · Tag" when the voice carries a tag.
+    - clone: the chat's OWN clones (build 212) — ownership is
+      the permission, so they show even in test mode; same
+      "e:<voice_id>" callback as a registry pick. Needs the
+      EL key, exactly as before."""
+    cats = []
+    cats.append(("std", "🎙 Standard အသံများ", 2,
+                 [("🎙 " + s["label"], "v:" + s["key"])
+                  for s in tts.VOICE_STYLES]))
     gm_entries = gemini_tts.picker_entries()
-    gm_rate = gemini_tts.credits_per_min()
-    for i in range(0, len(gm_entries), 2):
-        row = []
-        for e in gm_entries[i:i + 2]:
+    if gm_entries:
+        gm_rate = gemini_tts.credits_per_min()
+        btns = []
+        for e in gm_entries:
             label = "✨ " + e["label"]
             if e.get("tag"):
                 label += " · " + e["tag"]
             if gm_rate != _standard_credits_per_min():
                 label += f" ({gm_rate} credits/မိနစ်)"
-            row.append((label, "gm:" + e["name"]))
-        rows.append(row)
-    tg.send_message(chat_id, "အသံ ရွေးပေးပါ", buttons=rows)
+            btns.append((label, "gm:" + e["name"]))
+        cats.append(("gm", "✨ Gemini အသံများ", 2, btns))
+    el_btns = []
+    for e in elevenlabs_tts.picker_entries(_tg_el_subject(chat_id)):
+        label = "🌟 " + e["label"]
+        if e.get("tag"):
+            label += " · " + e["tag"]
+        el_btns.append((label + f" ({e['rate']} credits/မိနစ်)",
+                        "e:" + elevenlabs_tts.voice_id_of(e["id"])))
+    if el_btns:
+        cats.append(("el", "🌟 Premium အသံများ", 1, el_btns))
+    acct = accounts.user_for_tg(chat_id)
+    if acct and elevenlabs_tts.key_configured():
+        rate = elevenlabs_tts.credits_per_min()
+        cbtns = [(f"🎙 {c['name']} ({rate} credits/မိနစ်)",
+                  "e:" + c["voice_id"])
+                 for c in accounts.clones_for(acct["id"])]
+        if cbtns:
+            cats.append(("clone", "🎙 ကျွန်တော့် clone များ", 1, cbtns))
+    return cats
+
+
+def _tg_voice_send(chat_id, rows):
+    """One voice-step send (build 249). A failure is NEVER
+    silent and never propagates: the user gets a plain-text
+    note, and False tells the caller to keep the flow on the
+    step whose buttons are still on the user's screen, so a
+    re-tap can retry."""
+    from pipeline import telegram_send as tg
+    try:
+        tg.send_message(chat_id, "အသံ ရွေးပေးပါ", buttons=rows)
+        return True
+    except Exception:
+        try:
+            tg.send_message(chat_id, _VOICE_FAIL_TEXT)
+        except Exception:
+            pass
+        return False
+
+
+def _tg_voice_step(chat_id, flow):
+    """Voice step, level 1 (build 249): one button per
+    available category — or, when only ONE category exists,
+    its list directly (no pointless menu)."""
+    cats = _tg_voice_categories(chat_id)
+    if len(cats) == 1:
+        flow["vroot"] = False
+        flow["vcat"] = cats[0][0]
+        flow["vpage"] = 0
+        _tg_voice_list(chat_id, flow, cats)
+        return
+    flow["step"] = "voice"
+    flow["vroot"] = True
+    _tg_voice_send(chat_id, [[(label, "vc:" + key)]
+                             for key, label, _w, _b in cats])
+
+
+def _tg_voice_list(chat_id, flow, cats=None):
+    """Voice step, level 2 (build 249): the flow's category
+    (flow["vcat"]) one page at a time — at most
+    _VOICE_PER_PAGE voice buttons in the category's own row
+    layout, then ONE nav row (◀ / ▶ as they apply, plus
+    «⬅ အမျိုးအစား» back to level 1 unless level 1 was
+    skipped). Returns the send result."""
+    if cats is None:
+        cats = _tg_voice_categories(chat_id)
+    cat = next((c for c in cats if c[0] == flow.get("vcat")),
+               None)
+    if cat is None:
+        _tg_voice_step(chat_id, flow)
+        return True
+    _key, _label, per_row, btns = cat
+    pages = max(1, -(-len(btns) // _VOICE_PER_PAGE))
+    try:
+        page = int(flow.get("vpage") or 0)
+    except (TypeError, ValueError):
+        page = 0
+    page = min(max(page, 0), pages - 1)
+    flow["vpage"] = page
+    flow["step"] = "voice_list"
+    chunk = btns[page * _VOICE_PER_PAGE:(page + 1) * _VOICE_PER_PAGE]
+    rows = [chunk[i:i + per_row]
+            for i in range(0, len(chunk), per_row)]
+    nav = []
+    if page > 0:
+        nav.append(("◀", f"vp:{page - 1}"))
+    if page < pages - 1:
+        nav.append(("▶", f"vp:{page + 1}"))
+    if flow.get("vroot"):
+        nav.append(("⬅ အမျိုးအစား", "vc:root"))
+    if nav:
+        rows.append(nav)
+    return _tg_voice_send(chat_id, rows)
 
 
 def _tg_speed_step(chat_id, flow):
@@ -2540,14 +2636,56 @@ def _on_tg_callback(cq):
             return
         _tg_start_flow_job(chat_id, flow)
         return
-    if data.startswith("v:") and flow.get("step") == "voice":
+    if data.startswith("vc:") and flow.get("step") == "voice":
+        # Build 249: a category tap on voice level 1. An
+        # unknown or no-longer-available category is a stale
+        # tap — ignored silently, like every other stale tap.
+        cats = _tg_voice_categories(chat_id)
+        if data[3:] not in [c[0] for c in cats]:
+            return
+        flow["vcat"] = data[3:]
+        flow["vpage"] = 0
+        if not _tg_voice_list(chat_id, flow, cats):
+            # The list send failed (fallback note already
+            # sent): stay on level 1, whose buttons are the
+            # ones still on the user's screen.
+            flow["step"] = "voice"
+        return
+    if data == "vc:root" and flow.get("step") == "voice_list":
+        # Build 249: back to the category menu.
+        _tg_voice_step(chat_id, flow)
+        return
+    if data.startswith("vp:") and flow.get("step") == \
+            "voice_list":
+        # Build 249: a page turn within the current category
+        # (the category rides on the flow, not the callback).
+        try:
+            page = int(data[3:])
+        except ValueError:
+            return
+        cats = _tg_voice_categories(chat_id)
+        cat = next((c for c in cats
+                    if c[0] == flow.get("vcat")), None)
+        if cat is None:
+            return
+        pages = max(1, -(-len(cat[3]) // _VOICE_PER_PAGE))
+        if page < 0 or page >= pages:
+            return
+        old_page = flow.get("vpage") or 0
+        flow["vpage"] = page
+        if not _tg_voice_list(chat_id, flow, cats):
+            flow["vpage"] = old_page
+        return
+    if data.startswith("v:") and flow.get("step") in \
+            ("voice", "voice_list"):
         style = tts.STYLE_BY_KEY.get(data[2:])
         if not style:
             return
         flow["voice_style"] = style["key"]
         _tg_speed_step(chat_id, flow)
         return
-    if data.startswith("e:") and flow.get("step") == "voice":
+    if data.startswith("e:") and flow.get("step") in \
+            ("voice", "voice_list"):
         # Build 205: an ElevenLabs premium tap. The voice must
         # still be in the owner's registry (it may have been
         # removed after these buttons were sent) — a stale tap is
@@ -2576,7 +2714,8 @@ def _on_tg_callback(cq):
         flow["voice_style"] = "el:" + entry["id"]
         _tg_speed_step(chat_id, flow)
         return
-    if data.startswith("gm:") and flow.get("step") == "voice":
+    if data.startswith("gm:") and flow.get("step") in \
+            ("voice", "voice_list"):
         # Build 229: a Gemini tap. The voice must still be in
         # the 30-voice table — a stale tap is ignored, never
         # substituted with another voice (the EL rule).
