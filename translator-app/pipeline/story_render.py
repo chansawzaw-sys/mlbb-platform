@@ -1175,7 +1175,10 @@ def render_story(workdir, job, progress=None):
     # Build 246: burn to the temp name and rename over output.mp4
     # only when complete, so a kill mid-burn never leaves a torn
     # output.mp4 that a resumed job would mistake for finished.
-    tmp_final = workdir / "output.mp4.tmp"
+    # Build 250: same temp name as run_job.FINAL_TMP_NAME — it
+    # keeps the .mp4 extension because the burn encode lets
+    # ffmpeg infer the muxer from the output filename.
+    tmp_final = workdir / "output.tmp.mp4"
     burn.burn(av, srt, tmp_final, font=job.get("font") or "noto",
               subs=subs, cap_k=maxrate_cap_k("hd"),
               style="karaoke" if job.get("story_karaoke") else None)

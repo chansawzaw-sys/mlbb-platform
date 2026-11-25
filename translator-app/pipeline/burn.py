@@ -622,7 +622,10 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
                     "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
                     "-crf", "24", "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
                     "-c:a", "copy", "-threads", str(encode_threads()),
-                    str(output_mp4)]
+                    # Build 250: explicit muxer — the caller may hand
+                    # us the finalize temp name, whose format must
+                    # never depend on filename inference alone.
+                    "-f", "mp4", str(output_mp4)]
             run(cmd)
             return output_mp4
     ass_path, fonts_dir, _w, _h = _prepare_ass(
@@ -635,7 +638,7 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
          "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
          "-c:a", "copy", "-threads", str(encode_threads()),
-         str(output_mp4)])
+         "-f", "mp4", str(output_mp4)])
     return output_mp4
 
 

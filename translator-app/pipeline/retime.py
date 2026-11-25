@@ -234,7 +234,10 @@ def _video_merged(src, chunks, dub_wav, spec, cap_k=2500, timeout=1800):
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
             "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
             "-c:a", "aac", "-b:a", "96k", "-shortest",
-            "-threads", str(encode_threads()), str(spec["output"])]
+            "-threads", str(encode_threads()),
+            # Build 250: spec["output"] is the finalize temp name —
+            # pin the muxer explicitly, never filename inference.
+            "-f", "mp4", str(spec["output"])]
     run(cmd, timeout=timeout)
 
 
@@ -299,7 +302,9 @@ def _video_passthrough_merged(src, dub_wav, spec, cap_k=2500,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
             "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
             "-c:a", "aac", "-b:a", "96k", "-shortest",
-            "-threads", str(encode_threads()), str(spec["output"])]
+            "-threads", str(encode_threads()),
+            # Build 250: explicit muxer for the finalize temp name.
+            "-f", "mp4", str(spec["output"])]
     run(cmd, timeout=timeout)
 
 

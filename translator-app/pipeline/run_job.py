@@ -24,7 +24,13 @@ ALL_STEPS = ["download", "transcribe", "translate", "tts", "retime", "finalize"]
 # and is complete; anything half-written is redone from the
 # stage's start. The final video is encoded to FINAL_TMP_NAME and
 # renamed to output.mp4, so a torn final encode never counts.
-FINAL_TMP_NAME = "output.mp4.tmp"
+# Build 250: the temp name keeps the .mp4 extension — the finalize
+# encodes let ffmpeg infer the muxer from the output filename, and
+# "output.mp4.tmp" has no inferable format, so every finalize
+# ENCODE to it failed ("Unable to choose an output format").
+# (The finalize commands also pass an explicit -f mp4 now —
+# defence in depth; keep the extension anyway.)
+FINAL_TMP_NAME = "output.tmp.mp4"
 
 
 def _video_ok(path):
