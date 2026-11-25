@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 255"
+BUILD_TAG = "build 256"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1403,6 +1403,7 @@ _LINK_CODES = {}   # code -> (user_id, expires) — web-issued, bot-redeemed
 _LINK_FAILS = {}   # chat_id -> (fail_count, locked_until) — code guessing
 _RESET_CODES = {}  # code -> (user_id, expires) — bot-issued, web-redeemed (build 251)
 _RESET_FAILS = {}  # client ip -> (fail_count, locked_until) — reset-code guessing (build 251)
+_GOOGLE_FLOW = {}  # state -> (nonce, expires) — Google redirect flow, single-use (build 256)
 
 
 def _issue_reset_code(chat_id, acct):
@@ -5336,17 +5337,28 @@ def auth_logout():
 
 
 def _public_origin():
-    """The origin browsers actually see. Behind Caddy the app
-    sees plain HTTP on loopback, so — exactly as _set_session
-    already trusts the proxy — X-Forwarded-Proto decides the
-    scheme and X-Forwarded-Host (falling back to the Host
-    header) the authority. On the live host this yields
-    https://85-155-149-58.sslip.io."""
-    proto = request.headers.get("X-Forwarded-Proto", "")
-    scheme = "https" if (request.is_secure or proto == "https") \
-        else "http"
+    """The origin browsers actually see — deployment-canonical
+    (build 256). Build 255 trusted X-Forwarded-Proto /
+    request.is_secure for the scheme, but in the real server
+    chain (Caddy + an iptables 80->8611 redirect) that signal
+    says http in production, so Google received an http://
+    redirect_uri and refused every sign-in with
+    redirect_uri_mismatch — only the https URI is registered
+    in the console. The origin therefore must NOT depend on
+    forwarded headers: an explicit PUBLIC_ORIGIN setting (the
+    env-settings mechanism, default empty) wins outright;
+    otherwise only the HOST is taken from the request
+    (X-Forwarded-Host -> Host) and the scheme is forced to
+    https for any non-local host. http survives only for
+    localhost / 127.0.0.1 development."""
+    origin = _env_value("PUBLIC_ORIGIN").strip().rstrip("/")
+    if origin:
+        return origin
     host = request.headers.get("X-Forwarded-Host", "")
     host = host.split(",")[0].strip() if host else request.host
+    bare = host.split(":")[0].lower()
+    scheme = "http" if bare in ("localhost", "127.0.0.1") \
+        else "https"
     return scheme + "://" + host
 
 
@@ -5358,33 +5370,44 @@ def auth_google_start():
     machinery itself never completes — so this is a plain
     top-level redirect into Google's OpenID Connect implicit
     flow using only our own code: we bounce the browser to
-    accounts.google.com with a fresh nonce (kept in an HttpOnly
-    cookie AND sent as nonce+state), Google returns the browser
-    to /auth/google-landing with the ID token in the URL
-    fragment, and that page POSTs it to /api/auth/google, which
-    additionally checks the token's nonce claim against the
-    cookie whenever the cookie is present."""
+    accounts.google.com, Google returns it to
+    /auth/google-landing with the ID token in the URL
+    fragment, and that page POSTs the token to
+    /api/auth/google.
+
+    Build 256 mechanics: the flow is bound together by a
+    server-side single-use state — _GOOGLE_FLOW maps an
+    independent random `state` to the OIDC `nonce`, both
+    fresh per attempt, 600 s TTL, expired entries swept on
+    each call. Build 255 kept the nonce in a g_nonce cookie
+    instead; cookies split across phone browser contexts
+    (the webview that starts the flow is not always the
+    browser that returns from Google) and a stale cookie
+    could refuse a good login, so the cookie is gone
+    entirely — nothing is set here."""
     import urllib.parse
     cid = _google_client_id()
     if not cid:
         return jsonify({"error": "Google login မဖွင့်ရသေးပါ"}), 400
+    now = time.time()
+    for s, (_n, exp) in list(_GOOGLE_FLOW.items()):
+        if exp <= now:
+            _GOOGLE_FLOW.pop(s, None)
     nonce = secrets.token_urlsafe(24)
-    secure = request.is_secure or \
-        request.headers.get("X-Forwarded-Proto", "") == "https"
+    state = secrets.token_urlsafe(24)
+    _GOOGLE_FLOW[state] = (nonce, now + 600)
     params = urllib.parse.urlencode({
         "client_id": cid,
         "redirect_uri": _public_origin() + "/auth/google-landing",
         "response_type": "id_token",
         "scope": "openid email profile",
         "nonce": nonce,
-        "state": nonce,
+        "state": state,
         "prompt": "select_account",
     })
     resp = Response(status=302)
     resp.headers["Location"] = \
         "https://accounts.google.com/o/oauth2/v2/auth?" + params
-    resp.set_cookie("g_nonce", nonce, max_age=600, httponly=True,
-                    path="/", samesite="Lax", secure=secure)
     return resp
 
 
@@ -5420,6 +5443,7 @@ _GOOGLE_LANDING_HTML = """<!DOCTYPE html>
   }
   var h = new URLSearchParams(location.hash.replace(/^#/, ""));
   var token = h.get("id_token");
+  var state = h.get("state");
   var err = h.get("error");
   /* Scrub the fragment (it carries the token) from the
      address bar and history before doing anything else. */
@@ -5431,7 +5455,7 @@ _GOOGLE_LANDING_HTML = """<!DOCTYPE html>
   }
   fetch("/api/auth/google", {method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({credential: token})})
+    body: JSON.stringify({credential: token, state: state})})
     .then(function (r) {
       return r.json().catch(function () { return {}; })
         .then(function (d) {
@@ -5486,18 +5510,26 @@ def auth_google():
     info = google_auth.verify_id_token(token, cid)
     if not info:
         return jsonify({"error": "Google အတည်ပြုချက် မအောင်မြင်ပါ — ပြန် ကြိုးစားပေးပါ"}), 401
-    # Build 255: the redirect flow (/api/auth/google/start)
-    # planted a g_nonce cookie before bouncing the browser to
-    # Google. When that cookie is present, the verified token
-    # MUST carry the same nonce — a token minted for any other
-    # flow (or replayed) is refused, and the spent cookie is
-    # cleared on the way out. No cookie = the GSI flow, whose
-    # behaviour stays exactly the old path.
-    cookie_nonce = request.cookies.get("g_nonce")
-    if cookie_nonce is not None and info.get("nonce") != cookie_nonce:
-        resp = jsonify({"error": "Google login မအောင်မြင်ပါ — ပြန်ကြိုးစားပါ"})
-        resp.delete_cookie("g_nonce", path="/")
-        return resp, 400
+    # Build 256: the redirect flow proves itself with the
+    # server-side single-use `state` issued by
+    # /api/auth/google/start. When the body carries a state,
+    # it must exist in _GOOGLE_FLOW (unknown or expired ->
+    # refused); it is popped BEFORE the nonce comparison so
+    # it can never be replayed, and the verified token's
+    # nonce claim must equal the nonce the state was issued
+    # with. Build 255 bound the flow with a g_nonce cookie
+    # instead — that mechanism is removed outright (never
+    # read, never cleared here), so a stale cookie from a
+    # 255 attempt can never refuse a login again. No state
+    # in the body = the GSI flow, whose behaviour stays
+    # exactly the pre-255 path.
+    flow_state = data.get("state") or ""
+    if flow_state:
+        entry = _GOOGLE_FLOW.pop(flow_state, None)
+        if entry is None or entry[1] <= time.time() \
+                or info.get("nonce") != entry[0]:
+            return jsonify(
+                {"error": "Google login မအောင်မြင်ပါ — ပြန်ကြိုးစားပါ"}), 400
     if not info["email_verified"]:
         return jsonify({"error": "ဒီ Google account ရဲ့ email ကို Google က အတည်မပြုရသေးပါ"}), 401
     me = _current_user()
@@ -5524,8 +5556,6 @@ def auth_google():
     else:
         resp = _set_session(jsonify({"user": user}),
                             accounts.new_session(user["id"]))
-    if cookie_nonce is not None:
-        resp.delete_cookie("g_nonce", path="/")
     return resp
 
 

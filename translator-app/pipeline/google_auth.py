@@ -25,9 +25,10 @@ def verify_id_token(id_token, client_id):
     as the string "true"). Callers decide what an unverified email
     means — app.py rejects such sign-ins outright. nonce is the
     token's nonce claim verbatim (None when the token carries
-    none — build 255's redirect flow checks it against the
-    g_nonce cookie its start route set; the GSI flow's tokens
-    carry no nonce and are never checked)."""
+    none — the redirect flow checks it against the nonce its
+    start route stored server-side for the flow's state,
+    build 256; the GSI flow's tokens carry no nonce and are
+    never checked)."""
     if not id_token or not client_id:
         return None
     try:
