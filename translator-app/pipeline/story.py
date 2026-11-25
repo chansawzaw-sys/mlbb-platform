@@ -118,7 +118,7 @@ PROMPT_STORY = """You are a Burmese cartoon-story writer. The topic is below. Wr
 
 Rules for the script:
 - Tell ONE complete story with a beginning, a middle and an end, in natural spoken Burmese (ပြောစကား), warm storyteller style, easy for children and families to follow.
-- NAMES IN ENGLISH: every personal name, place name and brand name stays in Latin letters (Chinese names in pinyin) — never write names in Burmese script, never translate a name by its meaning.
+- NAMES IN BURMESE: every personal name, place name and brand name is written in Burmese script, transliterated by its SOUND (for a Chinese name, transliterate the pinyin sound — Lin Feng becomes လင်ဖုန်း) — never leave a name in Latin letters, never translate a name by its meaning, and use ONE fixed Burmese form for each name every time it appears.
 - Numbers must be exact — copy every number precisely.
 - STORY-FIRST: plan the whole story first, then write flowing narration — never a list of disconnected lines.
 - NO BRACKETED GLOSSES: every name or term appears once, in a single chosen form — no parenthetical explanations, no translator notes.
@@ -264,8 +264,8 @@ def _parse_reply(text):
 def _usable_script(script, target):
     """Recap's usability bar, shared verbatim: long enough to
     be a real story (a stub reply fails over) and mostly
-    Myanmar script (names stay in Latin, so the prose around
-    them must carry the ratio)."""
+    Myanmar script (names are Burmese transliterations since
+    build 252, so the whole script carries the ratio)."""
     return recap._usable(script, target)
 
 

@@ -8,8 +8,9 @@ login; see app.py) — it never travels through chat, is never returned in
 any API payload, and is never written to logs or segment files.
 
 One request translates ALL segments (JSON in/out, ids preserved) with a
-prompt that asks for natural spoken Burmese (ပြောစကား), keeping names and
-numbers intact and translating idioms by meaning. The response is strictly
+prompt that asks for natural spoken Burmese (ပြောစကား), transliterating
+names into Burmese script by sound (build 252) and keeping numbers
+exact, and translating idioms by meaning. The response is strictly
 validated (same id set, non-empty strings); ANY failure raises, and the
 caller falls back to the free Google->Bing->source chain.
 
@@ -61,9 +62,9 @@ Rules:
 - Stay COMPLETE and FAITHFUL to what is actually said in the video: translate everything, in order — never add, omit, summarise, soften or censor anything.
 - Within that faithfulness, phrase it the way a Burmese storyteller would say it: natural connectors and natural word order, idioms and slang by MEANING never word-by-word, so consecutive segments read like one continuous story and the emotion of the scene carries through.
 - FIRST read all the segments together and understand the whole story; then render each segment so it fits the storyline and flows with its neighbours — never translate a segment in isolation.
-- NAMES IN ENGLISH: write every personal name, place name and brand name in English (Latin letters) — for a Chinese name use its pinyin/English form; never write a name in Burmese script and never translate a name's meaning. Keep ALL numbers exactly as they are.
+- NAMES IN BURMESE: write every personal name, place name and brand name in Burmese script, transliterated by its SOUND — for a Chinese name, transliterate its pinyin sound (Lin Feng becomes လင်ဖုန်း) — never leave a name in Latin letters and never translate a name's meaning. Fix ONE Burmese form for each name and use that exact form every time the name appears, all through the video; if an earlier part already established a Burmese form for a name, reuse that exact form. Keep ALL numbers exactly as they are.
 - Keep each translation roughly as short as the original (it must fit the same on-screen window).
-- Do not add explanations, notes or extra sentences. NO bracketed glosses: never put a parenthetical explanation after a name, a term or any line, and never give a name twice (like "Wang Zhong (Manager Wang)") — every name and term appears ONCE, in its single chosen form, and the translation speaks for itself.
+- Do not add explanations, notes or extra sentences. NO bracketed glosses: never put a parenthetical explanation after a name, a term or any line, and never give a name twice (like "လင်ဖုန်း (မန်နေဂျာ လင်ဖုန်း)") — every name and term appears ONCE, in its single chosen form, and the translation speaks for itself.
 
 Input is a JSON array of {"id": <int>, "text": "<source segment>"}.
 Output MUST be only a JSON array of {"id": <same int>, "my": "<burmese translation>"} with exactly the same ids, in the same order. No markdown fences, no commentary.
@@ -84,9 +85,9 @@ Rules:
 - FIRST read all the segments together and understand the whole story; then narrate each segment so it fits the storyline and flows with its neighbours — never translate a segment in isolation, never word-by-word.
 - When a character speaks, voice it the way that character would say it in Burmese.
 - PUNCTUATION CARRIES THE ENERGY: the voice reads your punctuation as delivery, so let it act out the emotion that is already in the scene — an excited, shouted or joyful line ends with "!", a real question keeps "?", a trailing-off or hesitant line may end with "…", and a calm line keeps the plain "။". Mirror the source line's emotion only: never add or remove words, never change the meaning, and never put an energy mark on a line whose scene does not have it.
-- NAMES IN ENGLISH: write every personal name, place name and brand name in English (Latin letters) — for a Chinese name use its pinyin/English form; never write a name in Burmese script and never translate a name's meaning. Keep ALL numbers exactly as they are.
+- NAMES IN BURMESE: write every personal name, place name and brand name in Burmese script, transliterated by its SOUND — for a Chinese name, transliterate its pinyin sound (Lin Feng becomes လင်ဖုန်း) — never leave a name in Latin letters and never translate a name's meaning. Fix ONE Burmese form for each name and use that exact form every time the name appears, all through the video; if an earlier part already established a Burmese form for a name, reuse that exact form. Keep ALL numbers exactly as they are.
 - Keep each segment roughly as short as the original (it will be spoken in the same time window).
-- Do not add explanations, notes or extra sentences. NO bracketed glosses: never put a parenthetical explanation after a name, a term or any line, and never give a name twice (like "Wang Zhong (Manager Wang)") — every name and term appears ONCE, in its single chosen form, and the translation speaks for itself.
+- Do not add explanations, notes or extra sentences. NO bracketed glosses: never put a parenthetical explanation after a name, a term or any line, and never give a name twice (like "လင်ဖုန်း (မန်နေဂျာ လင်ဖုန်း)") — every name and term appears ONCE, in its single chosen form, and the translation speaks for itself.
 
 Input is a JSON array of {"id": <int>, "text": "<english>"}.
 Output MUST be only a JSON array of {"id": <same int>, "my": "<burmese narration>"} with exactly the same ids, in the same order. No markdown fences, no commentary.

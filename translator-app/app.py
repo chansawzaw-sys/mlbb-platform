@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 251"
+BUILD_TAG = "build 254"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1404,6 +1404,32 @@ _LINK_FAILS = {}   # chat_id -> (fail_count, locked_until) — code guessing
 _RESET_CODES = {}  # code -> (user_id, expires) — bot-issued, web-redeemed (build 251)
 _RESET_FAILS = {}  # client ip -> (fail_count, locked_until) — reset-code guessing (build 251)
 
+
+def _issue_reset_code(chat_id, acct):
+    """Hand the fixed admin chat a one-time password-reset code
+    for ONE account (build 251; factored out in build 253 so the
+    direct path and the pr: account-pick callback share it).
+    Issuing kills that account's previous unused code. The
+    message NAMES the account the code belongs to, so a code can
+    never be redeemed against the wrong account by mistake. No
+    password ever travels through Telegram — the bot only hands
+    out the code; the new password is typed on the web form."""
+    from pipeline import telegram_send as tg
+    for c, (uid, _exp) in list(_RESET_CODES.items()):
+        if uid == acct["id"]:
+            _RESET_CODES.pop(c, None)
+    code = str(secrets.randbelow(90000000) + 10000000)
+    _RESET_CODES[code] = (acct["id"], time.time() + 600)
+    tg.send_message(
+        chat_id,
+        f"🔑 '{acct['username']}' အကောင့် အတွက် Password "
+        f"ပြန်သတ်မှတ် code: {code}\n"
+        "⏱ ၁၀ မိနစ် အတွင်း သုံးပါ — တစ်ခါပဲ သုံးလို့ ရပါတယ်\n"
+        "👉 web app ကို ဖွင့်ပါ → login card မှာ «🔑 code နဲ့ "
+        "password အသစ် သတ်မှတ်မယ်» ကို နှိပ်ပါ → code နဲ့ "
+        "password အသစ် ထည့်ပါ\n"
+        "ပြီးရင် password အသစ်နဲ့ login ပြန်ဝင်နိုင်ပါပြီ 🙏")
+
 # Whenever the bot sends a user off to the web app (to register or
 # link), the message carries the app link AND the install reminder.
 APP_LINK = os.environ.get("VT_APP_URL", "https://85-155-149-58.sslip.io")
@@ -1790,34 +1816,41 @@ def _tg_menu_step(msg, chat_id, text):
                          "အားလုံး ပုံမှန် ဖြစ်နေပါတယ်")
         return True
     if _is_resetpw_text(text) and tg.is_admin(chat_id):
-        # Password reset (build 251): ONLY the owner's fixed
-        # Telegram chat — that chat id IS the owner's identity.
-        # Issues a one-time code for the account LINKED to this
-        # chat; the owner redeems it on the web login card with a
-        # NEW password of his own choosing. No password ever
-        # travels through Telegram — the bot only hands out the
-        # code. Any other chat's message is not consumed here and
-        # falls through, exactly like /recover_admin.
-        acct = accounts.user_for_tg(chat_id)
-        if not acct:
+        # Password reset (build 251; target selection fixed in
+        # build 253): ONLY the owner's fixed Telegram chat — that
+        # chat id IS the owner's identity. Candidate targets are
+        # every ADMIN account PLUS the account linked to this
+        # chat: the account the owner is locked out of (his
+        # admin) need not be the linked one — live on 251 the
+        # chat was linked to his test account while the locked-
+        # out account was his separate admin, so the code could
+        # never restore the account that mattered. One candidate
+        # -> the code is issued at once; several -> the owner
+        # picks by button (pr: callback in _on_tg_callback). The
+        # owner redeems the code on the web login card with a NEW
+        # password of his own choosing. No password ever travels
+        # through Telegram — the bot only hands out the code. Any
+        # other chat's message is not consumed here and falls
+        # through, exactly like /recover_admin.
+        linked = accounts.user_for_tg(chat_id)
+        candidates = accounts.list_admins()
+        if linked and all(u["id"] != linked["id"]
+                          for u in candidates):
+            candidates.append(linked)
+        if not candidates:
             tg.send_message(
                 chat_id, "⚠️ တောင်းပန်ပါတယ် — ဒီ Telegram chat နဲ့ "
                          "ချိတ်ထားတဲ့ account မရှိလို့ code ထုတ်ပေးလို့ "
                          "မရပါ 🙏")
             return True
-        for c, (uid, _exp) in list(_RESET_CODES.items()):
-            if uid == acct["id"]:
-                _RESET_CODES.pop(c, None)
-        code = str(secrets.randbelow(90000000) + 10000000)
-        _RESET_CODES[code] = (acct["id"], time.time() + 600)
+        if len(candidates) == 1:
+            _issue_reset_code(chat_id, candidates[0])
+            return True
         tg.send_message(
-            chat_id,
-            f"🔑 Password ပြန်သတ်မှတ် code: {code}\n"
-            "⏱ ၁၀ မိနစ် အတွင်း သုံးပါ — တစ်ခါပဲ သုံးလို့ ရပါတယ်\n"
-            "👉 web app ကို ဖွင့်ပါ → login card မှာ «🔑 code နဲ့ "
-            "password အသစ် သတ်မှတ်မယ်» ကို နှိပ်ပါ → code နဲ့ "
-            "password အသစ် ထည့်ပါ\n"
-            "ပြီးရင် password အသစ်နဲ့ login ပြန်ဝင်နိုင်ပါပြီ 🙏")
+            chat_id, "🔑 ဘယ် account ရဲ့ password ကို "
+                     "ပြန်သတ်မှတ်ချင်ပါသလဲ — account ရွေးပေးပါ 👇",
+            buttons=[[(u["username"], f"pr:{u['id']}")]
+                     for u in candidates])
         return True
     flow = _TG_FLOW.get(chat_id)
     acct = accounts.user_for_tg(chat_id)
@@ -2537,6 +2570,30 @@ def _on_tg_callback(cq):
         # binding. These live outside the choice flow, so they
         # are handled before the flow gate below.
         _tg_review_callback(chat_id, data)
+        return
+    if data.startswith("pr:"):
+        # Password-reset account pick (build 253): the buttons
+        # were offered ONLY to the fixed admin chat; a tap from
+        # any other chat is ignored silently, matching the
+        # admin-command pattern. The pick must still be a reset
+        # candidate — an admin account, or the account linked to
+        # the fixed chat — and must exist; anything else issues
+        # nothing. Handled before the flow gate: the owner needs
+        # this exactly when he has no flow running.
+        if not tg.is_admin(chat_id):
+            return
+        try:
+            uid = int(data[3:])
+        except ValueError:
+            return
+        acct = accounts.get_user(uid)
+        if not acct:
+            return
+        linked = accounts.user_for_tg(chat_id)
+        if acct.get("role") != "admin" and (
+                not linked or linked["id"] != acct["id"]):
+            return
+        _issue_reset_code(chat_id, acct)
         return
     flow = _TG_FLOW.get(chat_id)
     if not flow:

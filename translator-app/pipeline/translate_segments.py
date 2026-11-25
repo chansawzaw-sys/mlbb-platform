@@ -52,10 +52,10 @@ shipping source-language subtitles):
      probe rules, same admin variant), sequentially, and
      every chunk after the first receives a carry-over
      context: the story so far (the most recent translated
-     lines, source -> Burmese) plus a glossary of the
-     Latin-letter names established so far, threaded into
-     the engines' shared prompt builder so names and story
-     stay consistent across chunk boundaries. Segment count
+     lines, source -> Burmese) plus a glossary of the names
+     established so far, threaded into the engines' shared
+     prompt builder so names and story stay consistent
+     across chunk boundaries. Segment count
      and order never change: each chunk's output is
      validated for exact count/order against its input
      before acceptance, a failed chunk falls back exactly
@@ -70,6 +70,25 @@ shipping source-language subtitles):
      provider, and the chunk's own walk report (errors,
      fill, rescue, second wind) — so a bad job's report
      shows WHERE it degraded.
+
+  Build 252 (owner decision 2026-11-25, REVERSING the
+     builds 153-154 rule): names are no longer kept in
+     Latin letters — every personal/place/brand name is
+     written in Burmese script, transliterated by SOUND
+     (a Chinese name by its pinyin sound, e.g. Lin Feng
+     -> လင်ဖုန်း), in ONE fixed form per name, never
+     translated by meaning. The shared prompt source
+     (pipeline/gemini_translate.py PROMPT_SUBS/PROMPT_DUB,
+     imported by the OpenAI/OpenRouter/xKiro builders)
+     carries the new rule, as do the Recap/Commentary/
+     Story prose prompts. The build-248 glossary follows
+     the same flip: it no longer pins Latin forms — it
+     pins the CHOSEN BURMESE FORMS, recovered from the
+     completed output by elimination (see
+     _established_name_entries), rendered as
+     source-name -> Burmese-form pairs alongside the
+     story-so-far lines, which already show each recent
+     name's rendering in place.
 
 CLI: python -m pipeline.translate_segments <workdir>
 Reads segments_en.json, writes segments_my.json + subs_my.srt (original timings).
@@ -667,13 +686,17 @@ def _split_chunks(segs):
     return chunks
 
 
-# Glossary extraction (build 248): the standing prompt rules
-# keep every personal/place/brand name in Latin letters, so
-# the names established so far are exactly the capitalised
-# Latin runs in the source text and in the Burmese output.
+# Glossary extraction (build 248; flipped by build 252):
+# the names established so far are identified by the
+# capitalised Latin runs in the SOURCE text — since build
+# 252 the output writes every name in Burmese script, so
+# the source side is where a name's identity is visible.
 # Single capitalised words are filtered against common
-# sentence-start words; multi-word capitalised sequences and
-# ALLCAPS tokens are almost always names or brands.
+# sentence-start words; multi-word capitalised sequences
+# and ALLCAPS tokens are almost always names or brands.
+# The CHOSEN BURMESE FORM for each name is recovered from
+# the completed output by elimination (see
+# _established_name_entries below), never from the source.
 _NAME_MULTI = re.compile(r"[A-Z][A-Za-z'’-]*(?:\s+[A-Z][A-Za-z'’-]*)+")
 _NAME_SINGLE = re.compile(r"[A-Z][a-z]{2,}")
 _NAME_CAPS = re.compile(r"\b[A-Z]{2,}\b")
@@ -711,17 +734,94 @@ def _glossary_add(found, text):
             found.setdefault(w, True)
 
 
-def _chunk_context(done_out, glossary):
+def _name_candidates(text):
+    """The set of name candidates in ONE source text (the
+    same extraction _glossary_add accumulates job-wide)."""
+    found = {}
+    _glossary_add(found, text)
+    return set(found)
+
+
+# Build 252: recovering the chosen Burmese form of a name
+# from completed output. Burmese tokens are the maximal
+# Myanmar-script runs of a rendering; grammatical tokens
+# that can never be a transliterated name are stoplisted,
+# and the pairing itself is by elimination (see
+# _established_name_entries).
+_MY_TOKEN = re.compile(r"[\u1000-\u109f]+")
+_NAME_FORM_STOP = {
+    "သည်", "တယ်", "ပါ", "ကို", "မှာ", "နှင့်", "တဲ့",
+    "ရဲ့", "တွေ", "များ", "ဖြစ်", "ရှိ", "သူ", "သူ့",
+    "ဒီ", "အဲ", "ဟို", "လို့", "ပြီး", "နေ", "ခဲ့",
+    "မယ်", "သော", "တို့", "လည်း", "ပဲ", "မှ",
+    "ရင်", "တော့", "ဘူး", "မ", "ခြင်း", "စွာ",
+}
+
+
+def _burmese_tokens(text):
+    """The Myanmar-script tokens of one translated line,
+    in order (runs of at least two codepoints — a lone
+    consonant is a fragment, never a name form)."""
+    return [t for t in _MY_TOKEN.findall(text or "")
+            if len(t) >= 2]
+
+
+def _established_name_entries(history, src_names):
+    """The names list for the next chunk's context (build
+    252): one entry per established source name, in the
+    order the names first appeared — "Source Name ->
+    Burmese form" when the form can be determined, the
+    bare source name when it cannot (the story-so-far
+    lines and the context instruction then carry it: keep
+    the Burmese form already used for it).
+
+    `history` is one (names-in-segment, Burmese tokens of
+    its rendering) record per completed segment. A name's
+    form is determined by elimination: the tokens present
+    in EVERY rendering of a segment containing the name,
+    minus every token that appears in a rendering whose
+    source does NOT contain the name (ordinary vocabulary
+    and other names' forms live there), minus the
+    grammatical stoplist, minus forms already claimed by
+    an earlier name. Exactly one survivor is a confident
+    pair; zero or several survivors stay unpaired rather
+    than guess."""
+    per_seg = [(names, set(toks)) for names, toks in history]
+    entries = []
+    claimed = set()
+    for name in src_names:
+        occ = [toks for names, toks in per_seg if name in names]
+        if not occ:
+            continue
+        cand = set.intersection(*occ) if len(occ) > 1 \
+            else set(occ[0])
+        for names, toks in per_seg:
+            if name not in names:
+                cand -= toks
+        cand -= _NAME_FORM_STOP
+        cand -= claimed
+        if len(cand) == 1:
+            form = next(iter(cand))
+            claimed.add(form)
+            entries.append(f"{name} → {form}")
+        else:
+            entries.append(name)
+    return entries
+
+
+def _chunk_context(done_out, name_entries):
     """The carry-over block for the next chunk (build 248):
     the story so far as the most recent translated lines
     (source -> the Burmese rendering used, so the next chunk
-    matches voice and wording), plus the accumulated names
-    glossary. Returns None when there is nothing to carry
-    (every prior segment empty and no names yet) — the next
-    chunk then runs context-free, exactly like chunk 1."""
+    matches voice and wording), plus the established names
+    list (build 252: source name -> the chosen Burmese
+    form, from _established_name_entries). Returns None
+    when there is nothing to carry (every prior segment
+    empty and no names yet) — the next chunk then runs
+    context-free, exactly like chunk 1."""
     tail = [s for s in done_out
             if (s.get("text") or "").strip()][-_CONTEXT_TAIL:]
-    if not tail and not glossary:
+    if not tail and not name_entries:
         return None
     lines = ["CONTEXT — this video's earlier parts "
              "(background ONLY: do not translate this block "
@@ -734,12 +834,17 @@ def _chunk_context(done_out, glossary):
             lines.append("- " + (s.get("text") or "").strip()
                          + " → "
                          + (s.get("text_my") or "").strip())
-    if glossary:
+    if name_entries:
         lines.append(
-            "Names and terms already established — keep "
-            "these EXACT Latin-letter forms wherever the "
-            "same names or terms appear again: "
-            + ", ".join(glossary))
+            "Names already established — names are written "
+            "in Burmese transliteration: where a pair is "
+            "shown (source name → Burmese form), that is "
+            "the EXACT Burmese form already chosen — use "
+            "that same Burmese form wherever the name "
+            "appears again; for a name shown without a "
+            "pair, keep the Burmese form already used for "
+            "it in the lines above: "
+            + ", ".join(name_entries))
     return "\n".join(lines)[:_CONTEXT_MAX_CHARS]
 
 
@@ -765,11 +870,13 @@ def translate_segments(workdir, style="subs", admin=False):
     chunk_entries = []
     out_all = []
     glossary_found = {}
+    history = []
     offset = 0
     for ci, chunk in enumerate(chunks):
-        glossary = list(glossary_found)[:_GLOSSARY_MAX]
+        name_entries = _established_name_entries(
+            history, list(glossary_found))[:_GLOSSARY_MAX]
         context = None if ci == 0 else _chunk_context(
-            out_all, glossary)
+            out_all, name_entries)
         out, crep = _walk_batch(chunk, style, admin=admin,
                                 context=context)
         # Segment integrity is absolute (build 248): the
@@ -827,7 +934,8 @@ def translate_segments(workdir, style="subs", admin=False):
                                   crep[sec])
         for c, o in zip(chunk, out):
             _glossary_add(glossary_found, c.get("text"))
-            _glossary_add(glossary_found, o.get("text_my"))
+            history.append((_name_candidates(c.get("text")),
+                            _burmese_tokens(o.get("text_my"))))
         out_all.extend(out)
         offset += len(chunk)
     if not single:

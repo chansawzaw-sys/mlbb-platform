@@ -46,7 +46,7 @@ PROMPT_RECAP = """You are a Burmese recap narrator. Below is the full transcript
 
 Rules:
 - Cover the whole story in order — beginning, middle and end. Do not summarise away the ending, and do not invent anything that is not in the transcript.
-- NAMES IN ENGLISH: every personal name, place name and brand name stays in Latin letters exactly as in the transcript (Chinese names in pinyin) — never write names in Burmese script, never translate a name by its meaning.
+- NAMES IN BURMESE: every personal name, place name and brand name is written in Burmese script, transliterated by its SOUND as it sounds in the transcript (for a Chinese name, transliterate the pinyin sound — Lin Feng becomes လင်ဖုန်း) — never leave a name in Latin letters, never translate a name by its meaning, and use ONE fixed Burmese form for each name every time it appears.
 - Numbers must be exact — copy every number, score, date and amount precisely.
 - STORY-FIRST: read the whole transcript first, understand the whole story, then write flowing narration that follows the storyline — never word-by-word translation, never a list of disconnected lines.
 - NO BRACKETED GLOSSES: every name or term appears once, in a single chosen form — no parenthetical explanations, no translator notes, no markdown, no headings, no quotation marks around the script.
@@ -81,8 +81,9 @@ def _clean(text):
 def _usable(script, target):
     """A generation counts only if it is real Burmese narration
     of plausible size: long enough (a stub reply fails over to
-    the next gateway) and mostly Myanmar script (names stay in
-    Latin, so the prose around them must carry the ratio)."""
+    the next gateway) and mostly Myanmar script (names are
+    Burmese transliterations since build 252, so the whole
+    script — names included — carries the ratio)."""
     if not script or len(script) < max(120, target * SCRIPT_MIN_RATIO):
         return False
     letters = [ch for ch in script if ch.isalpha()]
