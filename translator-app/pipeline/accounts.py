@@ -334,11 +334,42 @@ def _clear_fails(username, ip):
                      (_fail_key(username, ip),))
 
 
+def _drop_served_lock(username, ip):
+    """Build 251: a lock whose time has been SERVED clears the
+    slate. The fail count used to survive the lock (only a
+    successful login cleared it), so the first wrong try after
+    the lock expired instantly re-locked for another 15 minutes
+    — a spiral the owner hit live on 2026-11-25. Now an expired
+    lock deletes the row before the attempt is judged, so the
+    user gets a fresh set of _MAX_FAILS attempts and it takes a
+    full new run of misses to lock again."""
+    key = _fail_key(username, ip)
+    with _LOCK, _db() as conn:
+        row = conn.execute("SELECT locked_until FROM login_fails "
+                           "WHERE key = ?", (key,)).fetchone()
+        if row and 0 < row["locked_until"] <= time.time():
+            conn.execute("DELETE FROM login_fails WHERE key = ?",
+                         (key,))
+
+
+def clear_login_fails(username):
+    """Build 251: wipe EVERY login_fails row for a username (all
+    IP keys). Used by the password-reset flow: a reset must not
+    leave a live or stale lockout standing behind the new
+    password."""
+    prefix = f"{(username or '').lower()}|"
+    with _LOCK, _db() as conn:
+        conn.execute(
+            "DELETE FROM login_fails WHERE substr(key, 1, ?) = ?",
+            (len(prefix), prefix))
+
+
 def authenticate(username, password, ip=""):
     """(user, error). Lockout checked first; failures are counted."""
     username = (username or "").strip()
     if login_locked(username, ip):
         return None, "ခဏ ခဏ မှားထားလို့ ၁၅ မိနစ် ပိတ်ထားပါတယ်"
+    _drop_served_lock(username, ip)
     with _db() as conn:
         row = conn.execute("SELECT * FROM users WHERE username = ?",
                            (username,)).fetchone()

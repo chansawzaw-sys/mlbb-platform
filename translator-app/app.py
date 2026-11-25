@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 250"
+BUILD_TAG = "build 251"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -1401,6 +1401,8 @@ _MENU_ROWS = [["🎬 Video ထုတ်မယ်", "💰 Credit ဖြည့်"
               ["💳 လက်ကျန်", "👤 Username ချိတ်"]]
 _LINK_CODES = {}   # code -> (user_id, expires) — web-issued, bot-redeemed
 _LINK_FAILS = {}   # chat_id -> (fail_count, locked_until) — code guessing
+_RESET_CODES = {}  # code -> (user_id, expires) — bot-issued, web-redeemed (build 251)
+_RESET_FAILS = {}  # client ip -> (fail_count, locked_until) — reset-code guessing (build 251)
 
 # Whenever the bot sends a user off to the web app (to register or
 # link), the message carries the app link AND the install reminder.
@@ -1734,6 +1736,23 @@ def _is_recovery_text(text):
             or _phrase_skeleton(text) in _RECOVERY_SKEL)
 
 
+# ------------------------------------------------------------------
+# Password-reset phrase (build 251). Same codepoint discipline as
+# the recovery phrase above: the Burmese words are built from
+# explicit codepoints so a tone-mark ordering slip in this file
+# can never make the owner's correctly typed phrase unmatchable;
+# matching is norm + skeleton tolerant, like _is_recovery_text.
+_RESETPW_PHRASE = ("Password " + "\u1015\u103c\u1014\u103a" + " "
+                   + "\u101e\u1010\u103a\u1019\u103e\u1010\u103a")
+_RESETPW_SET = {_phrase_norm(_RESETPW_PHRASE), "/reset_password"}
+_RESETPW_SKEL = {_phrase_skeleton(_RESETPW_PHRASE)}
+
+
+def _is_resetpw_text(text):
+    return (_phrase_norm(text) in _RESETPW_SET
+            or _phrase_skeleton(text) in _RESETPW_SKEL)
+
+
 def _recovery_allowed(chat_id):
     """Owner-only recovery: the fixed Telegram chat, or a chat
     linked to an admin account (linking itself required that
@@ -1769,6 +1788,36 @@ def _tg_menu_step(msg, chat_id, text):
             tg.send_message(
                 chat_id, "ပြန်ဖွင့်စရာ ပိတ်နေတဲ့ admin account မရှိပါ — "
                          "အားလုံး ပုံမှန် ဖြစ်နေပါတယ်")
+        return True
+    if _is_resetpw_text(text) and tg.is_admin(chat_id):
+        # Password reset (build 251): ONLY the owner's fixed
+        # Telegram chat — that chat id IS the owner's identity.
+        # Issues a one-time code for the account LINKED to this
+        # chat; the owner redeems it on the web login card with a
+        # NEW password of his own choosing. No password ever
+        # travels through Telegram — the bot only hands out the
+        # code. Any other chat's message is not consumed here and
+        # falls through, exactly like /recover_admin.
+        acct = accounts.user_for_tg(chat_id)
+        if not acct:
+            tg.send_message(
+                chat_id, "⚠️ တောင်းပန်ပါတယ် — ဒီ Telegram chat နဲ့ "
+                         "ချိတ်ထားတဲ့ account မရှိလို့ code ထုတ်ပေးလို့ "
+                         "မရပါ 🙏")
+            return True
+        for c, (uid, _exp) in list(_RESET_CODES.items()):
+            if uid == acct["id"]:
+                _RESET_CODES.pop(c, None)
+        code = str(secrets.randbelow(90000000) + 10000000)
+        _RESET_CODES[code] = (acct["id"], time.time() + 600)
+        tg.send_message(
+            chat_id,
+            f"🔑 Password ပြန်သတ်မှတ် code: {code}\n"
+            "⏱ ၁၀ မိနစ် အတွင်း သုံးပါ — တစ်ခါပဲ သုံးလို့ ရပါတယ်\n"
+            "👉 web app ကို ဖွင့်ပါ → login card မှာ «🔑 code နဲ့ "
+            "password အသစ် သတ်မှတ်မယ်» ကို နှိပ်ပါ → code နဲ့ "
+            "password အသစ် ထည့်ပါ\n"
+            "ပြီးရင် password အသစ်နဲ့ login ပြန်ဝင်နိုင်ပါပြီ 🙏")
         return True
     flow = _TG_FLOW.get(chat_id)
     acct = accounts.user_for_tg(chat_id)
@@ -5174,6 +5223,51 @@ def auth_login():
         return jsonify({"error": err}), 401
     return _set_session(jsonify({"user": user}),
                         accounts.new_session(user["id"]))
+
+
+@app.post("/api/auth/reset-with-code")
+def auth_reset_with_code():
+    """Build 251: redeem a one-time password-reset code — issued
+    by the bot ONLY to the owner's fixed Telegram chat — and set
+    a NEW password. Success consumes the code, revokes every
+    session for the account (accounts.set_password) and wipes
+    its login lockouts on every IP key, then returns OK: the
+    user logs in with the new password (no auto-login here).
+    Wrong codes are counted per client IP: after 5 misses the
+    IP is refused for 10 minutes — a VALID code presented from
+    a refused IP is refused too."""
+    ip = _client_ip()
+    fails = _RESET_FAILS.get(ip)
+    if fails and fails[1] > time.time():
+        return jsonify({"error": "code မှား ထည့်တာ များလို့ ၁၀ မိနစ် "
+                                 "ပိတ်ထားပါတယ် — ခဏ စောင့်ပြီး ပြန် "
+                                 "ကြိုးစားပါ"}), 429
+    data = request.get_json(force=True, silent=True) or {}
+    code = str(data.get("code") or "").strip()
+    entry = _RESET_CODES.get(code)
+    if entry and entry[1] <= time.time():
+        _RESET_CODES.pop(code, None)
+        entry = None
+    if not entry:
+        count = (fails[0] + 1) if fails else 1
+        until = time.time() + 600 if count >= 5 else 0
+        _RESET_FAILS[ip] = (count, until)
+        return jsonify({"error": "code မမှန်ပါ (သို့) သက်တမ်း "
+                                 "ကုန်သွားပါပြီ — bot မှာ code အသစ် "
+                                 "ပြန်တောင်းပါ"}), 400
+    new_password = data.get("new_password")
+    if not isinstance(new_password, str):
+        new_password = ""
+    if len(new_password) < 6:
+        return jsonify({"error": "password အနည်းဆုံး ၆ လုံး ထားပါ"}), 400
+    _RESET_CODES.pop(code, None)
+    user = accounts.get_user(entry[0])
+    if not user or not accounts.set_password(entry[0], new_password):
+        return jsonify({"error": "တောင်းပန်ပါတယ် — ပြန်သတ်မှတ်လို့ "
+                                 "မရပါ။ bot မှာ code အသစ် ပြန်တောင်းပါ"}), 400
+    accounts.clear_login_fails(user["username"])
+    _RESET_FAILS.pop(ip, None)
+    return jsonify({"ok": True})
 
 
 @app.post("/api/auth/logout")
