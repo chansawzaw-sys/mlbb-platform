@@ -19,11 +19,15 @@ _ISSUERS = ("accounts.google.com", "https://accounts.google.com")
 
 
 def verify_id_token(id_token, client_id):
-    """-> {"sub", "email", "email_verified"} or None.
+    """-> {"sub", "email", "email_verified", "nonce"} or None.
 
     email_verified is normalised to a bool (tokeninfo reports it
     as the string "true"). Callers decide what an unverified email
-    means — app.py rejects such sign-ins outright."""
+    means — app.py rejects such sign-ins outright. nonce is the
+    token's nonce claim verbatim (None when the token carries
+    none — build 255's redirect flow checks it against the
+    g_nonce cookie its start route set; the GSI flow's tokens
+    carry no nonce and are never checked)."""
     if not id_token or not client_id:
         return None
     try:
@@ -51,4 +55,5 @@ def verify_id_token(id_token, client_id):
         return None
     verified = data.get("email_verified")
     return {"sub": str(sub), "email": email,
-            "email_verified": verified is True or verified == "true"}
+            "email_verified": verified is True or verified == "true",
+            "nonce": data.get("nonce")}

@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 254"
+BUILD_TAG = "build 255"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -5335,6 +5335,133 @@ def auth_logout():
     return resp
 
 
+def _public_origin():
+    """The origin browsers actually see. Behind Caddy the app
+    sees plain HTTP on loopback, so — exactly as _set_session
+    already trusts the proxy — X-Forwarded-Proto decides the
+    scheme and X-Forwarded-Host (falling back to the Host
+    header) the authority. On the live host this yields
+    https://85-155-149-58.sslip.io."""
+    proto = request.headers.get("X-Forwarded-Proto", "")
+    scheme = "https" if (request.is_secure or proto == "https") \
+        else "http"
+    host = request.headers.get("X-Forwarded-Host", "")
+    host = host.split(",")[0].strip() if host else request.host
+    return scheme + "://" + host
+
+
+@app.get("/api/auth/google/start")
+def auth_google_start():
+    """Build 255: Google sign-in WITHOUT Google's GSI
+    JavaScript. Build 254 made the GSI button as reliable as
+    the library allows, but on the owner's phone the GSI
+    machinery itself never completes — so this is a plain
+    top-level redirect into Google's OpenID Connect implicit
+    flow using only our own code: we bounce the browser to
+    accounts.google.com with a fresh nonce (kept in an HttpOnly
+    cookie AND sent as nonce+state), Google returns the browser
+    to /auth/google-landing with the ID token in the URL
+    fragment, and that page POSTs it to /api/auth/google, which
+    additionally checks the token's nonce claim against the
+    cookie whenever the cookie is present."""
+    import urllib.parse
+    cid = _google_client_id()
+    if not cid:
+        return jsonify({"error": "Google login မဖွင့်ရသေးပါ"}), 400
+    nonce = secrets.token_urlsafe(24)
+    secure = request.is_secure or \
+        request.headers.get("X-Forwarded-Proto", "") == "https"
+    params = urllib.parse.urlencode({
+        "client_id": cid,
+        "redirect_uri": _public_origin() + "/auth/google-landing",
+        "response_type": "id_token",
+        "scope": "openid email profile",
+        "nonce": nonce,
+        "state": nonce,
+        "prompt": "select_account",
+    })
+    resp = Response(status=302)
+    resp.headers["Location"] = \
+        "https://accounts.google.com/o/oauth2/v2/auth?" + params
+    resp.set_cookie("g_nonce", nonce, max_age=600, httponly=True,
+                    path="/", samesite="Lax", secure=secure)
+    return resp
+
+
+_GOOGLE_LANDING_HTML = """<!DOCTYPE html>
+<html lang="my">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Google login</title>
+<style>
+  body { font-family: "Noto Sans Myanmar", system-ui, sans-serif;
+         margin: 0; background: #101013; color: #f2f2f5;
+         padding: 24px 16px; }
+  .card { max-width: 420px; margin: 12vh auto 0; background: #1a1a20;
+          border: 1px solid #2c2c35; border-radius: 12px;
+          padding: 20px 16px; text-align: center; }
+  p { font-size: 15px; line-height: 1.7; }
+  a { color: #8db0ff; }
+</style>
+</head>
+<body>
+<div class="card">
+  <p id="msg">Google login စစ်ဆေးနေပါတယ်…</p>
+  <p><a id="back" href="/" style="display:none">← အစ ပြန်သွားမယ်</a></p>
+</div>
+<script>
+(function () {
+  var msg = document.getElementById("msg");
+  var back = document.getElementById("back");
+  function fail(txt) {
+    msg.textContent = txt;
+    back.style.display = "";
+  }
+  var h = new URLSearchParams(location.hash.replace(/^#/, ""));
+  var token = h.get("id_token");
+  var err = h.get("error");
+  /* Scrub the fragment (it carries the token) from the
+     address bar and history before doing anything else. */
+  try { history.replaceState(null, "", location.pathname); } catch (e) {}
+  if (!token) {
+    fail(err ? ("Google login မအောင်မြင်ပါ (" + err + ") — ပြန်ကြိုးစားပါ")
+             : "Google login မအောင်မြင်ပါ — ပြန်ကြိုးစားပါ");
+    return;
+  }
+  fetch("/api/auth/google", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({credential: token})})
+    .then(function (r) {
+      return r.json().catch(function () { return {}; })
+        .then(function (d) {
+          if (r.ok) { location.replace("/"); return; }
+          fail(d.error || "Google login မအောင်မြင်ပါ — ပြန်ကြိုးစားပါ");
+        });
+    })
+    .catch(function () {
+      fail("ကွန်ရက် အဆင်မပြေပါ — နောက်တစ်ခါ ပြန်ကြိုးစားပါ");
+    });
+})();
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/auth/google-landing")
+def auth_google_landing():
+    """Build 255: the redirect-flow return page. Google sends
+    the browser here with the ID token in the URL fragment
+    (fragments never reach the server, so the token exists only
+    in this page's memory); the inline script POSTs it to
+    /api/auth/google and replaces to "/" on success, or shows
+    the server's error with a way back. No external scripts —
+    this page must work exactly where the GSI library cannot
+    load. The token is never rendered or logged."""
+    return Response(_GOOGLE_LANDING_HTML, mimetype="text/html")
+
+
 @app.post("/api/auth/google")
 def auth_google():
     """Google one-tap sign-in AND account linking (build 180).
@@ -5359,6 +5486,18 @@ def auth_google():
     info = google_auth.verify_id_token(token, cid)
     if not info:
         return jsonify({"error": "Google အတည်ပြုချက် မအောင်မြင်ပါ — ပြန် ကြိုးစားပေးပါ"}), 401
+    # Build 255: the redirect flow (/api/auth/google/start)
+    # planted a g_nonce cookie before bouncing the browser to
+    # Google. When that cookie is present, the verified token
+    # MUST carry the same nonce — a token minted for any other
+    # flow (or replayed) is refused, and the spent cookie is
+    # cleared on the way out. No cookie = the GSI flow, whose
+    # behaviour stays exactly the old path.
+    cookie_nonce = request.cookies.get("g_nonce")
+    if cookie_nonce is not None and info.get("nonce") != cookie_nonce:
+        resp = jsonify({"error": "Google login မအောင်မြင်ပါ — ပြန်ကြိုးစားပါ"})
+        resp.delete_cookie("g_nonce", path="/")
+        return resp, 400
     if not info["email_verified"]:
         return jsonify({"error": "ဒီ Google account ရဲ့ email ကို Google က အတည်မပြုရသေးပါ"}), 401
     me = _current_user()
@@ -5381,9 +5520,13 @@ def auth_google():
         user = accounts.get_user(user["id"])
     accounts.touch_login(user["id"])
     if me:
-        return jsonify({"user": user})
-    return _set_session(jsonify({"user": user}),
-                        accounts.new_session(user["id"]))
+        resp = jsonify({"user": user})
+    else:
+        resp = _set_session(jsonify({"user": user}),
+                            accounts.new_session(user["id"]))
+    if cookie_nonce is not None:
+        resp.delete_cookie("g_nonce", path="/")
+    return resp
 
 
 _PROBE = {"running": False}
