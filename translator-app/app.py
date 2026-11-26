@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 258"
+BUILD_TAG = "build 259"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -238,6 +238,16 @@ def _fold_timing(job, key, secs):
     customer-visible step), recomputed from both phase_s
     parts so a mid-render fold never drops the retime half;
     the dispatcher's queue wait becomes queue_s."""
+    if key == "transcribe_engine":
+        # Build 259: a label, not a duration — the engine that
+        # produced this job's transcript (groq / local-fallback
+        # / local), carried in phase_s by run_job from
+        # transcribe_report.json. Stored beside the seconds;
+        # the Admin averages iterate fixed numeric keys only
+        # and never see it.
+        if isinstance(secs, str) and secs:
+            job.setdefault("timings", {})["transcribe_engine"] = secs
+        return
     try:
         secs = round(float(secs), 1)
     except (TypeError, ValueError):
@@ -4436,6 +4446,54 @@ def xkiro_key_save():
 def xkiro_key_delete():
     _env_remove("XKIRO_API_KEY")
     return jsonify({"ok": True, "configured": False})
+
+
+# ---------- Groq transcription (build 259) ----------
+# The Groq key lives in .env exactly like the other keys
+# (chmod 600, never in git) and is NEVER returned — only
+# whether one is configured, the selected model, and the last
+# transcription outcome. Every /api/settings/* route is
+# restricted to admins by _accounts_guard.
+
+@app.get("/api/settings/groq")
+def groq_status():
+    from pipeline import groq_transcribe
+    return jsonify({"configured": groq_transcribe.key_configured(),
+                    "model": groq_transcribe.get_model(),
+                    "last": groq_transcribe.last_status()})
+
+
+@app.post("/api/settings/groq-key")
+def groq_key_save():
+    data = request.get_json(force=True) or {}
+    key = (data.get("key") or "").strip()
+    ok_format = key.startswith("gsk_") and 20 <= len(key) <= 200 \
+        and all(ch.isalnum() or ch in "._-" for ch in key)
+    if not ok_format:
+        return jsonify({"error": "key မမှန်ပါ — Groq key (gsk_ နဲ့ စတာ) ဖြစ်ရပါမယ်"}), 400
+    _env_write("GROQ_API_KEY", key)
+    return jsonify({"ok": True, "configured": True})
+
+
+@app.delete("/api/settings/groq-key")
+def groq_key_delete():
+    _env_remove("GROQ_API_KEY")
+    return jsonify({"ok": True, "configured": False})
+
+
+@app.post("/api/settings/groq")
+def groq_save():
+    # Partial save, same shape as the ElevenLabs settings
+    # post: each PRESENT field is validated then written;
+    # absent fields keep their saved values.
+    data = request.get_json(force=True) or {}
+    from pipeline import groq_transcribe
+    if "model" in data:
+        if data["model"] not in groq_transcribe.MODELS:
+            return jsonify({"error": "model မမှန်ပါ"}), 400
+        _env_write("GROQ_MODEL", data["model"])
+    return jsonify({"ok": True,
+                    "model": groq_transcribe.get_model()})
 
 
 # ---------- ElevenLabs premium voices (build 205) ----------

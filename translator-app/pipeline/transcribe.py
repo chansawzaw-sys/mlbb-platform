@@ -1,17 +1,27 @@
 """Step 2: transcribe speech to timestamped segments.
 
-Default: faster-whisper (model size from WHISPER_MODEL env, default "small", CPU int8).
+Engine order (build 259): Groq cloud (whisper-large-v3) FIRST
+when a Groq key is configured — ~200x real-time and far more
+accurate than the local base model, especially on Chinese.
+ANY Groq failure falls back to the local faster-whisper path
+(CPU int8; model size from WHISPER_MODEL env, default base)
+and the fallback + its error class are recorded in
+<workdir>/transcribe_report.json. No key -> local exactly as
+before. The Groq path also persists word-level timestamps to
+<workdir>/words.json for a later subtitle-timing build.
 Fast path: --captions uses a .vtt caption file already fetched by download.py.
 
 CLI: python -m pipeline.transcribe <source.mp4> <workdir> [--captions]
 Writes <workdir>/segments_en.json  [{start, end, text}]
 """
+import json
 import os
 import re
 import sys
 import threading
 from pathlib import Path
 
+from . import groq_transcribe
 from .common import run, save_segments
 
 MIN_DUR = 0.4  # drop ultra-short noise segments
@@ -94,24 +104,35 @@ def _get_model(model_ref):
         return m
 
 
-def transcribe(video_path, workdir, use_captions=False):
-    workdir = Path(workdir)
-    workdir.mkdir(parents=True, exist_ok=True)
+def _write_report(workdir, report):
+    """transcribe_report.json — the transcribe stage's engine
+    record (build 259), following translate_report.json's
+    convention: which engine produced the transcript, and when
+    Groq failed, the fallback + the error class that caused it.
+    run_job reads the engine back for the job's timings note.
+    Best-effort — a report failure never breaks a job."""
+    try:
+        (Path(workdir) / "transcribe_report.json").write_text(
+            json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
-    if use_captions:
-        vtts = sorted(workdir.glob("source.*.vtt"))
-        if vtts:
-            segs = _parse_vtt(vtts[0])
-            if segs:
-                save_segments(segs, workdir / "segments_en.json")
-                return segs
-        # fall through to whisper if captions unusable
 
-    # extract 16k mono wav for whisper
-    wav = workdir / "audio16k.wav"
-    run(["ffmpeg", "-y", "-v", "error", "-i", str(video_path),
-         "-vn", "-ac", "1", "-ar", "16000", str(wav)])
+def read_report(workdir):
+    """The transcribe_report.json in a workdir ({} when absent
+    or unreadable — captions path, pre-259 workdirs)."""
+    try:
+        return json.loads((Path(workdir) / "transcribe_report.json")
+                          .read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
+
+def _transcribe_local(wav, workdir):
+    """The pre-259 local faster-whisper path, verbatim: decode
+    the extracted 16k mono wav, apply the segment hygiene, save
+    segments_en.json, return the segments. Raises RuntimeError
+    when no speech is found — exactly as before."""
     # Prefer the project-local model (models/faster-whisper-small) when present
     # so the app is self-contained and never re-downloads; else use the
     # WHISPER_MODEL name (default "small") from the HF hub.
@@ -140,6 +161,64 @@ def transcribe(video_path, workdir, use_captions=False):
     if not segs:
         raise RuntimeError("no speech segments found by whisper")
     save_segments(segs, workdir / "segments_en.json")
+    return segs
+
+
+def transcribe(video_path, workdir, use_captions=False):
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    if use_captions:
+        vtts = sorted(workdir.glob("source.*.vtt"))
+        if vtts:
+            segs = _parse_vtt(vtts[0])
+            if segs:
+                save_segments(segs, workdir / "segments_en.json")
+                return segs
+        # fall through to whisper if captions unusable
+
+    # extract 16k mono wav (the local path decodes it; the Groq
+    # path cuts its upload chunks from it)
+    wav = workdir / "audio16k.wav"
+    run(["ffmpeg", "-y", "-v", "error", "-i", str(video_path),
+         "-vn", "-ac", "1", "-ar", "16000", str(wav)])
+
+    # Build 259: Groq FIRST when a key is configured. ANY Groq
+    # failure (network, HTTP error, quota, malformed or empty
+    # result) falls back to the local path, and the fallback is
+    # recorded with the Groq error class. No key -> local only,
+    # byte-for-byte the pre-259 behaviour.
+    groq_error = None
+    if groq_transcribe.key_configured():
+        try:
+            got = groq_transcribe.transcribe_audio(wav, workdir)
+        except Exception as e:  # GroqError or anything unexpected
+            groq_error = {"kind": getattr(e, "kind", "error"),
+                          "detail": str(e)[:200]}
+        else:
+            segs = got["segments"]
+            save_segments(segs, workdir / "segments_en.json")
+            if got.get("words"):
+                # Word-level timestamps for a later
+                # subtitle-timing build; no consumer reads
+                # this yet, so segments_en.json keeps its
+                # exact pre-259 shape.
+                save_segments(got["words"], workdir / "words.json")
+            _write_report(workdir, {
+                "engine": "groq", "model": got["model"],
+                "chunks": got["chunks"],
+                "language": got.get("language") or "",
+                "duration": got.get("duration") or 0})
+            return segs
+
+    segs = _transcribe_local(wav, workdir)
+    if groq_error is not None:
+        _write_report(workdir, {
+            "engine": "local-fallback",
+            "groq_error": groq_error["kind"],
+            "groq_error_detail": groq_error["detail"]})
+    else:
+        _write_report(workdir, {"engine": "local"})
     return segs
 
 

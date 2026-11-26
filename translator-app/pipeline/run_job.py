@@ -143,7 +143,7 @@ def _marks(progress):
     instead — timing must never break a job."""
     starts = {}
 
-    def mark(step, state, note=""):
+    def mark(step, state, note="", extra=None):
         if not progress:
             return
         if state == "running":
@@ -152,13 +152,34 @@ def _marks(progress):
             return
         if state == "done" and step in starts:
             secs = round(time.monotonic() - starts.pop(step), 1)
+            payload = {step: secs}
+            if extra:
+                # Build 259: non-second annotations ride the
+                # same phase_s channel (the transcribe engine
+                # label); app.py's fold stores them beside the
+                # seconds, never as a duration.
+                payload.update(extra)
             try:
-                progress(step, state, note, phase_s={step: secs})
+                progress(step, state, note, phase_s=payload)
                 return
             except TypeError:
                 pass
         progress(step, state, note)
     return mark
+
+
+def _transcribe_engine_extra(workdir):
+    """Build 259: the transcribe stage's engine note for the
+    job's timings — {"transcribe_engine": "groq" |
+    "local-fallback" | "local"} read from the
+    transcribe_report.json the transcribe step wrote, or None
+    when there is nothing to note (the captions path writes no
+    report; a pre-259 workdir has none), so those jobs'
+    timings stay exactly as they were."""
+    eng = transcribe.read_report(workdir).get("engine")
+    if eng in ("groq", "local-fallback", "local"):
+        return {"transcribe_engine": eng}
+    return None
 
 
 def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
@@ -225,7 +246,8 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
     # completed transcribe stage — a resumed job never re-transcribes.
     if _load_segments(workdir / "segments_en.json") is None:
         transcribe.transcribe(src, workdir, use_captions=True)
-    mark("transcribe", "done")
+    mark("transcribe", "done",
+         extra=_transcribe_engine_extra(workdir))
 
     mark("translate", "running")
     # Build 246: reuse a completed translation when its artifacts
@@ -483,7 +505,8 @@ def run_recap_phase1(workdir, url, progress=None, quality="hd",
     # existing segments_en.json is the completed stage.
     if _load_segments(workdir / "segments_en.json") is None:
         transcribe.transcribe(src, workdir, use_captions=True)
-    mark("transcribe", "done")
+    mark("transcribe", "done",
+         extra=_transcribe_engine_extra(workdir))
     return src
 
 
