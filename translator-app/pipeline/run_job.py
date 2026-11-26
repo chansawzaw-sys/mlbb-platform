@@ -11,7 +11,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import burn, download, elevenlabs_tts, fx as fx_mod, gemini_tts, retime, transcribe, translate_segments, tts
+from . import burn, download, elevenlabs_tts, fx as fx_mod, gemini_tts, parts, retime, transcribe, translate_segments, tts
 from .common import load_segments, maxrate_cap_k, probe_duration
 
 ALL_STEPS = ["download", "transcribe", "translate", "tts", "retime", "finalize"]
@@ -304,7 +304,7 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
 def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
                fx=None, font=burn.DEFAULT_FONT, voice_rate=0, voice_pitch=0,
                subs=None, max_speed=None, quality="hd", voice_name=None,
-               karaoke=False):
+               karaoke=False, parts_ok=True, start_at=0.0, end_at=None):
     """Phase 2: from the FINAL (possibly user-edited) segments_my.json —
     TTS -> retime -> logo/blur -> subtitle burn -> output.mp4.
     `subs` is the subtitle-layout dict (size_pct/width_pct/bottom_pct/align);
@@ -316,7 +316,13 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
     subtitles ("subs" and "both"): the burn uses the karaoke
     subtitle style — a free style option, same price. Build
     231 extended it from Captions-only to Dub/Recap/
-    Commentary as well."""
+    Commentary as well.
+    Build 260: `parts_ok` gates long-video part mode (see
+    pipeline.parts) — the Recap/Commentary workers pass False
+    (their products keep the classic whole-video flow exactly);
+    `start_at`/`end_at` are the part window when THIS call is
+    itself one part of a part-mode job (the defaults are the
+    classic whole-video call, unchanged)."""
     workdir = Path(workdir)
     mark = _marks(progress)
     cap_k = maxrate_cap_k(quality)
@@ -328,16 +334,41 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
     # temp output is promoted to output.mp4, never re-encoded.
     if not _video_ok(final) and _video_ok(tmp_final):
         os.replace(tmp_final, final)
+    if parts_ok and mode in ("subs", "dub", "both") \
+            and _video_ok(src):
+        # Build 260: a long source runs the media stages in
+        # parts (pipeline.parts) so a failure costs one part,
+        # not the whole stage. Pre-flight problems fall through
+        # to the classic flow below, which decides the job's
+        # fate exactly as it would have without part mode.
+        try:
+            _dur = parts.media_duration(src)
+        except Exception:
+            _dur = 0.0
+        if _dur > parts.threshold_seconds():
+            try:
+                return parts.run_phase2_parts(
+                    workdir, mode=mode, phase2=run_phase2,
+                    progress=progress, voice=voice, fx=fx, font=font,
+                    voice_rate=voice_rate, voice_pitch=voice_pitch,
+                    subs=subs, max_speed=max_speed, quality=quality,
+                    voice_name=voice_name, karaoke=karaoke)
+            except parts.PartsUnavailable:
+                pass
     if mode == "subs":
         mark("finalize", "running")
         if not _video_ok(final):
             # fx (if any) rides INSIDE the burn encode — no separate
             # fx pass. The burn lands on the temp name and is
-            # renamed over output.mp4 only when complete.
+            # renamed over output.mp4 only when complete. Build
+            # 260: a part call restricts the burn to its window
+            # (win_end set); the classic call passes None and the
+            # command is unchanged.
             burn.burn(src, workdir / "subs_my.srt", tmp_final, font=font,
                       subs=subs, blur_box=(fx or {}).get("blur"),
                       fx=fx if fx_mod.has_fx(fx) else None, cap_k=cap_k,
-                      style="karaoke" if karaoke else None)
+                      style="karaoke" if karaoke else None,
+                      win_start=start_at, win_end=end_at)
             os.replace(tmp_final, final)
         mark("finalize", "done")
         return final
@@ -412,7 +443,8 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
     if plan is None:
         plan = retime.retime(workdir,
                              max_speed=max_speed or retime.MAX_SPEED,
-                             cap_k=cap_k, make_finalize=_make_finalize)
+                             cap_k=cap_k, make_finalize=_make_finalize,
+                             start_at=start_at, end_at=end_at)
         redo = True
     mark("retime", "done")
     if plan.get("final_merged"):

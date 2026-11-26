@@ -92,7 +92,15 @@ def filter_chain(fx, vw, vh, start="[0:v]", logo="[1:v]"):
     # apply in order, so overlapping boxes simply blur twice
     # (the union) and can never break the encode. When pieces
     # exist they replace the boxes, exactly as before.
-    boxes = [] if pieces else (
+    # Build 260: the mere PRESENCE of the blur_pieces key — even
+    # an empty list — means piece mode, so the boxes stay
+    # replaced. Part mode slices the pieces per window; a window
+    # with no overlapping piece hands over an empty list and
+    # must not resurrect the box blur the pieces replaced (the
+    # classic flow blurs that box nowhere when pieces exist).
+    # No pre-260 job carries an empty list (app.py sets the key
+    # only when pieces exist), so classic behaviour is unchanged.
+    boxes = [] if fx.get("blur_pieces") is not None else (
         fx.get("blur_boxes")
         or ([fx["blur"]] if fx.get("blur") else []))
     for i, box in enumerate(boxes):

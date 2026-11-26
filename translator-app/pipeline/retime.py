@@ -69,12 +69,17 @@ def _canary_timeout(total_dur):
     return int(max(240, min(1200, 4 * float(total_dur or 0))))
 
 
-def _plan(segs, total_dur, max_speed=MAX_SPEED):
-    """Build chunk list covering [0, total_dur]: gaps and speech segments."""
+def _plan(segs, total_dur, max_speed=MAX_SPEED, start_at=0.0):
+    """Build chunk list covering [start_at, total_dur]: gaps and
+    speech segments. Build 260: `start_at` is the part window's
+    start when retime runs for one part of a long video (the
+    caller's segments are that window's, in absolute times); the
+    default 0.0 is the historical whole-video plan, unchanged."""
     chunks = []
-    cursor = 0.0
+    cursor = float(start_at)
     for idx, seg in enumerate(sorted(segs, key=lambda s: s["start"])):
-        start, end = float(seg["start"]), min(float(seg["end"]), total_dur)
+        start = max(float(seg["start"]), float(start_at))
+        end = min(float(seg["end"]), total_dur)
         if start - cursor > 0.05:
             chunks.append({"kind": "gap", "start": cursor, "end": start})
         orig = max(0.1, end - start)
@@ -112,17 +117,22 @@ def _plan(segs, total_dur, max_speed=MAX_SPEED):
 
 def time_map(plan):
     """[(src_t, dst_t)] breakpoints of a retime plan: chunk ends in
-    source time against their cumulative retimed positions."""
-    pts = [(0.0, 0.0)]
+    source time against their cumulative retimed positions. The
+    map's origin is the FIRST chunk's start — 0.0 for every
+    whole-video plan (the leading gap starts at 0), the window
+    start for a build-260 part plan, whose chunks cover only
+    [window_start, window_end] of the source."""
+    chunks = plan["chunks"]
+    pts = [(float(chunks[0]["start"]), 0.0)] if chunks else [(0.0, 0.0)]
     dst = 0.0
-    for c in plan["chunks"]:
+    for c in chunks:
         dst += float(c["new_dur"])
         pts.append((float(c["end"]), round(dst, 3)))
     return pts
 
 
 def map_time(pts, t):
-    if t <= 0:
+    if t <= pts[0][0]:
         return 0.0
     for (s0, d0), (s1, d1) in zip(pts, pts[1:]):
         if t <= s1:
@@ -432,7 +442,8 @@ def _render_chunk_audio(chunks, segs, cdir):
         _render_chunk_audio_loop(chunks, segs, cdir)
 
 
-def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None):
+def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None,
+           start_at=0.0, end_at=None):
     """Re-time the picture to the dub and mux the narration.
 
     `make_finalize` (build 182): optional callable(plan) -> spec|None
@@ -467,8 +478,23 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None):
         if s.get("codec_type") == "video" and s.get("duration"):
             total = min(total, float(s["duration"]))
             break
+    # Build 260 part mode: [start_at, end_at) is one part's
+    # window of the job's full source (the workdir's source.mp4
+    # is a hardlink to it, and the workdir's segments are the
+    # window's, in absolute times). The plan covers only the
+    # window and every trim below reads the window out of the
+    # full source, so the part's outputs are part-local. With
+    # the defaults (0 / None) everything is the whole-video
+    # behaviour, byte for byte.
+    start_at = max(0.0, float(start_at or 0.0))
+    if end_at is not None:
+        total = min(total, float(end_at))
+    windowed = start_at > 0.0 or end_at is not None
+    if windowed and start_at >= total:
+        raise RuntimeError(
+            f"retime window [{start_at}, {total}] is empty")
     max_speed = max(1.0, min(4.0, float(max_speed or MAX_SPEED)))
-    chunks = _plan(segs, total, max_speed)
+    chunks = _plan(segs, total, max_speed, start_at=start_at)
 
     cdir = workdir / "chunks"
     cdir.mkdir(exist_ok=True)
@@ -511,6 +537,14 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None):
     passthrough = all(c["kind"] == "gap"
                       or abs(c["new_dur"] - c["orig_dur"]) <= 0.01
                       for c in chunks)
+    if windowed:
+        # The passthrough shortcuts move the WHOLE source (the
+        # copy-mux) or run the finalize graph untrimmed off it
+        # (passthrough-merged) — both wrong for a window. A
+        # windowed plan always takes the trim-based paths below
+        # (merged / single-pass / grouped / chunked), which cut
+        # exactly the window out of the full source.
+        passthrough = False
     # The re-timed subtitle timings depend only on the plan, so they
     # are written BEFORE the video stage now (build 182): the merged
     # encode's finalize graph burns subs_retimed.srt in the same
@@ -520,6 +554,8 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None):
     plan = {"chunks": chunks, "source_duration": round(total, 3),
             "retimed_duration": round(t_cursor, 3),
             "video_passthrough": passthrough, "max_speed": max_speed}
+    if windowed:
+        plan["window"] = [round(start_at, 3), round(total, 3)]
 
     merged = False
     canary_failed = False

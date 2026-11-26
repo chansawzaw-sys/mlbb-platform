@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 259"
+BUILD_TAG = "build 260"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -8153,7 +8153,10 @@ def _recap_worker2(job):
                 max_speed=job.get("speed_cap") or 1.3,
                 quality=job.get("quality") or "hd",
                 voice_name=job.get("voice_name"),
-                karaoke=bool(job.get("karaoke")))
+                karaoke=bool(job.get("karaoke")),
+                # Build 260: Recap is not a dub/captions product —
+                # part mode must never reach it.
+                parts_ok=False)
             _finish(job)
         except _ShutdownInterrupt:
             _shutdown_stop(job)
@@ -8934,7 +8937,10 @@ def _commentary_worker2(job):
                     max_speed=job.get("speed_cap") or 1.3,
                     quality=job.get("quality") or "hd",
                     voice_name=job.get("voice_name"),
-                    karaoke=bool(job.get("karaoke")))
+                    karaoke=bool(job.get("karaoke")),
+                    # Build 260: Commentary is not a dub/captions
+                    # product — part mode must never reach it.
+                    parts_ok=False)
             if job.get("commentary_audio") != "off" \
                     and job.get("commentary_bed") is not True:
                 # Ducked bed (the default): the original

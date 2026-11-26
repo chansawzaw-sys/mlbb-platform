@@ -598,7 +598,18 @@ def finalize_filters(input_mp4, srt_path, font=DEFAULT_FONT, subs=None,
 
 
 def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
-         blur_box=None, fx=None, cap_k=2500, style=None):
+         blur_box=None, fx=None, cap_k=2500, style=None,
+         win_start=0.0, win_end=None):
+    # Build 260 part mode: [win_start, win_end) restricts the
+    # encode to one part's window of the input via an input seek
+    # (frame-accurate under re-encode, which the burn always
+    # does); the caller hands over a part-local SRT and part-local
+    # fx. With win_end=None (every classic caller) the commands
+    # below are byte-identical to before.
+    seek = []
+    if win_end is not None:
+        seek = ["-ss", f"{float(win_start):.3f}",
+                "-t", f"{float(win_end) - float(win_start):.3f}"]
     if fx:
         from . import fx as fx_mod
         if fx_mod.has_fx(fx):
@@ -608,7 +619,8 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
             filters, _out, logo_path = finalize_filters(
                 input_mp4, srt_path, font, subs, blur_box, fx,
                 style=style)
-            cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4)]
+            cmd = ["ffmpeg", "-y", "-v", "error"] + seek \
+                + ["-i", str(input_mp4)]
             if logo_path:
                 cmd += ["-i", str(logo_path)]
             mr = target_maxrate_k(input_mp4, cap_k)
@@ -634,7 +646,8 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
     if _fps_cap(input_mp4):
         vf += "," + _FPS_CAP
     mr = target_maxrate_k(input_mp4, cap_k)
-    run(["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4), "-vf", vf,
+    run(["ffmpeg", "-y", "-v", "error"] + seek
+        + ["-i", str(input_mp4), "-vf", vf,
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
          "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
          "-c:a", "copy", "-threads", str(encode_threads()),
