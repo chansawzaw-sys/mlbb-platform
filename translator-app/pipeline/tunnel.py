@@ -5,8 +5,8 @@ Direct Gemini is LOCATION-blocked and direct OpenAI is
 territory-blocked from this VPS (builds 164/168): Google/OpenAI
 judge the API caller's IP country, and the server sits in Hong
 Kong. The owner already owns a V2Ray subscription, so instead of
-moving the server, ONLY the Gemini and OpenAI API calls leave
-through a tunnel:
+moving the server, ONLY the Gemini, OpenAI and (since build
+263) Groq API calls leave through a tunnel:
 
   * sing-box (build 191; builds 189/190 used xray-core) runs on
     the server — installed and supervised by
@@ -18,7 +18,11 @@ through a tunnel:
     an HTTP proxy, and the same port also answers SOCKS5.
   * pipeline/gemini_translate.py and pipeline/openai_translate.py
     pass that proxy to `requests` EXPLICITLY, per call, and only
-    while the tunnel is verified up (see proxy_url()). Nothing
+    while the tunnel is verified up (see proxy_url()). Build
+    263 added a third rider: pipeline/groq_transcribe.py sends
+    its transcription POSTs through the same per-call proxies
+    (its direct route turned out to be 403-blocked from this
+    host too — see that module's docstring). Nothing
     else in the app passes a proxy anywhere: downloads,
     OpenRouter, xKiro, Apps Script, the free chain, edge-tts and
     Telegram all keep the direct route, and there is no OS-level
@@ -1050,7 +1054,10 @@ def proxy_url():
 
 def requests_proxies():
     """The `proxies` argument for requests calls in the Gemini /
-    OpenAI clients: the tunnel dict while verified, else None —
+    OpenAI clients (and, since build 263, the Groq transcription
+    client, which reads this helper directly because its
+    routing must also express a forced direct retry): the
+    tunnel dict while verified, else None —
     and proxies=None is byte-for-byte requests' default
     behaviour, so an unused tunnel changes NOTHING anywhere."""
     url = proxy_url()

@@ -194,7 +194,8 @@ def transcribe(video_path, workdir, use_captions=False):
             got = groq_transcribe.transcribe_audio(wav, workdir)
         except Exception as e:  # GroqError or anything unexpected
             groq_error = {"kind": getattr(e, "kind", "error"),
-                          "detail": str(e)[:200]}
+                          "detail": str(e)[:200],
+                          "route": getattr(e, "route", "")}
         else:
             segs = got["segments"]
             save_segments(segs, workdir / "segments_en.json")
@@ -208,7 +209,8 @@ def transcribe(video_path, workdir, use_captions=False):
                 "engine": "groq", "model": got["model"],
                 "chunks": got["chunks"],
                 "language": got.get("language") or "",
-                "duration": got.get("duration") or 0})
+                "duration": got.get("duration") or 0,
+                "route": got.get("route") or ""})
             return segs
 
     segs = _transcribe_local(wav, workdir)
@@ -216,7 +218,8 @@ def transcribe(video_path, workdir, use_captions=False):
         _write_report(workdir, {
             "engine": "local-fallback",
             "groq_error": groq_error["kind"],
-            "groq_error_detail": groq_error["detail"]})
+            "groq_error_detail": groq_error["detail"],
+            "route": groq_error["route"]})
     else:
         _write_report(workdir, {"engine": "local"})
     return segs

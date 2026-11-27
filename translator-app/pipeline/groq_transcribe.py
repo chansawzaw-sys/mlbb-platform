@@ -6,9 +6,27 @@ base model on this small VPS's CPU — minutes for a long video, and
 the base model mis-hears Chinese, which then poisons the
 translation downstream. Groq serves whisper-large-v3 at roughly
 200x real-time with far better accuracy, over a plain
-OpenAI-compatible endpoint. Groq is NOT geo-blocked from this
-server, so the calls go out DIRECT HTTPS — no VPN tunnel (contrast
-OpenAI/Gemini, which must ride tunnel.py).
+OpenAI-compatible endpoint.
+
+Routing (build 263): builds 259–262 sent the calls DIRECT,
+believing Groq was not geo-blocked from this server. Live
+evidence 2026-11-26 20:02 disproved that: a direct attempt was
+refused with http_403 {"error":{"message":"Forbidden"}} — an
+IP/region-class block on this Hong Kong datacenter route (a bad
+key would be a 401), and the job silently fell back to local
+whisper. The calls now ride the owner's Singapore tunnel FIRST
+— the same per-call `proxies` from tunnel.requests_proxies()
+that the Gemini/OpenAI clients use, never a global proxy. If
+the failure is at the proxy layer itself (proxy unreachable /
+refused — Groq never saw the request), exactly ONE direct
+attempt follows; if Groq itself answered on the tunnel route
+(any HTTP status, 403 included), there is NO direct retry —
+the direct route is already proven blocked from this host, and
+re-uploading megabytes of audio would be waste. Total attempts
+per chunk are capped at 2. Tunnel down (not verified) -> the
+direct route only, exactly the pre-263 behaviour. Every
+attempt's route + outcome is recorded in the .groq_last_status
+breadcrumb and in the result/report "route" field.
 
 Key handling (security): read ONLY from env GROQ_API_KEY or the
 git-ignored `.env` in the project root (same pattern as
@@ -28,17 +46,22 @@ last chunk keeps everything). No duplicates, no coverage gaps.
 
 Output: {"segments": [{start, end, text}], "words":
 [{start, end, word}], "language": str, "duration": float,
-"model": str, "chunks": int} — segment shape identical to the
-local path's (seconds rounded to 3 decimals, empty/ultra-short
-dropped). ANY failure raises GroqError with a machine-readable
-.kind; the caller (transcribe.py) falls back to local whisper
-and records the kind.
+"model": str, "chunks": int, "route": str} — segment shape
+identical to the local path's (seconds rounded to 3 decimals,
+empty/ultra-short dropped); "route" (build 263) names the
+route(s) that carried the successful chunks ("tunnel",
+"direct", or "tunnel+direct" if the tunnel died mid-job).
+ANY failure raises GroqError with a machine-readable
+.kind (and .route); the caller (transcribe.py) falls back
+to local whisper and records the kind.
 """
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
+from . import tunnel
 from .common import PROJECT_ROOT, probe_duration, run
 
 _API_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -54,12 +77,38 @@ _STATUS_NAME = ".groq_last_status"
 class GroqError(RuntimeError):
     """A Groq failure with a machine-readable `kind`:
     http_429 / http_401 / http_403 / http_5xx / http_other /
-    network / bad_response / empty / no_key."""
+    network / bad_response / empty / no_key. Build 263 adds
+    `route`: the route of the decisive attempt ("tunnel" /
+    "direct", "" when no attempt was made, e.g. no_key)."""
 
     def __init__(self, kind, detail=""):
         super().__init__(f"groq {kind}: {detail}"[:300])
         self.kind = kind
         self.detail = str(detail)[:200]
+        self.route = ""
+
+
+class _ProxyLayerError(Exception):
+    """A proxied attempt died AT the proxy layer (connection
+    refused / proxy error / connect timeout to the local
+    127.0.0.1:18119 proxy): Groq never saw the request, so the
+    one direct retry in _post_transcription is safe. Any other
+    transport failure is a plain GroqError("network") — the
+    request may have reached Groq, so no retry."""
+
+
+# Per-thread log of the current transcribe_audio call's chunk
+# attempts ("tunnel:ok", "tunnel:proxy", "direct:http_403", …)
+# — jobs run in parallel threads, and each job's breadcrumb /
+# report must describe ITS OWN attempts only.
+_ATTEMPTS = threading.local()
+
+
+def _attempts():
+    lst = getattr(_ATTEMPTS, "list", None)
+    if lst is None:
+        lst = _ATTEMPTS.list = []
+    return lst
 
 
 def _env_file_value(key):
@@ -89,40 +138,62 @@ def get_model():
     return model if model in MODELS else DEFAULT_MODEL
 
 
-def _note_status(ok, detail):
+def _note_status(ok, detail, route=""):
     """Last-outcome breadcrumb for the Admin card (mirrors
     openai_translate._note_error, but successes are noted too —
-    the card shows the last Groq success OR failure)."""
+    the card shows the last Groq success OR failure). Build
+    263: a "route=<route>" token rides between the status word
+    and the detail when a route is known; records written
+    before 263 have no token and parse with route "" — the
+    detail text itself is unchanged either way."""
     try:
+        rec = f"{int(time.time())} {'ok' if ok else 'error'} "
+        if route:
+            rec += f"route={route} "
+        rec += str(detail)
         (PROJECT_ROOT / _STATUS_NAME).write_text(
-            f"{int(time.time())} {'ok' if ok else 'error'} "
-            f"{detail}"[:300], encoding="utf-8")
+            rec[:300], encoding="utf-8")
     except Exception:
         pass
 
 
 def last_status():
-    """{"ts": epoch, "ok": bool, "detail": str} of the most
-    recent Groq attempt, or None when there has never been one."""
+    """{"ts": epoch, "ok": bool, "detail": str, "route": str}
+    of the most recent Groq attempt, or None when there has
+    never been one. `route` (build 263) is "" for records
+    written before the field existed."""
     try:
         raw = (PROJECT_ROOT / _STATUS_NAME).read_text(
             encoding="utf-8").split(" ", 2)
+        rest = raw[2] if len(raw) > 2 else ""
+        route = ""
+        if rest.startswith("route="):
+            head, _, tail = rest.partition(" ")
+            route = head[len("route="):]
+            rest = tail
         return {"ts": int(raw[0]), "ok": raw[1] == "ok",
-                "detail": raw[2] if len(raw) > 2 else ""}
+                "detail": rest, "route": route}
     except Exception:
         return None
 
 
-def _post_transcription(chunk_path, model, language, timeout):
-    """THE HTTP seam — one multipart POST to Groq, returning the
-    parsed verbose_json payload. Raises GroqError on any HTTP or
-    transport problem. (proof259 stubs this function; everything
-    above and below it runs for real.)"""
+def _post_once(chunk_path, model, language, timeout, proxies):
+    """ONE multipart POST attempt (build 263). `proxies` is the
+    tunnel dict from tunnel.requests_proxies(), or None for a
+    direct attempt — in which case the `proxies` kwarg is
+    omitted entirely, byte-for-byte the pre-263 call. The
+    chunk file is opened per attempt, so a retry re-reads it
+    from byte 0 and the multipart body goes out intact on
+    whichever route carries the attempt. Returns the parsed
+    verbose_json payload; raises GroqError on any HTTP error
+    or non-proxy transport problem, and _ProxyLayerError when
+    a PROXIED attempt died at the proxy layer (the local proxy
+    refused / errored / the connect timed out — with a proxy
+    in play the connect phase targets 127.0.0.1:18119, so no
+    HTTP request ever reached Groq)."""
     import requests
 
     key = get_api_key()
-    if not key:
-        raise GroqError("no_key")
     chunk_path = Path(chunk_path)
     mime = "audio/mpeg" if chunk_path.suffix == ".mp3" else "audio/wav"
     data = [("model", model),
@@ -131,14 +202,22 @@ def _post_transcription(chunk_path, model, language, timeout):
             ("timestamp_granularities[]", "word")]
     if language:
         data.append(("language", language))
+    kwargs = {}
+    if proxies:
+        kwargs["proxies"] = proxies
     try:
         with open(chunk_path, "rb") as fh:
             resp = requests.post(
                 _API_URL,
                 headers={"Authorization": f"Bearer {key}"},
                 files={"file": (chunk_path.name, fh, mime)},
-                data=data, timeout=timeout)
-    except Exception as e:  # DNS / connect / read timeout / TLS
+                data=data, timeout=timeout, **kwargs)
+    except (requests.exceptions.ProxyError,
+            requests.exceptions.ConnectTimeout) as e:
+        if proxies:
+            raise _ProxyLayerError(str(e)[:150]) from e
+        raise GroqError("network", e) from e
+    except Exception as e:  # DNS / read timeout / TLS / reset
         raise GroqError("network", e) from e
     if resp.status_code == 429:
         raise GroqError("http_429", resp.text[:150])
@@ -154,6 +233,53 @@ def _post_transcription(chunk_path, model, language, timeout):
         return resp.json()
     except Exception as e:
         raise GroqError("bad_response", f"unparseable JSON: {e}") from e
+
+
+def _post_transcription(chunk_path, model, language, timeout):
+    """THE HTTP seam — the routed transcription POST, returning
+    the parsed verbose_json payload. Raises GroqError on any
+    failure. (proof259 stubs this function; everything above
+    and below it runs for real.)
+
+    Build 263 routing (see the module docstring): the tunnel
+    route goes FIRST while the tunnel is verified up — via
+    tunnel.requests_proxies(), the same helper
+    tunnel.request_kwargs() wraps for the Gemini/OpenAI
+    clients (request_kwargs itself cannot express the forced
+    direct retry below, so the routing reads the helper
+    directly). Exactly ONE direct attempt follows a
+    proxy-layer failure; a Groq answer on the tunnel route —
+    any HTTP status — is final for this chunk, as is a
+    non-proxy transport failure there. Tunnel not verified ->
+    the direct route only. Every attempt is logged to the
+    per-thread attempt list for the breadcrumb/report."""
+    if not get_api_key():
+        raise GroqError("no_key")
+    attempts = _attempts()
+    proxies = tunnel.requests_proxies()
+    if proxies:
+        try:
+            payload = _post_once(chunk_path, model, language,
+                                 timeout, proxies)
+        except _ProxyLayerError:
+            attempts.append("tunnel:proxy")
+            # fall through to the single direct attempt
+        except GroqError as e:
+            attempts.append(f"tunnel:{e.kind}")
+            e.route = "tunnel"
+            raise
+        else:
+            attempts.append("tunnel:ok")
+            return payload
+    try:
+        payload = _post_once(chunk_path, model, language,
+                             timeout, None)
+    except GroqError as e:
+        attempts.append(f"direct:{e.kind}")
+        e.route = "direct"
+        raise
+    attempts.append("direct:ok")
+    return payload
 
 
 def _windows(duration):
@@ -211,11 +337,20 @@ def _clean(items, offset, keep_before, text_key, min_dur):
 def transcribe_audio(wav_path, workdir, language=None):
     """Transcribe a wav file via Groq. Returns the contract
     dict from the module docstring. Raises GroqError on ANY
-    failure — the caller falls back to local whisper."""
+    failure — the caller falls back to local whisper. On
+    failure the breadcrumb additionally records the decisive
+    attempt's route and a compact per-attempt outcome list
+    (build 263)."""
+    _attempts().clear()
     try:
         return _transcribe_audio(wav_path, Path(workdir), language)
     except GroqError as e:
-        _note_status(False, f"{e.kind} {e.detail}"[:200])
+        detail = f"{e.kind} {e.detail}"[:170]
+        att = ",".join(_attempts())
+        if att:
+            detail += f" | attempts: {att}"
+        _note_status(False, detail[:260],
+                     route=getattr(e, "route", ""))
         raise
 
 
@@ -272,10 +407,16 @@ def _transcribe_audio(wav_path, workdir, language):
     words.sort(key=lambda w: w["start"])
     if not segments:
         raise GroqError("empty", "groq returned no usable segments")
-    _note_status(True, model)
+    ok_routes = []
+    for a in _attempts():
+        r, _, outcome = a.partition(":")
+        if outcome == "ok" and r not in ok_routes:
+            ok_routes.append(r)
+    route = "+".join(ok_routes)
+    _note_status(True, model, route=route)
     return {"segments": segments, "words": words,
             "language": language_out, "duration": round(duration_out, 3),
-            "model": model, "chunks": len(wins)}
+            "model": model, "chunks": len(wins), "route": route}
 
 
 if __name__ == "__main__":
