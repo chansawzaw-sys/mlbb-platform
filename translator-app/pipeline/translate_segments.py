@@ -118,6 +118,51 @@ shipping source-language subtitles):
      story-so-far lines, which already show each recent
      name's rendering in place.
 
+  Build 265 (owner complaint 2026-11-27: on a 2 h job the
+     translate stage took 51:49 — 12 chunks walked strictly
+     one after another at ~4:19 each, now the largest stage
+     since Groq fixed transcription in build 263): chunked
+     jobs translate their chunks with BOUNDED CONCURRENCY —
+     TRANSLATE_CHUNK_PARALLEL chunks in flight (default 3,
+     hard cap 4, read once at import like the chain gate;
+     1 restores the pre-265 serial walk byte for byte, and
+     a single-chunk job is always the old path). Chunk 0
+     still runs first and alone (context-free, exactly as
+     before) to seed the glossary. Each later chunk, when
+     it STARTS, snapshots its completed predecessors (in
+     index order) and builds the same carry-over context
+     the serial walk would have used over that subset —
+     story-so-far pairs plus established-names pins; when
+     its immediate predecessor has not finished, the
+     predecessor's SOURCE-side tail is appended (labelled
+     source-only) so the story thread is never missing.
+     The coherence trade-off is honest: a chunk cannot see
+     predecessors that are still in flight, so a name first
+     rendered by two parallel chunks could diverge before
+     either pins it. The invariant — one source name, one
+     Burmese form, in EVERY chunk — is therefore enforced
+     after the merge by _glossary_consistency_pass: the
+     build-252 elimination run job-wide finds every form a
+     name is actually rendered in; the earliest chunk's
+     form wins and losing forms are replaced whole-token,
+     only inside segments whose source contains the name.
+     The pass is recorded in translate_report.json
+     ("glossary_pass"), as is each chunk's wall time and
+     the predecessors its context came from ("ctx_from").
+     One chunk's failure never stalls or cancels the
+     others: the walk's own rescue/fallback shapes stay
+     inside the chunk, an unexpected worker error degrades
+     that chunk alone to the rescue rebuild (then to
+     fallback-source entries), and run_job's guard judges
+     the merged result exactly as before. Per-chunk calls
+     stay sequential inside a chunk (batch, then fill, then
+     rescue), so in-flight OpenAI calls never exceed the
+     chunk bound — no retry storm. The per-segment rescue
+     is deliberately NOT batched: on the success path the
+     batch call carries the chunk and rescue only fills
+     gaps, and the rescue tail is shared verbatim with the
+     legacy gate, whose behaviour build 264 froze.
+
 CLI: python -m pipeline.translate_segments <workdir>
 Reads segments_en.json, writes segments_my.json + subs_my.srt (original timings).
 """
@@ -125,7 +170,9 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .common import (PROJECT_ROOT, ensure_system_ca, load_segments,
@@ -168,6 +215,52 @@ def chain_mode():
     the Admin card can show what is actually live versus
     what is saved for the next start)."""
     return _CHAIN
+
+
+# --- Build 265: the chunk-concurrency knob -------------------
+# TRANSLATE_CHUNK_PARALLEL — how many chunks of a chunked
+# job may be in flight at once. Read ONCE at import from
+# the process env, falling back to the project .env — the
+# same two sources, in the same order, as the chain gate
+# above — so a change takes effect on the next app start,
+# never mid-job. Default 3, hard cap 4: enough to collapse
+# the serial wall time (the 51:49 of the 2026-11-27 2 h
+# job), small enough that OpenAI rate-limit pressure and
+# the tunnel stay calm. 1 = the pre-265 serial walk.
+# Junk values fall back to the default rather than failing
+# a job over a config typo.
+
+def _read_chunk_parallel():
+    raw = (os.environ.get("TRANSLATE_CHUNK_PARALLEL")
+           or "").strip()
+    if not raw:
+        try:
+            env_file = PROJECT_ROOT / ".env"
+            if env_file.exists():
+                for line in env_file.read_text(
+                        encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line.startswith(
+                            "TRANSLATE_CHUNK_PARALLEL="):
+                        raw = line.split("=", 1)[1].strip() \
+                            .strip('"').strip("'")
+                        break
+        except Exception:
+            raw = ""
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 3
+    return max(1, min(4, n))
+
+
+_CHUNK_PARALLEL = _read_chunk_parallel()
+
+
+def chunk_parallel():
+    """The chunk concurrency this process booted with
+    (1..4; diagnostics/proofs, like chain_mode)."""
+    return _CHUNK_PARALLEL
 
 
 # --- The per-segment LLM rescue (build 231) -------------------
@@ -1021,6 +1114,279 @@ def _merge_counts(dst, src):
             d["last"] = r["last"]
 
 
+def _run_one_chunk(chunk, style, admin=False, context=None):
+    """ONE chunk's walk + integrity rebuild (build 248,
+    extracted verbatim in build 265 so the serial loop and
+    the parallel workers share it): returns (out, crep)
+    with exactly len(chunk) entries in input order —
+    segment integrity is absolute, so if the walk's output
+    ever breaks exact count/order against its input, the
+    chunk is rebuilt per-segment through the rescue (exact
+    by construction) instead of accepting a shifted list,
+    and the rebuild is recorded as crep["chunk_rescue"]."""
+    out, crep = _walk_batch(chunk, style, admin=admin,
+                            context=context)
+    if len(out) != len(chunk) or any(
+            (o.get("text") or "") != (c.get("text") or "")
+            or o.get("start") != c.get("start")
+            or o.get("end") != c.get("end")
+            for o, c in zip(out, chunk)):
+        rescue = _Rescue(style, admin=admin, context=context)
+        fixed = []
+        for seg in chunk:
+            if not (seg.get("text") or "").strip():
+                fixed.append({**seg, "text_my": "",
+                              "provider": "empty"})
+            else:
+                _my, _prov = rescue.one(seg)
+                fixed.append({**seg, "text_my": _my,
+                              "provider": _prov})
+        crep["chunk_rescue"] = rescue.report
+        out = fixed
+    return out, crep
+
+
+def _chunk_entry(ci, offset, chunk, out, crep, context,
+                 extra=None):
+    """One chunk's translate_report.json entry (build 248
+    shape; build 265: `extra` carries the parallel path's
+    additive fields — the serial path passes none, so its
+    entries keep the old shape exactly)."""
+    providers = {}
+    for o in out:
+        if (o.get("text") or "").strip():
+            p = o.get("provider") or ""
+            providers[p] = providers.get(p, 0) + 1
+    winner = max(providers, key=providers.get) \
+        if providers else ""
+    entry = {
+        "index": ci,
+        "seg_from": offset,
+        "seg_to": offset + len(chunk),
+        "count": len(chunk),
+        "start_s": chunk[0].get("start"),
+        "end_s": chunk[-1].get("end"),
+        "context": bool(context),
+        "winner": winner,
+        "providers": providers,
+        "walk": crep,
+    }
+    if extra:
+        entry.update(extra)
+    return entry
+
+
+# --- Build 265: the parallel chunk machinery -----------------
+
+def _parallel_context(ci, chunks, preds, results):
+    """The carry-over context for a parallel chunk: the
+    serial walk's context (_chunk_context: story-so-far
+    pairs + established-names pins, from
+    _established_name_entries) computed over the chunk's
+    COMPLETED predecessors only — `preds` is their index
+    list in order, `results` maps index -> (out, crep,
+    meta) for them; stored outputs are never mutated
+    before the merge, so this reads them lock-free. When
+    the immediate predecessor (ci - 1) is NOT among them,
+    its SOURCE-side tail is appended as a clearly labelled
+    source-only block, so the story thread is present even
+    while that chunk is still in flight. Returns None when
+    there is nothing to carry at all."""
+    done_out = []
+    glossary_found = {}
+    history = []
+    for i in preds:
+        cout = results[i][0]
+        for c, o in zip(chunks[i], cout):
+            _glossary_add(glossary_found, c.get("text"))
+            history.append((_name_candidates(c.get("text")),
+                            _burmese_tokens(o.get("text_my"))))
+        done_out.extend(cout)
+    name_entries = _established_name_entries(
+        history, list(glossary_found))[:_GLOSSARY_MAX]
+    parts = []
+    base = _chunk_context(done_out, name_entries)
+    if base:
+        parts.append(base)
+    if ci - 1 not in preds:
+        tail = [s for s in chunks[ci - 1]
+                if (s.get("text") or "").strip()][-_CONTEXT_TAIL:]
+        if tail:
+            lines = ["Previous lines in the original — the "
+                     "part immediately before yours, not yet "
+                     "translated when this request was made "
+                     "(background ONLY for story flow: do "
+                     "not translate this block and do not "
+                     "include any of it in your output):"]
+            for s in tail:
+                lines.append("- " + (s.get("text") or "").strip())
+            parts.append("\n".join(lines))
+    if not parts:
+        return None
+    return "\n".join(parts)[:_CONTEXT_MAX_CHARS]
+
+
+def _glossary_consistency_pass(pairs):
+    """Post-merge glossary consistency (build 265) — the
+    parallel scheme's guarantee that ONE source name ends
+    up in ONE Burmese form in EVERY chunk. `pairs` is the
+    full (source_seg, out_seg) list in segment order; the
+    out_segs are mutated in place where a form is replaced.
+
+    For each established name (first-appearance order,
+    capped at _GLOSSARY_MAX like the context glossary), the
+    candidate forms come from the build-252 elimination
+    run job-wide: Burmese tokens that appear in a rendering
+    of a segment containing the name and in NO rendering of
+    a segment without it, minus the grammatical stoplist
+    and minus forms already claimed as an earlier name's
+    winner (the build-252 claimed-forms rule). Zero or
+    one candidate = nothing to reconcile (already
+    consistent, or the form cannot be isolated — left
+    alone rather than guessed at). A name appearing in
+    EVERY segment is skipped outright: with no contrast
+    set the elimination cannot isolate its form at all.
+    Two or more = parallel chunks rendered the name
+    differently before either could pin it: the form used
+    by the EARLIEST segment in chunk order wins (the same
+    first-wins rule the serial glossary applies), and
+    every losing candidate token is replaced by the
+    winner — whole-token only, and only inside segments
+    whose source contains the name.
+    Returns (pins, replaced) for the report."""
+    glossary_found = {}
+    for c, _o in pairs:
+        _glossary_add(glossary_found, c.get("text"))
+    names = list(glossary_found)[:_GLOSSARY_MAX]
+    src_names = [_name_candidates(c.get("text"))
+                 for c, _o in pairs]
+    pins = {}
+    replaced = {}
+    claimed = set()
+    for name in names:
+        with_idx = [i for i, ns in enumerate(src_names)
+                    if name in ns]
+        if not with_idx or len(with_idx) == len(pairs):
+            continue
+        a = set()
+        for i in with_idx:
+            a.update(_burmese_tokens(pairs[i][1].get("text_my")))
+        b = set()
+        for i, ns in enumerate(src_names):
+            if name not in ns:
+                b.update(_burmese_tokens(pairs[i][1].get("text_my")))
+        cand = a - b - _NAME_FORM_STOP - claimed
+        if len(cand) < 2:
+            continue
+        winner = None
+        for i in with_idx:
+            for t in _burmese_tokens(pairs[i][1].get("text_my")):
+                if t in cand:
+                    winner = t
+                    break
+            if winner:
+                break
+        if winner is None:
+            continue
+        pins[name] = winner
+        claimed.add(winner)
+        for loser in sorted(cand - {winner}):
+            n = 0
+            for i in with_idx:
+                o = pairs[i][1]
+                if loser in _burmese_tokens(o.get("text_my")):
+                    o["text_my"] = _MY_TOKEN.sub(
+                        lambda m: winner
+                        if m.group(0) == loser else m.group(0),
+                        o.get("text_my") or "")
+                    n += 1
+            if n:
+                replaced[loser] = replaced.get(loser, 0) + n
+    return pins, replaced
+
+
+def _run_chunks_parallel(chunks, style, admin=False):
+    """Translate every chunk of a multi-chunk job with
+    _CHUNK_PARALLEL chunks in flight (build 265). Returns
+    (results, pass_info): results maps chunk index ->
+    (out, crep, meta) with meta {"secs", "ctx_from",
+    "context"}; pass_info is the consistency pass's
+    {"pins", "replaced"} record. Chunk 0 runs first, alone
+    and context-free — the serial seed. A worker NEVER
+    raises: the walk's own failure shapes stay inside its
+    chunk, and an unexpected error degrades that chunk
+    alone to the rescue rebuild, then to fallback-source
+    entries — the merged list is always complete and in
+    order, and run_job's guard judges it as before."""
+    lock = threading.Lock()
+    done = set()
+    results = {}
+
+    def run_chunk(ci, context):
+        t0 = time.time()
+        try:
+            out, crep = _run_one_chunk(
+                chunks[ci], style, admin=admin, context=context)
+        except Exception as e:
+            crep = {"parallel_error": str(e)[:120]}
+            try:
+                rescue = _Rescue(style, admin=admin,
+                                 context=context)
+                out = []
+                for seg in chunks[ci]:
+                    if not (seg.get("text") or "").strip():
+                        out.append({**seg, "text_my": "",
+                                    "provider": "empty"})
+                    else:
+                        _my, _prov = rescue.one(seg)
+                        out.append({**seg, "text_my": _my,
+                                    "provider": _prov})
+                crep["chunk_rescue"] = rescue.report
+            except Exception as e2:
+                crep["parallel_error2"] = str(e2)[:120]
+                out = []
+                for seg in chunks[ci]:
+                    if (seg.get("text") or "").strip():
+                        out.append({
+                            **seg, "text_my": seg.get("text") or "",
+                            "provider": "fallback-source "
+                                        "(parallel worker failed)"})
+                    else:
+                        out.append({**seg, "text_my": "",
+                                    "provider": "empty"})
+        return out, crep, round(time.time() - t0, 3)
+
+    out0, crep0, secs0 = run_chunk(0, None)
+    results[0] = (out0, crep0, {"secs": secs0, "ctx_from": [],
+                                "context": False})
+    done.add(0)
+
+    def worker(ci):
+        with lock:
+            preds = sorted(i for i in done if i < ci)
+            snap = {i: results[i] for i in preds}
+        try:
+            context = _parallel_context(ci, chunks, preds, snap)
+        except Exception:
+            context = None
+        out, crep, secs = run_chunk(ci, context)
+        with lock:
+            results[ci] = (out, crep, {"secs": secs,
+                                       "ctx_from": preds,
+                                       "context": bool(context)})
+            done.add(ci)
+
+    if len(chunks) > 1:
+        with ThreadPoolExecutor(
+                max_workers=_CHUNK_PARALLEL) as ex:
+            list(ex.map(worker, range(1, len(chunks))))
+    pairs = []
+    for ci, chunk in enumerate(chunks):
+        pairs.extend(zip(chunk, results[ci][0]))
+    pins, replaced = _glossary_consistency_pass(pairs)
+    return results, {"pins": pins, "replaced": replaced}
+
+
 def translate_segments(workdir, style="subs", admin=False):
     ensure_system_ca()
     workdir = Path(workdir)
@@ -1030,60 +1396,46 @@ def translate_segments(workdir, style="subs", admin=False):
     report = {"rescue": {}, "fill": {}}
     chunk_entries = []
     out_all = []
+    offset = 0
+    if not single and _CHUNK_PARALLEL > 1:
+        # Build 265: bounded-concurrency chunk translation.
+        # Assembly is in chunk order and the report merging
+        # matches the serial multi-chunk branch exactly; the
+        # parallel path only adds its additive fields.
+        results, pass_info = _run_chunks_parallel(
+            chunks, style, admin=admin)
+        report["parallel"] = {"workers": _CHUNK_PARALLEL,
+                              "chunks": len(chunks)}
+        report["glossary_pass"] = pass_info
+        for ci, chunk in enumerate(chunks):
+            out, crep, meta = results[ci]
+            chunk_entries.append(_chunk_entry(
+                ci, offset, chunk, out, crep, meta["context"],
+                extra={"secs": meta["secs"], "parallel": True,
+                       "ctx_from": meta["ctx_from"]}))
+            for sec in ("rescue", "fill", "fill2"):
+                if crep.get(sec):
+                    _merge_counts(report.setdefault(sec, {}),
+                                  crep[sec])
+            out_all.extend(out)
+            offset += len(chunk)
+        report["chunked"] = True
+        report["chunks"] = chunk_entries
+        _write_report(workdir, report)
+        save_segments(out_all, workdir / "segments_my.json")
+        write_srt(out_all, workdir / "subs_my.srt")
+        return out_all
     glossary_found = {}
     history = []
-    offset = 0
     for ci, chunk in enumerate(chunks):
         name_entries = _established_name_entries(
             history, list(glossary_found))[:_GLOSSARY_MAX]
         context = None if ci == 0 else _chunk_context(
             out_all, name_entries)
-        out, crep = _walk_batch(chunk, style, admin=admin,
-                                context=context)
-        # Segment integrity is absolute (build 248): the
-        # chunk's output is validated for exact count and
-        # order against its input BEFORE acceptance. The
-        # walk's contract already guarantees this; if it is
-        # ever broken, rebuild the chunk per-segment through
-        # the rescue (whose output is exact by construction)
-        # instead of accepting a shifted list.
-        if len(out) != len(chunk) or any(
-                (o.get("text") or "") != (c.get("text") or "")
-                or o.get("start") != c.get("start")
-                or o.get("end") != c.get("end")
-                for o, c in zip(out, chunk)):
-            rescue = _Rescue(style, admin=admin,
-                             context=context)
-            fixed = []
-            for seg in chunk:
-                if not (seg.get("text") or "").strip():
-                    fixed.append({**seg, "text_my": "",
-                                  "provider": "empty"})
-                else:
-                    _my, _prov = rescue.one(seg)
-                    fixed.append({**seg, "text_my": _my,
-                                  "provider": _prov})
-            crep["chunk_rescue"] = rescue.report
-            out = fixed
-        providers = {}
-        for o in out:
-            if (o.get("text") or "").strip():
-                p = o.get("provider") or ""
-                providers[p] = providers.get(p, 0) + 1
-        winner = max(providers, key=providers.get) \
-            if providers else ""
-        chunk_entries.append({
-            "index": ci,
-            "seg_from": offset,
-            "seg_to": offset + len(chunk),
-            "count": len(chunk),
-            "start_s": chunk[0].get("start"),
-            "end_s": chunk[-1].get("end"),
-            "context": bool(context),
-            "winner": winner,
-            "providers": providers,
-            "walk": crep,
-        })
+        out, crep = _run_one_chunk(chunk, style, admin=admin,
+                                   context=context)
+        chunk_entries.append(_chunk_entry(
+            ci, offset, chunk, out, crep, context))
         if single:
             # One chunk = the pre-248 job: the top-level
             # report is exactly the walk's report, as before.
