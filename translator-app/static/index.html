@@ -4750,11 +4750,29 @@ function timingLineHtml(job) {
   const parts = [];
   for (const [k, label] of TIMING_LABELS)
     if (t[k] != null) parts.push(T(label) + " " + fmtStageS(t[k]));
-  if (!parts.length) return "";
   let tail = "";
   if (t.queue_s) tail += T(" · တန်းစီ ") + fmtStageS(t.queue_s);
   if (t.total_s != null) tail += T(" · စုစုပေါင်း ") + fmtStageS(t.total_s);
-  return `<div class="timingLine">⏱ ${parts.join(" · ")}${tail}</div>`;
+  let html = parts.length
+    ? `<div class="timingLine">⏱ ${parts.join(" · ")}${tail}</div>` : "";
+  // Build 266: recorded part-failure notes (admin views only —
+  // the server attaches part_failures solely for admins), one
+  // line per failed part attempt under the timings.
+  const pf = (job && job.part_failures) || [];
+  const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g,
+    c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;",
+           "'": "&#39;"}[c]));
+  for (const f of pf) {
+    const d = new Date((Number(f.at) || 0) * 1000);
+    const hm = isNaN(d.getTime()) ? "" :
+      String(d.getHours()).padStart(2, "0") + ":" +
+      String(d.getMinutes()).padStart(2, "0");
+    html += `<div class="timingLine">⚠ အပိုင်း ${esc(f.part)} · `
+      + `${esc(f.stage)} · ${esc(f.error_class)} · ${hm}`
+      + (f.short_message ? ` — ${esc(f.short_message)}` : "")
+      + `</div>`;
+  }
+  return html;
 }
 
 // Build 198: the compact copy is generated lazily on the first
@@ -7095,6 +7113,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 265</p>
+<p class="hint" id="buildTag" style="text-align:center">build 266</p>
 </body>
 </html>

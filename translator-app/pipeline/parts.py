@@ -35,13 +35,44 @@ whole text):
     copy; the result is probe-validated against the sum of the
     parts and a re-encode fallback covers any parameter drift.
 
-Attempts: there is deliberately NO extra retry loop here. A part
-failure fails the job attempt through the existing honest path
-(zero charge — charging lives in app.py's _finish, which an
-exception never reaches), the completed parts stay on disk, and
-build 246's job-level auto-resume cap (3) governs how often the
-job comes back. Per part, that is the same spirit as 246's caps:
-bounded, honest, never a silent whole-job restart loop.
+Attempts (build 260): there was deliberately NO extra retry
+loop — a part failure failed the job attempt through the
+existing honest path (zero charge — charging lives in app.py's
+_finish, which an exception never reaches), the completed parts
+stayed on disk, and build 246's job-level auto-resume cap (3)
+governed how often the job came back.
+
+Build 266 (owner approved 2026-11-27) supersedes that paragraph
+— the live evidence: a 2-hour job's stage totals DECREASED
+between two progress screenshots (render 23:50 -> 19:25) because
+each attempt re-initialised the stage totals and reported only
+the parts that ran in THAT attempt, so ~80 minutes of stage work
+stretched past 3.5 hours and the owner could not tell progress
+from looping; and no part failure recorded its reason anywhere.
+Now:
+
+  * A failed part is retried IN PLACE up to PART_MAX_ATTEMPTS
+    total attempts (1 + 2 retries) before the failure escalates
+    to the same honest job-level path as before. A retry reuses
+    the part dir, so run_phase2's own build-246 gates skip the
+    part stages that already landed — a retry never re-buys a
+    finished stage, and a completed part is still NEVER
+    re-encoded. Cancel/shutdown interrupts are never retried.
+  * Every failed part attempt appends a structured note to
+    part_failures.json in the job dir ({part, stage,
+    error_class, short_message, at, attempt}) — the same
+    durable store family as the checkpoints, so the notes
+    survive restarts. app.py surfaces them to admins only in
+    the job views; customers keep the polite messages.
+  * Stage totals ACCUMULATE across attempts and resumes in
+    parts/accum.json (seeded once from job.json's phase_s for
+    a pre-266 job that resumes under this build), so a reported
+    stage total can never be lower than a previously reported
+    one for the same job.
+  * Before each part attempt, a disk floor guard
+    (DISK_FLOOR_BYTES) fails the attempt immediately with the
+    recorded reason "disk_low" instead of dying obscurely
+    mid-encode. Diagnostic only — it never deletes anything.
 
 Segment assignment: a segment belongs to the part containing
 its START; its end is clamped to that part's end. A line that
@@ -59,6 +90,16 @@ from .common import (PROJECT_ROOT, load_segments, probe_duration,
                      probe_streams, run, save_segments, write_srt)
 
 PART_SECONDS = 600
+# Build 266: total attempts per part within one part-mode run
+# (the first try plus two in-place retries) before the failure
+# escalates to build 246's job-level path.
+PART_MAX_ATTEMPTS = 3
+# Build 266: free-space floor on the job-data filesystem,
+# checked before every part attempt. Below it the attempt fails
+# fast with the recorded reason "disk_low" instead of dying
+# obscurely mid-encode. A diagnostic guard, not a cleanup
+# feature — nothing is ever deleted to satisfy it.
+DISK_FLOOR_BYTES = 3 * 1024 * 1024 * 1024
 DEFAULT_THRESHOLD_SECONDS = 900
 # A part (or the concat) counts as complete when its probed
 # duration is within this many seconds of the expected value —
@@ -253,6 +294,137 @@ def _probe(path):
         return 0.0
 
 
+# ---------- build 266: failure notes, accumulated totals, disk floor
+
+FAILURES_NAME = "part_failures.json"
+ACCUM_NAME = "accum.json"
+
+
+class DiskLowError(Exception):
+    """The disk floor guard tripped. Recorded with the stable
+    error_class "disk_low" (never the class name) so the owner
+    sees the reason, not an exception type."""
+
+
+def _free_bytes(path):
+    """Free bytes on the filesystem holding `path` (a separate
+    seam so proofs can stub the floor without filling a disk)."""
+    return shutil.disk_usage(path).free
+
+
+def _check_disk(workdir):
+    free = _free_bytes(workdir)
+    if free < DISK_FLOOR_BYTES:
+        raise DiskLowError(
+            f"disk space low: {free // (1024 * 1024)} MB free "
+            f"(floor {DISK_FLOOR_BYTES // (1024 * 1024)} MB)")
+
+
+def _write_json_atomic(path, data):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def load_failures(workdir):
+    """The job's recorded part-failure notes ([] when none).
+    Read by app.py for the admin job views and by proofs."""
+    try:
+        notes = json.loads((Path(workdir) / FAILURES_NAME)
+                           .read_text(encoding="utf-8"))
+        return notes if isinstance(notes, list) else []
+    except Exception:
+        return []
+
+
+def _record_failure(workdir, *, part, stage, exc, attempt):
+    """Append ONE structured note for a failed part attempt.
+    short_message is the exception's text with whitespace
+    collapsed, capped at 200 chars — no stack traces, and the
+    pipeline's own error strings carry no secrets. A note that
+    cannot be written must never mask the real failure, so
+    write errors are swallowed."""
+    if isinstance(exc, DiskLowError):
+        error_class = "disk_low"
+    else:
+        error_class = type(exc).__name__ or "Error"
+    note = {"part": part, "stage": stage,
+            "error_class": error_class,
+            "short_message": " ".join(str(exc).split())[:200],
+            "at": time.time(), "attempt": attempt}
+    try:
+        notes = load_failures(workdir)
+        notes.append(note)
+        _write_json_atomic(Path(workdir) / FAILURES_NAME, notes)
+    except Exception:
+        pass
+    return note
+
+
+def _stage_label(step):
+    """Presentation stage for a failure note: the part's own
+    step keys fold the way the timings do — tts stays "tts",
+    the encode side (retime / finalize / nothing announced
+    yet, e.g. the disk guard) reads "render"."""
+    return "tts" if step == "tts" else "render"
+
+
+def _load_accum(workdir, n_parts):
+    """Accumulated part-mode totals (build 266): stage seconds,
+    per-part wall seconds, concat seconds and per-part attempt
+    counters, persisted in parts/accum.json so they survive
+    kills and build-246 resumes. A pre-266 job resuming under
+    this build has no accum file — seed the stage totals ONCE
+    from job.json's phase_s (the last totals the old code
+    reported), so the accumulated series continues from what
+    the owner already saw instead of restarting below it."""
+    base = {"stage_secs": {"tts": 0.0, "retime": 0.0,
+                           "finalize": 0.0},
+            "part_secs": [0.0] * n_parts,
+            "concat_secs": 0.0, "attempts": {}}
+    path = Path(workdir) / "parts" / ACCUM_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        try:
+            ph = json.loads((Path(workdir) / "job.json")
+                            .read_text(encoding="utf-8")) \
+                .get("phase_s") or {}
+            for k in base["stage_secs"]:
+                if isinstance(ph.get(k), (int, float)):
+                    base["stage_secs"][k] = float(ph[k])
+        except Exception:
+            pass
+        return base
+    ss = data.get("stage_secs") or {}
+    for k in base["stage_secs"]:
+        if isinstance(ss.get(k), (int, float)):
+            base["stage_secs"][k] = float(ss[k])
+    ps = data.get("part_secs") or []
+    for i in range(min(n_parts, len(ps))):
+        if isinstance(ps[i], (int, float)):
+            base["part_secs"][i] = float(ps[i])
+    if isinstance(data.get("concat_secs"), (int, float)):
+        base["concat_secs"] = float(data["concat_secs"])
+    att = data.get("attempts") or {}
+    if isinstance(att, dict):
+        base["attempts"] = {str(k): int(v) for k, v in att.items()
+                            if isinstance(v, (int, float))}
+    return base
+
+
+def _save_accum(workdir, accum):
+    try:
+        path = Path(workdir) / "parts" / ACCUM_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(path, accum)
+    except Exception:
+        pass
+
+
 def _part_done(workdir, pdir, part_file, mode, w0, w1):
     """A part counts as done ONLY when its job-dir encode exists
     and probes within tolerance of the part's expected duration:
@@ -398,67 +570,121 @@ def run_phase2_parts(workdir, *, mode, phase2, progress=None, fx=None,
         _say("retime", "running")
         _say("finalize", "running")
 
+    # Build 266: totals accumulate across attempts and resumes
+    # (parts/accum.json) — the values reported at the end are
+    # the accumulated series, never just this run's slice, so a
+    # stage total can never drop below a previously reported
+    # one. part_secs[i] likewise accumulates per part.
+    accum = _load_accum(workdir, len(windows))
+    stage_secs = accum["stage_secs"]
+    part_secs = accum["part_secs"]
     part_files = []
-    part_secs = []
-    stage_secs = {"tts": 0.0, "retime": 0.0, "finalize": 0.0}
-    concat_secs = 0.0
     for i, (w0, w1) in enumerate(windows):
         pdir = workdir / "parts" / f"part_{i:02d}"
         part_file = workdir / f"part_{i:02d}.mp4"
         part_files.append(part_file)
         if _part_done(workdir, pdir, part_file, mode, w0, w1):
-            part_secs.append(0.0)  # no work done this attempt
-            continue
-        _prepare_part_dir(workdir, pdir, src, segs, mode, w0, w1)
+            continue  # completed parts are NEVER re-encoded
         fx_part = slice_fx_pieces(fx, w0, w1) if mode != "subs" \
             else rebase_fx_pieces(fx, w0, w1)
-        captured = {}
+        # Build 266: in-place retries — a failed part is retried
+        # here (reusing the part dir and run_phase2's own stage
+        # gates) up to PART_MAX_ATTEMPTS total attempts, every
+        # failure recorded, before the last error escalates to
+        # the job-level path exactly as build 260 raised it.
+        last_exc = None
+        part_ok = False
+        for _try in range(PART_MAX_ATTEMPTS):
+            att = int(accum["attempts"].get(str(i), 0)) + 1
+            accum["attempts"][str(i)] = att
+            _save_accum(workdir, accum)
+            captured = {}
+            last_step = {"step": None}
 
-        def _part_progress(step, state, note="", phase_s=None,
-                           _cap=captured):
-            if phase_s:
-                for k, v in phase_s.items():
-                    if isinstance(v, (int, float)):
-                        _cap[k] = _cap.get(k, 0.0) + float(v)
-            # State (and the job's cancel/shutdown checks, which
-            # live in the real progress callback) still flow —
-            # the part's own phase_s stays captured, never
-            # forwarded, so a half-folded stage total can never
-            # pose as the job's.
-            _say(step, state, note)
+            def _part_progress(step, state, note="", phase_s=None,
+                               _cap=captured, _ls=last_step):
+                _ls["step"] = step
+                if phase_s:
+                    for k, v in phase_s.items():
+                        if isinstance(v, (int, float)):
+                            _cap[k] = _cap.get(k, 0.0) + float(v)
+                # State (and the job's cancel/shutdown checks,
+                # which live in the real progress callback)
+                # still flow — the part's own phase_s stays
+                # captured, never forwarded, so a half-folded
+                # stage total can never pose as the job's.
+                _say(step, state, note)
 
-        t0 = time.monotonic()
-        # parts_ok=False is load-bearing: the part dir's source
-        # is the FULL video (a hardlink), so the phase-2 gate
-        # would part the part forever without it.
-        out = phase2(pdir, mode=mode, progress=_part_progress,
-                     fx=fx_part, parts_ok=False,
-                     start_at=w0, end_at=w1,
-                     **phase2_kwargs)
-        # The part's encode lands in the job dir via temp +
-        # rename and must probe as the part it claims to be;
-        # anything else fails this attempt honestly with the
-        # completed parts left in place.
-        tmp_part = workdir / f"part_{i:02d}.tmp.mp4"
-        shutil.copyfile(out, tmp_part)
-        if not _part_done(workdir, pdir, tmp_part, mode, w0, w1):
+            t0 = time.monotonic()
             try:
-                tmp_part.unlink(missing_ok=True)
-            except Exception:
-                pass
-            raise RuntimeError(
-                f"အပိုင်း {i + 1} ထုတ်တာ မမှန်ပါ — ခဏနေမှ ပြန်စမ်းပါ "
-                "(credit လုံးဝ မဖြတ်ပါ)")
-        os.replace(tmp_part, part_file)
-        part_secs.append(round(time.monotonic() - t0, 1))
-        for k in stage_secs:
-            stage_secs[k] += captured.get(k, 0.0)
+                _check_disk(workdir)
+                _prepare_part_dir(workdir, pdir, src, segs, mode,
+                                  w0, w1)
+                # parts_ok=False is load-bearing: the part dir's
+                # source is the FULL video (a hardlink), so the
+                # phase-2 gate would part the part forever
+                # without it.
+                out = phase2(pdir, mode=mode,
+                             progress=_part_progress, fx=fx_part,
+                             parts_ok=False, start_at=w0, end_at=w1,
+                             **phase2_kwargs)
+                # The part's encode lands in the job dir via
+                # temp + rename and must probe as the part it
+                # claims to be; anything else fails the attempt
+                # honestly with the completed parts left in
+                # place.
+                tmp_part = workdir / f"part_{i:02d}.tmp.mp4"
+                shutil.copyfile(out, tmp_part)
+                if not _part_done(workdir, pdir, tmp_part, mode,
+                                  w0, w1):
+                    try:
+                        tmp_part.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"အပိုင်း {i + 1} ထုတ်တာ မမှန်ပါ — "
+                        "ခဏနေမှ ပြန်စမ်းပါ (credit လုံးဝ မဖြတ်ပါ)")
+                os.replace(tmp_part, part_file)
+            except Exception as e:
+                # The attempt's measured stage/wall time is real
+                # work — accumulate it before anything else, so
+                # the totals stay truthful even when the job
+                # level escalates or the process dies next.
+                for k in stage_secs:
+                    stage_secs[k] += captured.get(k, 0.0)
+                part_secs[i] = round(
+                    part_secs[i] + (time.monotonic() - t0), 1)
+                _save_accum(workdir, accum)
+                if type(e).__name__ in ("JobCancelled",
+                                         "_ShutdownInterrupt"):
+                    # The owner's own stop signals (raised by the
+                    # real progress callback through the part's
+                    # stages): never retried, never recorded as a
+                    # part failure.
+                    raise
+                _record_failure(workdir, part=i + 1,
+                                stage=_stage_label(last_step["step"]),
+                                exc=e, attempt=att)
+                last_exc = e
+                continue
+            for k in stage_secs:
+                stage_secs[k] += captured.get(k, 0.0)
+            part_secs[i] = round(
+                part_secs[i] + (time.monotonic() - t0), 1)
+            _save_accum(workdir, accum)
+            part_ok = True
+            break
+        if not part_ok:
+            raise last_exc
 
     t0 = time.monotonic()
     tmp_final = workdir / _rj.FINAL_TMP_NAME
     _concat_parts(workdir, part_files, tmp_final)
     os.replace(tmp_final, final)
-    concat_secs = round(time.monotonic() - t0, 1)
+    accum["concat_secs"] = round(
+        accum["concat_secs"] + (time.monotonic() - t0), 1)
+    _save_accum(workdir, accum)
+    concat_secs = accum["concat_secs"]
 
     note = {"parts": len(windows),
             "part_secs": [round(s, 1) for s in part_secs]}

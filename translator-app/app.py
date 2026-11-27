@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 265"
+BUILD_TAG = "build 266"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -7277,7 +7277,24 @@ def create_job():
     return jsonify(job)
 
 
-def _job_view(job):
+def _part_failures(jid):
+    """Build 266: the job's recorded part-failure notes —
+    pipeline.parts appends one structured note per failed part
+    attempt to part_failures.json in the job dir (the durable
+    store that survives restarts). Admin surface only: the
+    notes carry internal error text, so they are attached to a
+    view solely when the requester is an admin (or accounts
+    are not enforced, the single-user mode); a customer view
+    never carries them."""
+    try:
+        p = JOBS_DIR / str(jid) / "part_failures.json"
+        notes = json.loads(p.read_text(encoding="utf-8"))
+        return notes if isinstance(notes, list) else []
+    except Exception:
+        return []
+
+
+def _job_view(job, admin=False):
     view = {k: job.get(k) for k in
             ("id", "url", "mode", "status", "current", "error", "tg",
              "created_at", "updated_at", "finished_at", "cleanup_at",
@@ -7288,6 +7305,11 @@ def _job_view(job):
     # Build 213: per-stage timings ride the view (owner/admin
     # only ever see them — _owns gates every caller).
     view["timings"] = _timings_of(job)
+    if admin:
+        # Build 266: part-failure notes for the admin's eye.
+        notes = _part_failures(job.get("id"))
+        if notes:
+            view["part_failures"] = notes
     view["upload"] = bool(job.get("upload"))  # build 215
     if job.get("status") == "queued":
         # 1-based place among waiting jobs, so the UI/bot can SAY
@@ -7477,20 +7499,25 @@ def _scan_disk_jobs():
 def list_jobs():
     user = _current_user()
     mine = [j for j in _all_jobs() if _owns(user, j)]
-    return jsonify({"jobs": [_job_view(j) for j in mine[:10]]})
+    admin = not ACCOUNTS_ENFORCED \
+        or bool(user and user["role"] == "admin")
+    return jsonify({"jobs": [_job_view(j, admin=admin)
+                             for j in mine[:10]]})
 
 
 @app.get("/api/jobs/latest")
 def latest_job():
     user = _current_user()
+    admin = not ACCOUNTS_ENFORCED \
+        or bool(user and user["role"] == "admin")
     for j in _all_jobs():
         if not _owns(user, j):
             continue
         if j.get("status") in ("queued", "running", "waiting_review"):
-            return jsonify({"job": _job_view(j)})
+            return jsonify({"job": _job_view(j, admin=admin)})
         age = time.time() - (j.get("finished_at") or j.get("created_at") or 0)
         if age < 20 * 60:
-            return jsonify({"job": _job_view(j)})
+            return jsonify({"job": _job_view(j, admin=admin)})
         break
     return jsonify({"job": None})
 
@@ -7498,12 +7525,21 @@ def latest_job():
 @app.get("/api/jobs/<jid>")
 def get_job(jid):
     job = _load_job(jid)
-    if not job or not _owns(_current_user(), job):
+    user = _current_user()
+    if not job or not _owns(user, job):
         return jsonify({"error": "job မတွေ့ပါ"}), 404
     if job.get("status") == "queued":
         waiting = [q for q, _kind in _JOB_QUEUE]
         if jid in waiting:
             job = dict(job, queue_pos=waiting.index(jid) + 1)
+    if not ACCOUNTS_ENFORCED or (user and user["role"] == "admin"):
+        # Build 266: part-failure notes ride the detail payload
+        # for admins only, on a copy — the stored job record
+        # itself never gains the key.
+        notes = _part_failures(jid)
+        if notes:
+            job = dict(job)
+            job["part_failures"] = notes
     return jsonify(job)
 
 
