@@ -1,6 +1,34 @@
 """Step 3: translate each segment to Myanmar (Burmese).
 
-Provider walk — LLM engines only (build 231 removed the
+Build 264 (owner decision 2026-11-26): translation is
+OpenAI-ONLY. The owner's words: OpenAI in front; Gemini no
+longer translates — it stays for voice only, left in place
+so it can be switched back on conveniently later. Both the
+batch/chunk walk and the per-segment rescue now call ONLY
+pipeline/openai_translate (its own model walk —
+gpt-4o-mini -> gpt-4.1-mini, tunnel-routed — unchanged).
+Gemini / OpenRouter / xKiro leave the walk; their modules,
+keys, settings cards and the probe machinery stay in the
+tree, dormant, and Gemini TTS is untouched (Gemini leaves
+TRANSLATION only). The build-232 admin-vs-user order
+difference is gone — one walk for everyone. If OpenAI
+fails a chunk/segment after its model walk, the segments
+stay untranslated and the build-124 guard in run_job fails
+the job loudly (Burmese error, zero charge) — no engine is
+silently substituted.
+
+RE-ENABLE GATE: the pre-264 walk described below is
+preserved verbatim as _walk_batch_legacy plus the legacy
+branch of _Rescue._attempts. Setting TRANSLATE_CHAIN=legacy
+in the project env (.env or process env — also flippable
+from Admin -> the OpenAI card, via
+/api/settings/translate-chain) restores it exactly: probe
+rules, admin variant and all. The gate is read ONCE at
+import into the module constant _CHAIN, so a flip takes
+effect on the next app start. Any other value (or unset)
+means "openai", the default.
+
+Provider walk (LEGACY gate only) — LLM engines only (build 231 removed the
 literal free chain on the owner's order: its word-for-word
 output was the quality floor he rejected, so a job whose LLM
 engines all fail now fails LOUDLY with zero charge instead of
@@ -94,6 +122,7 @@ CLI: python -m pipeline.translate_segments <workdir>
 Reads segments_en.json, writes segments_my.json + subs_my.srt (original timings).
 """
 import json
+import os
 import re
 import sys
 import time
@@ -101,6 +130,44 @@ from pathlib import Path
 
 from .common import (PROJECT_ROOT, ensure_system_ca, load_segments,
                      save_segments, write_srt)
+
+
+# --- Build 264: the translation-chain gate --------------------
+# "openai" (default): the walk and the rescue call ONLY
+# pipeline/openai_translate. "legacy": the pre-264 walk,
+# preserved verbatim below. Read ONCE at import from the
+# process env, falling back to the project .env — the same
+# two sources, in the same order, as
+# openai_translate.get_api_key. A flip therefore takes
+# effect on the next app start, never mid-job.
+
+def _read_chain_gate():
+    v = (os.environ.get("TRANSLATE_CHAIN") or "").strip().lower()
+    if not v:
+        try:
+            env_file = PROJECT_ROOT / ".env"
+            if env_file.exists():
+                for line in env_file.read_text(
+                        encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line.startswith("TRANSLATE_CHAIN="):
+                        v = line.split("=", 1)[1].strip() \
+                            .strip('"').strip("'").lower()
+                        break
+        except Exception:
+            v = ""
+    return "legacy" if v == "legacy" else "openai"
+
+
+_CHAIN = _read_chain_gate()
+
+
+def chain_mode():
+    """The chain this process booted with: "openai" or
+    "legacy" (surfaced by /api/settings/translate-chain so
+    the Admin card can show what is actually live versus
+    what is saved for the next start)."""
+    return _CHAIN
 
 
 # --- The per-segment LLM rescue (build 231) -------------------
@@ -143,7 +210,10 @@ class _Rescue:
     carry-over context (when the rescue runs for a later
     chunk) rides along on every per-segment call, so a
     rescued line still lands in the established names and
-    story voice."""
+    story voice. Build 264: under the default gate the
+    rescue is OpenAI-only (see _attempts_openai); the
+    multi-engine behaviour described above is the legacy
+    gate's, preserved verbatim in _attempts_legacy."""
 
     def __init__(self, style="subs", admin=False, context=None):
         self.style = style
@@ -163,6 +233,38 @@ class _Rescue:
                 r["last"] = str(err)[:80]
 
     def _attempts(self):
+        """(engine, fn) pairs in walk order — the gate
+        decides which walk (build 264): OpenAI-only by
+        default, the pre-264 multi-engine walk under
+        TRANSLATE_CHAIN=legacy."""
+        if _CHAIN == "legacy":
+            return self._attempts_legacy()
+        return self._attempts_openai()
+
+    def _attempts_openai(self):
+        """Build 264: OpenAI is the ONLY rescue engine. No
+        probe skip — the probe machinery serves the legacy
+        walk, and skipping the only engine on a stale
+        verdict would fail every segment without an attempt.
+        Unconfigured -> no attempts -> one() returns the
+        source under fallback-source, exactly the loud-
+        failure shape the guard expects."""
+        found = {}
+        ctx = self.context
+        try:
+            from . import openai_translate
+            if openai_translate.key_configured():
+                found["openai"] = lambda seg: \
+                    (_engine_translate(
+                        openai_translate, [seg], self.style,
+                        ctx)[0],
+                     "openai")
+        except Exception:
+            pass
+        return [(name, found[name]) for name in ("openai",)
+                if name in found]
+
+    def _attempts_legacy(self):
         """(engine, fn) pairs in walk order; fn(seg) returns
         (text, provider_label). Unconfigured or
         probe-skipped engines are simply absent. Build 232:
@@ -353,12 +455,17 @@ def _gemini_attempt(segs, style, report, admin=False,
 
 
 def _openai_attempt(segs, style, report, admin=False,
-                    context=None):
-    """ONE OpenAI attempt; same contract as _gemini_attempt."""
+                    context=None, probe_skip=True):
+    """ONE OpenAI attempt; same contract as _gemini_attempt.
+    Build 264: `probe_skip` is honoured only by the legacy
+    walk — the OpenAI-only walk passes probe_skip=False,
+    because skipping the ONLY engine on a probe verdict
+    would fail the chunk without an attempt (the probe
+    machinery stays in the tree for the legacy gate)."""
     try:
         from . import openai_translate
         if openai_translate.key_configured() \
-                and not _probe_blocked("openai"):
+                and not (probe_skip and _probe_blocked("openai")):
             by_idx = _engine_translate(openai_translate, segs,
                                        style, context)
             out = [{**seg, "text_my": by_idx[i], "provider": "openai"}
@@ -450,7 +557,91 @@ def _write_report(workdir, report):
         pass
 
 
+def _rescue_tail(segs, style, report, admin=False,
+                 context=None):
+    """The shared end of every walk (extracted verbatim from
+    the pre-264 _walk_batch tail in build 264): whatever the
+    batch slots could not carry is retried per-segment
+    through the rescue (gate-aware — OpenAI-only by default,
+    the legacy engine set under TRANSLATE_CHAIN=legacy), and
+    whatever still fails keeps its source text under a
+    fallback-source label for run_job's guard to reject
+    loudly. Ends with the D2 "second wind": when real
+    progress was made but a remainder is left, wait out the
+    throttle window ONCE and run one more fill pass with a
+    fresh rescue before giving up."""
+    rescue = _Rescue(style, admin=admin, context=context)
+    out = []
+    for seg in segs:
+        if not (seg.get("text") or "").strip():
+            out.append({**seg, "text_my": "",
+                        "provider": "empty"})
+        else:
+            _my, _prov = rescue.one(seg)
+            out.append({**seg, "text_my": _my,
+                        "provider": _prov})
+    report["rescue"] = rescue.report
+    out = _fill_missing(out, report, style=style, admin=admin,
+                        context=context)
+    # D2 "second wind": the 21:19 job died with 24 of ~50
+    # segments translated — the working route was throttled
+    # mid-job and the first fill pass ran while it was still
+    # cooling down. When real progress was made but a
+    # remainder is left, wait out the throttle window ONCE
+    # and run one more fill pass with a fresh rescue before
+    # giving up. Costs under a minute; rescues exactly the
+    # near-miss jobs that used to fail whole.
+    stats = translation_stats(out)
+    if stats["untranslated"] > 0 \
+            and stats["total"] - stats["untranslated"] > 0:
+        pause = 40.0 if stats["untranslated"] >= 5 else 6.0
+        report["second_wind"] = {
+            "remaining_before": stats["untranslated"],
+            "pause_s": pause}
+        time.sleep(pause)
+        tmp = {}
+        out = _fill_missing(out, tmp, style=style, admin=admin,
+                            context=context)
+        report["fill2"] = tmp.get("fill", {})
+        report["second_wind"]["remaining_after"] = \
+            translation_stats(out)["untranslated"]
+    return out, report
+
+
+def _walk_batch_openai(segs, style, admin=False, context=None):
+    """Build 264: the OpenAI-only walk over ONE batch of
+    segments (build 248: one chunk). Same (out, report)
+    contract as the legacy walk: out always has exactly
+    len(segs) entries in input order, and the final fallback
+    is the per-segment rescue (OpenAI-only under this gate).
+    `admin` is accepted for signature parity and changes
+    nothing — one walk for everyone. OpenAI's own model walk
+    (gpt-4o-mini -> gpt-4.1-mini, tunnel-routed) runs inside
+    openai_translate; if it fails the batch, the error lands
+    in report["openai_err"] and the rescue tail takes over —
+    no other engine is substituted, ever."""
+    report = {"rescue": {}, "fill": {}}
+    if segs:
+        out = _openai_attempt(segs, style, report, admin=admin,
+                              context=context, probe_skip=False)
+        if out is not None:
+            return out, report
+    return _rescue_tail(segs, style, report, admin=admin,
+                        context=context)
+
+
 def _walk_batch(segs, style, admin=False, context=None):
+    """Walk selection (build 264): the gate read at import
+    decides — OpenAI-only by default, the pre-264 walk under
+    TRANSLATE_CHAIN=legacy."""
+    if _CHAIN == "legacy":
+        return _walk_batch_legacy(segs, style, admin=admin,
+                                  context=context)
+    return _walk_batch_openai(segs, style, admin=admin,
+                              context=context)
+
+
+def _walk_batch_legacy(segs, style, admin=False, context=None):
     """The pre-248 walk, unchanged, over ONE batch of segments
     (build 248: one chunk — for a single-chunk job this is the
     whole job, called exactly as before). Returns (out,
@@ -462,7 +653,9 @@ def _walk_batch(segs, style, admin=False, context=None):
     it under the chunk's entry in translate_report.json).
     `context` is the chunk carry-over (None for chunk 1 and
     for single-chunk jobs), threaded into every engine call,
-    fill and rescue below."""
+    fill and rescue below. Build 264: reachable only under
+    TRANSLATE_CHAIN=legacy — preserved verbatim as the
+    re-enable path."""
     report = {"rescue": {}, "fill": {}}
     # 0-lead. Gemini FIRST while its probe verdict is green
     # (build 189): direct Gemini is location-blocked from this
@@ -607,43 +800,11 @@ def _walk_batch(segs, style, admin=False, context=None):
     # reaches here is retried per-segment through the LLM
     # rescue itself, and whatever still fails keeps its
     # source text under a fallback-source label for
-    # run_job's guard to reject loudly.
-    rescue = _Rescue(style, admin=admin, context=context)
-    out = []
-    for seg in segs:
-        if not (seg.get("text") or "").strip():
-            out.append({**seg, "text_my": "",
-                        "provider": "empty"})
-        else:
-            _my, _prov = rescue.one(seg)
-            out.append({**seg, "text_my": _my,
-                        "provider": _prov})
-    report["rescue"] = rescue.report
-    out = _fill_missing(out, report, style=style, admin=admin,
+    # run_job's guard to reject loudly. Build 264: that
+    # tail now lives in _rescue_tail, shared verbatim with
+    # the OpenAI-only walk.
+    return _rescue_tail(segs, style, report, admin=admin,
                         context=context)
-    # D2 "second wind": the 21:19 job died with 24 of ~50
-    # segments translated — the working route was throttled
-    # mid-job and the first fill pass ran while it was still
-    # cooling down. When real progress was made but a
-    # remainder is left, wait out the throttle window ONCE
-    # and run one more fill pass with a fresh rescue before
-    # giving up. Costs under a minute; rescues exactly the
-    # near-miss jobs that used to fail whole.
-    stats = translation_stats(out)
-    if stats["untranslated"] > 0 \
-            and stats["total"] - stats["untranslated"] > 0:
-        pause = 40.0 if stats["untranslated"] >= 5 else 6.0
-        report["second_wind"] = {
-            "remaining_before": stats["untranslated"],
-            "pause_s": pause}
-        time.sleep(pause)
-        tmp = {}
-        out = _fill_missing(out, tmp, style=style, admin=admin,
-                            context=context)
-        report["fill2"] = tmp.get("fill", {})
-        report["second_wind"]["remaining_after"] = \
-            translation_stats(out)["untranslated"]
-    return out, report
 
 
 # --- Build 248: chunked translation ----------------------------

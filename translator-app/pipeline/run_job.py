@@ -194,8 +194,11 @@ def run_phase1(workdir, url, source_path=None, progress=None, style="subs",
     50 KB preview-integrity floor below does not apply to it.
     `admin` (build 232) is the job account's admin flag — the
     same role lookup that exempts the job from charging —
-    and only steers the translation walk order (admin jobs
-    lead with Gemini, then OpenAI; see translate_segments)."""
+    and steered the translation walk order under the
+    pre-264 chain (admin jobs led with Gemini, then OpenAI).
+    Build 264: the walk is OpenAI-only for everyone, so the
+    flag changes nothing unless the legacy TRANSLATE_CHAIN
+    gate is on (see translate_segments)."""
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     mark = _marks(progress)

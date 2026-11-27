@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 263"
+BUILD_TAG = "build 264"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -3063,9 +3063,12 @@ def _job_is_admin(job):
     (_quote_for_job / _charge_for_job below): the job's user_id
     resolved through accounts, role == "admin". Anonymous jobs
     (no user_id) are never charged either, but they are NOT
-    admin and return False here. The flag only steers the
-    translation walk order for the main video job path (admin
-    jobs lead with Gemini, then OpenAI — see
+    admin and return False here. Build 232: the flag steered
+    the translation walk order for the main video job path
+    (admin jobs led with Gemini, then OpenAI). Build 264:
+    the walk is OpenAI-only for everyone, so the flag no
+    longer changes translation — it still threads through
+    for the legacy TRANSLATE_CHAIN gate (see
     pipeline.translate_segments)."""
     uid = job.get("user_id")
     if not uid:
@@ -4396,6 +4399,50 @@ def openai_key_save():
 def openai_key_delete():
     _env_remove("OPENAI_API_KEY")
     return jsonify({"ok": True, "configured": False})
+
+
+# ---------- Translation chain gate (build 264) ----------
+# Translation is OpenAI-only by default (owner decision
+# 2026-11-26). The pre-264 multi-engine walk survives,
+# dormant, behind TRANSLATE_CHAIN=legacy in the project
+# .env. The gate is read ONCE at pipeline import, so this
+# endpoint only saves the choice for the NEXT app start —
+# the GET reports both the saved value and the value the
+# running process actually booted with, and the card says
+# so. "openai" is stored as the ABSENCE of the line.
+
+@app.get("/api/settings/translate-chain")
+def translate_chain_status():
+    from pipeline import translate_segments
+    saved = ""
+    try:
+        env_path = ROOT / ".env"
+        if env_path.exists():
+            for line in env_path.read_text(
+                    encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("TRANSLATE_CHAIN="):
+                    saved = line.split("=", 1)[1].strip() \
+                        .strip('"').strip("'").lower()
+                    break
+    except Exception:
+        saved = ""
+    return jsonify({
+        "saved": "legacy" if saved == "legacy" else "openai",
+        "effective": translate_segments.chain_mode()})
+
+
+@app.post("/api/settings/translate-chain")
+def translate_chain_save():
+    data = request.get_json(force=True) or {}
+    chain = (data.get("chain") or "").strip().lower()
+    if chain not in ("openai", "legacy"):
+        return jsonify({"error": "chain မမှန်ပါ — openai သို့မဟုတ် legacy ဖြစ်ရပါမယ်"}), 400
+    if chain == "legacy":
+        _env_write("TRANSLATE_CHAIN", "legacy")
+    else:
+        _env_remove("TRANSLATE_CHAIN")
+    return jsonify({"ok": True, "saved": chain})
 
 
 # ---------- OpenRouter key (server-side only, same rules) ----------
