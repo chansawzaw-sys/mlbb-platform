@@ -163,6 +163,29 @@ shipping source-language subtitles):
      gaps, and the rescue tail is shared verbatim with the
      legacy gate, whose behaviour build 264 froze.
 
+  Build 278 (owner decision 2026-11-28, made after a plain
+     warning that the old problems could return): ALL
+     instruction rules in the translation prompts are
+     stripped and replaced with ONE rule — translate into
+     Myanmar, output only the translation, explain nothing,
+     add nothing in brackets or parentheses (the prompts
+     themselves live in pipeline/gemini_translate.py). The
+     build-248 carry-over context no longer injects the
+     established-names glossary: the story-so-far lines are
+     the only background a later chunk receives. The guard
+     is adjusted to match: _seg_untranslated no longer
+     counts a segment against the job for Latin-script
+     names/words — a reply containing Burmese passes however
+     its names are written, and a name-only segment may come
+     back in Latin unchanged; a reply with NO Burmese still
+     counts when it echoes the source (exactly or nearly)
+     or is dominated by the source language's script (e.g.
+     CJK), and the majority-untranslated failure at zero
+     charge is unchanged. The build-265 consistency pass is
+     NOT changed: its candidates are Myanmar-script tokens
+     only, so it never rewrote a Latin name — it only ever
+     harmonised Burmese forms the model itself produced.
+
 CLI: python -m pipeline.translate_segments <workdir>
 Reads segments_en.json, writes segments_my.json + subs_my.srt.
 Build 271: the SRT is written through pipeline.cue_timing —
@@ -623,13 +646,68 @@ def _fill_missing(out, report=None, style="subs", admin=False,
     return out
 
 
+def _name_only(text):
+    """Build 278: True when a source segment is nothing but a
+    Latin-script proper name (or a short run of them): every
+    Latin word in it is Capitalised or ALLCAPS, none is a
+    common sentence word (the glossary stoplist below), and
+    there are at most four. Since build 278 a name may
+    legitimately come back in Latin, so an unchanged
+    name-only segment is a translation, not an echo."""
+    toks = re.findall(r"[A-Za-z][A-Za-z'’-]*", text or "")
+    if not toks or len(toks) > 4:
+        return False
+    for t in toks:
+        if t in _NAME_STOP:
+            return False
+        if len(t) >= 2 and t.isupper():
+            continue
+        if t[:1].isupper() and t[1:].islower():
+            continue
+        return False
+    return True
+
+
+def _echo_key(text):
+    """Comparison key for echo detection: whitespace and
+    punctuation removed, case folded — a reply that differs
+    from the source only in spacing, punctuation or case is
+    still the source."""
+    return re.sub(r"[\s\W_]+", "", text or "").lower()
+
+
+def _cjk_dominated(text):
+    """True when at least half of a text's letters are CJK —
+    the shape of a reply that came back in the source
+    language's script instead of Burmese."""
+    letters = [ch for ch in (text or "") if ch.isalpha()]
+    if not letters:
+        return False
+    cjk = sum(1 for ch in letters
+              if "\u3400" <= ch <= "\u9fff")
+    return cjk * 2 >= len(letters)
+
+
 def _seg_untranslated(seg):
     """True when a segment effectively stayed in the source
     language: the chain's last-resort fallback fired, or the
-    'translation' is byte-identical to a non-Myanmar source.
+    reply carries no Burmese at all and is the source echoed
+    back (exactly or near-identically), or it is dominated
+    by the source language's script (e.g. CJK).
     (Owner report 2026-11-09: a finished job whose TXT export was
     entirely Chinese — every provider had failed and the source
-    text silently stood in as the 'translation'.)"""
+    text silently stood in as the 'translation'.)
+
+    Build 278 (owner decision 2026-11-28): the prompt no
+    longer orders names into Burmese script, so Latin-script
+    names/words no longer count against a segment — a reply
+    containing Burmese passes however its names are written,
+    and a segment that is only a name may come back in Latin
+    unchanged. What still counts is a reply with NO Burmese
+    that echoes the source or stays in the source's script;
+    every other behaviour (the fallback-source label, the
+    Myanmar-source exemption, pure numbers staying unchanged)
+    is as before."""
     src = (seg.get("text") or "").strip()
     my = (seg.get("text_my") or "").strip()
     if not src or not my:
@@ -638,10 +716,19 @@ def _seg_untranslated(seg):
         return False  # source already Myanmar: identical is fine
     if (seg.get("provider") or "").startswith("fallback-source"):
         return True
-    # Identical output counts as untranslated when the source has
-    # any letters (CJK included) — short drama lines are often 2-3
-    # chars, while pure numbers/names legitimately stay unchanged.
-    return my == src and any(ch.isalpha() for ch in src)
+    if any("\u1000" <= ch <= "\u109f" for ch in my):
+        return False  # Burmese present: translated — its
+        # Latin-script names/words are acceptable (build 278)
+    if _name_only(src):
+        return False  # a lone name may stay in Latin (build 278)
+    # Identical or near-identical output counts as untranslated
+    # when the source has any letters (CJK included) — short
+    # drama lines are often 2-3 chars, while pure numbers
+    # legitimately stay unchanged.
+    if any(ch.isalpha() for ch in src) \
+            and _echo_key(my) == _echo_key(src):
+        return True
+    return _cjk_dominated(src) and _cjk_dominated(my)
 
 
 def translation_stats(out):
@@ -954,6 +1041,11 @@ def _split_chunks(segs):
 # capitalised Latin runs in the SOURCE text — since build
 # 252 the output writes every name in Burmese script, so
 # the source side is where a name's identity is visible.
+# Build 278: the extracted entries are no longer injected
+# into any prompt (the glossary pinning instruction was
+# stripped with the other prompt rules); the extraction
+# now serves only the build-265 consistency pass, whose
+# candidates are source-side name occurrences.
 # Single capitalised words are filtered against common
 # sentence-start words; multi-word capitalised sequences
 # and ALLCAPS tokens are almost always names or brands.
@@ -1030,8 +1122,11 @@ def _burmese_tokens(text):
 
 
 def _established_name_entries(history, src_names):
-    """The names list for the next chunk's context (build
-    252): one entry per established source name, in the
+    """The names list the next chunk's context used to
+    carry (build 252; build 278 removed the injection —
+    the function is kept as inert mechanics and nothing
+    calls it into a prompt any more): one entry per
+    established source name, in the
     order the names first appeared — "Source Name ->
     Burmese form" when the form can be determined, the
     bare source name when it cannot (the story-so-far
@@ -1072,42 +1167,36 @@ def _established_name_entries(history, src_names):
     return entries
 
 
-def _chunk_context(done_out, name_entries):
+def _chunk_context(done_out):
     """The carry-over block for the next chunk (build 248):
     the story so far as the most recent translated lines
-    (source -> the Burmese rendering used, so the next chunk
-    matches voice and wording), plus the established names
-    list (build 252: source name -> the chosen Burmese
-    form, from _established_name_entries). Returns None
+    (source -> the Burmese rendering used). Returns None
     when there is nothing to carry (every prior segment
-    empty and no names yet) — the next chunk then runs
-    context-free, exactly like chunk 1."""
+    empty) — the next chunk then runs context-free, exactly
+    like chunk 1.
+
+    Build 278: the established-names list the block used to
+    carry (build 252: source name -> the chosen Burmese
+    form, with the instruction to reuse that exact form) is
+    NO LONGER injected — glossary pinning was one of the
+    prompt instructions the owner stripped. The story-so-far
+    lines are background data only; the block's header is
+    the mechanical guard that keeps the model from
+    translating the block itself."""
     tail = [s for s in done_out
             if (s.get("text") or "").strip()][-_CONTEXT_TAIL:]
-    if not tail and not name_entries:
+    if not tail:
         return None
     lines = ["CONTEXT — this video's earlier parts "
              "(background ONLY: do not translate this block "
              "and do not include any of it in your output; "
              "the segments to translate follow it):"]
-    if tail:
-        lines.append("Story so far — the most recent lines, "
-                     "source then the Burmese rendering used:")
-        for s in tail:
-            lines.append("- " + (s.get("text") or "").strip()
-                         + " → "
-                         + (s.get("text_my") or "").strip())
-    if name_entries:
-        lines.append(
-            "Names already established — names are written "
-            "in Burmese transliteration: where a pair is "
-            "shown (source name → Burmese form), that is "
-            "the EXACT Burmese form already chosen — use "
-            "that same Burmese form wherever the name "
-            "appears again; for a name shown without a "
-            "pair, keep the Burmese form already used for "
-            "it in the lines above: "
-            + ", ".join(name_entries))
+    lines.append("Story so far — the most recent lines, "
+                 "source then the Burmese rendering used:")
+    for s in tail:
+        lines.append("- " + (s.get("text") or "").strip()
+                     + " → "
+                     + (s.get("text_my") or "").strip())
     return "\n".join(lines)[:_CONTEXT_MAX_CHARS]
 
 
@@ -1190,8 +1279,8 @@ def _chunk_entry(ci, offset, chunk, out, crep, context,
 def _parallel_context(ci, chunks, preds, results):
     """The carry-over context for a parallel chunk: the
     serial walk's context (_chunk_context: story-so-far
-    pairs + established-names pins, from
-    _established_name_entries) computed over the chunk's
+    pairs — build 278 removed the established-names pins
+    it also used to carry) computed over the chunk's
     COMPLETED predecessors only — `preds` is their index
     list in order, `results` maps index -> (out, crep,
     meta) for them; stored outputs are never mutated
@@ -1202,19 +1291,10 @@ def _parallel_context(ci, chunks, preds, results):
     while that chunk is still in flight. Returns None when
     there is nothing to carry at all."""
     done_out = []
-    glossary_found = {}
-    history = []
     for i in preds:
-        cout = results[i][0]
-        for c, o in zip(chunks[i], cout):
-            _glossary_add(glossary_found, c.get("text"))
-            history.append((_name_candidates(c.get("text")),
-                            _burmese_tokens(o.get("text_my"))))
-        done_out.extend(cout)
-    name_entries = _established_name_entries(
-        history, list(glossary_found))[:_GLOSSARY_MAX]
+        done_out.extend(results[i][0])
     parts = []
-    base = _chunk_context(done_out, name_entries)
+    base = _chunk_context(done_out)
     if base:
         parts.append(base)
     if ci - 1 not in preds:
@@ -1262,7 +1342,17 @@ def _glossary_consistency_pass(pairs):
     every losing candidate token is replaced by the
     winner — whole-token only, and only inside segments
     whose source contains the name.
-    Returns (pins, replaced) for the report."""
+    Returns (pins, replaced) for the report.
+
+    Build 278 finding (checked against the owner's prompt
+    strip): the candidates here come ONLY from
+    _burmese_tokens — maximal Myanmar-script runs — so a
+    name the model left in Latin letters is never a
+    candidate and is never rewritten by this pass; it only
+    harmonises Burmese forms the model itself produced.
+    That does not contradict the single-rule prompt (which
+    no longer asks for any particular name form), so the
+    pass is unchanged."""
     glossary_found = {}
     for c, _o in pairs:
         _glossary_add(glossary_found, c.get("text"))
@@ -1444,13 +1534,8 @@ def translate_segments(workdir, style="subs", admin=False):
         cue_timing.write_subs_srt(workdir, out_all,
                                   workdir / "subs_my.srt")
         return out_all
-    glossary_found = {}
-    history = []
     for ci, chunk in enumerate(chunks):
-        name_entries = _established_name_entries(
-            history, list(glossary_found))[:_GLOSSARY_MAX]
-        context = None if ci == 0 else _chunk_context(
-            out_all, name_entries)
+        context = None if ci == 0 else _chunk_context(out_all)
         out, crep = _run_one_chunk(chunk, style, admin=admin,
                                    context=context)
         chunk_entries.append(_chunk_entry(
@@ -1464,10 +1549,6 @@ def translate_segments(workdir, style="subs", admin=False):
                 if crep.get(sec):
                     _merge_counts(report.setdefault(sec, {}),
                                   crep[sec])
-        for c, o in zip(chunk, out):
-            _glossary_add(glossary_found, c.get("text"))
-            history.append((_name_candidates(c.get("text")),
-                            _burmese_tokens(o.get("text_my"))))
         out_all.extend(out)
         offset += len(chunk)
     if not single:

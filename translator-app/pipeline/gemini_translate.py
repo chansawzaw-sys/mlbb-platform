@@ -7,12 +7,16 @@ The user saves it via the app's own settings endpoint (behind the app
 login; see app.py) — it never travels through chat, is never returned in
 any API payload, and is never written to logs or segment files.
 
-One request translates ALL segments (JSON in/out, ids preserved) with a
-prompt that asks for natural spoken Burmese (ပြောစကား), transliterating
-names into Burmese script by sound (build 252) and keeping numbers
-exact, and translating idioms by meaning. The response is strictly
-validated (same id set, non-empty strings); ANY failure raises, and the
-caller falls back to the free Google->Bing->source chain.
+One request translates ALL segments (JSON in/out, ids preserved). The
+prompt carries the owner's ONE translation rule (build 278: translate
+into Myanmar, output only the translation, explain nothing, add
+nothing in brackets or parentheses) plus the JSON format scaffolding
+— every earlier instruction rule (spoken/storyteller style, names
+transliterated into Burmese script by sound, idioms by meaning,
+numbers kept exact, no bracketed glosses) was removed on the owner's
+order. The response is strictly validated (same id set, non-empty
+strings); ANY failure raises, and the caller falls back to the free
+Google->Bing->source chain.
 
 Model order: see _models() — the configured model and the static
 Flash primary first, then preferred names from the key's LIVE
@@ -33,15 +37,7 @@ from .common import PROJECT_ROOT
 DEFAULT_MODEL = "gemini-2.0-flash"
 _API_TMPL = "https://generativelanguage.googleapis.com/{ver}/models/{model}:generateContent"
 
-PROMPT = """You are a professional video translator. Translate each English subtitle segment below into natural, spoken Burmese (Myanmar) — the way a Myanmar narrator would actually SAY it (ပြောစကား), not stiff written style.
-
-Rules:
-- Stay FAITHFUL to what is actually said in the video: translate everything, in order — never add, omit, summarise, soften or censor anything.
-- At the same time, render the MEANING in smooth, natural Burmese that fits the scene (အဓိပ္ပာယ် ဆီလျော်အောင်): if a literal rendering sounds awkward, rephrase freely — as long as the meaning, tone and emotion stay exactly the same.
-- Translate idioms and slang by MEANING, never word-by-word.
-- Keep personal names, place names, brand names and ALL numbers exactly as they are.
-- Keep each translation roughly as short as the original (it will be spoken in the same time window).
-- Do not add explanations, notes or extra sentences.
+PROMPT = """Translate into Myanmar (Burmese). Output only the translation. Do not explain anything. Do not add anything in brackets or parentheses.
 
 Input is a JSON array of {"id": <int>, "text": "<english>"}.
 Output MUST be only a JSON array of {"id": <same int>, "my": "<burmese translation>"} with exactly the same ids, in the same order. No markdown fences, no commentary.
@@ -50,21 +46,16 @@ Segments:
 __SEGMENTS_JSON__
 """
 
-# Subtitle style (owner's rule, 2026-11-11, build 142): even for
-# subtitle-only jobs the Burmese must read like a STORY being told
-# (ဇာတ်လမ်းဆန်ဆန်) — flowing spoken Burmese, connected across
-# segments — while staying complete and faithful to what is said.
-# (Before build 142, subs used the plain faithful PROMPT above and
-# only dub mode had the storyteller voice.)
-PROMPT_SUBS = """You are a Burmese storyteller subtitling a video. Render each segment below in natural, spoken Burmese (ပြောစကား) told like a story (ဇာတ်လမ်း ပြောသလို) — smooth and flowing from segment to segment, the way a narrator tells the tale — NOT stiff, word-by-word translation.
-
-Rules:
-- Stay COMPLETE and FAITHFUL to what is actually said in the video: translate everything, in order — never add, omit, summarise, soften or censor anything.
-- Within that faithfulness, phrase it the way a Burmese storyteller would say it: natural connectors and natural word order, idioms and slang by MEANING never word-by-word, so consecutive segments read like one continuous story and the emotion of the scene carries through.
-- FIRST read all the segments together and understand the whole story; then render each segment so it fits the storyline and flows with its neighbours — never translate a segment in isolation.
-- NAMES IN BURMESE: write every personal name, place name and brand name in Burmese script, transliterated by its SOUND — for a Chinese name, transliterate its pinyin sound (Lin Feng becomes လင်ဖုန်း) — never leave a name in Latin letters and never translate a name's meaning. Fix ONE Burmese form for each name and use that exact form every time the name appears, all through the video; if an earlier part already established a Burmese form for a name, reuse that exact form. Keep ALL numbers exactly as they are.
-- Keep each translation roughly as short as the original (it must fit the same on-screen window).
-- Do not add explanations, notes or extra sentences. NO bracketed glosses: never put a parenthetical explanation after a name, a term or any line, and never give a name twice (like "လင်ဖုန်း (မန်နေဂျာ လင်ဖုန်း)") — every name and term appears ONCE, in its single chosen form, and the translation speaks for itself.
+# Build 278 (owner decision 2026-11-28): ALL instruction rules
+# in the translation prompts are stripped — the storyteller
+# voice (build 142), the story-first/context instruction
+# (build 154), the names-in-Burmese transliteration rule
+# (builds 153/252), the no-bracketed-gloss rule (build 154,
+# absorbed into the single rule) and the glossary pinning.
+# What remains is the owner's ONE rule plus the machine-format
+# scaffolding (JSON in/out, one output per input segment, ids
+# preserved) the parser depends on.
+PROMPT_SUBS = """Translate into Myanmar (Burmese). Output only the translation. Do not explain anything. Do not add anything in brackets or parentheses.
 
 Input is a JSON array of {"id": <int>, "text": "<source segment>"}.
 Output MUST be only a JSON array of {"id": <same int>, "my": "<burmese translation>"} with exactly the same ids, in the same order. No markdown fences, no commentary.
@@ -73,21 +64,11 @@ Segments:
 __SEGMENTS_JSON__
 """
 
-# Dub mode (owner's rule, 2026-11-09): the voice NARRATES — retell the
-# scene like a storyteller, in flowing spoken Burmese. Subtitle-only
-# jobs keep the faithful style above; anything that will be SPOKEN
-# (dub and both) uses this one.
-PROMPT_DUB = """You are the narrator of a Burmese-dubbed video. Retell each segment below in natural, spoken Burmese (ပြောစကား) the way a storyteller narrates a story (ဇာတ်လမ်း ပြောသလို) — flowing, vivid, and easy to listen to.
-
-Rules:
-- Keep EVERY fact, event and line of meaning, in the same order — never invent, add, omit or soften anything.
-- You may rephrase freely and use natural storytelling connectors so the narration flows from segment to segment, as long as the meaning, tone and emotion stay exactly the same.
-- FIRST read all the segments together and understand the whole story; then narrate each segment so it fits the storyline and flows with its neighbours — never translate a segment in isolation, never word-by-word.
-- When a character speaks, voice it the way that character would say it in Burmese.
-- PUNCTUATION CARRIES THE ENERGY: the voice reads your punctuation as delivery, so let it act out the emotion that is already in the scene — an excited, shouted or joyful line ends with "!", a real question keeps "?", a trailing-off or hesitant line may end with "…", and a calm line keeps the plain "။". Mirror the source line's emotion only: never add or remove words, never change the meaning, and never put an energy mark on a line whose scene does not have it.
-- NAMES IN BURMESE: write every personal name, place name and brand name in Burmese script, transliterated by its SOUND — for a Chinese name, transliterate its pinyin sound (Lin Feng becomes လင်ဖုန်း) — never leave a name in Latin letters and never translate a name's meaning. Fix ONE Burmese form for each name and use that exact form every time the name appears, all through the video; if an earlier part already established a Burmese form for a name, reuse that exact form. Keep ALL numbers exactly as they are.
-- Keep each segment roughly as short as the original (it will be spoken in the same time window).
-- Do not add explanations, notes or extra sentences. NO bracketed glosses: never put a parenthetical explanation after a name, a term or any line, and never give a name twice (like "လင်ဖုန်း (မန်နေဂျာ လင်ဖုန်း)") — every name and term appears ONCE, in its single chosen form, and the translation speaks for itself.
+# Dub mode: the same single rule as PROMPT_SUBS (build 278 —
+# the storytelling-narration instructions that used to differ
+# here are stripped with the rest); only the format
+# scaffolding's field labels differ.
+PROMPT_DUB = """Translate into Myanmar (Burmese). Output only the translation. Do not explain anything. Do not add anything in brackets or parentheses.
 
 Input is a JSON array of {"id": <int>, "text": "<english>"}.
 Output MUST be only a JSON array of {"id": <same int>, "my": "<burmese narration>"} with exactly the same ids, in the same order. No markdown fences, no commentary.
@@ -108,12 +89,13 @@ def _build_prompt(style, segments, context=None):
     construction — the style template with the segments JSON
     substituted in — so a context-free call behaves exactly
     as before. When the caller passes a carry-over context
-    (build 248 chunked translation: the story so far plus the
-    established names glossary for a later chunk of a long
-    video), the block is inserted immediately before the
-    "Segments:" section, after every standing rule, so the
-    rules keep the last word on names/format and the block
-    reads as background for the segments that follow it."""
+    (build 248 chunked translation: the story so far for a
+    later chunk of a long video), the block is inserted
+    immediately before the "Segments:" section, after the
+    standing rule, so the block reads as background for the
+    segments that follow it. (Build 278: the context no
+    longer carries an established-names glossary — the
+    story-so-far lines are all that is carried over.)"""
     payload_in = [{"id": i, "text": (s.get("text") or "").strip()}
                   for i, s in enumerate(segments)]
     prompt = _prompt_for(style).replace(
