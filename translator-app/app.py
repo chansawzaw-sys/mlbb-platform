@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 275"
+BUILD_TAG = "build 277"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -987,7 +987,21 @@ def _web_tg_autosend(job):
       remains available.
     * Exactly-once: the job["auto_tg"] record is set and saved
       BEFORE the thread fires, so a re-finish (a review re-render
-      calls _finish again) or a restart can never send twice."""
+      calls _finish again) or a restart can never send twice.
+    * Build 277 (owner re-order 2026-11-28 — "နှိပ်စရာမလိုဘူး
+      အော်တိုပို့", no button, no toggle): the size gate sits
+      HERE, before the delivery core. An output over the bot's
+      send cap (tg.send_cap() — the local Bot API server's
+      2 GB class, the same cap the manual button enforces) can
+      never be sent at all, so instead of the core's
+      shrink-a-copy fallback the linked chat gets ONE plain
+      message: the video is done, it is too big for Telegram,
+      take it from the web app within 24 hours. The bot flow
+      keeps the shrink behaviour (its customers live in the
+      chat); a web customer is already looking at the app.
+      No output.mp4 (edge products) → nothing recorded,
+      nothing sent — the manual button has nothing to send
+      for those either."""
     if job.get("tg_chat_id") or job.get("auto_tg"):
         return
     uid = job.get("user_id")
@@ -1001,11 +1015,52 @@ def _web_tg_autosend(job):
     if not chat_id:
         return
     chat_id = int(chat_id)
+    from pipeline import telegram_send as tg
+    out = JOBS_DIR / job["id"] / "output.mp4"
+    try:
+        size = out.stat().st_size if out.exists() else None
+    except Exception:
+        size = None
+    if size is None:
+        return  # no output file (edge products): nothing to send
+    if size > tg.send_cap():
+        # Too big for Telegram at any quality: one text notice
+        # instead of a file (or silence). The marker lands
+        # BEFORE the thread fires — exactly-once, like the
+        # send path below; a failed notice is recorded on the
+        # job and can never touch its status or charge.
+        job["auto_tg"] = {"state": "too_big", "to": chat_id,
+                          "at": time.time()}
+        _save(job)
+
+        def notify():
+            try:
+                tg.send_message(
+                    chat_id,
+                    "✅ ဗီဒီယို ပြီးပါပြီ — ဒါပေမဲ့ ဖိုင် "
+                    f"{size / 1e6:.0f}MB ဖြစ်နေလို့ Telegram ကနေ "
+                    "ပို့လို့ မရပါ\n"
+                    "🌐 web app မှာ ယူနိုင်ပါတယ်: " + APP_LINK
+                    + "\n(Jobs စာရင်းထဲမှာ ၂၄ နာရီ အတွင်း "
+                      "ယူပေးပါ) 🙏")
+                job["auto_tg"] = {"state": "too_big",
+                                  "to": chat_id,
+                                  "at": time.time(),
+                                  "notified": True}
+            except Exception as e:
+                job["auto_tg"] = {"state": "failed",
+                                  "to": chat_id,
+                                  "at": time.time(),
+                                  "error": str(e)[:200]}
+            _save(job)
+
+        threading.Thread(target=notify, daemon=True).start()
+        return
     job["auto_tg"] = {"state": "sending", "to": chat_id}
     _save(job)
 
     def record(d):
-        job["auto_tg"] = {**d, "to": chat_id}
+        job["auto_tg"] = {**d, "to": chat_id, "at": time.time()}
 
     def go():
         _deliver_video_core(
@@ -4644,6 +4699,59 @@ def generate_chain_save():
     else:
         _env_remove("GENERATE_CHAIN")
     return jsonify({"ok": True, "saved": chain})
+
+
+# ---------- Translation model choice (build 276) ----------
+# Which OpenAI model HEADS the translation walk (the batch/
+# chunk walk and the per-segment rescue share
+# pipeline/openai_translate.translate_all, so both follow
+# this one choice). "current" (the default) is the pre-276
+# walk — gpt-4o-mini -> gpt-4.1-mini — stored as the ABSENCE
+# of the line. "luna" heads the walk with GPT-6 Luna; a 404
+# on Luna falls through to gpt-4o-mini inside the walk, so
+# the choice can never fail a job by itself. Script
+# generation (build 269's gate above) does NOT follow this
+# choice. Like the chain gates, the choice is read ONCE at
+# pipeline import — this endpoint only saves it for the
+# NEXT app start, and the GET reports both the saved value
+# and the value the running process actually booted with.
+
+@app.get("/api/settings/translate-model")
+def translate_model_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    from pipeline import openai_translate
+    saved = ""
+    try:
+        env_path = ROOT / ".env"
+        if env_path.exists():
+            for line in env_path.read_text(
+                    encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("TRANSLATE_MODEL="):
+                    saved = line.split("=", 1)[1].strip() \
+                        .strip('"').strip("'").lower()
+                    break
+    except Exception:
+        saved = ""
+    return jsonify({
+        "saved": "luna" if saved == "luna" else "current",
+        "effective": openai_translate.model_choice()})
+
+
+@app.post("/api/settings/translate-model")
+def translate_model_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    data = request.get_json(force=True) or {}
+    model = (data.get("model") or "").strip().lower()
+    if model not in ("current", "luna"):
+        return jsonify({"error": "model မမှန်ပါ — current သို့မဟုတ် luna ဖြစ်ရပါမယ်"}), 400
+    if model == "luna":
+        _env_write("TRANSLATE_MODEL", "luna")
+    else:
+        _env_remove("TRANSLATE_MODEL")
+    return jsonify({"ok": True, "saved": model})
 
 
 # ---------- Off-host backup (build 273) ----------

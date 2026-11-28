@@ -35,6 +35,16 @@ Admin surface (app.py): GET/POST /api/admin/golden-check and
 POST /api/admin/golden-check/capture, admin-only like the
 api-stats board. CLI: `python -m pipeline.golden_check` runs a
 check, `--capture` (re)writes the baselines from CURRENT code.
+
+Build 276: translation runs through WHATEVER the Admin
+translate-model choice booted with (this module never named
+an engine — _run_pipeline calls translate_segments, whose
+OpenAI-only walk follows the choice), so the same samples
+can be run against GPT-6 Luna and compared with the
+gpt-4o-mini baseline. Every run/capture is stamped with the
+model that headed the walk (report["translate_model"], each
+baseline's "translate_model", and the formatted header) so
+a Luna run is never mistaken for a 4o-mini run.
 Baselines are environment-specific: the engines that serve a
 local run (free chain) differ from the server's (Gemini /
 OpenRouter lead), so after deploying, re-capture once on the
@@ -82,6 +92,18 @@ def _worst(*verdicts):
 
 def load_config():
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def _translate_model_label():
+    """Build 276: the model heading the translation walk
+    for THIS process (the Admin translate-model choice) —
+    stamped on every run/capture so a Golden Sample result
+    says which model produced it."""
+    try:
+        from . import openai_translate
+        return openai_translate.translate_models()[0]
+    except Exception:
+        return None
 
 
 def materialize_clips():
@@ -173,6 +195,7 @@ def capture_baselines(log=print):
     server) and after any intentional engine/prompt change."""
     BASELINES_DIR.mkdir(parents=True, exist_ok=True)
     cfg = load_config()
+    label = _translate_model_label()
     done = []
     for clip in cfg["clips"]:
         log(f"capture {clip['id']} …")
@@ -182,6 +205,7 @@ def capture_baselines(log=print):
             "id": clip["id"], "genre": clip["genre"],
             "lang": clip["lang"], "file": clip["file"],
             "captured_at": int(time.time()),
+            "translate_model": label,
             "metrics": metrics,
             "segments_en": segs_en, "segments_my": segs_my,
         }
@@ -278,10 +302,12 @@ def run_check(log=print):
     api_stats). A clip whose pipeline raises is a FAIL with the
     error recorded — never a crashed run."""
     cfg = load_config()
-    report = {"at": int(time.time()), "overall": "PASS", "clips": []}
+    label = _translate_model_label()
+    report = {"at": int(time.time()), "overall": "PASS",
+              "translate_model": label, "clips": []}
     for clip in cfg["clips"]:
         entry = {"id": clip["id"], "genre": clip["genre"],
-                 "lang": clip["lang"]}
+                 "lang": clip["lang"], "translate_model": label}
         base_path = BASELINES_DIR / (clip["id"] + ".json")
         if not base_path.exists():
             entry.update(verdict="FAIL", checks=[{
@@ -321,8 +347,11 @@ def run_check(log=print):
 
 
 def format_report(report):
-    lines = [f"Golden Sample check — overall: {report['overall']} "
-             f"(at {time.strftime('%Y-%m-%d %H:%M', time.localtime(report['at']))})"]
+    head = (f"Golden Sample check — overall: {report['overall']} "
+            f"(at {time.strftime('%Y-%m-%d %H:%M', time.localtime(report['at']))})")
+    if report.get("translate_model"):
+        head += f" · translation model: {report['translate_model']}"
+    lines = [head]
     for c in report["clips"]:
         lines.append(f"[{c['verdict']}] {c['id']} "
                      f"({c['genre']}, {c['lang']})")
