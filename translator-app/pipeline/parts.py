@@ -86,6 +86,7 @@ import shutil
 import time
 from pathlib import Path
 
+from . import cue_timing
 from .common import (PROJECT_ROOT, load_segments, probe_duration,
                      probe_streams, run, save_segments, write_srt)
 
@@ -470,9 +471,42 @@ def _prepare_part_dir(workdir, pdir, src, segs, mode, w0, w1):
             prev = load_segments(seg_file)
         except Exception:
             prev = None
-    save_segments(_inherit_tts(sliced, prev), seg_file)
+    saved = _inherit_tts(sliced, prev)
+    save_segments(saved, seg_file)
+    # Build 271: carry the job's word timings into the part
+    # (the words owned by this window, absolute times like
+    # the part's segments) and build the part's corrected
+    # cues from them, so a part's burn and dub placement
+    # correct exactly like the whole-video flow's. No words
+    # on the job -> the part gets neither file and every
+    # line below is build 270's.
+    cues = None
+    words = cue_timing.load_words(workdir)
+    if words:
+        wpart = [w for w in words
+                 if w0 <= float(w["start"]) < w1]
+        if wpart:
+            save_segments(wpart, pdir / "words.json")
+            cues = cue_timing.build_cues(saved, wpart)
+            if cues:
+                # A cue never reaches past the window end
+                # (slice_segments clamps segment ends the
+                # same way); a cue the clamp empties drops.
+                cues = [{**c, "end": min(float(c["end"]), w1)}
+                        for c in cues
+                        if min(float(c["end"]), w1)
+                        > float(c["start"])]
+                if cues:
+                    save_segments(cues, pdir / "cues_my.json")
+                else:
+                    cues = None
     if mode == "subs":
-        write_srt(rebase_segments(sliced, w0), pdir / "subs_my.srt")
+        if cues:
+            write_srt(rebase_segments(cues, w0),
+                      pdir / "subs_my.srt")
+        else:
+            write_srt(rebase_segments(sliced, w0),
+                      pdir / "subs_my.srt")
     return sliced
 
 

@@ -152,15 +152,32 @@ def _transcribe_local(wav, workdir):
     segments, _info = model.transcribe(str(wav), beam_size=1, vad_filter=True,
                                        condition_on_previous_text=False)
     segs = []
+    words = []
     for s in segments:
         t = (s.text or "").strip()
         if not t or (s.end - s.start) < 0.2:
             continue
         segs.append({"start": round(float(s.start), 3),
                      "end": round(float(s.end), 3), "text": t})
+        # Build 271: keep any word timestamps the local
+        # engine yields, in the Groq path's words.json shape.
+        # faster-whisper only produces them when asked
+        # (word_timestamps=True), which this path does not
+        # request — so today this collects nothing, local
+        # jobs keep segment timing, and the decode above is
+        # unchanged; if words ever do arrive, cue_timing
+        # picks them up with no further change here.
+        for w in getattr(s, "words", None) or []:
+            wt = (getattr(w, "word", "") or "").strip()
+            if wt:
+                words.append({"start": round(float(w.start), 3),
+                              "end": round(float(w.end), 3),
+                              "word": wt})
     if not segs:
         raise RuntimeError("no speech segments found by whisper")
     save_segments(segs, workdir / "segments_en.json")
+    if words:
+        save_segments(words, workdir / "words.json")
     return segs
 
 

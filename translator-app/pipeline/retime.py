@@ -33,6 +33,7 @@ Writes retimed.mp4, dub.wav, segments_retimed.json, subs_retimed.srt
 import sys
 from pathlib import Path
 
+from . import cue_timing
 from .common import (encode_threads, load_segments, probe_duration, run,
                      save_segments, target_maxrate_k, video_fps,
                      write_srt)
@@ -559,6 +560,24 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None,
     workdir = Path(workdir)
     src = workdir / "source.mp4"
     segs = load_segments(workdir / "segments_my.json")
+    # Build 271: word-corrected cue timings (pipeline.cue_timing).
+    # When this job carries a cues_my.json — written by the
+    # dub/subs/captions flows from the transcription's word
+    # timestamps — and the cues still validate against these
+    # segments, the plan's segment windows ARE the corrected
+    # spoken windows (first spoken word -> last spoken word),
+    # so the dub for a segment starts when its speech starts
+    # rather than at the Whisper segment's early start, and
+    # the re-timed subtitles below are the corrected cues
+    # carried through the plan's time map. No cues file (the
+    # Recap/Commentary script flows never write one) or a
+    # stale one: every line behaves exactly as build 270.
+    cues = cue_timing.validated_cues(workdir, segs)
+    if cues:
+        _wins = cue_timing.segment_windows(cues)
+        segs = [{**seg, "start": _wins[i][0], "end": _wins[i][1]}
+                if i in _wins else seg
+                for i, seg in enumerate(segs)]
     total = probe_duration(src)
     # the video stream can be slightly shorter than the container; plan on it
     from .common import probe_streams
@@ -638,7 +657,27 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None,
     # encode's finalize graph burns subs_retimed.srt in the same
     # pass that produces the retimed picture.
     save_segments(new_segs, workdir / "segments_retimed.json")
-    write_srt(new_segs, workdir / "subs_retimed.srt", start_key="start_new", end_key="end_new")
+    if cues:
+        # Build 271: the re-timed subtitles are the corrected
+        # cues carried through the plan's time map — the same
+        # cue list the source-timeline SRT carries, so the
+        # burn (normal and karaoke alike) shows a cue only
+        # while its words are spoken, on this timeline too.
+        _pts = time_map({"chunks": chunks})
+        _rcues = []
+        for _c in cues:
+            _ns = round(map_time(_pts, float(_c["start"])), 3)
+            _ne = round(map_time(_pts, float(_c["end"])), 3)
+            if _ne > _ns:
+                _rcues.append({"start": _ns, "end": _ne,
+                               "text_my": _c["text_my"]})
+        if _rcues:
+            write_srt(_rcues, workdir / "subs_retimed.srt")
+        else:
+            write_srt(new_segs, workdir / "subs_retimed.srt",
+                      start_key="start_new", end_key="end_new")
+    else:
+        write_srt(new_segs, workdir / "subs_retimed.srt", start_key="start_new", end_key="end_new")
     plan = {"chunks": chunks, "source_duration": round(total, 3),
             "retimed_duration": round(t_cursor, 3),
             "video_passthrough": passthrough, "max_speed": max_speed}

@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 270"
+BUILD_TAG = "build 271"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -7660,7 +7660,8 @@ def job_review(jid):
     data = request.get_json(force=True) or {}
     edits = {int(e["idx"]): str(e["text_my"]) for e in data.get("edits", [])
              if "idx" in e and "text_my" in e}
-    from pipeline.common import load_segments, save_segments, write_srt
+    from pipeline import cue_timing
+    from pipeline.common import load_segments, save_segments
     seg_path = JOBS_DIR / jid / "segments_my.json"
     segs = load_segments(seg_path)
     changed = 0
@@ -7671,7 +7672,11 @@ def job_review(jid):
             segs[idx]["edited"] = True
             changed += 1
     save_segments(segs, seg_path)
-    write_srt(segs, JOBS_DIR / jid / "subs_my.srt")  # keep subs-mode SRT in sync
+    # Build 271: written from the word-corrected cues when
+    # the job has them (pipeline.cue_timing) — keep the
+    # subs-mode SRT in sync.
+    cue_timing.write_subs_srt(JOBS_DIR / jid, segs,
+                              JOBS_DIR / jid / "subs_my.srt")
     # A re-render supersedes the pending auto-cleanup of the old result.
     _resume_review_job(job, changed, "rerun")
     return jsonify({"ok": True, "edited_count": changed})
@@ -9414,13 +9419,15 @@ def _captions_worker2(job):
             job["status"] = "running"
             _timing_start(job)  # build 213
             _save(job)
-            from pipeline.common import load_segments, write_srt
+            from pipeline import cue_timing
+            from pipeline.common import load_segments
             segs = load_segments(workdir / "segments_my.json")
             if not segs:
                 raise RuntimeError(
                     "စာတန်း မရှိပါ — ပြန်စမ်းပါ "
                     "(credit လုံးဝ မဖြတ်ပါ)")
-            write_srt(segs, workdir / "subs_my.srt")
+            cue_timing.write_subs_srt(workdir, segs,
+                                      workdir / "subs_my.srt")
             run_job.run_phase2(
                 workdir, mode="subs", progress=_progress_fn(job),
                 font=job.get("font") or "noto", subs=None,
@@ -9556,8 +9563,8 @@ def render_captions(jid):
                 edits[int(e["idx"])] = str(e["text_my"])
         except (TypeError, ValueError):
             continue
+    from pipeline import cue_timing
     from pipeline.common import load_segments, save_segments
-    from pipeline.common import write_srt
     seg_path = JOBS_DIR / jid / "segments_my.json"
     segs = load_segments(seg_path)
     if not segs:
@@ -9571,7 +9578,8 @@ def render_captions(jid):
             segs[idx]["edited"] = True
             changed += 1
     save_segments(segs, seg_path)
-    write_srt(segs, JOBS_DIR / jid / "subs_my.srt")
+    cue_timing.write_subs_srt(JOBS_DIR / jid, segs,
+                              JOBS_DIR / jid / "subs_my.srt")
     # A render supersedes any pending auto-cleanup (a parked
     # job has none today; the mirror of job_review stays
     # exact) — the shared tail in _resume_review_job.
@@ -9583,8 +9591,9 @@ def render_captions(jid):
 def download_captions_srt(jid):
     """The Burmese .srt download: subs_my.srt — regenerated
     from the final edited segments when the render started,
-    so it carries exactly the text that was burned, with the
-    segments' original timings."""
+    so it carries exactly the text that was burned, with
+    the same timings (word-corrected since build 271 when
+    the job has word timestamps)."""
     job = _load_job(jid)
     if not job or job.get("type") != "captions" \
             or not _owns(_current_user(), job):
@@ -10428,13 +10437,15 @@ def _api_captions_worker(job):
                 progress=_progress_fn(job), style="subs",
                 quality=job.get("quality") or "hd")
             _quote_for_job(job)
-            from pipeline.common import load_segments, write_srt
+            from pipeline import cue_timing
+            from pipeline.common import load_segments
             segs = load_segments(workdir / "segments_my.json")
             if not segs:
                 raise RuntimeError(
                     "စာတန်း မရှိပါ — ပြန်စမ်းပါ "
                     "(credit လုံးဝ မဖြတ်ပါ)")
-            write_srt(segs, workdir / "subs_my.srt")
+            cue_timing.write_subs_srt(workdir, segs,
+                                      workdir / "subs_my.srt")
             run_job.run_phase2(
                 workdir, mode="subs", progress=_progress_fn(job),
                 font=job.get("font") or "noto", subs=None,
@@ -10733,6 +10744,17 @@ def export_srt(jid):
     if not got:
         return jsonify({"error": "lang မမှန်ပါ"}), 400
     key, lang = got
+    if key == "text_my":
+        # Build 271: the Myanmar export carries the same
+        # word-corrected cue timings the burn uses — the
+        # job's persisted cues, validated against these very
+        # segments first. A job without word data (or with
+        # stale cues) exports from the segments, exactly as
+        # before.
+        from pipeline import cue_timing
+        cues = cue_timing.validated_cues(JOBS_DIR / jid, segs)
+        if cues:
+            segs = cues
     from pipeline.common import fmt_ts
     lines, n = [], 0
     for s in segs:
@@ -10786,7 +10808,8 @@ def _apply_bulk_assign(job, segs, assign):
     in sync; returns how many segments changed. Shared by the
     web bulk-paste route and the Telegram review return
     (build 244) so both apply text identically."""
-    from pipeline.common import save_segments, write_srt
+    from pipeline import cue_timing
+    from pipeline.common import save_segments
     changed = 0
     for i, new_text in assign.items():
         if new_text and new_text != (segs[i].get("text_my") or ""):
@@ -10795,7 +10818,8 @@ def _apply_bulk_assign(job, segs, assign):
             changed += 1
     seg_path = JOBS_DIR / job["id"] / "segments_my.json"
     save_segments(segs, seg_path)
-    write_srt(segs, JOBS_DIR / job["id"] / "subs_my.srt")
+    cue_timing.write_subs_srt(JOBS_DIR / job["id"], segs,
+                              JOBS_DIR / job["id"] / "subs_my.srt")
     return changed
 
 

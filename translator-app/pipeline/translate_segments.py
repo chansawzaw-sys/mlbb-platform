@@ -164,7 +164,10 @@ shipping source-language subtitles):
      legacy gate, whose behaviour build 264 froze.
 
 CLI: python -m pipeline.translate_segments <workdir>
-Reads segments_en.json, writes segments_my.json + subs_my.srt (original timings).
+Reads segments_en.json, writes segments_my.json + subs_my.srt.
+Build 271: the SRT is written through pipeline.cue_timing —
+from the word-corrected cues when the job has word
+timestamps, from the segments (original timings) when not.
 """
 import json
 import os
@@ -175,8 +178,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from . import cue_timing
 from .common import (PROJECT_ROOT, ensure_system_ca, load_segments,
-                     save_segments, write_srt)
+                     save_segments)
 
 
 # --- Build 264: the translation-chain gate --------------------
@@ -1423,7 +1427,8 @@ def translate_segments(workdir, style="subs", admin=False):
         report["chunks"] = chunk_entries
         _write_report(workdir, report)
         save_segments(out_all, workdir / "segments_my.json")
-        write_srt(out_all, workdir / "subs_my.srt")
+        cue_timing.write_subs_srt(workdir, out_all,
+                                  workdir / "subs_my.srt")
         return out_all
     glossary_found = {}
     history = []
@@ -1456,7 +1461,8 @@ def translate_segments(workdir, style="subs", admin=False):
     report["chunks"] = chunk_entries
     _write_report(workdir, report)
     save_segments(out_all, workdir / "segments_my.json")
-    write_srt(out_all, workdir / "subs_my.srt")
+    cue_timing.write_subs_srt(workdir, out_all,
+                              workdir / "subs_my.srt")
     return out_all
 
 
