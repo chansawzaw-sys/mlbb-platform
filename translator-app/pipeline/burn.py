@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .common import (FONTS_DIR, capped_dims, encode_threads,
                      ensure_fonts, probe_streams, run,
-                     target_maxrate_k, video_fps)
+                     target_maxrate_k, video_fps, x264_args)
 
 # Subtitle FONT CHOICES — all Myanmar UNICODE fonts bundled in assets/fonts.
 # Every one was verified to cover the full Myanmar block (U+1000–109F) and to
@@ -490,24 +490,27 @@ def video_size(input_mp4):
 # be probed the encode stays byte-for-byte the old one.
 _FPS_CAP = "fps=30,format=yuv420p"
 
-# Build 267 (owner's speed plan, step 3): LONG videos — a job in
-# build-260 part mode, or any source longer than
-# LONG_VIDEO_MIN_SECONDS — render their final picture capped at
-# 720p: the shorter side at most LONG_VIDEO_MAX_HEIGHT px,
-# aspect preserved, never upscaled (common.capped_dims). The
-# scale is the LAST step of the finalize graph (after the fx
-# chain and the subtitle burn), so every layout rule — in-box
-# text on top of the blurred band at full width, karaoke, blur
-# boxes, aspect reframe — is computed on the same canvas as
-# before and scales with the picture, unchanged in proportion.
-# Short videos are never capped: run_job passes cap_h=None for
-# them and every command below is byte-identical to build 266.
-LONG_VIDEO_MAX_HEIGHT = 720
-LONG_VIDEO_MIN_SECONDS = 900.0
+# Build 279 (owner complaint 2026-11-28: the output was
+# visibly below the source): the output now matches the
+# source at EVERY length — the only cap left is 1080p: the
+# shorter side at most OUTPUT_MAX_HEIGHT px, aspect
+# preserved, never upscaled (common.capped_dims). Build
+# 267's long-video 720p cap is REMOVED — it was a speed
+# measure, and the owner chose quality; run_job now passes
+# this cap for every job, short or long, whole or part
+# mode. The scale is still the LAST step of the finalize
+# graph (after the fx chain and the subtitle burn), so
+# every layout rule — in-box text on top of the blurred
+# band at full width, karaoke, blur boxes, aspect reframe
+# — is computed on the source canvas exactly as before and
+# scales with the picture, unchanged in proportion. A
+# source already at or under the cap gets no scale at all
+# (capped_dims returns None) and keeps its exact size.
+OUTPUT_MAX_HEIGHT = 1080
 
 
 def _cap_append(filters, out_label, width, height, cap_h):
-    """Append the build-267 720p scale segment to a finalize
+    """Append the output-cap scale segment to a finalize
     filter list when `cap_h` caps the (width, height) canvas;
     returns the label the finished picture leaves on (the
     input label unchanged when no cap applies)."""
@@ -612,9 +615,9 @@ def finalize_filters(input_mp4, srt_path, font=DEFAULT_FONT, subs=None,
     Build 182: retime's merged encode hangs this graph off its
     concat label so retime + finalize cost ONE encode instead of
     two; `logo` names the input slot the logo image will occupy in
-    that larger command. Build 267: `cap_h` (long videos only)
-    appends the 720p scale as the graph's last step; the out
-    label then reads [vcap] instead of [vout]."""
+    that larger command. `cap_h` (build 279: the uniform 1080p
+    output cap) appends the scale as the graph's last step; the
+    out label then reads [vcap] instead of [vout]."""
     ass_path, fonts_dir, width, height = _prepare_ass(
         input_mp4, srt_path, font, subs, blur_box, fx, style=style)
     if fx:
@@ -656,7 +659,6 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
                 + ["-i", str(input_mp4)]
             if logo_path:
                 cmd += ["-i", str(logo_path)]
-            mr = target_maxrate_k(input_mp4, cap_k)
             out_label = _out
             if _fps_cap(input_mp4):
                 # Build 201: cap AFTER the burn (subtitles are
@@ -664,9 +666,9 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
                 filters = filters + [f"{_out}{_FPS_CAP}[vfinal]"]
                 out_label = "[vfinal]"
             cmd += ["-filter_complex", ";".join(filters), "-map", out_label,
-                    "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
-                    "-crf", "24", "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-                    "-c:a", "copy", "-threads", str(encode_threads()),
+                    "-map", "0:a?"] \
+                + x264_args(input_mp4, cap_k) \
+                + ["-c:a", "copy", "-threads", str(encode_threads()),
                     # Build 250: explicit muxer — the caller may hand
                     # us the finalize temp name, whose format must
                     # never depend on filename inference alone.
@@ -676,22 +678,20 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
     ass_path, fonts_dir, _w, _h = _prepare_ass(
         input_mp4, srt_path, font, subs, blur_box, fx, style=style)
     vf = _ass_filter(ass_path, fonts_dir)
-    # Build 267: the 720p cap rides last in the chain (before
-    # the fps tail, mirroring the finalize_filters order) and
-    # only when run_job marked this job long — cap_h=None keeps
-    # the command byte-identical to build 266.
+    # Build 279: the 1080p output cap rides last in the chain
+    # (before the fps tail, mirroring the finalize_filters
+    # order); cap_h=None (no caller passes it today) keeps the
+    # source's exact size.
     _cd = capped_dims(_w, _h, cap_h) if cap_h else None
     if _cd:
         vf += f",scale={_cd[0]}:{_cd[1]}"
     if _fps_cap(input_mp4):
         vf += "," + _FPS_CAP
-    mr = target_maxrate_k(input_mp4, cap_k)
     run(["ffmpeg", "-y", "-v", "error"] + seek
-        + ["-i", str(input_mp4), "-vf", vf,
-         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
-         "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-         "-c:a", "copy", "-threads", str(encode_threads()),
-         "-f", "mp4", str(output_mp4)])
+        + ["-i", str(input_mp4), "-vf", vf]
+        + x264_args(input_mp4, cap_k)
+        + ["-c:a", "copy", "-threads", str(encode_threads()),
+           "-f", "mp4", str(output_mp4)])
     return output_mp4
 
 

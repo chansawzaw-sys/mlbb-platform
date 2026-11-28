@@ -123,23 +123,18 @@ def _retime_done(workdir, mode):
     return plan
 
 
-def _long_cap_h(src, windowed):
-    """Build 267: the 720p output cap's trigger for one
-    run_phase2 call — the call renders one window of a
-    build-260 part-mode job (`windowed`), or the job's whole
-    source runs longer than burn.LONG_VIDEO_MIN_SECONDS.
-    Returns burn.LONG_VIDEO_MAX_HEIGHT when the cap applies,
-    else None (every encode command then stays byte-identical
-    to build 266). An unprobeable source never caps."""
-    if windowed:
-        return burn.LONG_VIDEO_MAX_HEIGHT
-    try:
-        dur = parts.media_duration(src)
-    except Exception:
-        dur = 0.0
-    if dur > burn.LONG_VIDEO_MIN_SECONDS:
-        return burn.LONG_VIDEO_MAX_HEIGHT
-    return None
+def _output_cap_h(src, windowed):
+    """Build 279: the output resolution cap for one
+    run_phase2 call — burn.OUTPUT_MAX_HEIGHT (1080) for EVERY
+    call, short or long, whole-video or a part-mode window:
+    the output matches the source up to 1080p and is never
+    upscaled (capped_dims returns None at or under the cap,
+    so a <=1080p source's commands carry no scale at all).
+    Build 267's long-only 720p trigger is removed — it was
+    the visible quality loss on long jobs. `src`/`windowed`
+    stay in the signature for the call sites; the answer no
+    longer depends on them."""
+    return burn.OUTPUT_MAX_HEIGHT
 
 
 def steps_for_mode(mode):
@@ -350,13 +345,14 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
     mark = _marks(progress)
     cap_k = maxrate_cap_k(quality)
     src = workdir / "source.mp4"
-    # Build 267: this call's 720p cap decision (part-mode
-    # window, or a source longer than 15 minutes). Computed
-    # once here and threaded into every final encode below —
-    # the burn, the merged finalize spec and the classic fx
-    # pass — so a long job is capped on whichever render path
-    # it lands, and a short job is never touched.
-    cap_h = _long_cap_h(src, start_at > 0.0 or end_at is not None)
+    # Build 279: this call's output cap — the uniform 1080p
+    # cap for every job (build 267's long-only 720p decision
+    # is gone). Computed once here and threaded into every
+    # final encode below — the burn, the merged finalize
+    # spec and the classic fx pass — so the output matches
+    # the source up to 1080p on whichever render path the
+    # job lands.
+    cap_h = _output_cap_h(src, start_at > 0.0 or end_at is not None)
     final = workdir / "output.mp4"
     tmp_final = workdir / FINAL_TMP_NAME
     # Build 246: a previous attempt may have completed the final
@@ -462,7 +458,7 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
             filters, cur, logo_path = fx_mod.filter_chain(
                 fxm, vw, vh, start="[outv]", logo="[2:v]")
             if cap_h:
-                # Build 267: same last-step scale as
+                # Build 279: same last-step scale as
                 # finalize_filters, on the final canvas dims.
                 dims = fx_mod.ASPECT_DIMS.get(
                     (fxm.get("aspect") or {}).get("ratio")) or (vw, vh)

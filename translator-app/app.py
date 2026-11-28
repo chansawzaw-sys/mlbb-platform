@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 278"
+BUILD_TAG = "build 279"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -4715,12 +4715,20 @@ def generate_chain_save():
 # pipeline import — this endpoint only saves it for the
 # NEXT app start, and the GET reports both the saved value
 # and the value the running process actually booted with.
+# Build 279: two more choices — "sol" heads the OpenAI walk
+# with GPT-6.1 Sol (Luna's rules), and "gemini" steers the
+# whole translation walk to the Gemini builder
+# (translate_segments routes it; NO silent fallback — with
+# no Gemini key configured, jobs fail loudly at zero
+# charge). The GET also reports whether a Gemini key is
+# configured, so the card can warn before the owner picks
+# the engine.
 
 @app.get("/api/settings/translate-model")
 def translate_model_status():
     if not _require_admin():
         return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
-    from pipeline import openai_translate
+    from pipeline import gemini_translate, openai_translate
     saved = ""
     try:
         env_path = ROOT / ".env"
@@ -4734,9 +4742,15 @@ def translate_model_status():
                     break
     except Exception:
         saved = ""
+    try:
+        gemini_key = bool(gemini_translate.key_configured())
+    except Exception:
+        gemini_key = False
     return jsonify({
-        "saved": "luna" if saved == "luna" else "current",
-        "effective": openai_translate.model_choice()})
+        "saved": saved if saved in ("luna", "sol", "gemini")
+        else "current",
+        "effective": openai_translate.model_choice(),
+        "gemini_key": gemini_key})
 
 
 @app.post("/api/settings/translate-model")
@@ -4745,12 +4759,12 @@ def translate_model_save():
         return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True) or {}
     model = (data.get("model") or "").strip().lower()
-    if model not in ("current", "luna"):
-        return jsonify({"error": "model မမှန်ပါ — current သို့မဟုတ် luna ဖြစ်ရပါမယ်"}), 400
-    if model == "luna":
-        _env_write("TRANSLATE_MODEL", "luna")
-    else:
+    if model not in ("current", "luna", "sol", "gemini"):
+        return jsonify({"error": "model မမှန်ပါ — current, luna, sol သို့မဟုတ် gemini ဖြစ်ရပါမယ်"}), 400
+    if model == "current":
         _env_remove("TRANSLATE_MODEL")
+    else:
+        _env_write("TRANSLATE_MODEL", model)
     return jsonify({"ok": True, "saved": model})
 
 

@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 from .common import (capped_dims, encode_threads, probe_streams,
-                     run, target_maxrate_k)
+                     run, x264_args)
 
 
 def video_size(path):
@@ -169,11 +169,11 @@ def filter_chain(fx, vw, vh, start="[0:v]", logo="[1:v]"):
 def apply_effects(input_mp4, output_mp4, fx, cap_k=2500, cap_h=None):
     """Apply blur (first) and logo (on top) in ONE ffmpeg pass. Returns output.
 
-    Build 267: `cap_h` (long videos only, passed by run_job)
-    appends the 720p scale after the chain, computed on the
+    `cap_h` (build 279: the uniform 1080p output cap, passed by
+    run_job) appends the scale after the chain, computed on the
     FINAL canvas dims (the aspect reframe's, when one applies)
     — the same last-step placement as burn.finalize_filters.
-    cap_h=None keeps the command byte-identical to build 266."""
+    cap_h=None keeps the source's exact size."""
     if not has_fx(fx):
         raise ValueError("apply_effects called with empty fx")
     vw, vh = video_size(input_mp4)
@@ -188,11 +188,10 @@ def apply_effects(input_mp4, output_mp4, fx, cap_k=2500, cap_h=None):
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4)]
     if logo_path:
         cmd += ["-i", str(logo_path)]
-    mr = target_maxrate_k(input_mp4, cap_k)
-    cmd += ["-filter_complex", ";".join(filters), "-map", cur, "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
-            "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-            "-c:a", "copy", "-threads", str(encode_threads()),
+    cmd += ["-filter_complex", ";".join(filters), "-map", cur,
+            "-map", "0:a?"] \
+        + x264_args(input_mp4, cap_k) \
+        + ["-c:a", "copy", "-threads", str(encode_threads()),
             # Build 250: explicit muxer, never filename inference.
             "-f", "mp4", str(output_mp4)]
     run(cmd)

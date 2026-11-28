@@ -35,8 +35,7 @@ from pathlib import Path
 
 from . import cue_timing
 from .common import (encode_threads, load_segments, probe_duration, run,
-                     save_segments, target_maxrate_k, video_fps,
-                     write_srt)
+                     save_segments, video_fps, write_srt, x264_args)
 
 MAX_SPEED = 1.30
 MIN_VSLOW = 0.80   # legacy stat only; the plan no longer floors at it
@@ -207,7 +206,6 @@ def _video_single_pass(src, chunks, out, cap_k=2500, timeout=1800):
     subprocess timeout raises here and the caller falls back to
     the chunked path, exactly like any other encode failure."""
     filters, _label = _video_graph(chunks)
-    mr = target_maxrate_k(src, cap_k)
     # Build 193 capped every libx264 encode in the pipeline at
     # "-threads 2" (here, _video_merged, _video_chunked, burn, fx
     # and the app.py shrink/small-copy) — with up to four jobs on
@@ -216,10 +214,9 @@ def _video_single_pass(src, chunks, out, cap_k=2500, timeout=1800):
     # (common.encode_threads) — 4 threads when this is the only
     # active job, still exactly 2 whenever 2+ jobs are active.
     run(["ffmpeg", "-y", "-v", "error", "-i", str(src),
-         "-filter_complex", ";".join(filters), "-map", "[outv]",
-         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-         "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-         "-threads", str(encode_threads()), str(out)],
+         "-filter_complex", ";".join(filters), "-map", "[outv]"]
+        + x264_args(src, cap_k)
+        + ["-threads", str(encode_threads()), str(out)],
         timeout=timeout)
 
 
@@ -228,8 +225,9 @@ def _video_merged(src, chunks, dub_wav, spec, cap_k=2500, timeout=1800):
     graph (fx chain and/or subtitle burn, built by the caller in
     `spec`) run in ONE ffmpeg invocation, and the dub audio is muxed
     in the same pass — the picture is encoded exactly once at the
-    finalize stage's own settings (crf 24; the classic flow encoded
-    it at crf 23, decoded it, and encoded it again at crf 24).
+    finalize stage's own settings (build 279: the shared recipe,
+    common.x264_args; the classic flow encoded it, decoded it,
+    and encoded it again).
     `spec` = {"filters", "out_label", "logo_path", "output"} with the
     finalize filters rooted at the concat label [outv]; the logo, if
     any, is input 2 (0 = source, 1 = dub.wav)."""
@@ -239,16 +237,14 @@ def _video_merged(src, chunks, dub_wav, spec, cap_k=2500, timeout=1800):
            "-i", str(dub_wav)]
     if spec.get("logo_path"):
         cmd += ["-i", str(spec["logo_path"])]
-    mr = target_maxrate_k(src, cap_k)
     cmd += ["-filter_complex", ";".join(filters),
-            "-map", spec["out_label"], "-map", "1:a",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
-            "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-            "-c:a", "aac", "-b:a", "96k", "-shortest",
-            "-threads", str(encode_threads()),
-            # Build 250: spec["output"] is the finalize temp name —
-            # pin the muxer explicitly, never filename inference.
-            "-f", "mp4", str(spec["output"])]
+            "-map", spec["out_label"], "-map", "1:a"] \
+        + x264_args(src, cap_k) \
+        + ["-c:a", "aac", "-b:a", "96k", "-shortest",
+           "-threads", str(encode_threads()),
+           # Build 250: spec["output"] is the finalize temp name —
+           # pin the muxer explicitly, never filename inference.
+           "-f", "mp4", str(spec["output"])]
     run(cmd, timeout=timeout)
 
 
@@ -281,9 +277,10 @@ def _video_passthrough_merged(src, dub_wav, spec, cap_k=2500,
     finalize graph is timestamp-global, so on an identity plan it
     can hang straight off the source stream instead: re-rooted at
     [0:v], it runs as the job's ONE encode with the dub muxed in
-    the same pass, at the finalize stage's own settings (crf 24 —
-    the classic burn's settings; the picture the classic flow
-    encoded was a bit-exact copy of this same source). Raises on
+    the same pass, at the finalize stage's own settings (build
+    279: the shared recipe, common.x264_args; the picture the
+    classic flow encoded was a bit-exact copy of this same
+    source). Raises on
     a spec shape it cannot re-root; encode failures propagate to
     the caller's classic fallback, exactly like _video_merged."""
     # Build 201: hanging the graph straight off the source also
@@ -307,15 +304,13 @@ def _video_passthrough_merged(src, dub_wav, spec, cap_k=2500,
            "-i", str(dub_wav)]
     if spec.get("logo_path"):
         cmd += ["-i", str(spec["logo_path"])]
-    mr = target_maxrate_k(src, cap_k)
     cmd += ["-filter_complex", ";".join(filters),
-            "-map", spec["out_label"], "-map", "1:a",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
-            "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-            "-c:a", "aac", "-b:a", "96k", "-shortest",
-            "-threads", str(encode_threads()),
-            # Build 250: explicit muxer for the finalize temp name.
-            "-f", "mp4", str(spec["output"])]
+            "-map", spec["out_label"], "-map", "1:a"] \
+        + x264_args(src, cap_k) \
+        + ["-c:a", "aac", "-b:a", "96k", "-shortest",
+           "-threads", str(encode_threads()),
+           # Build 250: explicit muxer for the finalize temp name.
+           "-f", "mp4", str(spec["output"])]
     run(cmd, timeout=timeout)
 
 
@@ -323,8 +318,9 @@ def _video_grouped(src, chunks, cdir, out, cap_k=2500):
     """Build 186 (audit fix #3): grouped single-pass for jobs past
     the canary ceiling. The chunk list is encoded in groups of at
     most GROUP_MAX_CHUNKS chunks — each group is the ordinary
-    single-pass trim/concat graph at crf 23, exactly the chunked
-    path's settings — and the group files are concat-copied into
+    single-pass trim/concat graph at the shared encode recipe
+    (build 279: common.x264_args), exactly the chunked path's
+    settings — and the group files are concat-copied into
     `out`. This replaces N per-chunk encodes with
     ceil(N/GROUP_MAX_CHUNKS) graph encodes: the classic path's
     per-chunk process + encode overhead was ~45% of the phase on
@@ -378,14 +374,15 @@ def _video_grouped_merged(src, chunks, dub_wav, spec, cdir, cap_k=2500):
     belong to the group, and the group's slice of the dub is
     cut from dub.wav at the same offsets. Every group is
     therefore already the finished picture at the finalize
-    stage's own settings (crf 24); the groups are concat-copied
+    stage's own settings (build 279: common.x264_args); the
+    groups are concat-copied
     into spec["output"] and the classic finalize never runs.
     Any failure raises so the caller falls back to the classic
     grouped encode + classic finalize, unchanged. Returns the
     group count."""
     groups = [chunks[i:i + GROUP_MAX_CHUNKS]
               for i in range(0, len(chunks), GROUP_MAX_CHUNKS)]
-    mr = target_maxrate_k(src, cap_k)
+    xa = x264_args(src, cap_k)
     gfiles = []
     offset = 0.0  # this group's start on the retimed timeline
     for gi, group in enumerate(groups):
@@ -414,11 +411,9 @@ def _video_grouped_merged(src, chunks, dub_wav, spec, cdir, cap_k=2500):
         if spec.get("logo_path"):
             cmd += ["-i", str(spec["logo_path"])]
         cmd += ["-filter_complex", ";".join(filters),
-                "-map", "[vgout]", "-map", "[gaud]",
-                "-c:v", "libx264", "-preset", "ultrafast",
-                "-crf", "24",
-                "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-                "-c:a", "aac", "-b:a", "96k", "-shortest",
+                "-map", "[vgout]", "-map", "[gaud]"] \
+            + xa \
+            + ["-c:a", "aac", "-b:a", "96k", "-shortest",
                 "-threads", str(encode_threads()),
                 # Build 250 discipline: spec["output"] family
                 # names get an explicit muxer, never inference.
@@ -453,15 +448,15 @@ def _video_chunked(src, chunks, cdir, out, cap_k=2500):
     """Original path: one encode per chunk + concat-copy. Kept as the
     fallback for very many chunks, or if the single pass ever fails."""
     vlist = []
-    mr = target_maxrate_k(src, cap_k)
+    xa = x264_args(src, cap_k)
     for n, c in enumerate(chunks):
         dur = c["end"] - c["start"]
         vout = cdir / f"v{n:03d}.mp4"
         run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['start']:.3f}",
-             "-i", str(src), "-vf", _piece_vf(c, dur), "-an",
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-             "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
-             "-threads", str(encode_threads()), str(vout)], timeout=1200)
+             "-i", str(src), "-vf", _piece_vf(c, dur), "-an"]
+            + xa
+            + ["-threads", str(encode_threads()), str(vout)],
+            timeout=1200)
         vlist.append(vout)
     lst = cdir / "vlist_fb.txt"
     lst.write_text("".join(f"file '{f.resolve()}'\n" for f in vlist),

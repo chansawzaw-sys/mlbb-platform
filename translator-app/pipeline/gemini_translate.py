@@ -31,7 +31,7 @@ import re
 import time
 from pathlib import Path
 
-from . import gemini_pool, tunnel
+from . import gemini_pool, quota, tunnel
 from .common import PROJECT_ROOT
 
 DEFAULT_MODEL = "gemini-2.0-flash"
@@ -363,6 +363,15 @@ def _walk(key, body, validate):
                     fail_class = "quota_day"
                 elif cls == "quota" and fail_class is None:
                     fail_class = "quota"
+                elif cls is None and resp.status_code == 402 \
+                        and fail_class is None:
+                    # Build 279: a 402 is the prepay wall
+                    # (pipeline.quota) — the ACCOUNT's balance
+                    # is gone, not a key-shaped failure, so the
+                    # pool classifier has no class for it;
+                    # record "wall" and let _run_pool turn an
+                    # all-wall result into a QuotaWallError.
+                    fail_class = "wall"
                 # Record EVERY attempt with its own body
                 # snippet (build 197).
                 attempts.append(
@@ -380,18 +389,22 @@ def _run_pool(body, validate, what):
     and retries with the next; any OTHER failure keeps the
     pre-229 behaviour — stop at once and let the caller
     fall back to the other engines. Raises RuntimeError
-    when no key produces a result. Build 189's tunnel rule
+    when no key produces a result — or, build 279, a
+    quota.QuotaWallError when every key is per-day-dead or
+    a 402 prepay wall was seen. Build 189's tunnel rule
     is unchanged: every attempt's kwargs come from
     tunnel.request_kwargs via _walk."""
     keys = gemini_pool.ordered_keys()
     if not keys:
         raise RuntimeError("no GEMINI_API_KEY configured")
     all_attempts = []
+    classes = []
     for key in keys:
         result, attempts, fail_class = _walk(key, body, validate)
         all_attempts += attempts
         if result is not None:
             return result
+        classes.append(fail_class)
         if fail_class == "quota_day":
             gemini_pool.mark_cooling_day(key)
             continue
@@ -402,6 +415,20 @@ def _run_pool(body, validate, what):
             gemini_pool.mark_disabled(key)
             continue
         break
+    # Build 279 (completing build 275's pool contract for
+    # this caller, exactly as gemini_tts already does): when
+    # EVERY key landed on the per-day quota, the pool is dead
+    # until tomorrow; a 402 anywhere means the prepay balance
+    # is gone. Either way the job fails FAST with the quota
+    # wall message (zero charge) instead of re-walking dead
+    # keys segment after segment.
+    if classes and all(c == "quota_day" for c in classes):
+        raise quota.QuotaWallError(quota.wall_message(
+            "gemini", 429,
+            "GenerateRequestsPerDayPerProjectPerModel-FreeTier"))
+    if "wall" in classes:
+        raise quota.QuotaWallError(
+            quota.wall_message("gemini", 402, ""))
     msg = f"Gemini {what}failed: " + "; ".join(all_attempts)
     _note_error(msg)
     raise RuntimeError(msg)

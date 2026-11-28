@@ -87,8 +87,9 @@ import time
 from pathlib import Path
 
 from . import cue_timing
-from .common import (PROJECT_ROOT, load_segments, probe_duration,
-                     probe_streams, run, save_segments, write_srt)
+from .common import (ENCODE_CRF, PROJECT_ROOT, load_segments,
+                     probe_duration, probe_streams, run,
+                     save_segments, write_srt)
 
 PART_SECONDS = 600
 # Build 266: total attempts per part within one part-mode run
@@ -547,7 +548,7 @@ def _concat_parts(workdir, part_files, tmp_final):
     # shipping a torn timeline.
     run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
          "-i", str(lst), "-c:v", "libx264", "-preset", "ultrafast",
-         "-crf", "24", "-c:a", "aac", "-b:a", "96k",
+         "-crf", str(ENCODE_CRF), "-c:a", "aac", "-b:a", "96k",
          "-f", "mp4", str(tmp_final)], timeout=3600)
     if not _sane(tmp_final):
         raise RuntimeError(

@@ -214,6 +214,17 @@ from .common import (PROJECT_ROOT, ensure_system_ca, load_segments,
 # two sources, in the same order, as
 # openai_translate.get_api_key. A flip therefore takes
 # effect on the next app start, never mid-job.
+# Build 279: the Admin translation-MODEL choice
+# (openai_translate.model_choice(), TRANSLATE_MODEL) can
+# steer the walk to a THIRD engine set: "gemini" routes the
+# batch walk AND the rescue through pipeline.gemini_translate
+# only — the dormant Gemini machinery below (the same
+# _gemini_attempt the legacy walk uses), with NO silent
+# fallback to OpenAI, so the owner A/B-ing engines always
+# knows which engine actually translated. The gemini choice
+# wins over TRANSLATE_CHAIN when both are set; "current",
+# "luna" and "sol" leave this gate exactly as build 264
+# left it.
 
 def _read_chain_gate():
     v = (os.environ.get("TRANSLATE_CHAIN") or "").strip().lower()
@@ -242,6 +253,21 @@ def chain_mode():
     the Admin card can show what is actually live versus
     what is saved for the next start)."""
     return _CHAIN
+
+
+def _model_choice():
+    """Build 279: the Admin translation-model choice this
+    process booted with, read through openai_translate (the
+    choice's owner — TRANSLATE_MODEL, read once at ITS
+    import). Lazy import, this module's established pattern
+    for engine modules; openai_translate never imports this
+    module, so there is no cycle. Any failure reads as
+    "current" — the pre-279 behaviour."""
+    try:
+        from . import openai_translate
+        return openai_translate.model_choice()
+    except Exception:
+        return "current"
 
 
 # --- Build 265: the chunk-concurrency knob -------------------
@@ -356,10 +382,41 @@ class _Rescue:
         """(engine, fn) pairs in walk order — the gate
         decides which walk (build 264): OpenAI-only by
         default, the pre-264 multi-engine walk under
-        TRANSLATE_CHAIN=legacy."""
+        TRANSLATE_CHAIN=legacy. Build 279: the "gemini"
+        model choice is checked FIRST and wins over the
+        chain gate — Gemini-only, no silent substitution."""
+        if _model_choice() == "gemini":
+            return self._attempts_gemini()
         if _CHAIN == "legacy":
             return self._attempts_legacy()
         return self._attempts_openai()
+
+    def _attempts_gemini(self):
+        """Build 279: Gemini is the ONLY rescue engine under
+        the "gemini" model choice — the mirror of
+        _attempts_openai. No probe skip (same reasoning: the
+        only chosen engine is never skipped on a stale
+        verdict). Unconfigured -> no attempts -> one()
+        returns the source under fallback-source, the
+        loud-failure shape the guard expects (the batch walk
+        fails even louder and earlier — see
+        _walk_batch_gemini's no-key wall). A quota wall
+        raised inside the engine propagates out of one()
+        untouched (build 275)."""
+        found = {}
+        ctx = self.context
+        try:
+            from . import gemini_translate
+            if gemini_translate.key_configured():
+                found["gemini"] = lambda seg: \
+                    (_engine_translate(
+                        gemini_translate, [seg], self.style,
+                        ctx)[0],
+                     "gemini")
+        except Exception:
+            pass
+        return [(name, found[name]) for name in ("gemini",)
+                if name in found]
 
     def _attempts_openai(self):
         """Build 264: OpenAI is the ONLY rescue engine. No
@@ -554,7 +611,7 @@ def _probe_engine_ok(engine):
 
 
 def _gemini_attempt(segs, style, report, admin=False,
-                    context=None):
+                    context=None, probe_skip=True):
     """ONE Gemini attempt with the chain's usual report
     semantics; the translated segment list, or None when the
     engine is unconfigured / probe-skipped / failed (the error
@@ -563,11 +620,16 @@ def _gemini_attempt(segs, style, report, admin=False,
     caller guarantees it runs at most once per chunk. Build
     232: `admin` only steers the fill rescue's walk order.
     Build 248: `context` is the chunk carry-over, threaded
-    into the attempt and its fill rescue."""
+    into the attempt and its fill rescue. Build 279:
+    `probe_skip` mirrors _openai_attempt's — honoured by the
+    legacy callers (the default); the Gemini-choice walk
+    passes probe_skip=False, because skipping the ONLY chosen
+    engine on a stale probe verdict would fail every chunk
+    without an attempt."""
     try:
         from . import gemini_translate
         if gemini_translate.key_configured() \
-                and not _probe_blocked("gemini"):
+                and not (probe_skip and _probe_blocked("gemini")):
             by_idx = _engine_translate(gemini_translate, segs,
                                        style, context)
             out = [{**seg, "text_my": by_idx[i], "provider": "gemini"}
@@ -819,10 +881,49 @@ def _walk_batch_openai(segs, style, admin=False, context=None):
                         context=context)
 
 
+_GEMINI_NO_KEY_MSG = (
+    "Gemini ဘာသာပြန် engine ရွေးထားပေမယ့် Gemini key "
+    "မထည့်ရသေးပါ — admin က Gemini key အရင် ထည့်ပါ၊ "
+    "ဒါမှမဟုတ် တခြား engine ပြောင်းပါ "
+    "(credit လုံးဝ မဖြတ်ပါ)")
+
+
+def _walk_batch_gemini(segs, style, admin=False, context=None):
+    """Build 279: the Gemini-only walk over ONE batch of
+    segments, selected by TRANSLATE_MODEL=gemini — the
+    mirror of _walk_batch_openai on the dormant Gemini
+    machinery: the same _gemini_attempt the legacy walk
+    uses (build-278 single-rule prompts via
+    gemini_translate._build_prompt, tunnel routing, the
+    build-229 key pool), then the shared rescue tail, whose
+    rescue is Gemini-only under this choice too. NO silent
+    fallback, ever: no other engine is substituted, and
+    when no Gemini key is configured the walk raises the
+    quota-wall error below at once — the job fails loudly
+    at zero charge with a message that names the actual
+    problem, because the owner A/B-ing engines must know
+    which engine really translated."""
+    report = {"rescue": {}, "fill": {}}
+    if segs:
+        from . import gemini_translate
+        if not gemini_translate.key_configured():
+            raise quota.QuotaWallError(_GEMINI_NO_KEY_MSG)
+        out = _gemini_attempt(segs, style, report, admin=admin,
+                              context=context, probe_skip=False)
+        if out is not None:
+            return out, report
+    return _rescue_tail(segs, style, report, admin=admin,
+                        context=context)
+
+
 def _walk_batch(segs, style, admin=False, context=None):
     """Walk selection (build 264): the gate read at import
     decides — OpenAI-only by default, the pre-264 walk under
-    TRANSLATE_CHAIN=legacy."""
+    TRANSLATE_CHAIN=legacy. Build 279: the "gemini" model
+    choice is checked FIRST and wins over the chain gate."""
+    if _model_choice() == "gemini":
+        return _walk_batch_gemini(segs, style, admin=admin,
+                                  context=context)
     if _CHAIN == "legacy":
         return _walk_batch_legacy(segs, style, admin=admin,
                                   context=context)

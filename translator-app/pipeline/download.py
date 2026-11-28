@@ -36,9 +36,18 @@ def norm_quality(q):
 # yt-dlp format selectors per quality. "720" keeps the build-80
 # light-rendition selectors exactly (bitrate-capped first so a
 # same-height heavy rendition is not picked by accident); "hd"
-# takes the best available, period; "480" mirrors 720's shape.
+# takes the best available; "480" mirrors 720's shape.
+# Build 279: "hd" first prefers the best rendition inside the
+# 1080 box (width AND height <= 1920 — orientation-safe: a
+# portrait 1080x1920 fits, a landscape 1920x1080 fits) because
+# the renderer's output never exceeds 1080p, so fetching a 4K
+# rendition is pure waste on this disk-tight box; when nothing
+# fits the box it falls back to the unrestricted best, exactly
+# the pre-279 behaviour — it never silently picks less than
+# the best the box allows.
 _FORMAT_SELECTORS = {
-    "hd": "bv*+ba/b",
+    "hd": ("bv*[width<=1920][height<=1920]+ba/"
+           "bv*+ba/b"),
     "720": ("bv*[height<=720][tbr<=1800]+ba/b[height<=720][tbr<=1800]/"
             "bv*[height<=720]+ba/b[height<=720]/b"),
     "480": ("bv*[height<=480][tbr<=1200]+ba/b[height<=480][tbr<=1200]/"

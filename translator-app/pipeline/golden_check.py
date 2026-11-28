@@ -98,9 +98,18 @@ def _translate_model_label():
     """Build 276: the model heading the translation walk
     for THIS process (the Admin translate-model choice) —
     stamped on every run/capture so a Golden Sample result
-    says which model produced it."""
+    says which model produced it. Build 279: under the
+    "gemini" choice the walk runs on Gemini, so the label
+    names the engine and its head model —
+    "gemini:<model>"; the OpenAI choices keep their
+    build-276 label (the walk's head model)."""
     try:
         from . import openai_translate
+        if openai_translate.model_choice() == "gemini":
+            from . import gemini_translate
+            models = gemini_translate._models()
+            return "gemini:" + (models[0] if models
+                                else "gemini")
         return openai_translate.translate_models()[0]
     except Exception:
         return None

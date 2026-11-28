@@ -132,8 +132,27 @@ def maxrate_cap_k(quality):
     owner's explicit order — the build-102 ceiling of 2500k would
     strangle it straight back to blurry, so hd gets 6000k. The
     source anchor in target_maxrate_k still keeps a low-bitrate
-    source from ballooning; the cap only stops being the limit."""
-    return 6000 if quality == "hd" else 2500
+    source from ballooning; the cap only stops being the limit.
+    Build 279 raised both ceilings (16000 hd / 12000 else): the
+    ceiling must never strangle the CRF — the actual value comes
+    from target_maxrate_k, anchored to the source's own bitrate
+    with a per-resolution floor on top."""
+    return 16000 if quality == "hd" else 12000
+
+
+def _res_floor_k(width, height):
+    """Build 279: the maxrate floor (kbps) a frame of this size
+    needs so the encode can match source quality — 1080p-class
+    frames 10000, 720p-class 6000, smaller frames no floor (the
+    source anchor rules). "Class" is the SHORTER side — the
+    same "p" measure capped_dims uses — so a portrait frame
+    counts by its width."""
+    short = min(width, height) if width and height else 0
+    if short >= 1000:
+        return 10000
+    if short >= 700:
+        return 6000
+    return 0
 
 
 def target_maxrate_k(input_mp4, cap_k=2500):
@@ -142,19 +161,57 @@ def target_maxrate_k(input_mp4, cap_k=2500):
     or TikTok source at crf 23/24 ballooned one 12 MB job to 110 MB.
     Anchor on the original source.mp4 sitting next to the input when
     there is one (dub jobs burn the retimed intermediate, whose own
-    bitrate is already one re-encode away from the source)."""
+    bitrate is already one re-encode away from the source).
+    Build 279: the value is max(anchor x 1.1, the resolution floor
+    for the encode input's own frame size — _res_floor_k), bounded
+    above by cap_k except that the floor itself wins even over a
+    stale low cap, so no forgotten 2500 default can strangle a
+    1080p frame. The maxrate ceiling is also what keeps the CRF
+    honest on size: a low-bitrate source cannot balloon past
+    roughly its floor class."""
     try:
         src = Path(input_mp4)
+        floor = 0
+        for s in probe_streams(src):
+            if s.get("codec_type") == "video":
+                floor = _res_floor_k(int(s.get("width") or 0),
+                                     int(s.get("height") or 0))
+                break
         anchor = src.with_name("source.mp4")
         if anchor.exists():
             src = anchor
         dur = probe_duration(src)
         if dur <= 0:
-            return 1800
+            return max(1800, floor)
         kbps = src.stat().st_size * 8 / dur / 1000.0
-        return int(max(450, min(cap_k, kbps * 1.1)))
+        val = max(kbps * 1.1, float(floor))
+        return int(max(450, min(max(cap_k, floor), val)))
     except Exception:
         return 1800
+
+
+# Build 279: the ONE video-encode recipe for every render path
+# (burn finalize, fx, retime intermediates AND finals, the parts
+# concat fallback): libx264 ultrafast — the builds 265-267 speed
+# programme's preset; a slower preset would multiply render times
+# for a gain the CRF already delivers — at CRF 19, inside the
+# 18-20 visually-lossless band, with the maxrate from
+# target_maxrate_k so the CRF is never strangled by a bitrate
+# ceiling sized for a smaller frame. Build 278's CRF 23/24 under
+# the old 6000k/2500k caps was the visible quality loss the owner
+# reported on 2026-11-28. The retime intermediates use the same
+# recipe because the single-pass dub (no fx) ships retimed.mp4
+# itself as the final output.
+ENCODE_CRF = 19
+
+
+def x264_args(input_mp4, cap_k=2500):
+    """The shared libx264 argument block for one encode of
+    `input_mp4` (build 279; see ENCODE_CRF above)."""
+    mr = target_maxrate_k(input_mp4, cap_k)
+    return ["-c:v", "libx264", "-preset", "ultrafast",
+            "-crf", str(ENCODE_CRF),
+            "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k"]
 
 
 # --- Job-scoped process tracking (build 204, audit V09) ------------------

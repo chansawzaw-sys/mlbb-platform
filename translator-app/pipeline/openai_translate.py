@@ -18,6 +18,13 @@ The default stays the pre-276 walk byte for byte, and a Luna
 404 falls through to gpt-4o-mini like any missing model, so
 the choice can never fail a job by itself. Script generation
 (generate_text) does NOT follow the choice.
+
+Build 279: two more choices join the same gate — "sol" heads
+the walk with GPT-6.1 Sol (same fallthrough + strip-retry
+rules as Luna), and "gemini" steers the walk AWAY from this
+module entirely: translate_segments routes chunks + rescue
+through pipeline.gemini_translate instead (this module's
+walk is simply never called under that choice).
 """
 import json
 import os
@@ -55,8 +62,12 @@ def _models():
 # generate_text (Recap/Story/Commentary script generation,
 # build 269) does NOT follow this choice — it keeps
 # _models() exactly; this gate steers translation only.
+# Build 279: "sol" (GPT-6.1 Sol head, Luna's rules) and
+# "gemini" (translate_segments routes to the Gemini builder;
+# see _read_model_choice) join the same gate.
 
 LUNA_MODEL = "gpt-6-luna"
+SOL_MODEL = "gpt-6.1-sol"
 
 
 def _read_model_choice():
@@ -74,7 +85,7 @@ def _read_model_choice():
                         break
         except Exception:
             v = ""
-    return "luna" if v == "luna" else "current"
+    return v if v in ("luna", "sol", "gemini") else "current"
 
 
 _MODEL_CHOICE = _read_model_choice()
@@ -82,7 +93,7 @@ _MODEL_CHOICE = _read_model_choice()
 
 def model_choice():
     """The translation-model choice this process booted
-    with: "current" or "luna" (surfaced by
+    with: "current", "luna", "sol" or "gemini" (surfaced by
     /api/settings/translate-model so the Admin card can
     show what is actually live versus what is saved)."""
     return _MODEL_CHOICE
@@ -97,10 +108,16 @@ def translate_models():
     a 404 (model not on this account) falls through to
     gpt-4o-mini exactly like any missing model in the
     existing walk, so a wrong or unavailable Luna id can
-    never fail a job by itself."""
-    if _MODEL_CHOICE == "luna":
+    never fail a job by itself. "sol" (build 279): the
+    same shape with gpt-6.1-sol at the head. "gemini":
+    translate_segments never calls this walk — it routes
+    to the Gemini builder — so _models() is returned
+    unused, exactly like "current"."""
+    if _MODEL_CHOICE in ("luna", "sol"):
+        head = LUNA_MODEL if _MODEL_CHOICE == "luna" \
+            else SOL_MODEL
         out = []
-        for m in [LUNA_MODEL, "gpt-4o-mini", "gpt-4.1-mini"]:
+        for m in [head, "gpt-4o-mini", "gpt-4.1-mini"]:
             if m not in out:
                 out.append(m)
         return out
@@ -197,13 +214,15 @@ def translate_all(segments, style="subs", context=None):
         except Exception as e:  # network-level: next model shape
             attempts.append(f"{mdl}=net:{e}"[:60])
             continue
-        if resp.status_code == 400 and mdl == LUNA_MODEL:
+        if resp.status_code == 400 \
+                and mdl in (LUNA_MODEL, SOL_MODEL):
             # Build 276: GPT-6 models are reasoning models and
             # may reject a request parameter outright. On a 400
             # that NAMES the parameter (and only then), retry
             # this model ONCE with that parameter removed —
             # never a blind retry, and never for the mini
-            # models, whose path is unchanged.
+            # models, whose path is unchanged. Build 279: the
+            # same cover for the Sol head of the walk.
             bad = _unsupported_param(resp.text)
             if bad:
                 payload = {k: v for k, v in payload.items()
