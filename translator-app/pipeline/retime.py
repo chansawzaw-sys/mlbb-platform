@@ -360,6 +360,94 @@ def _video_grouped(src, chunks, cdir, out, cap_k=2500):
     return len(groups)
 
 
+def _video_grouped_merged(src, chunks, dub_wav, spec, cdir, cap_k=2500):
+    """Build 267: grouped single-pass WITH the finalize graph
+    merged into every group encode. Past the build-183 canary
+    ceiling the classic flow encoded the retimed picture in
+    groups (crf 23), stream-copied it into retimed.mp4, and then
+    run_job's classic finalize DECODED it and encoded it AGAIN
+    (crf 24) to burn the subtitles / apply the fx — two full
+    encodes at source resolution, measured at 61% of a 13-minute
+    job's total time (2026-11-26). The finalize graph is
+    timestamp-global (subtitle cues, blur-piece windows), so it
+    cannot hang off a group concat as-is — but each group's
+    concat label can be shifted onto the GLOBAL retimed
+    timeline (setpts + the group's retimed offset) before the
+    graph, which then renders exactly the cues and pieces that
+    belong to the group, and the group's slice of the dub is
+    cut from dub.wav at the same offsets. Every group is
+    therefore already the finished picture at the finalize
+    stage's own settings (crf 24); the groups are concat-copied
+    into spec["output"] and the classic finalize never runs.
+    Any failure raises so the caller falls back to the classic
+    grouped encode + classic finalize, unchanged. Returns the
+    group count."""
+    groups = [chunks[i:i + GROUP_MAX_CHUNKS]
+              for i in range(0, len(chunks), GROUP_MAX_CHUNKS)]
+    mr = target_maxrate_k(src, cap_k)
+    gfiles = []
+    offset = 0.0  # this group's start on the retimed timeline
+    for gi, group in enumerate(groups):
+        gout = cdir / f"m{gi:03d}.mp4"
+        gdur = sum(float(c["new_dur"]) for c in group)
+        filters, _label = _video_graph(group)
+        rooted = _reroot_finalize(spec["filters"], root="[gmrg]")
+        if rooted is None:
+            raise RuntimeError("finalize spec cannot be re-rooted")
+        filters.append(f"[outv]setpts=PTS+{offset:.3f}/TB[gmrg]")
+        filters += rooted
+        # The global offset was for the finalize graph's eyes
+        # only: reset the finished picture to a zero-based
+        # timeline before the encode, or the offset leaks into
+        # the group file's packet timestamps and the concat
+        # demuxer below inflates the joined timeline with it
+        # (proof267's first run: 242 s out for an 84.6 s plan —
+        # caught by the duration validation and fell back).
+        filters.append(
+            f"{spec['out_label']}setpts=PTS-STARTPTS[vgout]")
+        filters.append(
+            f"[1:a]atrim=start={offset:.3f}:end={offset + gdur:.3f},"
+            f"asetpts=PTS-STARTPTS[gaud]")
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src),
+               "-i", str(dub_wav)]
+        if spec.get("logo_path"):
+            cmd += ["-i", str(spec["logo_path"])]
+        cmd += ["-filter_complex", ";".join(filters),
+                "-map", "[vgout]", "-map", "[gaud]",
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-crf", "24",
+                "-maxrate", f"{mr}k", "-bufsize", f"{2 * mr}k",
+                "-c:a", "aac", "-b:a", "96k", "-shortest",
+                "-threads", str(encode_threads()),
+                # Build 250 discipline: spec["output"] family
+                # names get an explicit muxer, never inference.
+                "-f", "mp4", str(gout)]
+        run(cmd, timeout=_canary_timeout(
+            sum(c["end"] - c["start"] for c in group)))
+        gfiles.append(gout)
+        offset += gdur
+    lst = cdir / "mlist.txt"
+    lst.write_text("".join(f"file '{f.resolve()}'\n" for f in gfiles),
+                   encoding="utf-8")
+    out = Path(spec["output"])
+    run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+         "-i", str(lst), "-c", "copy", "-f", "mp4", str(out)],
+        timeout=1200)
+    # The merged file must BE the retimed timeline (within
+    # frame/packet slack of the summed plan); anything else is
+    # a torn merge — raise so the classic flow takes over.
+    got = probe_duration(out)
+    if got <= 0 or abs(got - offset) > 2.0:
+        raise RuntimeError(
+            f"grouped merged output duration {got} != {offset}")
+    for f in gfiles:
+        try:
+            f.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return len(groups)
+
+
 def _video_chunked(src, chunks, cdir, out, cap_k=2500):
     """Original path: one encode per chunk + concat-copy. Kept as the
     fallback for very many chunks, or if the single pass ever fails."""
@@ -594,16 +682,20 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None,
                  "-shortest", str(workdir / "retimed.mp4")], timeout=1200)
     else:
         spec = None
-        if make_finalize is not None and n_chunks <= CANARY_MAX_CHUNKS:
+        if make_finalize is not None:
             # Built OUTSIDE the try: a spec error (missing font, bad
             # fx) must fail the job loudly, exactly as the classic
             # finalize would — only an encode failure falls back.
             # Build 183: the spec is now also built in the canary
             # range (13..CANARY_MAX_CHUNKS chunks); the merged
             # encode there runs under _canary_timeout instead of
-            # the classic 1800 s budget.
+            # the classic 1800 s budget. Build 267: the spec is
+            # built at EVERY chunk count — past the canary ceiling
+            # it feeds _video_grouped_merged below; the single
+            # trim/concat graph itself stays capped at
+            # CANARY_MAX_CHUNKS, exactly as build 183 left it.
             spec = make_finalize(plan)
-        if spec is not None:
+        if spec is not None and n_chunks <= CANARY_MAX_CHUNKS:
             canary = n_chunks > MERGE_MAX_CHUNKS
             budget = _canary_timeout(total) if canary else 1800
             if canary:
@@ -621,6 +713,26 @@ def retime(workdir, max_speed=MAX_SPEED, cap_k=2500, make_finalize=None,
                 # partial file at the final path — remove it so it
                 # can never pose as the finished video; the classic
                 # flow below rewrites that path from scratch anyway.
+                try:
+                    Path(spec["output"]).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        if not merged and spec is not None \
+                and n_chunks > CANARY_MAX_CHUNKS:
+            # Build 267: past the canary ceiling, merge the
+            # finalize graph into GROUPED encodes (one encode
+            # per group, finished picture out) instead of the
+            # classic grouped encode + a second full finalize
+            # encode in run_job. A failure removes any partial
+            # final file and falls through to that classic flow
+            # below, unchanged.
+            try:
+                plan["merge_groups"] = _video_grouped_merged(
+                    src, chunks, dub_wav, spec, cdir, cap_k)
+                merged = True
+                plan["video_path"] = "grouped_merged"
+            except Exception:
+                merged = False
                 try:
                     Path(spec["output"]).unlink(missing_ok=True)
                 except Exception:

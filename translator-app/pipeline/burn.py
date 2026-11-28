@@ -16,8 +16,9 @@ import re
 import sys
 from pathlib import Path
 
-from .common import (FONTS_DIR, encode_threads, ensure_fonts,
-                     probe_streams, run, target_maxrate_k, video_fps)
+from .common import (FONTS_DIR, capped_dims, encode_threads,
+                     ensure_fonts, probe_streams, run,
+                     target_maxrate_k, video_fps)
 
 # Subtitle FONT CHOICES — all Myanmar UNICODE fonts bundled in assets/fonts.
 # Every one was verified to cover the full Myanmar block (U+1000–109F) and to
@@ -489,6 +490,33 @@ def video_size(input_mp4):
 # be probed the encode stays byte-for-byte the old one.
 _FPS_CAP = "fps=30,format=yuv420p"
 
+# Build 267 (owner's speed plan, step 3): LONG videos — a job in
+# build-260 part mode, or any source longer than
+# LONG_VIDEO_MIN_SECONDS — render their final picture capped at
+# 720p: the shorter side at most LONG_VIDEO_MAX_HEIGHT px,
+# aspect preserved, never upscaled (common.capped_dims). The
+# scale is the LAST step of the finalize graph (after the fx
+# chain and the subtitle burn), so every layout rule — in-box
+# text on top of the blurred band at full width, karaoke, blur
+# boxes, aspect reframe — is computed on the same canvas as
+# before and scales with the picture, unchanged in proportion.
+# Short videos are never capped: run_job passes cap_h=None for
+# them and every command below is byte-identical to build 266.
+LONG_VIDEO_MAX_HEIGHT = 720
+LONG_VIDEO_MIN_SECONDS = 900.0
+
+
+def _cap_append(filters, out_label, width, height, cap_h):
+    """Append the build-267 720p scale segment to a finalize
+    filter list when `cap_h` caps the (width, height) canvas;
+    returns the label the finished picture leaves on (the
+    input label unchanged when no cap applies)."""
+    dims = capped_dims(width, height, cap_h) if cap_h else None
+    if not dims:
+        return out_label
+    filters.append(f"{out_label}scale={dims[0]}:{dims[1]}[vcap]")
+    return "[vcap]"
+
 
 def _fps_cap(input_mp4):
     """True when this burn's input runs above 30fps and its
@@ -575,7 +603,7 @@ def _ass_filter(ass_path, fonts_dir):
 
 def finalize_filters(input_mp4, srt_path, font=DEFAULT_FONT, subs=None,
                      blur_box=None, fx=None, start="[0:v]", logo="[1:v]",
-                     style=None):
+                     style=None, cap_h=None):
     """Filter-complex segments turning the video stream at label
     `start` into the finished picture: the fx chain (blur/logo/
     aspect) with the subtitle burn appended — the same graph burn()
@@ -584,7 +612,9 @@ def finalize_filters(input_mp4, srt_path, font=DEFAULT_FONT, subs=None,
     Build 182: retime's merged encode hangs this graph off its
     concat label so retime + finalize cost ONE encode instead of
     two; `logo` names the input slot the logo image will occupy in
-    that larger command."""
+    that larger command. Build 267: `cap_h` (long videos only)
+    appends the 720p scale as the graph's last step; the out
+    label then reads [vcap] instead of [vout]."""
     ass_path, fonts_dir, width, height = _prepare_ass(
         input_mp4, srt_path, font, subs, blur_box, fx, style=style)
     if fx:
@@ -593,13 +623,16 @@ def finalize_filters(input_mp4, srt_path, font=DEFAULT_FONT, subs=None,
             filters, cur, logo_path = fx_mod.filter_chain(
                 fx, width, height, start=start, logo=logo)
             filters.append(f"{cur}{_ass_filter(ass_path, fonts_dir)}[vout]")
-            return filters, "[vout]", logo_path
-    return [f"{start}{_ass_filter(ass_path, fonts_dir)}[vout]"], "[vout]", None
+            out = _cap_append(filters, "[vout]", width, height, cap_h)
+            return filters, out, logo_path
+    filters = [f"{start}{_ass_filter(ass_path, fonts_dir)}[vout]"]
+    out = _cap_append(filters, "[vout]", width, height, cap_h)
+    return filters, out, None
 
 
 def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
          blur_box=None, fx=None, cap_k=2500, style=None,
-         win_start=0.0, win_end=None):
+         win_start=0.0, win_end=None, cap_h=None):
     # Build 260 part mode: [win_start, win_end) restricts the
     # encode to one part's window of the input via an input seek
     # (frame-accurate under re-encode, which the burn always
@@ -618,7 +651,7 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
             # (Was: a full fx encode followed by a full burn encode.)
             filters, _out, logo_path = finalize_filters(
                 input_mp4, srt_path, font, subs, blur_box, fx,
-                style=style)
+                style=style, cap_h=cap_h)
             cmd = ["ffmpeg", "-y", "-v", "error"] + seek \
                 + ["-i", str(input_mp4)]
             if logo_path:
@@ -643,6 +676,13 @@ def burn(input_mp4, srt_path, output_mp4, font=DEFAULT_FONT, subs=None,
     ass_path, fonts_dir, _w, _h = _prepare_ass(
         input_mp4, srt_path, font, subs, blur_box, fx, style=style)
     vf = _ass_filter(ass_path, fonts_dir)
+    # Build 267: the 720p cap rides last in the chain (before
+    # the fps tail, mirroring the finalize_filters order) and
+    # only when run_job marked this job long — cap_h=None keeps
+    # the command byte-identical to build 266.
+    _cd = capped_dims(_w, _h, cap_h) if cap_h else None
+    if _cd:
+        vf += f",scale={_cd[0]}:{_cd[1]}"
     if _fps_cap(input_mp4):
         vf += "," + _FPS_CAP
     mr = target_maxrate_k(input_mp4, cap_k)

@@ -12,7 +12,8 @@ import time
 from pathlib import Path
 
 from . import burn, download, elevenlabs_tts, fx as fx_mod, gemini_tts, parts, retime, transcribe, translate_segments, tts
-from .common import load_segments, maxrate_cap_k, probe_duration
+from .common import (capped_dims, load_segments, maxrate_cap_k,
+                     probe_duration)
 
 ALL_STEPS = ["download", "transcribe", "translate", "tts", "retime", "finalize"]
 
@@ -120,6 +121,25 @@ def _retime_done(workdir, mode):
     if mode == "both" and not (workdir / "subs_retimed.srt").exists():
         return None
     return plan
+
+
+def _long_cap_h(src, windowed):
+    """Build 267: the 720p output cap's trigger for one
+    run_phase2 call — the call renders one window of a
+    build-260 part-mode job (`windowed`), or the job's whole
+    source runs longer than burn.LONG_VIDEO_MIN_SECONDS.
+    Returns burn.LONG_VIDEO_MAX_HEIGHT when the cap applies,
+    else None (every encode command then stays byte-identical
+    to build 266). An unprobeable source never caps."""
+    if windowed:
+        return burn.LONG_VIDEO_MAX_HEIGHT
+    try:
+        dur = parts.media_duration(src)
+    except Exception:
+        dur = 0.0
+    if dur > burn.LONG_VIDEO_MIN_SECONDS:
+        return burn.LONG_VIDEO_MAX_HEIGHT
+    return None
 
 
 def steps_for_mode(mode):
@@ -330,6 +350,13 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
     mark = _marks(progress)
     cap_k = maxrate_cap_k(quality)
     src = workdir / "source.mp4"
+    # Build 267: this call's 720p cap decision (part-mode
+    # window, or a source longer than 15 minutes). Computed
+    # once here and threaded into every final encode below —
+    # the burn, the merged finalize spec and the classic fx
+    # pass — so a long job is capped on whichever render path
+    # it lands, and a short job is never touched.
+    cap_h = _long_cap_h(src, start_at > 0.0 or end_at is not None)
     final = workdir / "output.mp4"
     tmp_final = workdir / FINAL_TMP_NAME
     # Build 246: a previous attempt may have completed the final
@@ -371,7 +398,7 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
                       subs=subs, blur_box=(fx or {}).get("blur"),
                       fx=fx if fx_mod.has_fx(fx) else None, cap_k=cap_k,
                       style="karaoke" if karaoke else None,
-                      win_start=start_at, win_end=end_at)
+                      win_start=start_at, win_end=end_at, cap_h=cap_h)
             os.replace(tmp_final, final)
         mark("finalize", "done")
         return final
@@ -427,13 +454,23 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
                 blur_box=(fxm or {}).get("blur"),
                 fx=fxm if fx_mod.has_fx(fxm) else None,
                 start="[outv]", logo="[2:v]",
-                style="karaoke" if karaoke else None)
+                style="karaoke" if karaoke else None, cap_h=cap_h)
             return {"filters": filters, "out_label": out_label,
                     "logo_path": logo_path, "output": tmp_final}
         if fx_mod.has_fx(fxm):
             vw, vh = fx_mod.video_size(src)
             filters, cur, logo_path = fx_mod.filter_chain(
                 fxm, vw, vh, start="[outv]", logo="[2:v]")
+            if cap_h:
+                # Build 267: same last-step scale as
+                # finalize_filters, on the final canvas dims.
+                dims = fx_mod.ASPECT_DIMS.get(
+                    (fxm.get("aspect") or {}).get("ratio")) or (vw, vh)
+                cd = capped_dims(dims[0], dims[1], cap_h)
+                if cd:
+                    filters.append(
+                        f"{cur}scale={cd[0]}:{cd[1]}[vcap]")
+                    cur = "[vcap]"
             return {"filters": filters, "out_label": cur,
                     "logo_path": logo_path, "output": tmp_final}
         return None
@@ -482,11 +519,13 @@ def run_phase2(workdir, mode="both", voice=tts.DEFAULT_VOICE, progress=None,
                       font=font, subs=subs,
                       blur_box=(fx or {}).get("blur"),
                       fx=fx if fx_mod.has_fx(fx) else None, cap_k=cap_k,
-                      style="karaoke" if karaoke else None)
+                      style="karaoke" if karaoke else None,
+                      cap_h=cap_h)
         else:  # dub only — no burn, so fx gets its own (single) pass
             if fx_mod.has_fx(fx):
                 fxed = workdir / "fx.mp4"
-                fx_mod.apply_effects(base, fxed, fx, cap_k=cap_k)
+                fx_mod.apply_effects(base, fxed, fx, cap_k=cap_k,
+                                     cap_h=cap_h)
                 base = fxed
             shutil.copyfile(base, tmp_final)
         os.replace(tmp_final, final)

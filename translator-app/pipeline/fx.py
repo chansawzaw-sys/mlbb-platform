@@ -19,7 +19,8 @@ import json
 import sys
 from pathlib import Path
 
-from .common import encode_threads, probe_streams, run, target_maxrate_k
+from .common import (capped_dims, encode_threads, probe_streams,
+                     run, target_maxrate_k)
 
 
 def video_size(path):
@@ -165,12 +166,25 @@ def filter_chain(fx, vw, vh, start="[0:v]", logo="[1:v]"):
     return filters, cur, logo_path
 
 
-def apply_effects(input_mp4, output_mp4, fx, cap_k=2500):
-    """Apply blur (first) and logo (on top) in ONE ffmpeg pass. Returns output."""
+def apply_effects(input_mp4, output_mp4, fx, cap_k=2500, cap_h=None):
+    """Apply blur (first) and logo (on top) in ONE ffmpeg pass. Returns output.
+
+    Build 267: `cap_h` (long videos only, passed by run_job)
+    appends the 720p scale after the chain, computed on the
+    FINAL canvas dims (the aspect reframe's, when one applies)
+    — the same last-step placement as burn.finalize_filters.
+    cap_h=None keeps the command byte-identical to build 266."""
     if not has_fx(fx):
         raise ValueError("apply_effects called with empty fx")
     vw, vh = video_size(input_mp4)
     filters, cur, logo_path = filter_chain(fx, vw, vh)
+    if cap_h:
+        dims = ASPECT_DIMS.get((fx.get("aspect") or {}).get("ratio")) \
+            or (vw, vh)
+        cd = capped_dims(dims[0], dims[1], cap_h)
+        if cd:
+            filters.append(f"{cur}scale={cd[0]}:{cd[1]}[vcap]")
+            cur = "[vcap]"
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(input_mp4)]
     if logo_path:
         cmd += ["-i", str(logo_path)]

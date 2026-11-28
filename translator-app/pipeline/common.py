@@ -100,6 +100,32 @@ def encode_threads():
     return 4 if active_job_count() <= 1 else 2
 
 
+def capped_dims(width, height, cap_h):
+    """Build 267: (w, h) scaled down so the SHORTER side is at
+    most `cap_h`, aspect preserved, both dims even (yuv420p),
+    NEVER upscaled — or None when the frame is already within
+    the cap (or the dims are unusable). The shorter side is the
+    "p" dimension on both orientations: 1920x1080 -> 1280x720,
+    1080x1920 -> 720x1280, 1280x720 and 720x1280 pass through
+    unchanged."""
+    try:
+        w, h = int(width), int(height)
+        cap_h = int(cap_h)
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0 or cap_h <= 0:
+        return None
+    short = min(w, h)
+    if short <= cap_h:
+        return None
+    f = float(cap_h) / short
+    nw = max(2, int(round(w * f / 2.0)) * 2)
+    nh = max(2, int(round(h * f / 2.0)) * 2)
+    if (nw, nh) == (w, h):
+        return None
+    return (nw, nh)
+
+
 def maxrate_cap_k(quality):
     """Encode maxrate ceiling (kbps) for a job's download quality
     (build 167). "hd" jobs fetched the original rendition on the
