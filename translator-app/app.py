@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 267"
+BUILD_TAG = "build 268"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -9827,20 +9827,38 @@ def job_title_tags(jid):
 
 # ---------- Cover maker (build 223, roadmap 7) ----------------
 # On the DONE screen of a finished video job, one tap makes a
-# clean TikTok cover: a sharp REAL frame from the customer's
-# own finished video (the actual characters — never AI-faked
-# imagery) plus a template overlay. The step ASKS the creator
-# for the title text and the part number (owner's design,
-# 2026-11-17); the series name is remembered per account
-# (accounts.cover_series) so the next part of a series only
-# needs the number bumped. FREE — no credit moves anywhere in
-# this flow, and the job's own files are never touched: frames
-# and the finished cover live in the job's cover/ subdir and
-# are swept away with the job by the 24 h cleanup.
+# clean TikTok cover plus a template overlay. The step ASKS
+# the creator for the title text and the part number (owner's
+# design, 2026-11-17); the series name is remembered per
+# account (accounts.cover_series) so the next part of a series
+# only needs the number bumped. FREE — no credit moves anywhere
+# in this flow, and the job's own files are never touched:
+# frames, uploads and the finished cover live in the job's
+# cover/ subdir and are swept away with the job by the 24 h
+# cleanup.
+#
+# Build 268: the cover's base picture has THREE sources —
+#   "frame"         a sharp REAL frame from the customer's own
+#                   finished video (build 223, unchanged);
+#   "upload"        the customer's own uploaded image (e.g.
+#                   AI-generated elsewhere), used as-is;
+#   "upload_styled" the uploaded image with the same title /
+#                   series / PART template applied on top.
+# An upload is normalised ONCE at upload time (type-checked,
+# centre-cropped to the job video's aspect, width capped at
+# 1080 like every cover) and stored as cover/upload.jpg, so
+# both upload sources and the series memory work exactly like
+# the frame path from there on.
 
 COVER_FRAME_FRACS = (0.08, 0.28, 0.48, 0.68, 0.88)
 _COVER_NAME_RE = re.compile(
-    r"^(frame|thumb)_\d+\.jpg$|^cover\.jpg$")
+    r"^(frame|thumb)_\d+\.jpg$|^cover\.jpg$"
+    r"|^upload(_thumb)?\.jpg$")
+COVER_UPLOAD_MAX_BYTES = 10 * 1024 * 1024
+COVER_UPLOAD_MAX_PIXELS = 40_000_000
+_COVER_UPLOAD_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+_COVER_UPLOAD_FORMATS = {"PNG", "JPEG", "WEBP"}
+COVER_SOURCES = ("frame", "upload", "upload_styled")
 
 
 def _cover_dir(job):
@@ -9881,6 +9899,103 @@ def _cover_frames(job):
                 "frame": f"/api/jobs/{job['id']}/cover/"
                          f"frame_{i}.jpg"})
     return frames or None
+
+
+def _cover_target_size(job):
+    """The cover's output size for this job: the finished
+    video's own dimensions with the width capped at 1080 (the
+    same cap _compose_cover applies to frames), or None when
+    the video's dimensions cannot be probed."""
+    out = JOBS_DIR / job["id"] / "output.mp4"
+    if not out.exists():
+        return None
+    from pipeline.common import probe_streams
+    try:
+        for s in probe_streams(out):
+            if s.get("codec_type") == "video":
+                vw, vh = int(s["width"]), int(s["height"])
+                if vw <= 0 or vh <= 0:
+                    return None
+                if vw > 1080:
+                    return (1080, max(2, round(vh * 1080 / vw)))
+                return (vw, vh)
+    except Exception:
+        return None
+    return None
+
+
+def _cover_store_upload(job, f):
+    """Validate + normalise one uploaded cover image into the
+    job's cover/ dir as upload.jpg (+ upload_thumb.jpg).
+    Returns (info, None) on success — info carries the stored
+    size and the file URLs — or (None, burmese_error). The
+    image is centre-cropped to the job video's aspect (the
+    cover's output aspect) and never upscaled; a video whose
+    dimensions cannot be probed falls back to the image's own
+    aspect with the 1080 width cap. Nothing is left on disk
+    when validation fails."""
+    from PIL import Image
+    ext = Path(f.filename or "").suffix.lower()
+    if ext not in _COVER_UPLOAD_EXTS:
+        return None, ("ပုံ အမျိုးအစား မရပါ — PNG, JPG, WEBP "
+                      "ပဲ ရပါတယ်")
+    cdir = _cover_dir(job)
+    cdir.mkdir(parents=True, exist_ok=True)
+    tmp = cdir / "upload_src.tmp"
+    try:
+        size = 0
+        with open(tmp, "wb") as out:
+            while True:
+                chunk = f.stream.read(1 << 20)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > COVER_UPLOAD_MAX_BYTES:
+                    return None, ("ပုံ ကြီးလွန်းပါတယ် — "
+                                  "အများဆုံး 10 MB ပဲ ရပါတယ်")
+                out.write(chunk)
+        try:
+            img = Image.open(tmp)
+            img.load()
+        except Exception:
+            return None, ("ပုံ ဖတ်လို့ မရပါ — တခြား ပုံ "
+                          "ပြန်ရွေးပါ")
+        if img.format not in _COVER_UPLOAD_FORMATS:
+            return None, ("ပုံ အမျိုးအစား မရပါ — PNG, JPG, "
+                          "WEBP ပဲ ရပါတယ်")
+        if img.width * img.height > COVER_UPLOAD_MAX_PIXELS:
+            return None, ("ပုံ အရွယ် ကြီးလွန်းပါတယ် — တခြား "
+                          "ပုံ ပြန်ရွေးပါ")
+        img = img.convert("RGB")
+        target = _cover_target_size(job)
+        if target:
+            tw, th = target
+            ta = tw / th
+            if img.width / img.height > ta:
+                cw, ch = round(img.height * ta), img.height
+            else:
+                cw, ch = img.width, round(img.width / ta)
+            x0, y0 = (img.width - cw) // 2, (img.height - ch) // 2
+            img = img.crop((x0, y0, x0 + cw, y0 + ch))
+            if img.width > tw:
+                img = img.resize((tw, th), Image.LANCZOS)
+        elif img.width > 1080:
+            img = img.resize(
+                (1080, round(img.height * 1080 / img.width)),
+                Image.LANCZOS)
+        img.save(cdir / "upload.jpg", "JPEG", quality=88)
+        thumb = img.copy()
+        thumb.thumbnail((270, 270 * 4))
+        thumb.save(cdir / "upload_thumb.jpg", "JPEG", quality=80)
+        return {"url": f"/api/jobs/{job['id']}/cover/upload.jpg",
+                "thumb": f"/api/jobs/{job['id']}/cover/"
+                         f"upload_thumb.jpg",
+                "width": img.width, "height": img.height}, None
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _cover_font(size, bold=True):
@@ -10027,12 +10142,38 @@ def cover_series():
         {"series": accounts.cover_series_list(user["id"])})
 
 
+@app.post("/api/jobs/<jid>/cover/upload")
+def job_cover_upload(jid):
+    """Store the signed-in owner's own image as the cover base
+    for a DONE job (build 268): PNG/JPG/WEBP, at most 10 MB,
+    normalised into the job's cover/ dir (centre-cropped to
+    the video's aspect). Same owner-only 404 shape as every
+    other job route. FREE."""
+    job = _load_job(jid)
+    if not job or not _owns(_current_user(), job):
+        return jsonify({"error": "job မတွေ့ပါ"}), 404
+    if job.get("status") != "done":
+        return jsonify({"error": "ဗီဒီယို မပြီးသေးပါ — "
+                        "ပြီးမှ Cover လုပ်နိုင်ပါမယ်"}), 409
+    f = request.files.get("image")
+    if f is None or not f.filename:
+        return jsonify({"error": "တင်မယ့် ပုံ အရင် ရွေးပါ"}), 400
+    info, err = _cover_store_upload(job, f)
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify(info)
+
+
 @app.post("/api/jobs/<jid>/cover")
 def job_cover_make(jid):
-    """Compose the cover for a DONE job from a chosen extracted
-    frame + the creator's title / series / part. FREE. When a
-    series is named, the account's series record is upserted
-    with this part (last part only ever moves up)."""
+    """Compose the cover for a DONE job from the chosen source
+    + the creator's title / series / part. FREE. Sources
+    (build 268): "frame" — a chosen extracted frame (build
+    223); "upload" — the owner's uploaded image as-is;
+    "upload_styled" — the uploaded image with the same
+    template on top. When a series is named, the account's
+    series record is upserted with this part (last part only
+    ever moves up) — for every source."""
     job = _load_job(jid)
     user = _current_user()
     if not job or not _owns(user, job):
@@ -10041,21 +10182,32 @@ def job_cover_make(jid):
         return jsonify({"error": "ဗီဒီယို မပြီးသေးပါ — "
                         "ပြီးမှ Cover လုပ်နိုင်ပါမယ်"}), 409
     data = request.get_json(silent=True) or {}
+    source = (data.get("source") or "frame").strip()
+    if source not in COVER_SOURCES:
+        return jsonify({"error": "Cover ပုံ အမျိုးအစား "
+                        "မမှန်ပါ"}), 400
     title = (data.get("title") or "").strip()
-    if not title:
+    if source != "upload" and not title:
         return jsonify({"error": "Cover အတွက် ခေါင်းစဉ် စာသား "
                         "အရင် ထည့်ပါ"}), 400
-    try:
-        idx = int(data.get("frame"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "ပုံ အရင် ရွေးပါ"}), 400
     cdir = _cover_dir(job)
-    frame = cdir / f"frame_{idx}.jpg"
-    if not frame.exists():
-        _cover_frames(job)  # not extracted yet — do it now
-    if not frame.exists():
-        return jsonify({"error": "ရွေးထားတဲ့ ပုံ မတွေ့ပါ — "
-                        "ပုံ ပြန်ရွေးပါ"}), 400
+    idx = None
+    if source == "frame":
+        try:
+            idx = int(data.get("frame"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "ပုံ အရင် ရွေးပါ"}), 400
+        base = cdir / f"frame_{idx}.jpg"
+        if not base.exists():
+            _cover_frames(job)  # not extracted yet — do it now
+        if not base.exists():
+            return jsonify({"error": "ရွေးထားတဲ့ ပုံ မတွေ့ပါ — "
+                            "ပုံ ပြန်ရွေးပါ"}), 400
+    else:
+        base = cdir / "upload.jpg"
+        if not base.exists():
+            return jsonify({"error": "ပုံ မတင်ရသေးပါ — အရင် "
+                            "ပုံ တင်ပါ"}), 400
     series = (data.get("series") or "").strip()
     part = data.get("part")
     try:
@@ -10065,8 +10217,11 @@ def job_cover_make(jid):
     if part is not None and part <= 0:
         part = None
     try:
-        _compose_cover(frame, title, series, part,
-                       cdir / "cover.jpg")
+        if source == "upload":
+            shutil.copyfile(base, cdir / "cover.jpg")
+        else:
+            _compose_cover(base, title, series, part,
+                           cdir / "cover.jpg")
     except Exception:
         return jsonify({"error": "Cover ထုတ်တာ မရပါ — "
                         "ခဏနေမှ ပြန်စမ်းပါ"}), 502
@@ -10075,7 +10230,7 @@ def job_cover_make(jid):
         saved = accounts.cover_series_upsert(
             user["id"], series, part)
     job["cover"] = {"title": title, "series": series or None,
-                    "part": part, "frame": idx}
+                    "part": part, "frame": idx, "source": source}
     _save(job)
     return jsonify({"url": f"/api/jobs/{jid}/cover/cover.jpg",
                     "series": saved})

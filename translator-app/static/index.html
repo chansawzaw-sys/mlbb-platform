@@ -4999,13 +4999,15 @@ function showTitleTags(elId, job) {
 }
 /* ---------------- Build 223: TikTok cover maker ----------
    One shared widget, mounted by every product's done branch
-   next to the title-tags widget. The cover is a REAL frame
-   from the customer's own finished video (never AI imagery)
-   plus a template overlay. The form asks the creator for the
-   title text and the part number; the series name is
-   remembered per account on the server, so the next part of
-   a series only needs the number bumped (a known series
-   suggests last part + 1). Free — the endpoints never charge. */
+   next to the title-tags widget. The cover's base picture has
+   three sources (build 268): a REAL frame from the customer's
+   own finished video, the customer's own uploaded image used
+   as-is, or that uploaded image with the template overlay on
+   top. The form asks the creator for the title text and the
+   part number; the series name is remembered per account on
+   the server, so the next part of a series only needs the
+   number bumped (a known series suggests last part + 1).
+   Free — the endpoints never charge. */
 function showCover(elId, job) {
   const el = $(elId);
   if (!el || !job || !job.id) return;
@@ -5042,6 +5044,7 @@ function showCover(elId, job) {
     wait.textContent = T("🔄 ပုံတွေ ထုတ်နေပြီ… ခဏစောင့်ပါ");
     panel.appendChild(wait);
     btn.disabled = true;
+    let frames = [], frameErr = "";
     try {
       const fr = await fetch("/api/jobs/" + job.id
         + "/cover/frames", {method: "POST",
@@ -5049,28 +5052,39 @@ function showCover(elId, job) {
         body: "{}"});
       const fd = await fr.json();
       if (!fr.ok) throw new Error(fd.error || "မရပါ");
-      let seriesList = [];
-      try {
-        const sr = await fetch("/api/cover/series");
-        seriesList = (await sr.json()).series || [];
-      } catch (e) { /* chips are a nicety — the field still works */ }
-      buildForm(fd.frames || [], seriesList);
+      frames = fd.frames || [];
     } catch (e) {
-      panel.innerHTML = "";
-      const ep = document.createElement("p");
-      ep.className = "err";
-      ep.textContent = e.message || "မရပါ";
-      panel.appendChild(ep);
-      opened = false;
-    } finally {
-      btn.disabled = false;
+      /* Build 268: frames failing no longer blocks the form —
+         the upload sources still work without them. */
+      frameErr = e.message || "မရပါ";
     }
+    let seriesList = [];
+    try {
+      const sr = await fetch("/api/cover/series");
+      seriesList = (await sr.json()).series || [];
+    } catch (e) { /* chips are a nicety — the field still works */ }
+    btn.disabled = false;
+    buildForm(frames, seriesList, frameErr);
   }
-  function buildForm(frames, seriesList) {
+  function buildForm(frames, seriesList, frameErr) {
     panel.innerHTML = "";
     let selFrame = frames.length ? frames[0].i : 0;
     let partTouched = false;
-    panel.appendChild(label("📷 သုံးမယ့် ပုံ ရွေးပါ"));
+    /* Build 268: the base picture's source — a video frame,
+       an own uploaded image as-is, or the uploaded image with
+       the title/series template on top. */
+    let source = frames.length ? "frame" : "upload";
+    let uploaded = false;
+    panel.appendChild(label("🖼 Cover ပုံ ဘယ်လို လုပ်မလဲ"));
+    const srcRow = document.createElement("div");
+    srcRow.className = "chips";
+    srcRow.style.margin = "4px 0";
+    panel.appendChild(srcRow);
+    const frameSec = document.createElement("div");
+    frameSec.appendChild(label("📷 သုံးမယ့် ပုံ ရွေးပါ"));
+    panel.appendChild(frameSec);
+    const upSec = document.createElement("div");
+    panel.appendChild(upSec);
     const thumbs = document.createElement("div");
     thumbs.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;"
       + "margin-top:6px";
@@ -5091,15 +5105,62 @@ function showCover(elId, job) {
       imgs.push(im);
       thumbs.appendChild(im);
     });
-    panel.appendChild(thumbs);
-    panel.appendChild(label("📌 ခေါင်းစဉ် စာသား"));
+    frameSec.appendChild(thumbs);
+    /* Upload section (build 268): file picker + preview +
+       status. Picking a file uploads it at once; the cover
+       button then just composes from the stored image. */
+    upSec.appendChild(label("📤 ကိုယ်ပိုင် ပုံ တင်ပါ "
+      + "(PNG / JPG / WEBP — အများဆုံး 10 MB)"));
+    const fileIn = document.createElement("input");
+    fileIn.type = "file";
+    fileIn.accept = "image/png,image/jpeg,image/webp";
+    fileIn.style.cssText = IN_STYLE;
+    upSec.appendChild(fileIn);
+    const upMsg = document.createElement("p");
+    upMsg.className = "hint";
+    upSec.appendChild(upMsg);
+    const upPrev = document.createElement("img");
+    upPrev.alt = "";
+    upPrev.style.cssText = "width:100%;border-radius:10px;"
+      + "margin-top:6px;display:none";
+    upSec.appendChild(upPrev);
+    fileIn.addEventListener("change", async () => {
+      const file = fileIn.files && fileIn.files[0];
+      if (!file) return;
+      uploaded = false;
+      upMsg.textContent = T("🔄 ပုံ တင်နေပြီ… ခဏစောင့်ပါ");
+      try {
+        const fd = new FormData();
+        fd.append("image", file);
+        const res = await fetch("/api/jobs/" + job.id
+          + "/cover/upload", {method: "POST", body: fd});
+        const d = await res.json();
+        if (!res.ok) throw new Error(d.error || "မရပါ");
+        uploaded = true;
+        upPrev.src = d.url + "?t=" + Date.now();
+        upPrev.style.display = "";
+        upMsg.textContent = T("✅ ပုံ တင်ပြီးပါပြီ");
+      } catch (e) {
+        upMsg.textContent = e.message || "မရပါ";
+      }
+    });
+    const titleSec = document.createElement("div");
+    panel.appendChild(titleSec);
+    const titleLabel = label("📌 ခေါင်းစဉ် စာသား");
+    titleSec.appendChild(titleLabel);
+    const rawHint = document.createElement("p");
+    rawHint.className = "hint";
+    rawHint.textContent = T("တင်ထားတဲ့ ပုံကို ဒီအတိုင်း "
+      + "သုံးပါမယ် — ခေါင်းစဉ် စာသား မထည့်ပါ");
+    rawHint.style.display = "none";
+    titleSec.appendChild(rawHint);
     const titleIn = document.createElement("input");
     titleIn.type = "text";
     titleIn.style.cssText = IN_STYLE;
     titleIn.placeholder = T("ဗီဒီယို ခေါင်းစဉ် ရေးပါ");
     if (job.title_tags && job.title_tags.title)
       titleIn.value = job.title_tags.title;
-    panel.appendChild(titleIn);
+    titleSec.appendChild(titleIn);
     panel.appendChild(label("🎬 Series အမည် (ရှိရင်)"));
     const chips = document.createElement("div");
     chips.className = "chips";
@@ -5138,6 +5199,45 @@ function showCover(elId, job) {
     renderChips();
     seriesIn.addEventListener("input", () => suggestPart(seriesIn.value));
     partIn.addEventListener("input", () => { partTouched = true; });
+    /* Source chips (build 268) + per-source visibility: the
+       frame picker only for "frame", the uploader only for
+       the upload sources, and the title field only where a
+       title is actually drawn (frame + upload_styled). */
+    const SRC_DEFS = [
+      ["frame", "🎞 ဗီဒီယို ထဲက ပုံ"],
+      ["upload", "📤 ကိုယ်ပိုင် ပုံ (ဒီအတိုင်း)"],
+      ["upload_styled", "📤✨ ကိုယ်ပိုင် ပုံ + ခေါင်းစဉ် စတိုင်"]];
+    const srcBtns = {};
+    SRC_DEFS.forEach(([key, text]) => {
+      const c = document.createElement("button");
+      c.className = "chip";
+      c.textContent = T(text);
+      if (key === "frame" && !frames.length) c.disabled = true;
+      c.onclick = () => { source = key; applySource(); };
+      srcBtns[key] = c;
+      srcRow.appendChild(c);
+    });
+    if (frameErr) {
+      const ep = document.createElement("p");
+      ep.className = "err";
+      ep.textContent = frameErr;
+      frameSec.appendChild(ep);
+    }
+    function applySource() {
+      Object.keys(srcBtns).forEach(key => {
+        const c = srcBtns[key];
+        c.style.borderColor = key === source
+          ? "var(--accent, #2b5cff)" : "";
+        c.style.fontWeight = key === source ? "bold" : "";
+      });
+      frameSec.style.display = source === "frame" ? "" : "none";
+      upSec.style.display = source === "frame" ? "none" : "";
+      titleLabel.style.display = source === "upload"
+        ? "none" : "";
+      titleIn.style.display = source === "upload" ? "none" : "";
+      rawHint.style.display = source === "upload" ? "" : "none";
+    }
+    applySource();
     const go = document.createElement("button");
     go.textContent = T("✅ Cover ထုတ်မယ်");
     panel.appendChild(go);
@@ -5148,21 +5248,28 @@ function showCover(elId, job) {
     panel.appendChild(result);
     go.onclick = async () => {
       const title = titleIn.value.trim();
-      if (!title) {
+      if (source !== "upload" && !title) {
         msg.textContent = T("ခေါင်းစဉ် စာသား အရင် ထည့်ပါ");
+        return;
+      }
+      if (source !== "frame" && !uploaded) {
+        msg.textContent = T("ပုံ အရင် တင်ပါ");
         return;
       }
       go.disabled = true;
       msg.textContent = T("🔄 Cover ထုတ်နေပြီ… ခဏစောင့်ပါ");
       result.innerHTML = "";
       try {
+        const payload = {source,
+          series: seriesIn.value.trim(),
+          part: partIn.value === "" ? null
+            : parseInt(partIn.value, 10)};
+        if (source === "frame") payload.frame = selFrame;
+        if (source !== "upload") payload.title = title;
         const res = await fetch("/api/jobs/" + job.id + "/cover",
           {method: "POST",
            headers: {"Content-Type": "application/json"},
-           body: JSON.stringify({frame: selFrame, title,
-             series: seriesIn.value.trim(),
-             part: partIn.value === "" ? null
-               : parseInt(partIn.value, 10)})});
+           body: JSON.stringify(payload)});
         const d = await res.json();
         if (!res.ok) throw new Error(d.error || "မရပါ");
         msg.textContent = "";
@@ -7113,6 +7220,6 @@ if ("serviceWorker" in navigator) {
   }
 })();
 </script>
-<p class="hint" id="buildTag" style="text-align:center">build 267</p>
+<p class="hint" id="buildTag" style="text-align:center">build 268</p>
 </body>
 </html>
