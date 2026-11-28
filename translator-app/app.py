@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 268"
+BUILD_TAG = "build 270"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -4445,6 +4445,53 @@ def translate_chain_save():
     return jsonify({"ok": True, "saved": chain})
 
 
+# ---------- Script generation chain gate (build 269) ----------
+# Recap / Story / Commentary SCRIPT generation is OpenAI-only
+# by default (owner decision 2026-11-27), mirroring the
+# build-264 translation gate above: the pre-269 gateway walk
+# survives, dormant, behind GENERATE_CHAIN=legacy in the
+# project .env (pipeline/generate_chain.py). The gate is read
+# ONCE at pipeline import, so this endpoint only saves the
+# choice for the NEXT app start — the GET reports both the
+# saved value and the value the running process actually
+# booted with, and the card says so. "openai" is stored as
+# the ABSENCE of the line. Gemini TTS / voices are NOT part
+# of this gate.
+
+@app.get("/api/settings/generate-chain")
+def generate_chain_status():
+    from pipeline import generate_chain
+    saved = ""
+    try:
+        env_path = ROOT / ".env"
+        if env_path.exists():
+            for line in env_path.read_text(
+                    encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("GENERATE_CHAIN="):
+                    saved = line.split("=", 1)[1].strip() \
+                        .strip('"').strip("'").lower()
+                    break
+    except Exception:
+        saved = ""
+    return jsonify({
+        "saved": "legacy" if saved == "legacy" else "openai",
+        "effective": generate_chain.generate_mode()})
+
+
+@app.post("/api/settings/generate-chain")
+def generate_chain_save():
+    data = request.get_json(force=True) or {}
+    chain = (data.get("chain") or "").strip().lower()
+    if chain not in ("openai", "legacy"):
+        return jsonify({"error": "chain မမှန်ပါ — openai သို့မဟုတ် legacy ဖြစ်ရပါမယ်"}), 400
+    if chain == "legacy":
+        _env_write("GENERATE_CHAIN", "legacy")
+    else:
+        _env_remove("GENERATE_CHAIN")
+    return jsonify({"ok": True, "saved": chain})
+
+
 # ---------- OpenRouter key (server-side only, same rules) ----------
 
 @app.get("/api/settings/openrouter-key")
@@ -8087,10 +8134,26 @@ def tts_history():
 # Charge-on-success only: _finish is the single charge point;
 # a phase-1 failure, a script failure, an insufficient balance
 # at quote time or a render failure charges exactly zero.
+#
+# Build 270: the narration STYLE choice — job field
+# "recap_style", "summary" (the build-211 recap, default) or
+# "full" (the Reclivo-style full retelling: every scene, every
+# line of dialogue performed in-line by the one narrator —
+# pipeline/recap.py's PROMPT_RECAP_FULL). The style rides the
+# create form (JSON or multipart) onto the record, phase 1
+# generates with it, and the view returns it; pricing is
+# style-blind (the quote is started source minutes x the
+# voice rate either way). A full script runs far past the
+# summary edit cap, so the render-time text cap is per-style
+# (RECAP_TEXT_CAP_FULL for full jobs; summary jobs keep
+# RECAP_TEXT_CAP exactly).
 
 RECAP_STEPS = ["download", "transcribe", "script",
                "tts", "retime", "finalize"]
 RECAP_TEXT_CAP = 20000       # chars, for the render-time edit
+RECAP_TEXT_CAP_FULL = 120000  # build 270: full-mode edit cap
+                             # (the generation itself sees at
+                             # most TRANSCRIPT_CAP chars)
 
 
 def _recap_view(job):
@@ -8101,6 +8164,11 @@ def _recap_view(job):
              "title_tags",
              "created_at", "finished_at")}
     view["timings"] = _timings_of(job)  # build 213
+    # Build 270: the narration style, normalised for old
+    # records (a pre-270 job has no field — it was summary).
+    view["recap_style"] = job.get("recap_style") \
+        if job.get("recap_style") in ("summary", "full") \
+        else "summary"
     view["upload"] = bool(job.get("upload"))  # build 215
     view["steps"] = job.get("steps") or []
     if job.get("recap_text") is not None:
@@ -8170,9 +8238,16 @@ def _recap_worker(job):
                 script, provider = job["recap_text"], \
                     job.get("recap_provider")
             else:
-                target = recap_mod.target_chars_for(workdir)
+                # Build 270: generate in the job's narration
+                # style (a pre-270 record has none -> summary).
+                style = job.get("recap_style") \
+                    if job.get("recap_style") in ("summary",
+                                                  "full") \
+                    else "summary"
+                target = recap_mod.target_chars_for(workdir,
+                                                    style)
                 script, provider = recap_mod.generate_script(
-                    workdir, target)
+                    workdir, target, style)
             progress("script", "done")
             job["recap_text"] = script
             job["recap_provider"] = provider
@@ -8328,9 +8403,18 @@ def create_recap():
     fx, fx_err = _fx_from_data(data)
     if fx_err:
         return jsonify({"error": fx_err}), 400
+    # Build 270: the narration style — "full" is the
+    # Reclivo-style full retelling; anything else (missing,
+    # bogus) falls back to the default "summary", the same
+    # fail-safe shape as the voice resolution above. Pricing
+    # does not look at the style.
+    recap_style = data.get("recap_style") \
+        if data.get("recap_style") in ("summary", "full") \
+        else "summary"
     now = time.time()
     job = {"id": uuid.uuid4().hex[:12], "type": "recap",
            "url": url, "mode": "recap",
+           "recap_style": recap_style,
            "voice": voice, "voice_style": voice_style,
            "voice_label": voice_label,
            "voice_rate": voice_rate, "voice_pitch": voice_pitch,
@@ -8398,9 +8482,14 @@ def render_recap(jid):
     text = (data.get("text") or "").strip()
     if not text:
         return jsonify({"error": "Recap စာသား အရင် ထည့်ပါ"}), 400
-    if len(text) > RECAP_TEXT_CAP:
+    # Build 270: full-mode scripts are far longer than a
+    # summary — their edit cap is RECAP_TEXT_CAP_FULL. A
+    # summary job's cap is exactly what it was before 270.
+    text_cap = RECAP_TEXT_CAP_FULL \
+        if job.get("recap_style") == "full" else RECAP_TEXT_CAP
+    if len(text) > text_cap:
         return jsonify({"error":
-                        f"စာသား အရှည်ဆုံး {RECAP_TEXT_CAP} လုံး "
+                        f"စာသား အရှည်ဆုံး {text_cap} လုံး "
                         "ပဲ ရပါတယ် — လျှော့ပြီး ပြန်စမ်းပါ"}), 400
     if text != (job.get("recap_text") or ""):
         job["recap_edited"] = True

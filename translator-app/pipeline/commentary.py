@@ -4,15 +4,15 @@ the Commentary product's brain and its one render extra.
 Brain: the video's own transcript in, an energetic Burmese
 sports/commentary-style script out — play-by-play energy,
 present tense, following the action in the video's own
-order. The script is written by the SAME LLM gateways the
-translator / Recap / Story use, walked in the SAME order
-(story._chain_generate carries recap's seams verbatim:
-Gemini leads while its probe verdict is green, then the
-free-first gateways OpenRouter -> xKiro, then Gemini's
-fallback slot, then OpenAI). Doctrine matches the other
-products: if EVERY gateway fails (or answers junk),
-generate_script raises — the job fails loudly and is never
-charged. There is no silent fallback script.
+order. The script is written through the ONE shared
+generation walk (story._chain_generate, which delegates
+to pipeline/generate_chain): build 269 made generation
+OpenAI-only by default, with the pre-269 gateway walk
+dormant behind GENERATE_CHAIN=legacy. Doctrine matches
+the other products: if the active chain fails (or
+answers junk), generate_script raises — the job fails
+loudly and is never charged. There is no silent fallback
+script.
 
 Sizing mirrors Recap: ~700 Burmese chars per SOURCE minute
 (the measured 650-800 chars/min narration band), stated to
@@ -94,11 +94,12 @@ def usable_segment_count(workdir):
 
 
 def generate_script(workdir, target_chars):
-    """Walk the gateways for a commentary script of
-    ~target_chars. Returns (script, provider_label). Raises
-    RuntimeError with the polite Burmese message when every
-    gateway fails — the caller fails the job (never
-    charged)."""
+    """Generate a commentary script of ~target_chars
+    through the shared generation chain (build 269:
+    OpenAI-only by default). Returns (script,
+    provider_label). Raises RuntimeError with the polite
+    Burmese message when the chain fails — the caller
+    fails the job (never charged)."""
     transcript = recap._transcript_text(workdir)
     if not transcript:
         raise RuntimeError(SPARSE_MSG)

@@ -14,17 +14,21 @@ the new fields with the same strictness as the old ones;
 a plan using NONE of them keeps the exact build-218 shape
 and renders exactly as build 218 did.
 
-The script is written by the SAME LLM gateways the translator
-and Recap use, walked in the SAME order as recap.generate_
-script (Gemini leads while its probe verdict is green, then
-the free-first gateways OpenRouter -> xKiro, then Gemini's
-fallback slot, then OpenAI). Doctrine matches translation and
-Recap: if EVERY gateway fails (or answers junk), a topic job
-fails loudly and is never charged — there is no silent
-fallback script. For a PASTED story the script is the
-customer's own words, so only the shot plan is AI work; if
-every gateway fails there, a safe built-in plan is used
-instead of failing the customer's own text.
+The script is written through the ONE shared generation
+walk, pipeline/generate_chain.chain_generate (reached via
+this module's _chain_generate seam, which Commentary uses
+too). Build 269 (owner decision 2026-11-27, mirroring
+build 264 for translation): generation is OpenAI-only by
+default — the pre-269 gateway walk (Gemini lead, then
+OpenRouter -> xKiro, then Gemini's fallback slot, then
+OpenAI) survives dormant inside generate_chain behind
+GENERATE_CHAIN=legacy. Doctrine matches translation and
+Recap: if the active chain fails (or answers junk), a
+topic job fails loudly and is never charged — there is no
+silent fallback script. For a PASTED story the script is
+the customer's own words, so only the shot plan is AI
+work; if the chain fails there, a safe built-in plan is
+used instead of failing the customer's own text.
 
 The shot plan speaks a FIXED asset vocabulary (the renderer's
 code-drawn cast and sets). The prompt embeds the vocabulary
@@ -39,9 +43,7 @@ the model as a target with a ±20% window.
 """
 import json
 
-from . import (gemini_translate, openai_translate,
-               openrouter_translate, recap, translate_segments,
-               xkiro_translate)
+from . import generate_chain, recap
 
 CHARS_PER_MIN = recap.CHARS_PER_MIN
 
@@ -178,58 +180,18 @@ FAIL_MSG = ("Story စာသား ရေးတာ မရပါ — AI service �
 
 
 def _chain_generate(prompt, extract):
-    """Walk the gateways for one generation (recap's order,
-    recap's probe seams). Each reply goes through extract();
-    the first reply extract() accepts wins — a junk reply
-    fails over to the next gateway, exactly like recap's
-    in-walk usability gate. Returns (payload, provider_label);
-    raises RuntimeError with the per-gateway detail when
-    every gateway failed or answered junk."""
-    errors = {}
-
-    def _try(name, fn, label_fn):
-        try:
-            payload = extract(fn(prompt) or "")
-            if payload is not None:
-                return payload, label_fn()
-            errors[name] = "unusable reply"
-        except Exception as e:
-            errors[name] = str(e)[:100]
-        return None
-
-    gemini_tried = False
-    if translate_segments._probe_engine_ok("gemini"):
-        gemini_tried = True
-        if gemini_translate.key_configured():
-            r = _try("gemini", gemini_translate.generate_text,
-                     lambda: "gemini")
-            if r:
-                return r
-    if openrouter_translate.key_configured():
-        r = _try("openrouter", openrouter_translate.generate_text,
-                 openrouter_translate.last_label)
-        if r:
-            return r
-    if xkiro_translate.key_configured():
-        r = _try("xkiro", xkiro_translate.generate_text,
-                 xkiro_translate.last_label)
-        if r:
-            return r
-    if not gemini_tried \
-            and not translate_segments._probe_blocked("gemini") \
-            and gemini_translate.key_configured():
-        r = _try("gemini", gemini_translate.generate_text,
-                 lambda: "gemini")
-        if r:
-            return r
-    if not translate_segments._probe_blocked("openai") \
-            and openai_translate.key_configured():
-        r = _try("openai", openai_translate.generate_text,
-                 lambda: "openai")
-        if r:
-            return r
-    detail = "; ".join(f"{k}: {v}" for k, v in errors.items())
-    raise RuntimeError(detail[:300] or "no gateway configured")
+    """One generation through the shared chain — build 269
+    moved the walk itself into pipeline/generate_chain
+    (OpenAI-only by default; the pre-269 gateway walk that
+    used to live here verbatim is dormant there behind
+    GENERATE_CHAIN=legacy). This seam stays because
+    generate_story, the shot planner and pipeline/commentary
+    all route through it. Each reply goes through extract();
+    the first reply extract() accepts wins. Returns
+    (payload, provider_label); raises RuntimeError with the
+    per-engine detail when the chain failed or answered
+    junk."""
+    return generate_chain.chain_generate(prompt, extract)
 
 
 def _parse_reply(text):
