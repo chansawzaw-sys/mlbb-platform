@@ -17,7 +17,7 @@ import os
 import time
 from pathlib import Path
 
-from . import tunnel
+from . import quota, tunnel
 from .common import PROJECT_ROOT
 from .gemini_translate import (_build_prompt, _extract_json_array,
                                _prompt_for, _validated_result)
@@ -104,6 +104,15 @@ def translate_all(segments, style="subs", context=None):
             except Exception as e:
                 attempts.append(f"{mdl}=badformat:{e}"[:70])
                 continue
+        # Build 275 (quota fast-fail): insufficient_quota is a
+        # hard billing wall — the prepaid balance is gone and
+        # no other model on this account will answer either.
+        # Raise the wall at once instead of walking the rest.
+        wall = quota.wall_message("openai", resp.status_code,
+                                  resp.text)
+        if wall:
+            _note_error("OpenAI quota wall: " + wall)
+            raise quota.QuotaWallError(wall)
         attempts.append(f"{mdl}={resp.status_code}")
         last_body = resp.text[:200]
         if resp.status_code in (401, 403):
@@ -149,6 +158,11 @@ def generate_text(prompt):
                 attempts.append(f"{mdl}=badformat:{e}"[:70])
                 continue
             return text_out
+        wall = quota.wall_message("openai", resp.status_code,
+                                  resp.text)
+        if wall:
+            _note_error("OpenAI quota wall: " + wall)
+            raise quota.QuotaWallError(wall)
         attempts.append(f"{mdl}={resp.status_code}")
         last_body = resp.text[:200]
         if resp.status_code in (401, 403):

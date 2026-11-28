@@ -74,6 +74,7 @@ from pathlib import Path
 
 import requests
 
+from . import quota
 from .common import (PROJECT_ROOT, ensure_system_ca, load_segments,
                      probe_duration, save_segments)
 
@@ -319,6 +320,7 @@ def picker_entries(user=None):
              "desc": v.get("desc", ""),
              "preview": preview_url_el(v["id"]),
              "roles": roles_for_entry(v),
+             "gender": v.get("gender"),
              "premium": True, "rate": rate} for v in get_voices()]
 
 
@@ -438,9 +440,15 @@ def add_voice(name, sample_path):
                     return str(vid)
                 last = "no voice_id in response"
             else:
+                wall = quota.wall_message("elevenlabs",
+                                          r.status_code, r.text)
+                if wall:
+                    raise quota.QuotaWallError(wall)
                 last = f"HTTP {r.status_code}"
                 if r.status_code in (401, 403):
                     break
+        except quota.QuotaWallError:
+            raise
         except Exception as e:  # network blip — one retry
             last = str(e)[:120]
         if attempt + 1 < 2:
@@ -481,10 +489,12 @@ def delete_voice(voice_id):
 def _synth_one(key, model, voice_id, text, out_path):
     """One segment, up to _ATTEMPTS tries with a short backoff.
     Auth failures (401/403) fail fast — retrying a dead key per
-    segment would only multiply the wait. Any other failure
-    raises RuntimeError(FAIL_MSG) after the attempts: the caller
-    fails the whole job loudly (no substitute voice, no partial
-    dub shipped as if it were the premium pick)."""
+    segment would only multiply the wait. Hard plan/quota walls
+    (build 275, pipeline.quota) fail faster still: the wall
+    raises on the first response. Any other failure raises
+    RuntimeError(FAIL_MSG) after the attempts: the caller fails
+    the whole job loudly (no substitute voice, no partial dub
+    shipped as if it were the premium pick)."""
     url = f"{API_BASE}/v1/text-to-speech/{voice_id}"
     body = {"text": text, "model_id": model, "language_code": "my",
             "voice_settings": {"stability": STABILITY,
@@ -499,9 +509,20 @@ def _synth_one(key, model, voice_id, text, out_path):
             if r.status_code == 200 and r.content:
                 Path(out_path).write_bytes(r.content)
                 return
+            # Build 275 (quota fast-fail): a hard plan/quota
+            # wall (402 paid_plan_required, quota_exceeded)
+            # will not clear inside this job — raise the wall
+            # on the FIRST response instead of spending the
+            # remaining attempts (and every later segment's).
+            wall = quota.wall_message("elevenlabs", r.status_code,
+                                      r.text)
+            if wall:
+                raise quota.QuotaWallError(wall)
             last = f"HTTP {r.status_code}"
             if r.status_code in (401, 403):
                 break
+        except quota.QuotaWallError:
+            raise
         except Exception as e:  # network blip — back off, retry
             last = str(e)[:120]
         if attempt + 1 < _ATTEMPTS:

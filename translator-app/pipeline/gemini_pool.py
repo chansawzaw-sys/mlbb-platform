@@ -22,6 +22,11 @@ Failure classes (the rotation contract):
     COOLING for COOLDOWN_S and the caller retries with the
     next key. Cooling is process-local (a restart simply
     re-tries every key, which is harmless).
+  * quota_day (build 275) — a 429 whose body names a
+    PER-DAY quota: the key cools for COOLDOWN_DAY_S (it is
+    dead until tomorrow), and a caller whose every key
+    lands here fails fast via pipeline.quota instead of
+    re-walking the dead pool per segment.
   * invalid — the key ITSELF is dead: HTTP 400 with
     API_KEY_INVALID, or HTTP 403 with PERMISSION_DENIED /
     "API key not valid" wording (and no quota signature —
@@ -48,9 +53,14 @@ import time
 from pathlib import Path
 
 from .common import PROJECT_ROOT
+from .quota import _is_day_quota
 
 MAX_KEYS = 30
 COOLDOWN_S = 120.0
+# Build 275: a key that hit its DAILY quota rests for hours,
+# not COOLDOWN_S — it cannot serve again today, and a short
+# cooldown would have every later segment re-walk it.
+COOLDOWN_DAY_S = 6 * 3600.0
 
 ENV_PATH = PROJECT_ROOT / ".env"
 STATE_PATH = PROJECT_ROOT / ".gemini_key_state.json"
@@ -110,12 +120,19 @@ def key_count():
 # ---------- failure classification ----------
 
 def classify_error(status, body_text):
-    """Judge one failed Gemini response: "quota", "invalid"
-    or None. Quota is judged FIRST (a 403 carrying quota
-    wording is a quota failure, not a dead key); the invalid
-    class is reserved for failures keyed to the key itself."""
+    """Judge one failed Gemini response: "quota_day",
+    "quota", "invalid" or None. Quota is judged FIRST (a 403
+    carrying quota wording is a quota failure, not a dead
+    key); the invalid class is reserved for failures keyed
+    to the key itself. Build 275: a 429 whose body names a
+    PER-DAY quota is its own class — that key is dead until
+    tomorrow, not for COOLDOWN_S, and when EVERY key is in
+    that state the caller fails the job fast (pipeline.quota)
+    instead of re-walking dead keys for every segment."""
     body = str(body_text or "")
     low = body.lower()
+    if status == 429 and _is_day_quota(body):
+        return "quota_day"
     if status == 429 or "resource_exhausted" in low \
             or "quota" in low or "rate limit" in low \
             or "rate_limit" in low:
@@ -132,9 +149,15 @@ def classify_error(status, body_text):
 
 # ---------- cooling (process-local) ----------
 
-def mark_cooling(key):
+def mark_cooling(key, seconds=None):
     with _LOCK:
-        _cooling[key] = time.time() + COOLDOWN_S
+        _cooling[key] = time.time() + (COOLDOWN_S if seconds is None
+                                       else float(seconds))
+
+
+def mark_cooling_day(key):
+    """Build 275: the long rest for a daily-quota-dead key."""
+    mark_cooling(key, COOLDOWN_DAY_S)
 
 
 def is_cooling(key):

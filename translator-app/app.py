@@ -60,7 +60,7 @@ app = Flask(__name__, static_folder=None)
 # same string — proof193 asserts they are equal — and the page
 # polls /api/version so a device still showing an older shell
 # reloads itself once instead of sitting on a stale build.
-BUILD_TAG = "build 271"
+BUILD_TAG = "build 275"
 JOBS = {}  # id -> dict (also persisted to jobs/<id>/job.json)
 
 STEP_LABELS = {
@@ -385,17 +385,65 @@ def _heartbeat(job):
 # settings are not job data and are never touched here. Queued /
 # running jobs and parked review states (waiting_review /
 # waiting_script) are not finished states and are never reaped.
+#
+# Build 275 (owner-approved hidden-problem batch): the rule
+# SPLITS in two. The MEDIA still goes at 24 h (source,
+# intermediates, outputs, segment/script files, previews —
+# everything heavy), but the RECORD (job.json: id, owner, mode,
+# status, timings, charge) is kept for 30 days, so the job
+# history and the money trail outlive the files; at 30 days
+# _cleanup_job purges the record in full, exactly as the old
+# single rule did at 24 h. The credits ledger lives in
+# users.db, not in job data, and is never pruned by any of
+# this. A user-initiated delete (DELETE /api/jobs/<jid>) and a
+# cancel still remove everything at once, as before.
 CLEANUP_DELAY = 24 * 3600
+RECORD_RETENTION = 30 * 24 * 3600
 CLEANUP_TIMERS = {}
 
 
 def _job_retention(job):
-    """Build 215: the single 24h rule — every finished job, web or
-    bot, done, error or cancelled, is kept exactly CLEANUP_DELAY
-    after it finished, then deleted in full (files + records).
-    (Supersedes the build-180 web/bot split and the build-94
-    newest-2-per-account cap, both removed in this build.)"""
+    """The MEDIA window (build 215's 24h rule, kept verbatim):
+    every finished job, web or bot, done, error or cancelled,
+    keeps its files exactly CLEANUP_DELAY after it finished.
+    Build 275: at that point only the media is stripped —
+    the record's own window is _job_record_retention."""
     return CLEANUP_DELAY
+
+
+def _job_record_retention(job):
+    """Build 275: the RECORD window — a finished job's
+    job.json (metadata only, media already stripped) is kept
+    exactly RECORD_RETENTION after it finished, then purged
+    in full by _cleanup_job."""
+    return RECORD_RETENTION
+
+
+def _arm_retention(job, now=None):
+    """Build 275: arm the job's NEXT retention event from its
+    finish time — the media strip (_strip_job_media) at the
+    24 h window while the media is still here, the full purge
+    (_cleanup_job) at the 30-day window once it is gone. An
+    event already due fires on a near-zero timer (callers —
+    the finish paths, the disk scan — must not block on file
+    IO). Sets cleanup_at to the armed event's time, the value
+    the job card counts down to."""
+    jid = job["id"]
+    if now is None:
+        now = time.time()
+    ref = float(job.get("finished_at") or job.get("created_at")
+                or now)
+    if job.get("media_gone"):
+        delay = _job_record_retention(job) - (now - ref)
+        target = _cleanup_job
+    else:
+        delay = _job_retention(job) - (now - ref)
+        target = _strip_job_media
+    job["cleanup_at"] = now + max(delay, 0.0)
+    t = threading.Timer(max(delay, 0.05), target, args=(jid,))
+    t.daemon = True
+    t.start()
+    CLEANUP_TIMERS[jid] = t
 
 
 def _schedule_cleanup(job):
@@ -403,12 +451,7 @@ def _schedule_cleanup(job):
     old = CLEANUP_TIMERS.pop(jid, None)
     if old:
         old.cancel()
-    delay = _job_retention(job)
-    job["cleanup_at"] = time.time() + delay
-    t = threading.Timer(delay, _cleanup_job, args=(jid,))
-    t.daemon = True
-    t.start()
-    CLEANUP_TIMERS[jid] = t
+    _arm_retention(job)
 
 
 # ---------- Telegram round-trip: bot-submitted jobs ----------
@@ -2996,6 +3039,67 @@ def _cleanup_job(jid):
             shutil.rmtree(pdir, ignore_errors=True)
 
 
+def _strip_job_media(jid):
+    """Build 275, retention phase 1 (24 h after a job finishes):
+    delete the job's MEDIA — source, intermediates, outputs,
+    segment/script files and previews — but KEEP the record:
+    job.json stays, in memory and on disk, with media_gone set,
+    so the job list, the owner's history and the charge record
+    survive until the 30-day purge (_cleanup_job, armed below).
+    Never strips an active or parked job; a no-op when the
+    record is already gone. NOT tombstoned — unlike
+    _cleanup_job this is not the end of the job's life, and
+    later _save calls must still land."""
+    CLEANUP_TIMERS.pop(jid, None)
+    job = JOBS.get(jid)
+    if job is None:
+        try:
+            job = json.loads((JOBS_DIR / jid / "job.json")
+                             .read_text(encoding="utf-8"))
+            JOBS[jid] = job
+        except Exception:
+            return
+    if job.get("status") not in ("done", "error", "cancelled"):
+        return
+    if not job.get("media_gone"):
+        d = JOBS_DIR / jid
+        try:
+            for child in list(d.iterdir()):
+                if child.name == "job.json":
+                    continue
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    try:
+                        child.unlink()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Previews (build 203, audit V08 — the _cleanup_job
+        # rule): every preview dir this job's URL owns, plus
+        # the dir its own source_path pointed into, minus any
+        # dir an ACTIVE job still references.
+        keep = _active_preview_dirs()
+        targets = []
+        url = job.get("url")
+        source_path = job.get("source_path")
+        if url:
+            targets += [pdir for _pid, pdir
+                        in _preview_dirs_for(url)]
+        if source_path:
+            parent = Path(source_path).parent
+            if parent.parent == PREVIEWS_DIR:
+                targets.append(parent)
+        for pdir in targets:
+            if str(pdir) not in keep:
+                shutil.rmtree(pdir, ignore_errors=True)
+        job["media_gone"] = True
+        job["media_deleted_at"] = time.time()
+    _arm_retention(job)
+    _save(job)
+
+
 def _job_minutes(job):
     src = JOBS_DIR / job["id"] / "source.mp4"
     try:
@@ -3378,6 +3482,8 @@ def _mine_entries(user):
 
 @app.get("/api/voices")
 def voices():
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     # Build 200: the picker offers voice STYLES from the one
     # shared table in pipeline.tts (the two my-MM voices × three
     # pitch variants) — ids are style keys, resolved to a real
@@ -3391,6 +3497,7 @@ def voices():
     out = [{"id": s["key"], "label": s["label"], "name": s["name"],
             "tag": s["tag"], "desc": s["desc"],
             "roles": s.get("roles") or ["narration"],
+            "gender": s.get("gender"),
             "preview": f"/voice-previews/std-{s['key']}.mp3"}
            for s in tts.style_library()]
     # Build 205: ElevenLabs premium voices join the picker ONLY
@@ -3555,6 +3662,19 @@ def voice_preview_file(name):
     if not re.fullmatch(r"(?:el|std|usr|gm)-[A-Za-z0-9_-]{1,64}\.mp3",
                         name or ""):
         return jsonify({"error": "မရှိပါ"}), 404
+    if name.startswith("usr-") and ACCOUNTS_ENFORCED:
+        # Build 274: a usr- clip is a customer's own cloned
+        # voice — the URL is only ever handed to its owner
+        # (the picker's "mine" rows / the clones view), so
+        # serving it to anyone else was a class leak. Owner
+        # or admin only; the refusal keeps the plain 404
+        # shape so existence is not leaked either.
+        clone = accounts.clone_by_voice(name[4:-4])
+        user = _current_user()
+        if not clone or not user or (
+                user["role"] != "admin"
+                and clone.get("user_id") != user["id"]):
+            return jsonify({"error": "မရှိပါ"}), 404
     path = elevenlabs_tts.PREVIEW_DIR / name
     if not path.exists() and name.startswith("std-"):
         _ensure_std_preview(name[4:-4])
@@ -3634,6 +3754,8 @@ def _clone_sample_error(path):
 
 @app.get("/api/clones")
 def clones_list():
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     user = _current_user()
     clones = [_clone_view(c) for c in accounts.clones_for(user["id"])] \
         if user and user.get("id") else []
@@ -3939,6 +4061,8 @@ def _preview_download_bounded(url, pdir, quality):
 def make_preview():
     """Download (once, cached by URL+quality) and report
     size/duration for the editor."""
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     data = request.get_json(force=True)
     _me = _current_user()  # build 247: the preview cap exempts admins
     url = dl_mod.clean_url(data.get("url") or "")
@@ -4050,6 +4174,8 @@ def make_preview():
 
 @app.get("/api/preview/<pid>/frame")
 def preview_frame(pid):
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     src = PREVIEWS_DIR / pid / "source.mp4"
     if not src.exists():
         return jsonify({"error": "preview မတွေ့ပါ"}), 404
@@ -4082,6 +4208,8 @@ def frame_upload():
     upload_token form field names a finished chunked upload
     instead of the file part — the grab reads the staged
     file in place and keeps it (only a job spends a token)."""
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     if not _preview_allowed():
         print("[frame-upload] FAILED rate cap hit", flush=True)
         return jsonify({"error": "ခဏ ခဏ မစမ်းပါနဲ့ — ခဏ စောင့်ပြီး "
@@ -4190,6 +4318,8 @@ def frame_upload():
 
 @app.post("/api/logo")
 def upload_logo():
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     f = request.files.get("logo")
     if not f or not f.filename:
         return jsonify({"error": "logo ဖိုင် မပါပါ"}), 400
@@ -4295,6 +4425,8 @@ FONT_LABELS = {
 
 @app.get("/api/fonts")
 def fonts():
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     from pipeline import burn as burn_mod
     return jsonify([{"id": k, "label": FONT_LABELS.get(k, k)}
                     for k in burn_mod.FONT_CHOICES])
@@ -4308,6 +4440,8 @@ def fonts():
 
 @app.get("/api/settings/gemini-key")
 def gemini_key_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     # Build 229: the status reports COUNTS only (pool size,
     # disabled keys, the voice rate) — key values are never
     # returned, exactly as before.
@@ -4320,6 +4454,8 @@ def gemini_key_status():
 
 @app.post("/api/settings/gemini-key")
 def gemini_key_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     # Build 229: the card saves a POOL — up to 30 keys, bulk
     # paste one per line (a one-line paste is a pool of one,
     # the pre-229 behaviour). Both Gemini key formats are
@@ -4344,6 +4480,8 @@ def gemini_key_save():
 
 @app.delete("/api/settings/gemini-key")
 def gemini_key_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     _env_remove("GEMINI_API_KEYS")
     _env_remove("GEMINI_API_KEY")
     gemini_pool.reset_disabled()
@@ -4357,6 +4495,8 @@ def gemini_save():
     the elevenlabs_save pattern: each PRESENT field is
     validated then written. Today: the per-minute credit
     rate for Gemini voices (GEMINI_CREDITS_PER_MIN)."""
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True) or {}
     writes = {}
     if "credits_per_min" in data:
@@ -4379,12 +4519,16 @@ def gemini_save():
 
 @app.get("/api/settings/openai-key")
 def openai_key_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import openai_translate
     return jsonify({"configured": openai_translate.key_configured()})
 
 
 @app.post("/api/settings/openai-key")
 def openai_key_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True) or {}
     key = (data.get("key") or "").strip()
     ok_format = key.startswith("sk-") and 20 <= len(key) <= 200 \
@@ -4397,6 +4541,8 @@ def openai_key_save():
 
 @app.delete("/api/settings/openai-key")
 def openai_key_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     _env_remove("OPENAI_API_KEY")
     return jsonify({"ok": True, "configured": False})
 
@@ -4413,6 +4559,8 @@ def openai_key_delete():
 
 @app.get("/api/settings/translate-chain")
 def translate_chain_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import translate_segments
     saved = ""
     try:
@@ -4434,6 +4582,8 @@ def translate_chain_status():
 
 @app.post("/api/settings/translate-chain")
 def translate_chain_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True) or {}
     chain = (data.get("chain") or "").strip().lower()
     if chain not in ("openai", "legacy"):
@@ -4460,6 +4610,8 @@ def translate_chain_save():
 
 @app.get("/api/settings/generate-chain")
 def generate_chain_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import generate_chain
     saved = ""
     try:
@@ -4481,6 +4633,8 @@ def generate_chain_status():
 
 @app.post("/api/settings/generate-chain")
 def generate_chain_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True) or {}
     chain = (data.get("chain") or "").strip().lower()
     if chain not in ("openai", "legacy"):
@@ -4492,16 +4646,296 @@ def generate_chain_save():
     return jsonify({"ok": True, "saved": chain})
 
 
+# ---------- Off-host backup (build 273) ----------
+# Customer credit balances and the app settings exist ONLY on
+# this VPS; the same-host _backup_loop cannot help if the box
+# itself dies. Once a day this section packs the four money /
+# identity sources into one archive, encrypts it, and sends it
+# to the FIXED admin Telegram chat as a document — the copy
+# lives off-host, in the owner's own Telegram.
+#
+# The four sources, where each actually lives in the deployed
+# layout (all under ROOT = the app dir):
+#   * users.db — accounts, the credit ledger, sessions, and
+#     the app_meta settings table. Archived through the SQLite
+#     backup API, never as a raw copy of the live file (a
+#     mid-write copy can tear a page — the build-204/B4
+#     lesson the same-host loop already learned).
+#   * .env — every Admin-card setting + every API key.
+#   * .tg_recipients.json — the Telegram recipients data.
+#   * the app settings proper — the app_meta table, exported
+#     from that same snapshot as app_meta.json so each of the
+#     four sources is individually restorable.
+#
+# Encryption is openssl symmetric AES-256-CBC with PBKDF2
+# (salted, stock defaults) — a stock tool, so the owner can
+# decrypt the file anywhere with the standard command the
+# Admin card documents, typed exactly as shown. The passphrase the owner sets in the
+# card is held ONLY in a dedicated chmod-600 file
+# (.backup_pass, next to .env — the same protection class as
+# the bot token in .env): unattended daily encryption is
+# impossible unless the app can read it, but it is never in
+# the database, never in .env, never inside the archive it
+# protects, never accepted via chat, and no endpoint ever
+# returns it — GET reports only whether one is set. openssl
+# reads it via -pass file:, so it never appears in argv.
+#
+# The scheduler (_offsite_backup_loop, started with the other
+# production loops) ticks every _BACKUP_TICK_S and runs when
+# the last SUCCESS is over 24 h old AND a passphrase is set;
+# with none set, nothing is created and nothing is sent, and
+# the card shows that state plainly. Every attempt records
+# its outcome in .backup_state.json; a failure is retried at
+# the next tick. Nothing in this section can raise into the
+# app or block a job.
+
+_BACKUP_TICK_S = 900
+_BACKUP_MAX_AGE_S = 24 * 3600
+_BACKUP_FILE_PREFIX = "vt-backup-"
+
+
+def _backup_pass_path():
+    return ROOT / ".backup_pass"
+
+
+def _backup_state_path():
+    return ROOT / ".backup_state.json"
+
+
+def _backup_passphrase():
+    """The owner-set backup passphrase (the first line of the
+    600 file), or "" when unset. Read live on every call so a
+    card save applies without a restart."""
+    try:
+        lines = _backup_pass_path().read_text(
+            encoding="utf-8").splitlines()
+        return lines[0].strip() if lines else ""
+    except Exception:
+        return ""
+
+
+def _backup_configured():
+    return bool(_backup_passphrase())
+
+
+def _backup_state():
+    st = {"last_run": None, "last_ok": None,
+          "last_result": None, "last_error": ""}
+    try:
+        saved = json.loads(
+            _backup_state_path().read_text(encoding="utf-8"))
+        if isinstance(saved, dict):
+            for k in st:
+                if k in saved:
+                    st[k] = saved[k]
+    except Exception:
+        pass
+    return st
+
+
+def _backup_save_state(st):
+    try:
+        p = _backup_state_path()
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(st), encoding="utf-8")
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
+def _backup_due(now=None, st=None, configured=None):
+    """The scheduler's due check, factored pure (like
+    _watchdog_tick) so proofs can drive it: due iff a
+    passphrase is set AND the last successful backup is more
+    than 24 h old (or none ever succeeded)."""
+    if configured is None:
+        configured = _backup_configured()
+    if not configured:
+        return False
+    if st is None:
+        st = _backup_state()
+    if now is None:
+        now = time.time()
+    last_ok = st.get("last_ok")
+    return not last_ok or (now - float(last_ok)) > _BACKUP_MAX_AGE_S
+
+
+class _BackupError(Exception):
+    pass
+
+
+def _backup_collect(stage):
+    """Stage the four sources into `stage` (a Path) and return
+    their archive names. A missing source raises _BackupError
+    naming it — a partial backup must never ship silently."""
+    import sqlite3 as _sq
+    db_src = ROOT / "users.db"
+    if not db_src.exists():
+        raise _BackupError("users.db မတွေ့ပါ")
+    c1 = _sq.connect(str(db_src))
+    try:
+        c2 = _sq.connect(str(stage / "users.db"))
+        try:
+            c1.backup(c2)
+            rows = c2.execute(
+                "SELECT key, value FROM app_meta "
+                "ORDER BY key").fetchall()
+        finally:
+            c2.close()
+    finally:
+        c1.close()
+    (stage / "app_meta.json").write_text(
+        json.dumps(dict(rows), ensure_ascii=False, indent=1,
+                   sort_keys=True), encoding="utf-8")
+    for name in (".env", ".tg_recipients.json"):
+        src = ROOT / name
+        if not src.exists():
+            raise _BackupError(f"{name} မတွေ့ပါ")
+        shutil.copy2(src, stage / name)
+    return ["users.db", "app_meta.json", ".env",
+            ".tg_recipients.json"]
+
+
+def _backup_run():
+    """One off-host backup attempt; NEVER raises. Returns
+    {"ok", "error", "at"} and records the outcome in the
+    state file. With no passphrase set it creates nothing,
+    sends nothing, and reports the unset state."""
+    import subprocess
+    import tarfile
+    now = time.time()
+    res = {"ok": False, "error": None, "at": now}
+    if not _backup_configured():
+        res["error"] = "backup passphrase မသတ်မှတ်ရသေးပါ"
+        return res
+    stage = None
+    try:
+        stage = Path(tempfile.mkdtemp(prefix="vt-backup-"))
+        names = _backup_collect(stage)
+        date = time.strftime("%Y-%m-%d", time.localtime(now))
+        tar_path = stage / f"{_BACKUP_FILE_PREFIX}{date}.tar.gz"
+        with tarfile.open(tar_path, "w:gz") as tf:
+            for n in names:
+                tf.add(stage / n, arcname=n)
+        enc_path = Path(str(tar_path) + ".enc")
+        proc = subprocess.run(
+            ["openssl", "enc", "-aes-256-cbc", "-pbkdf2",
+             "-salt",
+             "-pass", f"file:{_backup_pass_path()}",
+             "-in", str(tar_path), "-out", str(enc_path)],
+            capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0 or not enc_path.exists():
+            raise _BackupError(
+                "encrypt လုပ်လို့ မရပါ: "
+                + (proc.stderr or "").strip()[:120])
+        from pipeline import telegram_send as tg
+        tg.send_document(tg.FIXED_ADMIN_CHAT_ID, enc_path,
+                         caption=f"{date} · {BUILD_TAG}")
+        st = _backup_state()
+        st.update({"last_run": now, "last_ok": now,
+                   "last_result": "ok", "last_error": ""})
+        _backup_save_state(st)
+        res["ok"] = True
+    except Exception as e:
+        res["error"] = (str(e) or type(e).__name__)[:200]
+        st = _backup_state()
+        st.update({"last_run": now, "last_result": "error",
+                   "last_error": res["error"]})
+        _backup_save_state(st)
+    finally:
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
+    return res
+
+
+def _backup_tick():
+    """One scheduler pass: run a backup iff one is due. Can
+    never raise (the loop's life depends on it)."""
+    try:
+        if _backup_due():
+            _backup_run()
+    except Exception:
+        pass
+
+
+def _offsite_backup_loop():
+    while True:
+        time.sleep(_BACKUP_TICK_S)
+        _backup_tick()
+
+
+@app.get("/api/settings/backup")
+def backup_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    st = _backup_state()
+    return jsonify({
+        "configured": _backup_configured(),
+        "last_run": st.get("last_run"),
+        "last_ok": st.get("last_ok"),
+        "last_result": st.get("last_result"),
+        "last_error": st.get("last_error") or "",
+        "due": _backup_due(st=st)})
+
+
+@app.post("/api/settings/backup")
+def backup_passphrase_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    data = request.get_json(force=True) or {}
+    pw = (data.get("passphrase") or "").strip()
+    if not (8 <= len(pw) <= 200):
+        return jsonify({"error": "passphrase က အနည်းဆုံး ၈ လုံး "
+                        "ရှိရပါမယ်"}), 400
+    p = _backup_pass_path()
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, (pw + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
+    return jsonify({"ok": True, "configured": True})
+
+
+@app.delete("/api/settings/backup")
+def backup_passphrase_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    try:
+        _backup_pass_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+    return jsonify({"ok": True, "configured": False})
+
+
+@app.post("/api/settings/backup/run")
+def backup_run_now():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
+    if not _backup_configured():
+        return jsonify({"error": "backup passphrase အရင် "
+                        "သတ်မှတ်ပါ"}), 400
+    res = _backup_run()
+    return jsonify({"ok": res["ok"], "error": res["error"]})
+
+
 # ---------- OpenRouter key (server-side only, same rules) ----------
 
 @app.get("/api/settings/openrouter-key")
 def openrouter_key_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import openrouter_translate
     return jsonify({"configured": openrouter_translate.key_configured()})
 
 
 @app.post("/api/settings/openrouter-key")
 def openrouter_key_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True) or {}
     key = (data.get("key") or "").strip()
     ok_format = key.startswith("sk-or-") and 20 <= len(key) <= 200 \
@@ -4514,18 +4948,24 @@ def openrouter_key_save():
 
 @app.delete("/api/settings/openrouter-key")
 def openrouter_key_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     _env_remove("OPENROUTER_API_KEY")
     return jsonify({"ok": True, "configured": False})
 
 
 @app.get("/api/settings/xkiro-key")
 def xkiro_key_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import xkiro_translate
     return jsonify({"configured": xkiro_translate.key_configured()})
 
 
 @app.post("/api/settings/xkiro-key")
 def xkiro_key_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True) or {}
     key = (data.get("key") or "").strip()
     ok_format = 20 <= len(key) <= 200 \
@@ -4538,6 +4978,8 @@ def xkiro_key_save():
 
 @app.delete("/api/settings/xkiro-key")
 def xkiro_key_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     _env_remove("XKIRO_API_KEY")
     return jsonify({"ok": True, "configured": False})
 
@@ -4547,10 +4989,16 @@ def xkiro_key_delete():
 # (chmod 600, never in git) and is NEVER returned — only
 # whether one is configured, the selected model, and the last
 # transcription outcome. Every /api/settings/* route is
-# restricted to admins by _accounts_guard.
+# restricted to admins — since build 274 each handler ALSO
+# checks _require_admin() itself, because the deployed
+# proxy chain makes every request look like a loopback
+# internal call to _accounts_guard (which therefore never
+# fires in production).
 
 @app.get("/api/settings/groq")
 def groq_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import groq_transcribe
     return jsonify({"configured": groq_transcribe.key_configured(),
                     "model": groq_transcribe.get_model(),
@@ -4559,6 +5007,8 @@ def groq_status():
 
 @app.post("/api/settings/groq-key")
 def groq_key_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True) or {}
     key = (data.get("key") or "").strip()
     ok_format = key.startswith("gsk_") and 20 <= len(key) <= 200 \
@@ -4571,12 +5021,16 @@ def groq_key_save():
 
 @app.delete("/api/settings/groq-key")
 def groq_key_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     _env_remove("GROQ_API_KEY")
     return jsonify({"ok": True, "configured": False})
 
 
 @app.post("/api/settings/groq")
 def groq_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     # Partial save, same shape as the ElevenLabs settings
     # post: each PRESENT field is validated then written;
     # absent fields keep their saved values.
@@ -4610,6 +5064,8 @@ def _el_status_voices():
 
 @app.get("/api/settings/elevenlabs")
 def elevenlabs_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     return jsonify({
         "configured": elevenlabs_tts.key_configured(),
         "model": elevenlabs_tts.get_model(),
@@ -4626,6 +5082,8 @@ def elevenlabs_status():
 
 @app.post("/api/settings/elevenlabs-key")
 def elevenlabs_key_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True) or {}
     key = (data.get("key") or "").strip()
     ok_format = key.startswith("sk_") and 20 <= len(key) <= 200 \
@@ -4638,12 +5096,16 @@ def elevenlabs_key_save():
 
 @app.delete("/api/settings/elevenlabs-key")
 def elevenlabs_key_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     _env_remove("ELEVENLABS_API_KEY")
     return jsonify({"ok": True, "configured": False})
 
 
 @app.post("/api/settings/elevenlabs")
 def elevenlabs_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     # Build 206: partial saves — each PRESENT field is validated
     # then written; absent fields keep their saved values. The
     # card sends all four (model, rate, access, test users) at
@@ -4780,6 +5242,8 @@ def _el_validate_entry(data):
 
 @app.post("/api/settings/elevenlabs-voices")
 def elevenlabs_voice_add():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True) or {}
     entry, err = _el_validate_entry(data)
     if err:
@@ -4819,6 +5283,8 @@ def elevenlabs_voices_bulk():
     lazily on first request (see the /voice-previews route),
     so importing 58 voices costs zero ElevenLabs calls. The
     API key is never part of the request or the response."""
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True, silent=True)
     if isinstance(data, dict) and isinstance(
             data.get("voices"), list):
@@ -4859,6 +5325,8 @@ def elevenlabs_voice_preview_regen():
     """(Re)generate one voice's library preview clip (build
     207). Best-effort like the add-time generation: failure
     leaves the voice untouched and says so politely."""
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True, silent=True) or {}
     vid = (data.get("id") or "").strip()
     if not elevenlabs_tts.find_voice(vid):
@@ -4874,6 +5342,8 @@ def elevenlabs_voice_preview_regen():
 
 @app.delete("/api/settings/elevenlabs-voices")
 def elevenlabs_voice_remove():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True, silent=True) or {}
     vid = (data.get("id") or "").strip()
     voices = [v for v in elevenlabs_tts.get_voices()
@@ -4913,6 +5383,8 @@ def _env_remove(key):
 
 @app.get("/api/settings/telegram")
 def telegram_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import telegram_send as tg
     info = {"configured": bool(tg.token()), "bot": None,
             "recipients": len(tg.recipients()),
@@ -4928,6 +5400,8 @@ def telegram_status():
 
 @app.post("/api/settings/telegram")
 def telegram_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import telegram_send as tg
     data = request.get_json(force=True) or {}
     tok = (data.get("token") or "").strip()
@@ -4944,6 +5418,8 @@ def telegram_save():
 
 @app.delete("/api/settings/telegram")
 def telegram_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     _env_remove("TELEGRAM_BOT_TOKEN")
     return jsonify({"ok": True, "configured": False})
 
@@ -4969,6 +5445,8 @@ def _tg_api_hash():
 
 @app.get("/api/settings/telegram-api")
 def telegram_api_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import telegram_send as tg
     return jsonify({"api_id_set": bool(_tg_api_id()),
                     "api_hash_set": bool(_tg_api_hash()),
@@ -4977,6 +5455,8 @@ def telegram_api_status():
 
 @app.post("/api/settings/telegram-api")
 def telegram_api_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True, silent=True) or {}
     api_id = (data.get("api_id") or "").strip()
     api_hash = (data.get("api_hash") or "").strip().lower()
@@ -4993,6 +5473,8 @@ def telegram_api_save():
 
 @app.delete("/api/settings/telegram-api")
 def telegram_api_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     _env_remove("TG_API_ID")
     _env_remove("TG_API_HASH")
     # Revert to the cloud API at once. The local server (if the
@@ -5026,6 +5508,8 @@ def telegram_api_delete():
 
 @app.get("/api/settings/tunnel")
 def tunnel_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import tunnel
     info = tunnel.status()
     try:
@@ -5043,6 +5527,8 @@ def tunnel_status():
 
 @app.post("/api/settings/tunnel")
 def tunnel_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import tunnel
     data = request.get_json(force=True, silent=True) or {}
     raw = (data.get("link") or "").strip()
@@ -5061,6 +5547,8 @@ def tunnel_save():
 
 @app.delete("/api/settings/tunnel")
 def tunnel_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import tunnel
     tunnel.clear()
     info = tunnel.status()
@@ -5078,8 +5566,9 @@ def tunnel_delete():
 # Bilibili app, or by pasting a cookies.txt export — and
 # pipeline/download.py hands the stored cookies to yt-dlp
 # for bilibili URLs only. Same rules as the tunnel card:
-# admin-only (see _accounts_guard — every /api/settings/*
-# route needs the admin role), the session lives server-
+# admin-only (the handler checks _require_admin() itself,
+# build 274 — _accounts_guard alone is not enough in the
+# deployed proxy chain), the session lives server-
 # side only (bilibili-cookies.txt, chmod 600, never in
 # git), and NO endpoint ever returns a cookie value — the
 # status surface is {configured, logged_in_as} with the
@@ -5089,12 +5578,16 @@ def tunnel_delete():
 
 @app.get("/api/settings/bilibili")
 def bilibili_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import bilibili_auth
     return jsonify(bilibili_auth.status())
 
 
 @app.post("/api/settings/bilibili/qr")
 def bilibili_qr_start():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import bilibili_auth
     try:
         return jsonify(bilibili_auth.qr_start())
@@ -5104,6 +5597,8 @@ def bilibili_qr_start():
 
 @app.get("/api/settings/bilibili/qr/image")
 def bilibili_qr_image():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import bilibili_auth
     try:
         png = bilibili_auth.qr_image_png()
@@ -5116,12 +5611,16 @@ def bilibili_qr_image():
 
 @app.get("/api/settings/bilibili/qr/poll")
 def bilibili_qr_poll():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import bilibili_auth
     return jsonify(bilibili_auth.qr_poll())
 
 
 @app.post("/api/settings/bilibili/cookies")
 def bilibili_cookies_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import bilibili_auth
     data = request.get_json(force=True, silent=True) or {}
     try:
@@ -5135,6 +5634,8 @@ def bilibili_cookies_save():
 
 @app.delete("/api/settings/bilibili")
 def bilibili_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import bilibili_auth
     bilibili_auth.clear()
     info = bilibili_auth.status()
@@ -5144,8 +5645,8 @@ def bilibili_delete():
 
 # ---------- Apps Script bridge (server-side only, build 137) ----------
 # The owner's AutoTranslate.gs Web App URL + WEB_SECRET. Same rules as
-# the Gemini/OpenAI keys: admin-only (see _accounts_guard — every
-# /api/settings/* route needs the admin role), stored in the project
+# the Gemini/OpenAI keys: admin-only (each handler checks
+# _require_admin() itself since build 274), stored in the project
 # .env (chmod 600, never in git), and no endpoint ever returns the
 # secret — only whether a URL + secret are configured. The URL alone
 # is also never returned: knowing it without the secret is useless,
@@ -5153,12 +5654,16 @@ def bilibili_delete():
 
 @app.get("/api/settings/apps-script")
 def apps_script_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     from pipeline import apps_script_translate
     return jsonify({"configured": apps_script_translate.configured()})
 
 
 @app.post("/api/settings/apps-script")
 def apps_script_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True) or {}
     url = (data.get("url") or "").strip()
     secret = (data.get("secret") or "").strip()
@@ -5175,6 +5680,8 @@ def apps_script_save():
 
 @app.delete("/api/settings/apps-script")
 def apps_script_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     _env_remove("APPS_SCRIPT_URL")
     _env_remove("APPS_SCRIPT_SECRET")
     return jsonify({"ok": True, "configured": False})
@@ -5290,6 +5797,12 @@ def _accounts_guard():
         # web session guard must neither substitute for it nor
         # block it. The two auth paths never mix.
         return None
+    if path == "/api/version":
+        # Public by design (build 274): a bare build string —
+        # the already-open page polls it to notice a newer
+        # deploy, and the deploy watchers poll it with no
+        # session at all.
+        return None
     user = _current_user()
     if path.startswith("/api/settings/") or path.startswith("/api/admin/"):
         if not user or user["role"] != "admin":
@@ -5301,8 +5814,16 @@ def _accounts_guard():
 
 
 def _owns(user, job):
-    if not ACCOUNTS_ENFORCED or user is None:
+    # Build 274: fail closed. This used to treat user=None as
+    # "the guard already kept strangers out" — but a request
+    # can reach a route with no session even under enforcement
+    # (the guard trusts loopback callers, and in the deployed
+    # proxy chain EVERY request looks like loopback), so None
+    # must mean "owns nothing" whenever accounts are enforced.
+    if not ACCOUNTS_ENFORCED:
         return True
+    if user is None:
+        return False
     return user["role"] == "admin" or job.get("user_id") == user["id"]
 
 
@@ -6255,6 +6776,8 @@ def admin_topup_proof(tid):
 
 @app.post("/api/settings/payinfo")
 def payinfo_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True, silent=True) or {}
     _env_write("PAY_INFO", (data.get("text") or "").strip()[:300])
     return jsonify({"ok": True})
@@ -6276,6 +6799,8 @@ def wallflip_save():
     comes down (and accounts enforcement switches on), or the wall
     is restored. Nothing changes until that run — by design, so the
     operator chooses the moment."""
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True, silent=True) or {}
     _env_write("VT_FLIP", "1" if data.get("flip") else "0")
     return jsonify({"ok": True, "wall_flip": _wall_flip()})
@@ -6283,6 +6808,8 @@ def wallflip_save():
 
 @app.post("/api/settings/botopen")
 def botopen_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True, silent=True) or {}
     _env_write("BOT_OPEN", "1" if data.get("open") else "0")
     return jsonify({"ok": True, "bot_open": _bot_open()})
@@ -6300,11 +6827,15 @@ def botopen_save():
 
 @app.get("/api/settings/google")
 def google_settings_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     return jsonify({"configured": bool(_google_client_id())})
 
 
 @app.post("/api/settings/google")
 def google_settings_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True, silent=True) or {}
     cid = (data.get("client_id") or "").strip()
     ok_format = cid.endswith(".apps.googleusercontent.com") \
@@ -6318,6 +6849,8 @@ def google_settings_save():
 
 @app.delete("/api/settings/google")
 def google_settings_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     _env_remove("GOOGLE_CLIENT_ID")
     return jsonify({"ok": True, "configured": False})
 
@@ -6326,11 +6859,15 @@ def google_settings_delete():
 
 @app.get("/api/settings/daily-limit")
 def daily_limit_status():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     return jsonify({"limit": _daily_job_limit()})
 
 
 @app.post("/api/settings/daily-limit")
 def daily_limit_save():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     data = request.get_json(force=True, silent=True) or {}
     try:
         limit = int(data.get("limit"))
@@ -6345,6 +6882,8 @@ def daily_limit_save():
 def payqr_save():
     """Admin uploads the payment QR image customers scan to top
     up. Stored as payqr.png in the app dir (survives deploys)."""
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     f = request.files.get("qr")
     if not f or not f.filename:
         return jsonify({"error": "QR ပုံ မပါပါ"}), 400
@@ -6365,6 +6904,8 @@ def payqr_save():
 
 @app.delete("/api/settings/payqr")
 def payqr_delete():
+    if not _require_admin():
+        return jsonify({"error": "admin ပဲ ရပါတယ်"}), 403
     (ROOT / "payqr.png").unlink(missing_ok=True)
     return jsonify({"ok": True, "qr": False})
 
@@ -6381,6 +6922,8 @@ def payqr_file():
 @app.get("/api/pay-info")
 def pay_info_public():
     """What customers see when topping up: the address text + QR."""
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     return jsonify({"text": _pay_info(),
                     "qr": (ROOT / "payqr.png").exists()})
 
@@ -6619,9 +7162,11 @@ def _upload_owner_ok(rec, user):
     """A record belongs to the account that started it.
     With accounts off there is no caller identity (user
     is None) and the unguessable id/token is itself the
-    capability, as everywhere else in this app."""
+    capability, as everywhere else in this app. Build 274:
+    under enforcement a missing identity owns nothing (the
+    same fail-closed rule as _owns)."""
     if user is None:
-        return True
+        return not ACCOUNTS_ENFORCED
     return rec.get("owner") == user.get("id")
 
 
@@ -6705,6 +7250,8 @@ def upload_start():
     the accounts guard like every /api route; the record
     is bound to the caller and at most two uploads may be
     open (still receiving) per account at once."""
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     if not _upload_admit("start"):
         return jsonify({"error": "ခဏ ခဏ မစမ်းပါနဲ့ — ခဏ စောင့်ပြီး "
                                  "ပြန် စမ်းပါ"}), 429
@@ -7236,6 +7783,8 @@ def _new_job(data, user=None):
 
 @app.post("/api/jobs")
 def create_job():
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     # Build 215 (item 7): a multipart body means the source is an
     # uploaded file; JSON keeps the historical link behaviour.
     data, upload_file = _request_upload()
@@ -7345,6 +7894,9 @@ def _job_view(job, admin=False):
     view = {k: job.get(k) for k in
             ("id", "url", "mode", "status", "current", "error", "tg",
              "created_at", "updated_at", "finished_at", "cleanup_at",
+             # Build 275: the retention split's flag — the card
+             # labels a record whose media already went at 24 h.
+             "media_gone",
              # Build 210: studio (Text-to-Voice) jobs share this
              # listing — the UI labels them from these fields.
              "type", "voice_label", "duration", "story_topic",
@@ -7525,15 +8077,16 @@ def _scan_disk_jobs():
             JOBS[jid] = j
             if jid not in CLEANUP_TIMERS:
                 fin = j.get("finished_at") or j.get("created_at") or time.time()
-                remain = _job_retention(j) - (time.time() - float(fin))
-                if remain <= 0:
+                # Build 275: past the 30-day RECORD window the
+                # job is purged at once (the pre-275 shape, one
+                # window later); inside it, _arm_retention arms
+                # whichever event is next — the 24 h media
+                # strip or the 30-day purge.
+                if time.time() - float(fin) \
+                        > _job_record_retention(j):
                     _cleanup_job(jid)
                     continue
-                t = threading.Timer(remain, _cleanup_job, args=(jid,))
-                t.daemon = True
-                t.start()
-                CLEANUP_TIMERS[jid] = t
-                j["cleanup_at"] = time.time() + remain
+                _arm_retention(j)
         else:
             # waiting_review / waiting_script / anything else:
             # parked, not finished — load as-is, no timer (the
@@ -7544,6 +8097,8 @@ def _scan_disk_jobs():
 
 @app.get("/api/jobs")
 def list_jobs():
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     user = _current_user()
     mine = [j for j in _all_jobs() if _owns(user, j)]
     admin = not ACCOUNTS_ENFORCED \
@@ -7554,6 +8109,8 @@ def list_jobs():
 
 @app.get("/api/jobs/latest")
 def latest_job():
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     user = _current_user()
     admin = not ACCOUNTS_ENFORCED \
         or bool(user and user["role"] == "admin")
@@ -7999,6 +8556,8 @@ def _run_tts_job(job, text, speed):
 
 @app.post("/api/tts")
 def create_tts():
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     user = _current_user()
     data = request.get_json(force=True, silent=True) or {}
     text = (data.get("text") or "").strip()
@@ -8110,6 +8669,8 @@ def tts_history():
     """The caller's studio outputs, newest first — the studio's
     🕘 list. Ownership is the same _owns() rule as every other
     job surface."""
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     user = _current_user()
     mine = [j for j in _all_jobs()
             if j.get("type") == "tts" and _owns(user, j)]
@@ -8334,6 +8895,8 @@ def _recap_worker2(job):
 
 @app.post("/api/recap")
 def create_recap():
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     user = _current_user()
     # Build 215 (item 7): multipart = uploaded file source, the
     # same _accept_upload gate as the dub wizard.
@@ -8700,6 +9263,8 @@ def _story_worker2(job):
 
 @app.post("/api/story")
 def create_story():
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     user = _current_user()
     data = request.get_json(force=True, silent=True) or {}
     topic = (data.get("topic") or "").strip()
@@ -9149,6 +9714,8 @@ def _commentary_worker2(job):
 
 @app.post("/api/commentary")
 def create_commentary():
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     user = _current_user()
     # Multipart = uploaded file source, the same
     # _accept_upload gate as the dub wizard / Recap
@@ -9448,6 +10015,8 @@ def _captions_worker2(job):
 
 @app.post("/api/captions")
 def create_captions():
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     user = _current_user()
     # Multipart = uploaded file source, the same
     # _accept_upload gate as the dub wizard / Recap /
@@ -9754,6 +10323,8 @@ def _download_worker(job):
 
 @app.post("/api/downloads")
 def create_download():
+    if ACCOUNTS_ENFORCED and not _current_user():
+        return jsonify({"error": "အရင် login ဝင်ပါ"}), 401
     user = _current_user()
     data = request.get_json(force=True, silent=True) or {}
     url = (data.get("url") or "").strip()
@@ -10858,9 +11429,11 @@ def job_review_bulk(jid):
 
 def _startup_sweep():
     """Remove leftovers from before a restart — honouring the
-    single 24h retention window (build 215; the old flat 1-hour
-    sweep broke the 24h promise on every restart). Queued/running
-    leftovers are left for the heal in _scan_disk_jobs (build 204)."""
+    retention windows (build 215's 24h rule, split by build 275
+    into the 24h MEDIA window and the 30-day RECORD window; the
+    old flat 1-hour sweep broke the 24h promise on every
+    restart). Queued/running leftovers are left for the heal
+    in _scan_disk_jobs (build 204)."""
     now = time.time()
     # Build 203 (audit V08): preview dirs an active job still
     # references survive the sweep, exactly as in _cleanup_job.
@@ -10876,8 +11449,43 @@ def _startup_sweep():
         if meta and meta.get("status") in ("done", "error",
                                            "cancelled"):
             ref = meta.get("finished_at") or meta.get("created_at") or 0
-            if now - float(ref) > _job_retention(meta):
+            age = now - float(ref)
+            if age > _job_record_retention(meta):
                 shutil.rmtree(d, ignore_errors=True)
+                url = meta.get("url")
+                if url:
+                    for _pid, pdir in _preview_dirs_for(url):
+                        if str(pdir) not in keep:
+                            shutil.rmtree(pdir, ignore_errors=True)
+            elif age > _job_retention(meta) \
+                    and not meta.get("media_gone"):
+                # Build 275: past the media window but inside
+                # the record window — strip the media in place
+                # and keep job.json as the record (the disk
+                # scan that runs after this sweep loads it and
+                # arms the 30-day purge), previews included.
+                try:
+                    for child in list(d.iterdir()):
+                        if child.name == "job.json":
+                            continue
+                        if child.is_dir() \
+                                and not child.is_symlink():
+                            shutil.rmtree(child, ignore_errors=True)
+                        else:
+                            try:
+                                child.unlink()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                meta["media_gone"] = True
+                meta["media_deleted_at"] = now
+                try:
+                    (d / "job.json").write_text(
+                        json.dumps(meta, ensure_ascii=False,
+                                   indent=2), encoding="utf-8")
+                except Exception:
+                    pass
                 url = meta.get("url")
                 if url:
                     for _pid, pdir in _preview_dirs_for(url):
@@ -10983,6 +11591,242 @@ def _watchdog_loop():
         _watchdog_tick(st)
 
 
+# ---------- build 275: silent-death alarms (disk / Gemini /
+# tunnel expiry) ----------
+# The watchdog above covers the BOT dying. This loop covers
+# the ground dying quietly underneath healthy-looking jobs:
+# the disk filling toward the build-266 floor that starts
+# failing parts, and Gemini going unreachable when the
+# owner's V2Ray subscription lapses (the tunnel is the only
+# route to Gemini from this host). Every _ALARM_TICK_S the
+# tick computes the active incidents; a NEW incident sends
+# ONE plain-Burmese alert to the fixed admin chat (via
+# tg.send_alert — the watchdog's path, cloud fallback
+# included), an escalation (disk warn -> critical) sends one
+# more, a persisting incident sends NOTHING, and a recovered
+# incident sends ONE recovery note. Incident state persists
+# in .alarm_state.json (the .backup_state.json pattern), so
+# a restart mid-incident does not re-alert. State moves only
+# on a CONFIRMED send — a dead Telegram path retries next
+# tick instead of swallowing the alert — and no path in this
+# section can raise into the app.
+_ALARM_TICK_S = 900
+# Disk thresholds (bytes free on the app volume): WARN sits
+# well above the build-266 job floor (pipeline.parts
+# DISK_FLOOR_BYTES = 3 GB) so the owner hears BEFORE jobs
+# start dying; CRITICAL is the last call before that floor.
+ALARM_DISK_WARN_BYTES = 8 * 1024 * 1024 * 1024
+ALARM_DISK_CRIT_BYTES = 4 * 1024 * 1024 * 1024
+# Tunnel expiry: warn this many days ahead — when a date is
+# readable at all (see _tunnel_expiry_ts).
+ALARM_TUNNEL_WARN_DAYS = 3
+
+_ALARM_RECOVERY = {
+    "disk": "✅ Disk ပြန် အဆင်ပြေသွားပါပြီ — နေရာ ပြန်ရပါပြီ။",
+    "gemini": "✅ Gemini ပြန် ဆက်သွယ်လို့ ရပါပြီ။",
+    "tunnel_expiry": "✅ Tunnel (VPN subscription) သက်တမ်း "
+                     "ကိစ္စ ပြန် အဆင်ပြေသွားပါပြီ။",
+}
+
+
+def _alarm_state_path():
+    return ROOT / ".alarm_state.json"
+
+
+def _alarm_state():
+    st = {"incidents": {}}
+    try:
+        saved = json.loads(
+            _alarm_state_path().read_text(encoding="utf-8"))
+        if isinstance(saved, dict) \
+                and isinstance(saved.get("incidents"), dict):
+            st["incidents"] = saved["incidents"]
+    except Exception:
+        pass
+    return st
+
+
+def _alarm_save_state(st):
+    try:
+        p = _alarm_state_path()
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(st), encoding="utf-8")
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
+def _disk_free_bytes():
+    """Free bytes on the app volume — a seam (the parts.py
+    _free_bytes pattern) so proofs can stub the disk."""
+    return shutil.disk_usage(ROOT).free
+
+
+def _gemini_health_ok():
+    """True/False: Gemini answers a cheap ListModels call
+    through the tunnel (the _run_translate_probe diagnosis
+    path — the catalogue call burns no generation quota);
+    None when no Gemini key is configured (health not
+    applicable: an unconfigured engine is an admin choice,
+    not an outage). Tries the first few pool keys so one
+    dead key cannot fake an outage."""
+    try:
+        from pipeline import gemini_pool, tunnel
+        import requests
+        keys = gemini_pool.ordered_keys()
+        if not keys:
+            return None
+        url = ("https://generativelanguage.googleapis.com"
+               "/v1beta/models")
+        for key in keys[:3]:
+            try:
+                resp = requests.get(
+                    url, **tunnel.request_kwargs(
+                        timeout=20,
+                        headers={"x-goog-api-key": key}))
+            except Exception:
+                continue
+            if resp.status_code == 200:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _tunnel_expiry_ts():
+    """The tunnel/subscription expiry as a unix ts, or None
+    when NO readable date exists anywhere the app keeps the
+    tunnel config — the honest common case today (the saved
+    share links carry no expiry), in which case the expiry
+    sub-check simply never fires; nothing is invented.
+    Sources, in order: an explicit VT_TUNNEL_EXPIRES_AT in
+    the env/.env (epoch seconds or an ISO date), then an
+    ISO date (YYYY-MM-DD) appearing in the saved tunnel
+    label."""
+    import datetime as _dt
+    import re as _re
+    raw = ""
+    label = ""
+    try:
+        from pipeline import tunnel as _tun
+        raw = _tun._env_get("VT_TUNNEL_EXPIRES_AT")
+        label = _tun._env_get(_tun._ENV_LABEL)
+    except Exception:
+        pass
+    for text in (raw, label):
+        if not text:
+            continue
+        t = str(text).strip()
+        if t.isdigit() and len(t) >= 9:
+            return float(t)
+        m = _re.search(r"(20\d\d)-(\d\d)-(\d\d)", t)
+        if m:
+            try:
+                d = _dt.date(int(m.group(1)), int(m.group(2)),
+                             int(m.group(3)))
+                return _dt.datetime(
+                    d.year, d.month, d.day,
+                    tzinfo=_dt.timezone.utc).timestamp()
+            except Exception:
+                continue
+    return None
+
+
+def _alarm_incidents(now=None):
+    """The currently-active incidents as {key: (level, text)}
+    — factored out of the tick (the _watchdog_tick pattern)
+    so proofs can stub the seams and read the verdict. The
+    level orders severity within a key (disk: 1 = warn,
+    2 = critical); other keys sit at 1."""
+    if now is None:
+        now = time.time()
+    out = {}
+    try:
+        free = _disk_free_bytes()
+    except Exception:
+        free = None
+    if free is not None:
+        gb = free / float(1024 ** 3)
+        if free < ALARM_DISK_CRIT_BYTES:
+            out["disk"] = (2,
+                           "🆘 Disk ပြည့်လုနီးပါပြီ — "
+                           f"{gb:.1f} GB ပဲ ကျန်ပါတယ်။ job တွေ "
+                           "ပျက်တော့မှာမို့ အမြန် ရှင်းပေးပါ 🙏")
+        elif free < ALARM_DISK_WARN_BYTES:
+            out["disk"] = (1,
+                           "⚠️ Disk နည်းလာပါတယ် — "
+                           f"{gb:.1f} GB ပဲ ကျန်ပါတယ်။ "
+                           "ဆက်နည်းရင် job တွေ ပျက်နိုင်ပါတယ်။")
+    if _gemini_health_ok() is False:
+        out["gemini"] = (1,
+                         "⚠️ Gemini ဆက်သွယ်လို့ မရပါ — tunnel "
+                         "(VPN subscription) သက်တမ်း ကုန်တာ "
+                         "ဖြစ်နိုင်ပါတယ်။ စစ်ကြည့်ပေးပါ 🙏")
+    exp = _tunnel_expiry_ts()
+    if exp is not None:
+        days = (exp - now) / 86400.0
+        if days <= ALARM_TUNNEL_WARN_DAYS:
+            if days < 0:
+                out["tunnel_expiry"] = (
+                    1, "⚠️ Tunnel (VPN subscription) သက်တမ်း "
+                    "ကုန်သွားပါပြီ — Gemini ပြန်သုံးဖို့ အသစ် "
+                    "ပြန်ဝယ်ပေးပါ 🙏")
+            else:
+                left = max(1, int(math.ceil(days)))
+                out["tunnel_expiry"] = (
+                    1, f"⚠️ Tunnel (VPN subscription) သက်တမ်း "
+                    f"နောက် {left} ရက် အတွင်း ကုန်ပါမယ် — "
+                    "အသစ် ကြိုဝယ်ထားပေးပါ 🙏")
+    return out
+
+
+def _alarm_tick():
+    """One alarm pass; NEVER raises (the loop's life depends
+    on it, exactly like _backup_tick)."""
+    try:
+        from pipeline import telegram_send as tg
+        if not tg.token():
+            return
+        st = _alarm_state()
+        recorded = st["incidents"]
+        active = _alarm_incidents()
+        changed = False
+        for key, (level, text) in active.items():
+            cur = recorded.get(key)
+            if cur is None or int(cur.get("level") or 0) < level:
+                if tg.send_alert(text):
+                    recorded[key] = {
+                        "level": level,
+                        "since": (cur or {}).get("since")
+                                 or time.time()}
+                    changed = True
+        for key in list(recorded):
+            if key not in active:
+                if tg.send_alert(_ALARM_RECOVERY.get(
+                        key, "✅ ပြန် အဆင်ပြေသွားပါပြီ။")):
+                    recorded.pop(key, None)
+                    changed = True
+        # Silent de-escalation (critical -> warn): lower the
+        # recorded level without a message, so a later
+        # re-escalation alerts again.
+        for key, (level, _text) in active.items():
+            cur = recorded.get(key)
+            if cur is not None \
+                    and int(cur.get("level") or 0) > level:
+                cur["level"] = level
+                changed = True
+        if changed:
+            _alarm_save_state(st)
+    except Exception:
+        pass
+
+
+def _health_alarm_loop():
+    while True:
+        time.sleep(_ALARM_TICK_S)
+        _alarm_tick()
+
+
 try:
     _startup_sweep()
 except Exception:
@@ -11020,12 +11864,16 @@ for _target in (_backup_loop, _job_dispatcher, _upload_sweeper):
         pass
 
 # Build 246: production-only loops (the flow saver + the bot
-# watchdog) and the SIGTERM grace hook. Gated on the same
-# production signal as the shutdown hook so proof harnesses —
-# which import this module — never grow real timers or signal
-# handlers; they drive _tg_flow_save / _watchdog_tick directly.
+# watchdog; build 273 adds the off-host backup scheduler;
+# build 275 adds the silent-death alarm loop) and
+# the SIGTERM grace hook. Gated on the same production signal
+# as the shutdown hook so proof harnesses — which import this
+# module — never grow real timers or signal handlers; they
+# drive _tg_flow_save / _watchdog_tick / _backup_tick /
+# _alarm_tick directly.
 if os.environ.get("TRANSLATOR_APP_DIR") or __name__ == "__main__":
-    for _target in (_tg_flow_saver, _watchdog_loop):
+    for _target in (_tg_flow_saver, _watchdog_loop,
+                    _offsite_backup_loop, _health_alarm_loop):
         try:
             threading.Thread(target=_target, daemon=True).start()
         except Exception:

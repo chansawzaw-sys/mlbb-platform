@@ -42,7 +42,7 @@ generation moved.
 import os
 
 from . import (gemini_translate, openai_translate,
-               openrouter_translate, translate_segments,
+               openrouter_translate, quota, translate_segments,
                xkiro_translate)
 from .common import PROJECT_ROOT
 
@@ -112,6 +112,10 @@ def _chain_generate_openai(prompt, extract):
             if payload is not None:
                 return payload, "openai"
             errors["openai"] = "unusable reply"
+        except quota.QuotaWallError:
+            # Build 275: the wall's Burmese message IS the
+            # job error — never folded into the detail string.
+            raise
         except Exception as e:
             errors["openai"] = str(e)[:100]
     detail = "; ".join(f"{k}: {v}" for k, v in errors.items())

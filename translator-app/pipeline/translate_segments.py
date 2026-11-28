@@ -178,7 +178,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import cue_timing
+from . import cue_timing, quota
 from .common import (PROJECT_ROOT, ensure_system_ca, load_segments,
                      save_segments)
 
@@ -447,6 +447,11 @@ class _Rescue:
                     last_err = RuntimeError("empty reply")
                 self.fails[name] = self.fails.get(name, 0) + 1
                 self._note(name, False, last_err)
+            except quota.QuotaWallError:
+                # Build 275: a hard quota/billing wall is not
+                # a per-segment failure to route around — the
+                # whole job fails fast with the wall's message.
+                raise
             except Exception as e:
                 last_err = e
                 self.fails[name] = self.fails.get(name, 0) + 1
@@ -1331,6 +1336,13 @@ def _run_chunks_parallel(chunks, style, admin=False):
         try:
             out, crep = _run_one_chunk(
                 chunks[ci], style, admin=admin, context=context)
+        except quota.QuotaWallError:
+            # Build 275: the never-raise contract below exists
+            # so one chunk's ordinary failure cannot sink the
+            # others — a hard quota wall is job-fatal by
+            # definition, so it breaks the contract on purpose
+            # and fails the whole job fast with its message.
+            raise
         except Exception as e:
             crep = {"parallel_error": str(e)[:120]}
             try:
@@ -1346,6 +1358,8 @@ def _run_chunks_parallel(chunks, style, admin=False):
                         out.append({**seg, "text_my": _my,
                                     "provider": _prov})
                 crep["chunk_rescue"] = rescue.report
+            except quota.QuotaWallError:
+                raise
             except Exception as e2:
                 crep["parallel_error2"] = str(e2)[:120]
                 out = []

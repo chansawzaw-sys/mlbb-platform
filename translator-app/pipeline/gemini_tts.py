@@ -52,7 +52,7 @@ from pathlib import Path
 
 import requests
 
-from . import gemini_pool, tunnel
+from . import gemini_pool, quota, tunnel
 from .common import (ensure_system_ca, load_segments,
                      probe_duration, save_segments)
 from . import elevenlabs_tts as _el
@@ -321,6 +321,15 @@ def _synth_pcm(voice_name, text):
         },
     }
     last = None
+    # Build 275 (quota fast-fail): a 402 (prepay balance gone)
+    # is account-wide — raise the wall at once. A daily-quota
+    # 429 cools its key for hours; when EVERY key's failure is
+    # the daily wall, the pool is dead until tomorrow and the
+    # job fails fast with the quota message instead of
+    # re-walking the same dead keys for every later segment.
+    all_day = True
+    saw_http = False
+    day_body = ""
     for key in keys:
         for attempt in range(2):
             try:
@@ -332,19 +341,35 @@ def _synth_pcm(voice_name, text):
                                      "application/json"}))
             except Exception as e:  # network blip — retry once
                 last = _clean(e, keys)[:120]
+                all_day = False
                 if attempt + 1 < 2:
                     time.sleep(1)
                 continue
             if resp.status_code == 200:
                 return _extract_pcm(resp)
+            saw_http = True
+            wall = quota.wall_message("gemini", resp.status_code,
+                                      resp.text)
+            if resp.status_code == 402 and wall:
+                raise quota.QuotaWallError(wall)
             cls = gemini_pool.classify_error(resp.status_code,
                                              resp.text)
-            if cls == "quota":
+            if cls == "quota_day":
+                gemini_pool.mark_cooling_day(key)
+                day_body = resp.text
+            elif cls == "quota":
                 gemini_pool.mark_cooling(key)
+                all_day = False
             elif cls == "invalid":
                 gemini_pool.mark_disabled(key)
+                all_day = False
+            else:
+                all_day = False
             last = f"HTTP {resp.status_code}"
             break  # any HTTP failure: next key
+    if saw_http and all_day and day_body:
+        raise quota.QuotaWallError(
+            quota.wall_message("gemini", 429, day_body))
     raise RuntimeError(FAIL_MSG + (f" [{last}]" if last else ""))
 
 

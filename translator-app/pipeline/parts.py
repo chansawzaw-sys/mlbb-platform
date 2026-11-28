@@ -690,11 +690,14 @@ def run_phase2_parts(workdir, *, mode, phase2, progress=None, fx=None,
                     part_secs[i] + (time.monotonic() - t0), 1)
                 _save_accum(workdir, accum)
                 if type(e).__name__ in ("JobCancelled",
-                                         "_ShutdownInterrupt"):
+                                         "_ShutdownInterrupt",
+                                         "QuotaWallError"):
                     # The owner's own stop signals (raised by the
                     # real progress callback through the part's
-                    # stages): never retried, never recorded as a
-                    # part failure.
+                    # stages) — and, build 275, a hard provider
+                    # quota/billing wall (pipeline.quota), which
+                    # no in-place retry can clear: never retried,
+                    # never recorded as a part failure.
                     raise
                 _record_failure(workdir, part=i + 1,
                                 stage=_stage_label(last_step["step"]),

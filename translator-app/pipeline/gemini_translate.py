@@ -196,6 +196,9 @@ def list_models():
             last = f"{resp.status_code}: {resp.text[:150]}"
             cls = gemini_pool.classify_error(resp.status_code,
                                              resp.text)
+            if cls == "quota_day":
+                gemini_pool.mark_cooling_day(key)
+                break
             if cls == "quota":
                 gemini_pool.mark_cooling(key)
                 break
@@ -374,6 +377,8 @@ def _walk(key, body, validate):
                                                  resp.text)
                 if cls == "invalid":
                     fail_class = "invalid"
+                elif cls == "quota_day":
+                    fail_class = "quota_day"
                 elif cls == "quota" and fail_class is None:
                     fail_class = "quota"
                 # Record EVERY attempt with its own body
@@ -405,6 +410,9 @@ def _run_pool(body, validate, what):
         all_attempts += attempts
         if result is not None:
             return result
+        if fail_class == "quota_day":
+            gemini_pool.mark_cooling_day(key)
+            continue
         if fail_class == "quota":
             gemini_pool.mark_cooling(key)
             continue
